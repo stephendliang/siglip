@@ -86,6 +86,10 @@ def compute(args):
     c["TN"] = args.tile_n
     c["TK"] = args.tile_k
 
+    # ── Bench ──
+    c["warmup"] = args.warmup
+    c["iters"]  = args.iters
+
     # ── Batch ──
     c["imgs_per_sm"] = args.imgs_per_sm
     c["B"] = c["sm_count"] * c["imgs_per_sm"]
@@ -150,16 +154,16 @@ def compute(args):
     # TMA bytes per stage
     c["tma_bytes"] = c["sz_a"] + c["sz_b"]
 
-    # ── SMEM descriptor params (swizzle mode derived from TK) ──
-    c["sbo"] = 8 * c["TK"]
-    if c["TK"] >= 128:
-        c["swizzle_name"] = "SWIZZLE_128B"
-        c["swizzle_desc_bits"] = "(1ULL << 62)"   # mode 2 in bits [63:61]
-        c["swizzle_cu_enum"] = "CU_TENSOR_MAP_SWIZZLE_128B"
-    else:
-        c["swizzle_name"] = "SWIZZLE_32B"
-        c["swizzle_desc_bits"] = "(1ULL << 61)"   # mode 1 in bits [63:61]
-        c["swizzle_cu_enum"] = "CU_TENSOR_MAP_SWIZZLE_32B"
+    # ── SMEM descriptor params (SWIZZLE_32B for TK=32 FP8) ──
+    # TMA loads [TK, height] with 32B swizzle → tcgen05.mma reads with matching mode.
+    # SBO = 8 * swizzle_bytes (stride between 8-row core matrix groups).
+    # LBO = 0 for swizzled modes (swizzle pattern encodes row stride).
+    # Ref: gau-nernst "tcgen05 for dummies" — v2 uses same pattern with 128B swizzle.
+    c["elem_bytes"] = 1  # FP8
+    assert c["TK"] == 32, "Only TK=32 supported (SWIZZLE_32B); TK=128 needs SWIZZLE_128B (TODO)"
+    c["sbo"] = 8 * c["TK"] * c["elem_bytes"]  # 8 * 32 = 256
+    c["swizzle_tma"] = "CU_TENSOR_MAP_SWIZZLE_32B"
+    c["swizzle_desc_bits"] = 6  # SMEM desc layout_type: SWIZZLE_32B = 6
 
     # ── TMEM ──
     c["tmem_cols"] = c["TN"]
@@ -226,7 +230,7 @@ def print_analysis(c):
     Drain:    All {nw} warps epilogue for LAST tile ({nw} × 32 = {nw*32} rows)
 
   idesc: {c['idesc_hex']}  (E4M3 × E4M3 → FP32, M={c['TM']}, N={c['TN']})
-  SMEM desc: SBO={c['sbo']}B  {c['swizzle_name']}  (LBO implicit)  MMA/iter: {c['mma_per_ki']}
+  SMEM desc: SBO={c['sbo']}B  SWIZZLE_32B  MMA/iter: {c['mma_per_ki']}
   TMEM: 2 × {c['tmem_cols']} = {c['tmem_cols_total']} columns ({100*c['tmem_cols_total']/512:.0f}% of 512) [double-buffered]
 
   SMEM: {c['smem_used']:,} / {c['smem_bytes']:,} bytes ({pct:.1f}%)
@@ -337,12 +341,11 @@ uint32_t smem_to_uint(const void* p) {{
 }}""")
     w()
     w(f"""static __device__ __forceinline__
-uint64_t make_smem_desc(uint32_t addr, uint32_t sbo) {{
+uint64_t make_smem_desc(uint32_t addr) {{
     uint64_t d = 0;
-    d |= (uint64_t)((addr & 0x3FFFF) >> 4);
-    d |= (uint64_t)((sbo  & 0x3FFFF) >> 4) << 32;
-    d |= (1ULL << 46);
-    d |= {c['swizzle_desc_bits']};  // {c['swizzle_name']}
+    d |= (uint64_t)((addr & 0x3FFFF) >> 4);            // bits [13:0]  base addr
+    d |= (uint64_t)((SBO  & 0x3FFFF) >> 4) << 32;      // bits [45:32] SBO (stride_byte_offset)
+    d |= ({c['swizzle_desc_bits']}ULL << 61);           // bits [63:62] layout_type=3 (SWIZZLE_32B)
     return d;
 }}""")
     w()
@@ -417,15 +420,13 @@ patch_embed_gemm(
 
     # ── TMEM allocation (cta_group::CG) ──
     w(f"""    // ── TMEM allocation: 2 buffers (cta_group::{CG}) ──
-    // Warp 0 (WG0 leader) allocates both; all others relinquish twice
+    // One warp calls alloc (all lanes converged); other warps skip.
+    // No relinquish needed — only required if other warps also want to alloc.
     if (warp == 0) {{
         asm volatile("tcgen05.alloc.cta_group::{CG}.sync.aligned.shared::cta.b32 [%0], %1;"
             :: "r"(smem_to_uint(smem + OFF_TMEM_0)), "r"(TMEM_COLS));
         asm volatile("tcgen05.alloc.cta_group::{CG}.sync.aligned.shared::cta.b32 [%0], %1;"
             :: "r"(smem_to_uint(smem + OFF_TMEM_1)), "r"(TMEM_COLS));
-    }} else {{
-        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::{CG}.sync.aligned;");
-        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::{CG}.sync.aligned;");
     }}
     __syncthreads();
     const uint32_t tmem_base0 = *(volatile uint32_t*)(smem + OFF_TMEM_0);
@@ -515,8 +516,8 @@ patch_embed_gemm(
                     tma_phase[s] ^= 1;
 
                     for (int sub = 0; sub < MMA_PER_KI; sub++) {{
-                        uint64_t desc_a = make_smem_desc(smem_a[s] + sub * MMA_K, SBO);
-                        uint64_t desc_b = make_smem_desc(smem_b[s] + sub * MMA_K, SBO);
+                        uint64_t desc_a = make_smem_desc(smem_a[s]);
+                        uint64_t desc_b = make_smem_desc(smem_b[s]);
                         uint32_t accumulate = (ki == 0 && sub == 0) ? 0 : 1;
 
                         // MMA: cta_group::{CG}, {n_mask}-reg enable mask
@@ -642,7 +643,7 @@ patch_embed_gemm(
     if c["use_coop"]:
         w(f"    grid.sync();")
     w()
-    w(f"""    // ── TMEM dealloc: 2 buffers (warp 0, cta_group::{CG}) ──
+    w(f"""    // ── TMEM dealloc: 2 buffers (warp 0 only, cta_group::{CG}) ──
     if (warp == 0) {{
         asm volatile("tcgen05.dealloc.cta_group::{CG}.sync.aligned.b32 %0, %1;"
             :: "r"(tmem_base[0]), "r"(TMEM_COLS));
@@ -660,6 +661,7 @@ patch_embed_gemm(
 // ═════════════════════════════════════════════════════════════
 
 int main() {{
+    setbuf(stdout, NULL);  // unbuffered stdout for debugging
     printf("SigLIP2 patch embed GEMM — tcgen05 cta_group::{CG} ({c["n_warps"]} warps)\\n");
     printf("  GEMM: [%d,%d] x [%d,%d]^T  {NS}-stage pipeline  idesc: 0x%08X\\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, IDESC);
@@ -672,19 +674,20 @@ int main() {{
     CUDA_CHECK(cudaMalloc(&d_pos,   (size_t)SEQ_LEN * N_DIM * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_C,    (size_t)M_TOTAL * N_DIM * sizeof(float)));
 
-    curandGenerator_t rng;
-    curandCreateGenerator(&rng, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(rng, 42);
-    curandGenerate(rng, (unsigned int*)d_A, ((size_t)M_TOTAL * K_DIM + 3) / 4);
-    curandGenerate(rng, (unsigned int*)d_B, ((size_t)N_DIM * K_DIM + 3) / 4);
-    curandGenerateUniform(rng, d_bias, N_DIM);
-    curandGenerateUniform(rng, d_pos,  SEQ_LEN * N_DIM);
-    curandDestroyGenerator(rng);
+    // Fill A, B with 0x3C (=1.5 in FP8 E4M3, a valid finite value)
+    CUDA_CHECK(cudaMemset(d_A, 0x3C, (size_t)M_TOTAL * K_DIM));
+    CUDA_CHECK(cudaMemset(d_B, 0x3C, (size_t)N_DIM * K_DIM));
+    CUDA_CHECK(cudaMemset(d_bias, 0, (size_t)N_DIM * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_pos,  0, (size_t)SEQ_LEN * N_DIM * sizeof(float)));
+    printf("  Alloc + RNG done\\n");
 
     CUtensorMap h_tma_a, h_tma_b;
 
+    // 2D TMA with SWIZZLE_32B: load [TK, height] per stage
+    // Global memory: row-major A[M,K], B[N,K] with element=UINT8 (FP8)
+    // TK=32 FP8 = 32 bytes = exactly 32B → SWIZZLE_32B
     {{
-        uint64_t dims[2]    = {{K_DIM, M_TOTAL}};
+        uint64_t dims[2]    = {{(uint64_t)K_DIM, (uint64_t)M_TOTAL}};
         uint64_t strides[1] = {{(uint64_t)K_DIM}};
         uint32_t box[2]     = {{TK, TM}};
         uint32_t estrides[2]= {{1, 1}};
@@ -692,13 +695,13 @@ int main() {{
             CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (void*)d_A,
             dims, strides, box, estrides,
             CU_TENSOR_MAP_INTERLEAVE_NONE,
-            {c['swizzle_cu_enum']},
+            {c['swizzle_tma']},
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }}
 
     {{
-        uint64_t dims[2]    = {{K_DIM, N_DIM}};
+        uint64_t dims[2]    = {{(uint64_t)K_DIM, (uint64_t)N_DIM}};
         uint64_t strides[1] = {{(uint64_t)K_DIM}};
         uint32_t box[2]     = {{TK, TN}};
         uint32_t estrides[2]= {{1, 1}};
@@ -706,13 +709,14 @@ int main() {{
             CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (void*)d_B,
             dims, strides, box, estrides,
             CU_TENSOR_MAP_INTERLEAVE_NONE,
-            {c['swizzle_cu_enum']},
+            {c['swizzle_tma']},
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }}
 
     CUDA_CHECK(cudaFuncSetAttribute(patch_embed_gemm,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));""")
+        cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
+    printf("  TMA descriptors + func attr done\\n");""")
     w()
 
     # Generate the kernel launch as a macro/inline for reuse in loops
@@ -726,27 +730,29 @@ int main() {{
     else:
         launch = f"    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);"
 
-    w(f"""    // ── Warmup: 10 iterations ──
-    printf("Warmup: 10 iterations...\\n");
-    for (int _i = 0; _i < 10; _i++) {{
+    w(f"""    // ── Warmup: {c['warmup']} iterations ──
+    printf("Launching warmup ({c['warmup']} iters)...\\n");
+    for (int _i = 0; _i < {c['warmup']}; _i++) {{
 {launch}
     }}
+    printf("  Waiting for warmup sync...\\n");
     CUDA_CHECK(cudaDeviceSynchronize());
+    printf("  Warmup done.\\n");
 
-    // ── Timed: 100 iterations ──
-    printf("Timing: 100 iterations...\\n");
+    // ── Timed: {c['iters']} iterations ──
+    printf("Timing: {c['iters']} iterations...\\n");
     cudaEvent_t _t0, _t1;
     cudaEventCreate(&_t0);
     cudaEventCreate(&_t1);
     cudaEventRecord(_t0);
-    for (int _i = 0; _i < 100; _i++) {{
+    for (int _i = 0; _i < {c['iters']}; _i++) {{
 {launch}
     }}
     cudaEventRecord(_t1);
     cudaEventSynchronize(_t1);
     float _ms;
     cudaEventElapsedTime(&_ms, _t0, _t1);
-    _ms /= 100.0f;
+    _ms /= {c['iters']}.0f;
     printf("Custom kernel: %.3f ms  %.2f TFLOPS\\n",
            _ms, 2.0 * M_TOTAL * N_DIM * K_DIM / _ms / 1e9);
     cudaEventDestroy(_t0);
@@ -790,6 +796,10 @@ def main():
                    help="Disable snake (zigzag) tile traversal")
     p.add_argument("--cluster-size", type=int, default=None,
                    help="Override cluster size (1 = no clustering)")
+    p.add_argument("--warmup", type=int, default=2,
+                   help="Warmup iterations before timing")
+    p.add_argument("--iters", type=int, default=10,
+                   help="Timed iterations")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("-o", default="megakernel.cu")
     args = p.parse_args()
