@@ -714,16 +714,47 @@ int main() {{
     CUDA_CHECK(cudaFuncSetAttribute(patch_embed_gemm,
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));""")
     w()
+
+    # Generate the kernel launch as a macro/inline for reuse in loops
     if c["use_coop"]:
-        w(f"""    void* args[] = {{ &h_tma_a, &h_tma_b, &d_bias, &d_pos, &d_C }};
-    CUDA_CHECK(cudaLaunchCooperativeKernel(
-        (void*)patch_embed_gemm,
-        dim3(SM_COUNT), dim3(THREADS), args, SMEM_BYTES));""")
+        launch = (
+            f"    void* args[] = {{ &h_tma_a, &h_tma_b, &d_bias, &d_pos, &d_C }};\n"
+            f"    CUDA_CHECK(cudaLaunchCooperativeKernel(\n"
+            f"        (void*)patch_embed_gemm,\n"
+            f"        dim3(SM_COUNT), dim3(THREADS), args, SMEM_BYTES));"
+        )
     else:
-        w(f"    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);")
-    w()
-    w(f"""    CUDA_CHECK(cudaDeviceSynchronize());
-    printf("Kernel completed.\\n");
+        launch = f"    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);"
+
+    w(f"""    // ── Warmup: 10 iterations ──
+    printf("Warmup: 10 iterations...\\n");
+    for (int _i = 0; _i < 10; _i++) {{
+{launch}
+    }}
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // ── Timed: 100 iterations ──
+    printf("Timing: 100 iterations...\\n");
+    cudaEvent_t _t0, _t1;
+    cudaEventCreate(&_t0);
+    cudaEventCreate(&_t1);
+    cudaEventRecord(_t0);
+    for (int _i = 0; _i < 100; _i++) {{
+{launch}
+    }}
+    cudaEventRecord(_t1);
+    cudaEventSynchronize(_t1);
+    float _ms;
+    cudaEventElapsedTime(&_ms, _t0, _t1);
+    _ms /= 100.0f;
+    printf("Custom kernel: %.3f ms  %.2f TFLOPS\\n",
+           _ms, 2.0 * M_TOTAL * N_DIM * K_DIM / _ms / 1e9);
+    cudaEventDestroy(_t0);
+    cudaEventDestroy(_t1);
+
+    // ── Checksum run ──
+{launch}
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     float* h_C = (float*)malloc((size_t)M_TOTAL * N_DIM * sizeof(float));
     CUDA_CHECK(cudaMemcpy(h_C, d_C, (size_t)M_TOTAL * N_DIM * sizeof(float), cudaMemcpyDeviceToHost));
