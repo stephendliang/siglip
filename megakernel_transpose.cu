@@ -1,8 +1,8 @@
-// Hand-tuned from gen.py output — TK=128, SWIZZLE_128B, 7-stage pipeline
+// Hand-tuned from gen.py output — TK=128, SWIZZLE_128B, 6-stage pipeline
 // Target: B200  Batch: 4736  GEMM: [928256,768]×[768,768]^T
-// Pipeline: 7-stage  K-iters: 6  MMA/iter: 4  idesc: 0x08200010
+// Pipeline: 6-stage  K-iters: 6  MMA/iter: 4  idesc: 0x08200010
 // Warps: 6 (192 threads)  cta_group::1
-// Warp-specialized: Load(W0) | MMA(W1,cta_group::1) | Epilogue(W2-5)  BF16 output
+// Warp-specialized: Load(W0) | MMA(W1,cta_group::1) | Epilogue(W2-5)  BF16 output (SMEM transpose)
 // tcgen05.mma.cta_group::1.kind::f8f6f4  (E4M3 × E4M3 → FP32)
 
 #include <cuda.h>
@@ -26,13 +26,13 @@
 #define K_ITERS        6
 #define TOTAL_TILES    43512
 #define N_STAGES       6
-#define OFF_TMA_BUF    196608
-#define TMA_BUF_SIZE   1024
-#define OFF_TMEM_0     204800
-#define OFF_TMEM_1     204804
-#define OFF_TMA_MBAR   204808
-#define OFF_MMA_MBAR   204856
-#define SMEM_BYTES     204928
+#define OFF_TRANSPOSE  196608
+#define TRANS_STRIDE   33
+#define OFF_TMEM_0     213504
+#define OFF_TMEM_1     213508
+#define OFF_TMA_MBAR   213512
+#define OFF_MMA_MBAR   213560
+#define SMEM_BYTES     213632
 #define TMEM_COLS      128
 #define IDESC          0x08200010U
 #define SBO            1024
@@ -115,73 +115,6 @@ void tma_load_2d(uint32_t smem_dst, const void* tma_desc,
         : "memory");
 }
 
-static __device__ __forceinline__
-void tma_store_2d(const void* tma_desc, uint32_t smem_src,
-                  int32_t c0, int32_t c1) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group"
-        " [%0, {%2, %3}], [%1];"
-        :: "l"(tma_desc), "r"(smem_src), "r"(c0), "r"(c1)
-        : "memory");
-}
-
-static __device__ __forceinline__
-void tma_store_fence() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
-
-static __device__ __forceinline__
-void tma_store_commit() {
-    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-}
-
-static __device__ __forceinline__
-void tma_store_wait_0() {
-    asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
-}
-
-static __device__ __forceinline__
-void tma_store_wait_1() {
-    asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");
-}
-
-// ── Pipelined epilogue macros ────────────────────────────────
-
-#define TMEM_LOAD(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15, TADDR) \
-    asm volatile( \
-        "tcgen05.ld.sync.aligned.32x32b.x16.b32 " \
-        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];" \
-        : "=f"(r0),"=f"(r1),"=f"(r2),"=f"(r3), \
-          "=f"(r4),"=f"(r5),"=f"(r6),"=f"(r7), \
-          "=f"(r8),"=f"(r9),"=f"(r10),"=f"(r11), \
-          "=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15) \
-        : "r"(TADDR))
-
-#define TMEM_WAIT() \
-    asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory")
-
-#define CVT_STS(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15, SLANE, SLANE16) \
-    asm volatile( \
-        "{\n\t" \
-        ".reg .b32 b0,b1,b2,b3,b4,b5,b6,b7;\n\t" \
-        "cvt.rn.bf16x2.f32 b0, %1, %0;\n\t" \
-        "cvt.rn.bf16x2.f32 b1, %3, %2;\n\t" \
-        "cvt.rn.bf16x2.f32 b2, %5, %4;\n\t" \
-        "cvt.rn.bf16x2.f32 b3, %7, %6;\n\t" \
-        "cvt.rn.bf16x2.f32 b4, %9, %8;\n\t" \
-        "cvt.rn.bf16x2.f32 b5, %11, %10;\n\t" \
-        "cvt.rn.bf16x2.f32 b6, %13, %12;\n\t" \
-        "cvt.rn.bf16x2.f32 b7, %15, %14;\n\t" \
-        "st.shared.v4.b32 [%16], {b0,b1,b2,b3};\n\t" \
-        "st.shared.v4.b32 [%17], {b4,b5,b6,b7};\n\t" \
-        "}" \
-        :: "f"(r0),"f"(r1),"f"(r2),"f"(r3), \
-           "f"(r4),"f"(r5),"f"(r6),"f"(r7), \
-           "f"(r8),"f"(r9),"f"(r10),"f"(r11), \
-           "f"(r12),"f"(r13),"f"(r14),"f"(r15), \
-           "r"(SLANE), "r"(SLANE16) \
-        : "memory")
-
 // ═════════════════════════════════════════════════════════════
 // Patch embed GEMM — warp-specialized tcgen05 (cta_group::1)
 // ═════════════════════════════════════════════════════════════
@@ -190,7 +123,6 @@ __global__ void __launch_bounds__(192, 1)
 patch_embed_gemm(
     const __grid_constant__ CUtensorMap tma_a,
     const __grid_constant__ CUtensorMap tma_b,
-    const __grid_constant__ CUtensorMap tma_c,
     const float*   __restrict__ bias,
     const float*   __restrict__ pos_embed,
     __nv_bfloat16* __restrict__ C
@@ -323,7 +255,7 @@ patch_embed_gemm(
                 }
             }
         } else {
-            // ── OVERLAPPED EPILOGUE (W2-5): reordered TMEM load + bias prefetch ──
+            // ── OVERLAPPED EPILOGUE (W2-5): SMEM transpose for coalesced stores ──
             if (!first_tile) {
                 const int prev_idx = tile_idx - 1;
                 const int ptm = prev_idx / TILES_N;
@@ -333,61 +265,93 @@ patch_embed_gemm(
                 const int prev_n = ptn * TN;
                 const uint32_t prev_tmem = tmem_base[buf ^ 1];
 
-                const int ew = warp - 2;  // 0,1,2,3 for warps 2-5
-                const int gm_base = prev_m + ew * 32;
-                const int pos_row = (gm_base + lane) % SEQ_LEN;
-                const float* bp = bias + prev_n;
-                const float* pp = pos_embed + (long long)pos_row * N_DIM + prev_n;
+                {
+                    const int ew = warp - 2;  // 0,1,2,3 for warps 2-5
+                    const int gm_base = prev_m + ew * 32;
+                    const int pos_row = (gm_base + lane) % SEQ_LEN;
+                    const float* bp = bias + prev_n;
+                    const float* pp = pos_embed + (long long)pos_row * N_DIM + prev_n;
+                    float* tr = (float*)(smem + OFF_TRANSPOSE + ew * 32 * TRANS_STRIDE * (int)sizeof(float));
 
-                uint32_t smem_lane[2], smem_base[2];
-                smem_lane[0] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE) + lane * 32;
-                smem_lane[1] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE + TMA_BUF_SIZE) + lane * 32;
-                smem_base[0] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE);
-                smem_base[1] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE + TMA_BUF_SIZE);
+                    for (int nc = 0; nc < TN; nc += 32) {
+                        // First 16 cols: TMEM → bias+pos → SMEM[lane][0..15]
+                        {
+                            float v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15;
+                            int taddr = prev_tmem + (ew * 32 << 16) + nc;
+                            asm volatile(
+                                "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+                                "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+                                : "=f"(v0),"=f"(v1),"=f"(v2),"=f"(v3),
+                                  "=f"(v4),"=f"(v5),"=f"(v6),"=f"(v7),
+                                  "=f"(v8),"=f"(v9),"=f"(v10),"=f"(v11),
+                                  "=f"(v12),"=f"(v13),"=f"(v14),"=f"(v15)
+                                : "r"(taddr));
+                            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 
-                int bi = 0;
-                for (int nc = 0; nc < TN; nc += 16) {
-                    float v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15;
-                    int taddr = prev_tmem + (ew * 32 << 16) + nc;
+                            int c = nc;
+                            v0+=bp[c]+pp[c]; v1+=bp[c+1]+pp[c+1];
+                            v2+=bp[c+2]+pp[c+2]; v3+=bp[c+3]+pp[c+3];
+                            v4+=bp[c+4]+pp[c+4]; v5+=bp[c+5]+pp[c+5];
+                            v6+=bp[c+6]+pp[c+6]; v7+=bp[c+7]+pp[c+7];
+                            v8+=bp[c+8]+pp[c+8]; v9+=bp[c+9]+pp[c+9];
+                            v10+=bp[c+10]+pp[c+10]; v11+=bp[c+11]+pp[c+11];
+                            v12+=bp[c+12]+pp[c+12]; v13+=bp[c+13]+pp[c+13];
+                            v14+=bp[c+14]+pp[c+14]; v15+=bp[c+15]+pp[c+15];
 
-                    // Issue TMEM load (async)
-                    TMEM_LOAD(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, taddr);
+                            int b = lane * TRANS_STRIDE;
+                            tr[b]=v0; tr[b+1]=v1; tr[b+2]=v2; tr[b+3]=v3;
+                            tr[b+4]=v4; tr[b+5]=v5; tr[b+6]=v6; tr[b+7]=v7;
+                            tr[b+8]=v8; tr[b+9]=v9; tr[b+10]=v10; tr[b+11]=v11;
+                            tr[b+12]=v12; tr[b+13]=v13; tr[b+14]=v14; tr[b+15]=v15;
+                        }
+                        // Second 16 cols: TMEM → bias+pos → SMEM[lane][16..31]
+                        {
+                            float v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15;
+                            int taddr = prev_tmem + (ew * 32 << 16) + nc + 16;
+                            asm volatile(
+                                "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+                                "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+                                : "=f"(v0),"=f"(v1),"=f"(v2),"=f"(v3),
+                                  "=f"(v4),"=f"(v5),"=f"(v6),"=f"(v7),
+                                  "=f"(v8),"=f"(v9),"=f"(v10),"=f"(v11),
+                                  "=f"(v12),"=f"(v13),"=f"(v14),"=f"(v15)
+                                : "r"(taddr));
+                            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 
-                    // Pre-compute bias+pos sums while TMEM load is in-flight
-                    float s0=bp[nc]+pp[nc], s1=bp[nc+1]+pp[nc+1];
-                    float s2=bp[nc+2]+pp[nc+2], s3=bp[nc+3]+pp[nc+3];
-                    float s4=bp[nc+4]+pp[nc+4], s5=bp[nc+5]+pp[nc+5];
-                    float s6=bp[nc+6]+pp[nc+6], s7=bp[nc+7]+pp[nc+7];
-                    float s8=bp[nc+8]+pp[nc+8], s9=bp[nc+9]+pp[nc+9];
-                    float s10=bp[nc+10]+pp[nc+10], s11=bp[nc+11]+pp[nc+11];
-                    float s12=bp[nc+12]+pp[nc+12], s13=bp[nc+13]+pp[nc+13];
-                    float s14=bp[nc+14]+pp[nc+14], s15=bp[nc+15]+pp[nc+15];
+                            int c = nc + 16;
+                            v0+=bp[c]+pp[c]; v1+=bp[c+1]+pp[c+1];
+                            v2+=bp[c+2]+pp[c+2]; v3+=bp[c+3]+pp[c+3];
+                            v4+=bp[c+4]+pp[c+4]; v5+=bp[c+5]+pp[c+5];
+                            v6+=bp[c+6]+pp[c+6]; v7+=bp[c+7]+pp[c+7];
+                            v8+=bp[c+8]+pp[c+8]; v9+=bp[c+9]+pp[c+9];
+                            v10+=bp[c+10]+pp[c+10]; v11+=bp[c+11]+pp[c+11];
+                            v12+=bp[c+12]+pp[c+12]; v13+=bp[c+13]+pp[c+13];
+                            v14+=bp[c+14]+pp[c+14]; v15+=bp[c+15]+pp[c+15];
 
-                    // Wait for TMEM data
-                    TMEM_WAIT();
-
-                    // Apply pre-computed sums (just FADDs, no LDG)
-                    v0+=s0; v1+=s1; v2+=s2; v3+=s3;
-                    v4+=s4; v5+=s5; v6+=s6; v7+=s7;
-                    v8+=s8; v9+=s9; v10+=s10; v11+=s11;
-                    v12+=s12; v13+=s13; v14+=s14; v15+=s15;
-
-                    CVT_STS(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, smem_lane[bi], smem_lane[bi] + 16);
-
-                    tma_store_fence();
-                    __syncwarp();
-
-                    if (lane == 0) {
-                        if (nc >= 32) tma_store_wait_1();
-                        tma_store_2d(&tma_c, smem_base[bi], prev_n + nc, gm_base);
-                        tma_store_commit();
+                            int b = lane * TRANS_STRIDE + 16;
+                            tr[b]=v0; tr[b+1]=v1; tr[b+2]=v2; tr[b+3]=v3;
+                            tr[b+4]=v4; tr[b+5]=v5; tr[b+6]=v6; tr[b+7]=v7;
+                            tr[b+8]=v8; tr[b+9]=v9; tr[b+10]=v10; tr[b+11]=v11;
+                            tr[b+12]=v12; tr[b+13]=v13; tr[b+14]=v14; tr[b+15]=v15;
+                        }
+                        __syncwarp();
+                        // Transpose read + coalesced BF16 store
+                        {
+                            __nv_bfloat16* dst = C + (long long)gm_base * N_DIM + prev_n + nc + lane;
+                            int t_off = lane;
+                            #pragma unroll
+                            for (int j = 0; j < 32; j++) {
+                                float val = tr[t_off];
+                                t_off += TRANS_STRIDE;
+                                uint16_t bv;
+                                asm volatile("cvt.rn.bf16.f32 %0, %1;" : "=h"(bv) : "f"(val));
+                                asm volatile("st.global.cs.b16 [%0], %1;" :: "l"(dst), "h"(bv) : "memory");
+                                dst += N_DIM;
+                            }
+                        }
+                        __syncwarp();
                     }
-
-                    bi ^= 1;
                 }
-
-                if (lane == 0) tma_store_wait_0();
-                __syncwarp();
             }
         }
 
@@ -398,7 +362,7 @@ patch_embed_gemm(
         first_tile = 0;
     }  // tile loop
 
-    // ── Drain epilogue: warps 0-3 write the last tile, reordered ──
+    // ── Drain epilogue: warps 0-3 write the last tile (warps 4-5 idle) ──
     if (warp < 4) {
         const int last_idx = tile_end - 1;
         const int last_buf = last_idx & 1;
@@ -409,61 +373,90 @@ patch_embed_gemm(
         const int last_n = ltn * TN;
         const uint32_t last_tmem = tmem_base[last_buf];
 
-        const int ew = warp;
-        const int gm_base = last_m + ew * 32;
+        const int gm_base = last_m + warp * 32;
         const int pos_row = (gm_base + lane) % SEQ_LEN;
         const float* bp = bias + last_n;
         const float* pp = pos_embed + (long long)pos_row * N_DIM + last_n;
+        float* tr = (float*)(smem + OFF_TRANSPOSE + warp * 32 * TRANS_STRIDE * (int)sizeof(float));
 
-        uint32_t smem_lane[2], smem_base[2];
-        smem_lane[0] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE) + lane * 32;
-        smem_lane[1] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE + TMA_BUF_SIZE) + lane * 32;
-        smem_base[0] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE);
-        smem_base[1] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE + TMA_BUF_SIZE);
+        for (int nc = 0; nc < TN; nc += 32) {
+            // First 16 cols: TMEM → bias+pos → SMEM[lane][0..15]
+            {
+                float v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15;
+                int taddr = last_tmem + (warp * 32 << 16) + nc;
+                asm volatile(
+                    "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+                    "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+                    : "=f"(v0),"=f"(v1),"=f"(v2),"=f"(v3),
+                      "=f"(v4),"=f"(v5),"=f"(v6),"=f"(v7),
+                      "=f"(v8),"=f"(v9),"=f"(v10),"=f"(v11),
+                      "=f"(v12),"=f"(v13),"=f"(v14),"=f"(v15)
+                    : "r"(taddr));
+                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 
-        int bi = 0;
-        for (int nc = 0; nc < TN; nc += 16) {
-            float v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15;
-            int taddr = last_tmem + (ew * 32 << 16) + nc;
+                int c = nc;
+                v0+=bp[c]+pp[c]; v1+=bp[c+1]+pp[c+1];
+                v2+=bp[c+2]+pp[c+2]; v3+=bp[c+3]+pp[c+3];
+                v4+=bp[c+4]+pp[c+4]; v5+=bp[c+5]+pp[c+5];
+                v6+=bp[c+6]+pp[c+6]; v7+=bp[c+7]+pp[c+7];
+                v8+=bp[c+8]+pp[c+8]; v9+=bp[c+9]+pp[c+9];
+                v10+=bp[c+10]+pp[c+10]; v11+=bp[c+11]+pp[c+11];
+                v12+=bp[c+12]+pp[c+12]; v13+=bp[c+13]+pp[c+13];
+                v14+=bp[c+14]+pp[c+14]; v15+=bp[c+15]+pp[c+15];
 
-            // Issue TMEM load (async)
-            TMEM_LOAD(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, taddr);
-
-            // Pre-compute bias+pos sums while TMEM load is in-flight
-            float s0=bp[nc]+pp[nc], s1=bp[nc+1]+pp[nc+1];
-            float s2=bp[nc+2]+pp[nc+2], s3=bp[nc+3]+pp[nc+3];
-            float s4=bp[nc+4]+pp[nc+4], s5=bp[nc+5]+pp[nc+5];
-            float s6=bp[nc+6]+pp[nc+6], s7=bp[nc+7]+pp[nc+7];
-            float s8=bp[nc+8]+pp[nc+8], s9=bp[nc+9]+pp[nc+9];
-            float s10=bp[nc+10]+pp[nc+10], s11=bp[nc+11]+pp[nc+11];
-            float s12=bp[nc+12]+pp[nc+12], s13=bp[nc+13]+pp[nc+13];
-            float s14=bp[nc+14]+pp[nc+14], s15=bp[nc+15]+pp[nc+15];
-
-            // Wait for TMEM data
-            TMEM_WAIT();
-
-            // Apply pre-computed sums (just FADDs, no LDG)
-            v0+=s0; v1+=s1; v2+=s2; v3+=s3;
-            v4+=s4; v5+=s5; v6+=s6; v7+=s7;
-            v8+=s8; v9+=s9; v10+=s10; v11+=s11;
-            v12+=s12; v13+=s13; v14+=s14; v15+=s15;
-
-            CVT_STS(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, smem_lane[bi], smem_lane[bi] + 16);
-
-            tma_store_fence();
-            __syncwarp();
-
-            if (lane == 0) {
-                if (nc >= 32) tma_store_wait_1();
-                tma_store_2d(&tma_c, smem_base[bi], last_n + nc, gm_base);
-                tma_store_commit();
+                int b = lane * TRANS_STRIDE;
+                tr[b]=v0; tr[b+1]=v1; tr[b+2]=v2; tr[b+3]=v3;
+                tr[b+4]=v4; tr[b+5]=v5; tr[b+6]=v6; tr[b+7]=v7;
+                tr[b+8]=v8; tr[b+9]=v9; tr[b+10]=v10; tr[b+11]=v11;
+                tr[b+12]=v12; tr[b+13]=v13; tr[b+14]=v14; tr[b+15]=v15;
             }
+            // Second 16 cols: TMEM → bias+pos → SMEM[lane][16..31]
+            {
+                float v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15;
+                int taddr = last_tmem + (warp * 32 << 16) + nc + 16;
+                asm volatile(
+                    "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+                    "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+                    : "=f"(v0),"=f"(v1),"=f"(v2),"=f"(v3),
+                      "=f"(v4),"=f"(v5),"=f"(v6),"=f"(v7),
+                      "=f"(v8),"=f"(v9),"=f"(v10),"=f"(v11),
+                      "=f"(v12),"=f"(v13),"=f"(v14),"=f"(v15)
+                    : "r"(taddr));
+                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 
-            bi ^= 1;
+                int c = nc + 16;
+                v0+=bp[c]+pp[c]; v1+=bp[c+1]+pp[c+1];
+                v2+=bp[c+2]+pp[c+2]; v3+=bp[c+3]+pp[c+3];
+                v4+=bp[c+4]+pp[c+4]; v5+=bp[c+5]+pp[c+5];
+                v6+=bp[c+6]+pp[c+6]; v7+=bp[c+7]+pp[c+7];
+                v8+=bp[c+8]+pp[c+8]; v9+=bp[c+9]+pp[c+9];
+                v10+=bp[c+10]+pp[c+10]; v11+=bp[c+11]+pp[c+11];
+                v12+=bp[c+12]+pp[c+12]; v13+=bp[c+13]+pp[c+13];
+                v14+=bp[c+14]+pp[c+14]; v15+=bp[c+15]+pp[c+15];
+
+                int b = lane * TRANS_STRIDE + 16;
+                tr[b]=v0; tr[b+1]=v1; tr[b+2]=v2; tr[b+3]=v3;
+                tr[b+4]=v4; tr[b+5]=v5; tr[b+6]=v6; tr[b+7]=v7;
+                tr[b+8]=v8; tr[b+9]=v9; tr[b+10]=v10; tr[b+11]=v11;
+                tr[b+12]=v12; tr[b+13]=v13; tr[b+14]=v14; tr[b+15]=v15;
+            }
+            __syncwarp();
+            // Transpose read + coalesced BF16 store
+            {
+                __nv_bfloat16* dst = C + (long long)gm_base * N_DIM + last_n + nc + lane;
+                int t_off = lane;
+                #pragma unroll
+                for (int j = 0; j < 32; j++) {
+                    float val = tr[t_off];
+                    t_off += TRANS_STRIDE;
+                    uint16_t bv;
+                    asm volatile("cvt.rn.bf16.f32 %0, %1;" : "=h"(bv) : "f"(val));
+                    asm volatile("st.global.cs.b16 [%0], %1;" :: "l"(dst), "h"(bv) : "memory");
+                    dst += N_DIM;
+                }
+            }
+            __syncwarp();
         }
-
-        if (lane == 0) tma_store_wait_0();
-        __syncwarp();
     }
 
     __syncthreads();  // all warps done before dealloc
@@ -485,8 +478,9 @@ patch_embed_gemm(
 int main() {
     setbuf(stdout, NULL);  // unbuffered stdout for debugging
     printf("SigLIP2 patch embed GEMM — tcgen05 cta_group::1 (4 warps)\n");
-    printf("  GEMM: [%d,%d] x [%d,%d]^T  6-stage pipeline  TMA stores  idesc: 0x%08X\n",
+    printf("  GEMM: [%d,%d] x [%d,%d]^T  6-stage pipeline  idesc: 0x%08X\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, IDESC);
+    printf("  SMEM transpose epilogue  %d-stage pipeline\n", N_STAGES);
 
     uint8_t *d_A, *d_B;
     float *d_bias, *d_pos;
@@ -504,7 +498,7 @@ int main() {
     CUDA_CHECK(cudaMemset(d_pos,  0, (size_t)SEQ_LEN * N_DIM * sizeof(float)));
     printf("  Alloc + RNG done\n");
 
-    CUtensorMap h_tma_a, h_tma_b, h_tma_c;
+    CUtensorMap h_tma_a, h_tma_b;
 
     // 2D TMA with SWIZZLE_128B: load [TK, height] per stage
     // Global memory: row-major A[M,K], B[N,K] with element=UINT8 (FP8)
@@ -537,21 +531,6 @@ int main() {
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }
 
-    // TMA store descriptor for C: row-major BF16 [M_TOTAL, N_DIM]
-    {
-        uint64_t dims[2]    = {(uint64_t)N_DIM, (uint64_t)M_TOTAL};
-        uint64_t strides[1] = {(uint64_t)(N_DIM * sizeof(__nv_bfloat16))};
-        uint32_t box[2]     = {16, 32};   // 16 BF16 cols × 32 rows per TMA store
-        uint32_t estrides[2]= {1, 1};
-        CU_CHECK(cuTensorMapEncodeTiled(&h_tma_c,
-            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_C,
-            dims, strides, box, estrides,
-            CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CU_TENSOR_MAP_SWIZZLE_NONE,
-            CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-    }
-
     CUDA_CHECK(cudaFuncSetAttribute(patch_embed_gemm,
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     printf("  TMA descriptors + func attr done\n");
@@ -559,7 +538,7 @@ int main() {
     // ── Warmup: 2 iterations ──
     printf("Launching warmup (2 iters)...\n");
     for (int _i = 0; _i < 2; _i++) {
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_pos, d_C);
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);
     }
     printf("  Waiting for warmup sync...\n");
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -572,7 +551,7 @@ int main() {
     cudaEventCreate(&_t1);
     cudaEventRecord(_t0);
     for (int _i = 0; _i < 10; _i++) {
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_pos, d_C);
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);
     }
     cudaEventRecord(_t1);
     cudaEventSynchronize(_t1);
@@ -585,7 +564,7 @@ int main() {
     cudaEventDestroy(_t1);
 
     // ── Checksum run ──
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_pos, d_C);
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     __nv_bfloat16* h_C = (__nv_bfloat16*)malloc((size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16));
