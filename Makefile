@@ -34,7 +34,7 @@ b300:
 	$(NVCC) $(CFLAGS) $(CU) -o $(TARGET) $(LDFLAGS)
 
 cutlass-bench: cutlass_bench.cu
-	$(NVCC) $(CFLAGS) $(CUTLASS_INC) -std=c++17 $< -o $@ $(LDFLAGS)
+	$(NVCC) $(CFLAGS) $(CUTLASS_INC) -std=c++17 --expt-relaxed-constexpr $< -o $@ $(LDFLAGS)
 
 cublas-bench: cublas_bench.cu
 	$(NVCC) $(CFLAGS) -std=c++17 $< -o $@ -lcublasLt -lcublas

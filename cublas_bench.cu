@@ -1,9 +1,9 @@
-// cuBLAS FP8 GEMM baseline benchmark
-// Matches the SigLIP2 patch-embed GEMM: C[M,N] = A[M,K] × B[N,K]^T
-// FP8 E4M3 inputs, FP32 accumulation, BF16 output (cuBLAS FP8 standard path)
+// cuBLAS MXFP8 (microscaling) GEMM baseline benchmark
+// Matches the SigLIP2 patch-embed GEMM: C[M,N] = A[M,K] x B[N,K]^T
+// MXFP8 E4M3 inputs with UE8M0 per-32-element block scales, FP32 accumulation, BF16 output
 //
 // Usage: ./cublas-bench [imgs_per_sm]
-//   Default: imgs_per_sm=32 → M = 32 * 148 * 196 = 928256
+//   Default: imgs_per_sm=32 -> M = 32 * 148 * 196 = 928256
 
 #include <cstdio>
 #include <cstdlib>
@@ -40,10 +40,10 @@ int main(int argc, char** argv) {
     if (argc > 1) imgs_per_sm = atoi(argv[1]);
     const int M = imgs_per_sm * SM_COUNT * SEQ_LEN;
 
-    printf("cuBLAS FP8 GEMM baseline (cublasLt)\n");
+    printf("cuBLAS MXFP8 GEMM baseline (cublasLt)\n");
     printf("  M=%d  N=%d  K=%d  (imgs_per_sm=%d)\n", M, N, K, imgs_per_sm);
 
-    // ── Allocate ──
+    // ── Allocate data tensors ──
     void *d_A, *d_B;
     __nv_bfloat16 *d_C;
     CUDA_CHECK(cudaMalloc(&d_A, (size_t)M * K));
@@ -53,20 +53,31 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemset(d_A, 0x3C, (size_t)M * K));
     CUDA_CHECK(cudaMemset(d_B, 0x3C, (size_t)N * K));
 
-    // Device-side scale factors (1.0)
-    float h_one = 1.0f;
-    float *d_scaleA, *d_scaleB;
-    CUDA_CHECK(cudaMalloc(&d_scaleA, sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_scaleB, sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_scaleA, &h_one, sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_scaleB, &h_one, sizeof(float), cudaMemcpyHostToDevice));
+    // ── Allocate MXFP8 scale factor arrays ──
+    // UE8M0 format: one scale byte per 32 elements along K (innermost dim in col-major)
+    // cuBLAS "A" = our B stored as [K,N] col-major: ceil(K/32) * N scale bytes
+    // cuBLAS "B" = our A stored as [K,M] col-major: ceil(K/32) * M scale bytes
+    size_t sf_K = ((size_t)K + 31) / 32;
+    size_t sz_scaleA = sf_K * N;   // cuBLAS A scales (our B)
+    size_t sz_scaleB = sf_K * M;   // cuBLAS B scales (our A)
+
+    void *d_scaleA, *d_scaleB;
+    CUDA_CHECK(cudaMalloc(&d_scaleA, sz_scaleA));
+    CUDA_CHECK(cudaMalloc(&d_scaleB, sz_scaleB));
+
+    // Fill with 0x7F = UE8M0 encoding of 2^0 = 1.0
+    CUDA_CHECK(cudaMemset(d_scaleA, 0x7F, sz_scaleA));
+    CUDA_CHECK(cudaMemset(d_scaleB, 0x7F, sz_scaleB));
+
+    printf("  Scale factors: A=%zu bytes, B=%zu bytes (UE8M0, 1 per 32 along K)\n",
+           sz_scaleA, sz_scaleB);
 
     // ── cuBLASLt setup ──
     cublasLtHandle_t ltHandle;
     CUBLAS_CHECK(cublasLtCreate(&ltHandle));
 
-    // For row-major A[M,K] × B[N,K]^T = C[M,N]:
-    // In col-major (cuBLAS native): compute D[N,M] = B[K,N]^T × A[K,M]
+    // For row-major A[M,K] x B[N,K]^T = C[M,N]:
+    // In col-major (cuBLAS native): compute D[N,M] = B[K,N]^T x A[K,M]
     //   A is [M,K] row-major = [K,M] col-major with ld=K
     //   B is [N,K] row-major = [K,N] col-major with ld=K
     //   transa=T (transpose B to get [N,K]), transb=N (A stays as [K,M])
@@ -80,6 +91,14 @@ int main(int argc, char** argv) {
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc,
         CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
 
+    // Set MXFP8 block-scaled mode for both A and B
+    int32_t scaleMode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc,
+        CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &scaleMode, sizeof(scaleMode)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc,
+        CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &scaleMode, sizeof(scaleMode)));
+
+    // Point to scale factor arrays
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc,
         CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_scaleA, sizeof(d_scaleA)));
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc,
@@ -156,7 +175,7 @@ int main(int argc, char** argv) {
     double flops = 2.0 * M * N * K;
     double tflops = flops / ms / 1e9;
 
-    printf("\ncuBLAS FP8:  %.3f ms  %.2f TFLOPS\n", ms, tflops);
+    printf("\ncuBLAS MXFP8:  %.3f ms  %.2f TFLOPS\n", ms, tflops);
     printf("  M=%d  N=%d  K=%d\n", M, N, K);
 
     // ── Sweep all returned algorithms ──

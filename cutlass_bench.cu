@@ -1,6 +1,6 @@
-// CUTLASS 4.x Blackwell FP8 GEMM benchmark
-// A[M,K] x B[N,K]^T -> C[M,N]   FP8 E4M3 inputs, FP32 accumulate, BF16 output
-// Matches cuBLAS bench problem dimensions and output format.
+// CUTLASS 4.x Blackwell MXFP8 (microscaling) GEMM benchmark
+// A[M,K] x B[N,K]^T -> C[M,N]   MXFP8 E4M3 inputs w/ UE8M0 block scales, FP32 accumulate, BF16 output
+// Uses OpClassBlockScaledTensorOp (tcgen05.mma.kind::mxf8f6f4.block_scale)
 //
 // Usage: ./cutlass-bench [imgs_per_sm]
 
@@ -13,6 +13,7 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/epilogue/dispatch_policy.hpp"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
@@ -21,14 +22,14 @@
 using namespace cute;
 
 // ═══════════════════════════════════════════════════════════════
-// CUTLASS kernel configuration
+// CUTLASS kernel configuration — MXFP8 (block-scaled)
 // ═══════════════════════════════════════════════════════════════
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
-// A is [M,K] row-major, B is [N,K] row-major stored as ColumnMajor for B^T
-using ElementA       = cutlass::float_e4m3_t;
-using ElementB       = cutlass::float_e4m3_t;
+// MXFP8: mx_float8_t wraps float_e4m3_t data + UE8M0 per-32-element scale factors
+using ElementA       = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+using ElementB       = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
 using ElementAcc     = float;
 using ElementOut     = cutlass::bfloat16_t;      // BF16 output, matching cuBLAS bench
 using ElementCompute = float;
@@ -38,31 +39,44 @@ using LayoutB = cutlass::layout::ColumnMajor;
 using LayoutC = cutlass::layout::ColumnMajor;
 using LayoutD = cutlass::layout::ColumnMajor;
 
-constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementA>::value;    // 16
-constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;    // 16
+constexpr int AlignA = 16;   // MXFP8 alignment in elements
+constexpr int AlignB = 16;
 constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementOut>::value;  // 8
 constexpr int AlignD = AlignC;
 
-// 2SM MMA tile (256 in M requires cluster M divisible by 2)
-using MmaTileShape = Shape<_256, _128, _64>;
-using ClusterShape = Shape<_2, _1, _1>;
+// Block-scaled 2SM MMA tile — configurable via TILE_M/N/K and CLUSTER_M/N macros
+#ifndef TILE_M
+#define TILE_M 256
+#endif
+#ifndef TILE_N
+#define TILE_N 192
+#endif
+#ifndef TILE_K
+#define TILE_K 128
+#endif
+#ifndef CLUSTER_M
+#define CLUSTER_M 2
+#endif
+#ifndef CLUSTER_N
+#define CLUSTER_N 1
+#endif
+using MmaTileShape = Shape<cute::Int<TILE_M>, cute::Int<TILE_N>, cute::Int<TILE_K>>;
+using ClusterShape = Shape<cute::Int<CLUSTER_M>, cute::Int<CLUSTER_N>, _1>;
 
-// Simple epilogue: D = alpha * acc + beta * C  (alpha=1, beta=0)
-using FusionOp = cutlass::epilogue::fusion::LinearCombination<ElementOut, ElementCompute>;
+using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm100, OperatorClass,
     MmaTileShape, ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAcc, ElementCompute,
     ElementOut, LayoutC, AlignC,
     ElementOut, LayoutD, AlignD,
-    cutlass::epilogue::collective::EpilogueScheduleAuto,
-    FusionOp
+    cutlass::epilogue::collective::EpilogueScheduleAuto
 >::CollectiveOp;
 
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm100, OperatorClass,
     ElementA, LayoutA, AlignA,
     ElementB, LayoutB, AlignB,
     ElementAcc,
@@ -72,7 +86,6 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     cutlass::gemm::collective::KernelScheduleAuto
 >::CollectiveOp;
 
-// Default 4th parameter = CLC-based tile scheduler for SM100
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     Shape<int, int, int, int>,
     CollectiveMainloop,
@@ -80,10 +93,12 @@ using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
-using StrideA = typename Gemm::GemmKernel::StrideA;
-using StrideB = typename Gemm::GemmKernel::StrideB;
-using StrideC = typename Gemm::GemmKernel::StrideC;
-using StrideD = typename Gemm::GemmKernel::StrideD;
+using StrideA   = typename Gemm::GemmKernel::StrideA;
+using StrideB   = typename Gemm::GemmKernel::StrideB;
+using StrideC   = typename Gemm::GemmKernel::StrideC;
+using StrideD   = typename Gemm::GemmKernel::StrideD;
+using LayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::LayoutSFA;
+using LayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::LayoutSFB;
 
 #endif // CUTLASS_ARCH_MMA_SM100_SUPPORTED
 
@@ -103,10 +118,10 @@ int main(int argc, char** argv) {
     if (argc > 1) imgs_per_sm = atoi(argv[1]);
     const int M = imgs_per_sm * SM_COUNT * SEQ_LEN;
 
-    printf("CUTLASS 4.x Blackwell FP8 GEMM Benchmark\n");
+    printf("CUTLASS 4.x Blackwell MXFP8 GEMM Benchmark\n");
     printf("  M=%d  N=%d  K=%d  (imgs_per_sm=%d)\n", M, N, K, imgs_per_sm);
-    printf("  Types: FP8 E4M3 x FP8 E4M3 -> BF16 (acc: FP32)\n");
-    printf("  Tile: 256x128x64  Cluster: 2x1x1\n\n");
+    printf("  Types: MXFP8 E4M3 (UE8M0 block scales) -> BF16 (acc: FP32)\n");
+    printf("  Tile: %dx%dx%d  Cluster: %dx%dx1\n\n", TILE_M, TILE_N, TILE_K, CLUSTER_M, CLUSTER_N);
 
 #if !defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     printf("ERROR: CUTLASS_ARCH_MMA_SM100_SUPPORTED not defined.\n");
@@ -125,19 +140,24 @@ int main(int argc, char** argv) {
     hw_info.device_id = device;
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
-    // Strides
+    // Strides for A, B, C, D
     StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, make_shape(M, K, 1));
     StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(N, K, 1));
     StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, make_shape(M, N, 1));
     StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, make_shape(M, N, 1));
 
-    // Allocate device memory
-    size_t sz_a  = (size_t)M * K;
+    // Scale factor layouts (interleaved, computed from problem shape)
+    using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+    LayoutSFA layout_sfa = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, N, K, 1));
+    LayoutSFB layout_sfb = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
+
+    // Allocate device memory for data tensors
+    size_t sz_a  = (size_t)M * K;        // FP8 elements = 1 byte each
     size_t sz_b  = (size_t)N * K;
     size_t sz_cd = (size_t)M * N * sizeof(ElementOut);
 
-    ElementA*   d_A = nullptr;
-    ElementB*   d_B = nullptr;
+    ElementA::DataType* d_A = nullptr;
+    ElementB::DataType* d_B = nullptr;
     ElementOut* d_C = nullptr;   // source (beta=0, unused)
     ElementOut* d_D = nullptr;   // output
 
@@ -152,16 +172,40 @@ int main(int argc, char** argv) {
     cudaMemset(d_C, 0, sz_cd);
     cudaMemset(d_D, 0, sz_cd);
 
-    // Construct GEMM arguments: alpha=1, beta=0
+    // Allocate scale factor arrays (UE8M0, 1 byte per 32 elements along K)
+    // filter_zeros gives the actual allocation size
+    size_t sz_sfa = size(filter_zeros(layout_sfa));
+    size_t sz_sfb = size(filter_zeros(layout_sfb));
+
+    ElementA::ScaleFactorType* d_SFA = nullptr;  // cutlass::float_ue8m0_t
+    ElementB::ScaleFactorType* d_SFB = nullptr;
+
+    cudaMalloc(&d_SFA, sz_sfa);
+    cudaMalloc(&d_SFB, sz_sfb);
+
+    // Fill scale factors with 0x7F = UE8M0 encoding of 2^0 = 1.0
+    cudaMemset(d_SFA, 0x7F, sz_sfa);
+    cudaMemset(d_SFB, 0x7F, sz_sfb);
+
+    printf("  Scale factors: SFA=%zu bytes, SFB=%zu bytes\n\n", sz_sfa, sz_sfb);
+
+    // Construct GEMM arguments
     typename Gemm::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGemm,
         {M, N, K, 1},
-        {d_A, stride_a, d_B, stride_b},
-        {{}, d_C, stride_c, d_D, stride_d},
+        { // Mainloop: data + scale factors
+          d_A, stride_a,
+          d_B, stride_b,
+          d_SFA, layout_sfa,
+          d_SFB, layout_sfb
+        },
+        { // Epilogue: alpha * acc + beta * C
+          {1.0f, 0.0f},
+          d_C, stride_c,
+          d_D, stride_d
+        },
         hw_info
     };
-    arguments.epilogue.thread.alpha = 1.0f;
-    arguments.epilogue.thread.beta  = 0.0f;
 
     // Instantiate GEMM
     Gemm gemm;
@@ -226,7 +270,7 @@ int main(int argc, char** argv) {
     double flops = 2.0 * M * N * K;
     double tflops = flops / (avg_ms * 1e9);
 
-    printf("\nCUTLASS FP8:  %.3f ms  %.2f TFLOPS\n", avg_ms, tflops);
+    printf("\nCUTLASS MXFP8:  %.3f ms  %.2f TFLOPS\n", avg_ms, tflops);
     printf("  M=%d  N=%d  K=%d\n", M, N, K);
 
     // Cleanup
@@ -237,6 +281,8 @@ int main(int argc, char** argv) {
     cudaFree(d_B);
     cudaFree(d_C);
     cudaFree(d_D);
+    cudaFree(d_SFA);
+    cudaFree(d_SFB);
 
     return 0;
 #endif
