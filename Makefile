@@ -36,5 +36,8 @@ b300:
 cutlass-bench: cutlass_bench.cu
 	$(NVCC) $(CFLAGS) $(CUTLASS_INC) -std=c++17 $< -o $@ $(LDFLAGS)
 
+cublas-bench: cublas_bench.cu
+	$(NVCC) $(CFLAGS) -std=c++17 $< -o $@ -lcublasLt -lcublas
+
 clean:
-	rm -f $(CU) $(TARGET) cutlass-bench
+	rm -f $(CU) $(TARGET) cutlass-bench cublas-bench
