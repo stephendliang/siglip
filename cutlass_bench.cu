@@ -1,6 +1,8 @@
-// CUTLASS 3.x Blackwell FP8 GEMM reference benchmark
-// A[M,K] x B[N,K]^T -> C[M,N]   FP8 E4M3 inputs, FP32 accumulate, FP32 output
-// Problem: SigLIP2 patch embed — M=116032, N=768, K=768
+// CUTLASS 4.x Blackwell FP8 GEMM benchmark
+// A[M,K] x B[N,K]^T -> C[M,N]   FP8 E4M3 inputs, FP32 accumulate, BF16 output
+// Matches cuBLAS bench problem dimensions and output format.
+//
+// Usage: ./cutlass-bench [imgs_per_sm]
 
 #include <cstdio>
 #include <cstdlib>
@@ -13,17 +15,10 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
 using namespace cute;
-
-// ═══════════════════════════════════════════════════════════════
-// Problem dimensions (matching gen.py B200 defaults)
-// ═══════════════════════════════════════════════════════════════
-
-constexpr int M = 592 * 196;  // 116,032
-constexpr int N = 768;
-constexpr int K = 768;
 
 // ═══════════════════════════════════════════════════════════════
 // CUTLASS kernel configuration
@@ -31,33 +26,37 @@ constexpr int K = 768;
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
-// A is [M,K] row-major, B is [N,K] row-major → ColumnMajor for B^T
-using ElementA   = cutlass::float_e4m3_t;
-using ElementB   = cutlass::float_e4m3_t;
-using ElementAcc = float;
-using ElementOut = float;
+// A is [M,K] row-major, B is [N,K] row-major stored as ColumnMajor for B^T
+using ElementA       = cutlass::float_e4m3_t;
+using ElementB       = cutlass::float_e4m3_t;
+using ElementAcc     = float;
+using ElementOut     = cutlass::bfloat16_t;      // BF16 output, matching cuBLAS bench
+using ElementCompute = float;
 
 using LayoutA = cutlass::layout::RowMajor;
 using LayoutB = cutlass::layout::ColumnMajor;
-using LayoutC = cutlass::layout::RowMajor;
+using LayoutC = cutlass::layout::ColumnMajor;
+using LayoutD = cutlass::layout::ColumnMajor;
 
-constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementA>::value;  // 16
-constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;  // 16
-constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementOut>::value; // 4
+constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementA>::value;    // 16
+constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;    // 16
+constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementOut>::value;  // 8
+constexpr int AlignD = AlignC;
 
+// 2SM MMA tile (256 in M requires cluster M divisible by 2)
 using MmaTileShape = Shape<_256, _128, _64>;
-using ClusterShape = Shape<_2, _2, _1>;
+using ClusterShape = Shape<_2, _1, _1>;
 
-// Simple epilogue: D = alpha * acc + beta * C  (alpha=1, beta=0 → just GEMM result)
-using FusionOp = cutlass::epilogue::fusion::LinearCombination<ElementOut, float>;
+// Simple epilogue: D = alpha * acc + beta * C  (alpha=1, beta=0)
+using FusionOp = cutlass::epilogue::fusion::LinearCombination<ElementOut, ElementCompute>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
     MmaTileShape, ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAcc, float,
+    ElementAcc, ElementCompute,
     ElementOut, LayoutC, AlignC,
-    ElementOut, LayoutC, AlignC,
+    ElementOut, LayoutD, AlignD,
     cutlass::epilogue::collective::EpilogueScheduleAuto,
     FusionOp
 >::CollectiveOp;
@@ -73,11 +72,11 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     cutlass::gemm::collective::KernelScheduleAuto
 >::CollectiveOp;
 
+// Default 4th parameter = CLC-based tile scheduler for SM100
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     Shape<int, int, int, int>,
     CollectiveMainloop,
-    CollectiveEpilogue,
-    void>;
+    CollectiveEpilogue>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
@@ -92,11 +91,22 @@ using StrideD = typename Gemm::GemmKernel::StrideD;
 // Main
 // ═══════════════════════════════════════════════════════════════
 
-int main() {
-    printf("CUTLASS 3.x Blackwell FP8 GEMM Benchmark\n");
-    printf("  Problem: [%d, %d] x [%d, %d]^T -> [%d, %d]\n", M, K, N, K, M, N);
-    printf("  Types: FP8 E4M3 x FP8 E4M3 -> FP32 (acc: FP32)\n");
-    printf("  Tile: 256x128x64  Cluster: 2x2x1\n\n");
+int main(int argc, char** argv) {
+    setbuf(stdout, NULL);
+
+    const int SM_COUNT = 148;
+    const int SEQ_LEN  = 196;
+    const int N        = 768;
+    const int K        = 768;
+
+    int imgs_per_sm = 32;
+    if (argc > 1) imgs_per_sm = atoi(argv[1]);
+    const int M = imgs_per_sm * SM_COUNT * SEQ_LEN;
+
+    printf("CUTLASS 4.x Blackwell FP8 GEMM Benchmark\n");
+    printf("  M=%d  N=%d  K=%d  (imgs_per_sm=%d)\n", M, N, K, imgs_per_sm);
+    printf("  Types: FP8 E4M3 x FP8 E4M3 -> BF16 (acc: FP32)\n");
+    printf("  Tile: 256x128x64  Cluster: 2x1x1\n\n");
 
 #if !defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     printf("ERROR: CUTLASS_ARCH_MMA_SM100_SUPPORTED not defined.\n");
@@ -110,6 +120,11 @@ int main() {
     cudaGetDeviceProperties(&props, device);
     printf("  Device: %s (SM %d.%d)\n\n", props.name, props.major, props.minor);
 
+    // KernelHardwareInfo for CLC-based tile scheduler
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = device;
+    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
     // Strides
     StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, make_shape(M, K, 1));
     StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(N, K, 1));
@@ -117,33 +132,33 @@ int main() {
     StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, make_shape(M, N, 1));
 
     // Allocate device memory
-    size_t sz_a = (size_t)M * K;
-    size_t sz_b = (size_t)N * K;
-    size_t sz_c = (size_t)M * N * sizeof(float);
+    size_t sz_a  = (size_t)M * K;
+    size_t sz_b  = (size_t)N * K;
+    size_t sz_cd = (size_t)M * N * sizeof(ElementOut);
 
-    ElementA* d_A = nullptr;
-    ElementB* d_B = nullptr;
-    ElementOut* d_C = nullptr;  // source (beta=0, unused)
-    ElementOut* d_D = nullptr;  // output
+    ElementA*   d_A = nullptr;
+    ElementB*   d_B = nullptr;
+    ElementOut* d_C = nullptr;   // source (beta=0, unused)
+    ElementOut* d_D = nullptr;   // output
 
     cudaMalloc(&d_A, sz_a);
     cudaMalloc(&d_B, sz_b);
-    cudaMalloc(&d_C, sz_c);
-    cudaMalloc(&d_D, sz_c);
+    cudaMalloc(&d_C, sz_cd);
+    cudaMalloc(&d_D, sz_cd);
 
-    // Fill with random data (as uint8 via curand would work, but let's just zero-init
-    // and fill with a simple pattern — for benchmarking, data content doesn't matter)
-    cudaMemset(d_A, 0x3C, sz_a);  // ~1.0 in E4M3
+    // Fill A,B with 0x3C (1.5 in E4M3), zero C/D
+    cudaMemset(d_A, 0x3C, sz_a);
     cudaMemset(d_B, 0x3C, sz_b);
-    cudaMemset(d_C, 0, sz_c);
-    cudaMemset(d_D, 0, sz_c);
+    cudaMemset(d_C, 0, sz_cd);
+    cudaMemset(d_D, 0, sz_cd);
 
-    // Construct arguments: alpha=1, beta=0
+    // Construct GEMM arguments: alpha=1, beta=0
     typename Gemm::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGemm,
         {M, N, K, 1},
         {d_A, stride_a, d_B, stride_b},
-        {{}, d_C, stride_c, d_D, stride_d}
+        {{}, d_C, stride_c, d_D, stride_d},
+        hw_info
     };
     arguments.epilogue.thread.alpha = 1.0f;
     arguments.epilogue.thread.beta  = 0.0f;
@@ -169,8 +184,8 @@ int main() {
     }
 
     // Warmup
-    printf("Warmup: 10 iterations...\n");
-    for (int i = 0; i < 10; i++) {
+    printf("  Warmup (3 iters)...\n");
+    for (int i = 0; i < 3; i++) {
         status = gemm.run();
         if (status != cutlass::Status::kSuccess) {
             printf("ERROR: CUTLASS run failed on warmup iter %d (status %d)\n", i, (int)status);
@@ -179,16 +194,26 @@ int main() {
     }
     cudaDeviceSynchronize();
 
-    // Timed
-    constexpr int N_ITER = 100;
-    printf("Timing: %d iterations...\n", N_ITER);
+    // Verify output
+    {
+        ElementOut h_D[4];
+        cudaMemcpy(h_D, d_D, 4 * sizeof(ElementOut), cudaMemcpyDeviceToHost);
+        printf("  C[0,0..3] = %.1f %.1f %.1f %.1f",
+            float(h_D[0]), float(h_D[1]), float(h_D[2]), float(h_D[3]));
+        float expected = (float)K * 1.5f * 1.5f;
+        printf("  (expected %.1f)\n", expected);
+    }
+
+    // Timed runs
+    const int ITERS = 20;
+    printf("  Timing (%d iters)...\n", ITERS);
 
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0);
     cudaEventCreate(&t1);
 
     cudaEventRecord(t0);
-    for (int i = 0; i < N_ITER; i++) {
+    for (int i = 0; i < ITERS; i++) {
         gemm.run();
     }
     cudaEventRecord(t1);
@@ -196,12 +221,13 @@ int main() {
 
     float total_ms;
     cudaEventElapsedTime(&total_ms, t0, t1);
-    float avg_ms = total_ms / N_ITER;
+    float avg_ms = total_ms / ITERS;
 
     double flops = 2.0 * M * N * K;
     double tflops = flops / (avg_ms * 1e9);
 
-    printf("\nCUTLASS: %.3f ms  %.2f TFLOPS\n", avg_ms, tflops);
+    printf("\nCUTLASS FP8:  %.3f ms  %.2f TFLOPS\n", avg_ms, tflops);
+    printf("  M=%d  N=%d  K=%d\n", M, N, K);
 
     // Cleanup
     cudaEventDestroy(t0);
