@@ -5,7 +5,6 @@
 // Warp-specialized: Load(W0) | MMA(W1,cta_group::1) | Epilogue(W0-3)
 // tcgen05.mma.cta_group::1.kind::f8f6f4  (E4M3 × E4M3 → FP32)
 
-#include <cooperative_groups.h>
 #include <cuda.h>
 #include <curand.h>
 #include <cstdint>
@@ -124,8 +123,6 @@ patch_embed_gemm(
     const float*   __restrict__ pos_embed,
     float*         __restrict__ C
 ) {
-    namespace cg = cooperative_groups;
-    cg::grid_group grid = cg::this_grid();
 
     extern __shared__ __align__(128) char smem[];
     const int sm_id = blockIdx.x;
@@ -332,7 +329,6 @@ patch_embed_gemm(
 
     __syncthreads();  // all warps done before dealloc
 
-    grid.sync();
 
     // ── TMEM dealloc: 2 buffers (warp 0 only, cta_group::1) ──
     if (warp == 0) {
@@ -405,45 +401,36 @@ int main() {
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     printf("  TMA descriptors + func attr done\n");
 
-    // ── Warmup: 3 iterations ──
-    printf("Launching warmup (3 iters)...\n");
-    for (int _i = 0; _i < 3; _i++) {
-    void* args[] = { &h_tma_a, &h_tma_b, &d_bias, &d_pos, &d_C };
-    CUDA_CHECK(cudaLaunchCooperativeKernel(
-        (void*)patch_embed_gemm,
-        dim3(SM_COUNT), dim3(THREADS), args, SMEM_BYTES));
+    // ── Warmup: 2 iterations ──
+    printf("Launching warmup (2 iters)...\n");
+    for (int _i = 0; _i < 2; _i++) {
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);
     }
     printf("  Waiting for warmup sync...\n");
     CUDA_CHECK(cudaDeviceSynchronize());
     printf("  Warmup done.\n");
 
-    // ── Timed: 20 iterations ──
-    printf("Timing: 20 iterations...\n");
+    // ── Timed: 10 iterations ──
+    printf("Timing: 10 iterations...\n");
     cudaEvent_t _t0, _t1;
     cudaEventCreate(&_t0);
     cudaEventCreate(&_t1);
     cudaEventRecord(_t0);
-    for (int _i = 0; _i < 20; _i++) {
-    void* args[] = { &h_tma_a, &h_tma_b, &d_bias, &d_pos, &d_C };
-    CUDA_CHECK(cudaLaunchCooperativeKernel(
-        (void*)patch_embed_gemm,
-        dim3(SM_COUNT), dim3(THREADS), args, SMEM_BYTES));
+    for (int _i = 0; _i < 10; _i++) {
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);
     }
     cudaEventRecord(_t1);
     cudaEventSynchronize(_t1);
     float _ms;
     cudaEventElapsedTime(&_ms, _t0, _t1);
-    _ms /= 20.0f;
+    _ms /= 10.0f;
     printf("Custom kernel: %.3f ms  %.2f TFLOPS\n",
            _ms, 2.0 * M_TOTAL * N_DIM * K_DIM / _ms / 1e9);
     cudaEventDestroy(_t0);
     cudaEventDestroy(_t1);
 
     // ── Checksum run ──
-    void* args[] = { &h_tma_a, &h_tma_b, &d_bias, &d_pos, &d_C };
-    CUDA_CHECK(cudaLaunchCooperativeKernel(
-        (void*)patch_embed_gemm,
-        dim3(SM_COUNT), dim3(THREADS), args, SMEM_BYTES));
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     float* h_C = (float*)malloc((size_t)M_TOTAL * N_DIM * sizeof(float));
