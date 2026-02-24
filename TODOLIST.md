@@ -1,5 +1,3 @@
-Here's the complete action list, covering everything in the epilogue that needs to change:
-
 ## Complete Action List
 
 ### 1. Replace `__syncthreads` with mbarriers (line 394-397)
@@ -53,4 +51,4 @@ The overlapped epilogue (lines 327-391) and drain epilogue (lines 402-467) are n
 
 ---
 
-**Dependency order**: #7 first (refactor), then #2 + #6 (kill TMA stores), then #5 (reclaim SMEM), then #1 (mbarriers), then #4 (prefetch), then #3 (6-way interleaving). Items #2+#6 and #5 can be done together. #1 and #3 are tightly coupled.
+**Dependency order**: #7 first (refactor), then #1 (mbarriers), then #2, then #5 (reclaim SMEM) + #6 (kill TMA stores) which are conditional on #2, then #4 (prefetch), then #3 (6-way interleaving). Obviously the last one is the hardest.
