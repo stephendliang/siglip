@@ -1,17 +1,5 @@
 ## Rectified Profiling Playbook
 
-Your original notes have a few issues:
-
-1. **`sm__pipe_tensor_op_tcgen05_stalled_reason`** — not a real metric name. The stall reasons live under `smsp__warps_issue_stalled_*`.
-2. **`smsp__sass_warp_efficiency.avg`** — deprecated in recent NCU versions. Replaced by warp stall reason breakdown.
-3. **`smsp__inst_executed_not_predicated_off.avg`** — real and useful, but only for one specific sub-problem (lane-0 divergence in TMA stores).
-4. **`nvprune`** — strips architectures from fatbinaries. Irrelevant for perf diagnosis.
-5. **`nm`** — lists symbols. Marginal use here (verifying kernel name for ncu `-k` filter, that's it).
-
-Here's what you actually need, mapped to each TODOLIST item:
-
----
-
 ### Phase 0: Baseline (run before any changes)
 
 **Get the full warp stall breakdown** — this is the single most important measurement:
