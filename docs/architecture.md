@@ -261,11 +261,18 @@ Prove: pixels in → embedding out, single kernel launch, correct, fast.
 
 ```
 siglip/
-├── PLAN.md              # this file
-├── base86m.txt          # model architecture reference
-├── gen.py               # THE codegen script — edit this, not .cu
-├── Makefile             # build rules
-├── megakernel.cu        # GENERATED — do not edit
-├── pack_weights.py      # weight quantization + packing
-└── validate.py          # PyTorch reference + comparison
+├── CLAUDE.md              # LLM entry point — read first
+├── docs/
+│   ├── architecture.md    # this file — model specs, HW, codegen, milestones
+│   ├── tasks.md           # active optimization action items
+│   ├── profiling.md       # ncu/cuobjdump/sanitizer profiling playbook
+│   └── reference/
+│       ├── model.txt      # PyTorch model architecture dump
+│       └── sass_dump.txt  # SASS disassembly (large, load on demand)
+├── gen.py                 # THE codegen script — edit this, not .cu
+├── Makefile               # build rules
+├── megakernel.cu          # GENERATED — do not edit
+├── bench_sweep.sh         # M-size benchmark sweep
+├── pack_weights.py        # weight quantization + packing (future)
+└── validate.py            # PyTorch reference + comparison (future)
 ```
