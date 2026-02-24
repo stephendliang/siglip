@@ -21,11 +21,36 @@ CVT + st.global.v8.b32   (all 32 lanes store independently)
 ```
 Eliminates 5 instructions/barriers from the inner loop. No fence, no syncwarp, no wait, no lane-0 divergence. Every lane contributes every cycle.
 
-### 3. Make W0/W1 join epilogue after K-loop
+### 3. Software-pipeline TMEM loads across column iterations (lines 349-387)
 
-Currently W0 (TMA) and W1 (MMA) are stalled on mbarriers while W2-5 run the epilogue. That's **4-way** TMEM interleaving. After W0 finishes its last TMA load and W1 finishes its last `tcgen05.commit`, they should fall through into the epilogue path — giving **6-way** TMEM interleaving. 50% more warps hiding the ~200-cycle LDTM latency.
+The overlapped epilogue inner loop is serial per column chunk:
+```
+for nc = 0..TN step 16:
+    tcgen05.ld(col=nc)         // issue async TMEM load
+    bias+pos math              // ~16 FADDs hiding latency
+    TMEM_WAIT                  // STALL — 16 FADDs aren't enough to cover ~200 cycles
+    FADD (apply bias+pos)      // 16 FADDs
+    CVT + store                // convert FP32→BF16, write to global
+```
 
-The drain path (line 402) already proves this works: `if (warp < 4)` has W0-W3 all doing epilogue. Generalize this to the overlapped path. Each warp handles `128 / 6 ≈ 21-22` rows instead of 32.
+The `TMEM_WAIT` stalls because each `tcgen05.ld.sync.aligned.32x32b.x16` has ~200-cycle latency but there's only ~16 instructions of independent work between issue and wait. The 4-way warp interleaving (W2-W5) helps — the scheduler can run another warp while one is stalled — but it's not enough if all 4 warps hit their `TMEM_WAIT` before any load completes.
+
+**Fix**: Overlap adjacent column iterations by issuing the next `tcgen05.ld` before waiting on the current one:
+```
+tcgen05.ld(col=0)                // prefetch first chunk
+for nc = 0..TN-16:
+    bias+pos math(nc)            // independent work
+    TMEM_WAIT                    // wait for current chunk
+    tcgen05.ld(col=nc+16)        // issue NEXT chunk immediately after wait returns
+    FADD + CVT + store(nc)       // process current chunk (overlaps with next load)
+// handle last chunk
+TMEM_WAIT
+FADD + CVT + store(last)
+```
+
+This doubles the effective overlap window: the load for chunk N+1 is in flight during the entire compute phase of chunk N (~32 instructions of FADD+CVT+store). Combined with 4-way warp interleaving, this should fully hide TMEM latency.
+
+**Note on "6-way" (W0/W1 joining)**: The original plan to have W0/W1 join the overlapped epilogue was wrong — they're **busy** running the K-loop for the next tile during the overlapped epilogue (that's what "overlapped" means). W0/W1 only become free for the drain epilogue (last tile), where they already participate (line 402: `warp < 4` uses W0-W3). Making the drain use all 6 warps (`warp < 6`) is a trivial extension but low-impact since the drain is only 1 tile.
 
 ### 4. Prefetch bias + pos_embed into SMEM during K-loop (lines 357-364)
 
@@ -51,4 +76,4 @@ The overlapped epilogue (lines 327-391) and drain epilogue (lines 402-467) are n
 
 ---
 
-**Dependency order**: #7 first (refactor), then #1 (mbarriers), then #2, then #5 (reclaim SMEM) + #6 (kill TMA stores) which are conditional on #2, then #4 (prefetch), then #3 (6-way interleaving). Obviously the last one is the hardest.
+**Dependency order**: #7 first (refactor), then #1 (mbarriers), then #2 + #5 + #6 (st.global + dead code removal), then #3 (pipeline TMEM loads — straightforward once #2 simplifies the loop body), then #4 (prefetch — needs SMEM reclaimed by #5).
