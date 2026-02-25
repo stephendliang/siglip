@@ -26,15 +26,13 @@
 #define K_ITERS        6
 #define TOTAL_TILES    43512
 #define N_STAGES       6
-#define OFF_TMA_BUF    196608
-#define TMA_BUF_SIZE   1024
-#define OFF_TMEM_0     204800
-#define OFF_TMEM_1     204804
-#define OFF_TMA_MBAR   204808
-#define OFF_MMA_MBAR       204856
-#define OFF_MAINLOOP_MBAR  204904
-#define OFF_EPILOGUE_MBAR  204912
-#define SMEM_BYTES         204928
+#define OFF_TMEM_0         196608
+#define OFF_TMEM_1         196612
+#define OFF_TMA_MBAR       196616
+#define OFF_MMA_MBAR       196664
+#define OFF_MAINLOOP_MBAR  196712
+#define OFF_EPILOGUE_MBAR  196720
+#define SMEM_BYTES         196736
 #define TMEM_COLS      128
 #define IDESC          0x08200010U
 #define SBO            1024
@@ -123,36 +121,6 @@ void tma_load_2d(uint32_t smem_dst, const void* tma_desc,
         : "memory");
 }
 
-static __device__ __forceinline__
-void tma_store_2d(const void* tma_desc, uint32_t smem_src,
-                  int32_t c0, int32_t c1) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group"
-        " [%0, {%2, %3}], [%1];"
-        :: "l"(tma_desc), "r"(smem_src), "r"(c0), "r"(c1)
-        : "memory");
-}
-
-static __device__ __forceinline__
-void tma_store_fence() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
-
-static __device__ __forceinline__
-void tma_store_commit() {
-    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-}
-
-static __device__ __forceinline__
-void tma_store_wait_0() {
-    asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
-}
-
-static __device__ __forceinline__
-void tma_store_wait_1() {
-    asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");
-}
-
 // ── Pipelined epilogue macros ────────────────────────────────
 
 #define TMEM_LOAD(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15, TADDR) \
@@ -239,7 +207,6 @@ __global__ void __launch_bounds__(192, 1)
 patch_embed_gemm(
     const __grid_constant__ CUtensorMap tma_a,
     const __grid_constant__ CUtensorMap tma_b,
-    const __grid_constant__ CUtensorMap tma_c,
     const float*   __restrict__ bias,
     const float*   __restrict__ pos_embed,
     __nv_bfloat16* __restrict__ C
@@ -465,7 +432,7 @@ patch_embed_gemm(
 int main() {
     setbuf(stdout, NULL);  // unbuffered stdout for debugging
     printf("SigLIP2 patch embed GEMM — tcgen05 cta_group::1 (4 warps)\n");
-    printf("  GEMM: [%d,%d] x [%d,%d]^T  6-stage pipeline  TMA stores  idesc: 0x%08X\n",
+    printf("  GEMM: [%d,%d] x [%d,%d]^T  6-stage pipeline  st.global stores  idesc: 0x%08X\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, IDESC);
 
     uint8_t *d_A, *d_B;
@@ -484,7 +451,7 @@ int main() {
     CUDA_CHECK(cudaMemset(d_pos,  0, (size_t)SEQ_LEN * N_DIM * sizeof(float)));
     printf("  Alloc + RNG done\n");
 
-    CUtensorMap h_tma_a, h_tma_b, h_tma_c;
+    CUtensorMap h_tma_a, h_tma_b;
 
     // 2D TMA with SWIZZLE_128B: load [TK, height] per stage
     // Global memory: row-major A[M,K], B[N,K] with element=UINT8 (FP8)
@@ -517,21 +484,6 @@ int main() {
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }
 
-    // TMA store descriptor for C: row-major BF16 [M_TOTAL, N_DIM]
-    {
-        uint64_t dims[2]    = {(uint64_t)N_DIM, (uint64_t)M_TOTAL};
-        uint64_t strides[1] = {(uint64_t)(N_DIM * sizeof(__nv_bfloat16))};
-        uint32_t box[2]     = {16, 32};   // 16 BF16 cols × 32 rows per TMA store
-        uint32_t estrides[2]= {1, 1};
-        CU_CHECK(cuTensorMapEncodeTiled(&h_tma_c,
-            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_C,
-            dims, strides, box, estrides,
-            CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CU_TENSOR_MAP_SWIZZLE_NONE,
-            CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-    }
-
     CUDA_CHECK(cudaFuncSetAttribute(patch_embed_gemm,
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     printf("  TMA descriptors + func attr done\n");
@@ -539,7 +491,7 @@ int main() {
     // ── Warmup: 2 iterations ──
     printf("Launching warmup (2 iters)...\n");
     for (int _i = 0; _i < 2; _i++) {
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_pos, d_C);
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);
     }
     printf("  Waiting for warmup sync...\n");
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -552,7 +504,7 @@ int main() {
     cudaEventCreate(&_t1);
     cudaEventRecord(_t0);
     for (int _i = 0; _i < 10; _i++) {
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_pos, d_C);
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);
     }
     cudaEventRecord(_t1);
     cudaEventSynchronize(_t1);
@@ -565,7 +517,7 @@ int main() {
     cudaEventDestroy(_t1);
 
     // ── Checksum run ──
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_pos, d_C);
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     __nv_bfloat16* h_C = (__nv_bfloat16*)malloc((size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16));
