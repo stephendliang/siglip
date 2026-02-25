@@ -149,20 +149,19 @@ void tma_load_2d(uint32_t smem_dst, const void* tma_desc,
         "cvt.rn.bf16x2.f32 b5, %11, %10;\n\t" \
         "cvt.rn.bf16x2.f32 b6, %13, %12;\n\t" \
         "cvt.rn.bf16x2.f32 b7, %15, %14;\n\t" \
-        "st.global.v4.b32 [%16], {b0,b1,b2,b3};\n\t" \
-        "st.global.v4.b32 [%17], {b4,b5,b6,b7};\n\t" \
+        "st.global.v8.b32 [%16], {b0,b1,b2,b3,b4,b5,b6,b7};\n\t" \
         "}" \
         :: "f"(r0),"f"(r1),"f"(r2),"f"(r3), \
            "f"(r4),"f"(r5),"f"(r6),"f"(r7), \
            "f"(r8),"f"(r9),"f"(r10),"f"(r11), \
            "f"(r12),"f"(r13),"f"(r14),"f"(r15), \
-           "l"(GPTR), "l"((GPTR) + 8) \
+           "l"(GPTR) \
         : "memory")
 
-// ── Shared epilogue: TMEM readback → bias+pos add → FP32→BF16 → st.global ──
+// ── Unified epilogue: TMEM readback → sums add → FP32→BF16 → st.global.v8 ──
 // Software-pipelined: double-buffered TMEM loads (A/B) across column pairs.
-// Next chunk's load is issued immediately after current wait returns,
-// so FADD+CVT+STG of current chunk overlaps with next TMEM load.
+// Sums (bias+pos_embed) are pre-computed in SMEM with [ew][col][lane] layout,
+// stride 32 between columns. Both overlapped and drain paths use this function.
 
 static __device__ __forceinline__
 void epilogue_store(
@@ -171,76 +170,7 @@ void epilogue_store(
     int lane,
     int gm_base,
     int n_start,
-    const float* __restrict__ bp,
-    const float* __restrict__ pp,
-    __nv_bfloat16* __restrict__ C
-) {
-    __nv_bfloat16* row_out = C + (long long)(gm_base + lane) * N_DIM + n_start;
-    const int taddr_base = tmem_addr + (ew * 32 << 16);
-
-    // Double-buffered TMEM registers
-    float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
-    float b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15;
-
-    // Prefetch first chunk into buffer A
-    TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, taddr_base);
-
-    for (int nc = 0; nc < TN; nc += 32) {
-        // ── Chunk nc (buffer A) ──
-        float s0=bp[nc]+pp[nc], s1=bp[nc+1]+pp[nc+1];
-        float s2=bp[nc+2]+pp[nc+2], s3=bp[nc+3]+pp[nc+3];
-        float s4=bp[nc+4]+pp[nc+4], s5=bp[nc+5]+pp[nc+5];
-        float s6=bp[nc+6]+pp[nc+6], s7=bp[nc+7]+pp[nc+7];
-        float s8=bp[nc+8]+pp[nc+8], s9=bp[nc+9]+pp[nc+9];
-        float s10=bp[nc+10]+pp[nc+10], s11=bp[nc+11]+pp[nc+11];
-        float s12=bp[nc+12]+pp[nc+12], s13=bp[nc+13]+pp[nc+13];
-        float s14=bp[nc+14]+pp[nc+14], s15=bp[nc+15]+pp[nc+15];
-
-        TMEM_WAIT();
-        TMEM_LOAD(b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15, taddr_base + nc + 16);
-
-        a0+=s0; a1+=s1; a2+=s2; a3+=s3;
-        a4+=s4; a5+=s5; a6+=s6; a7+=s7;
-        a8+=s8; a9+=s9; a10+=s10; a11+=s11;
-        a12+=s12; a13+=s13; a14+=s14; a15+=s15;
-
-        CVT_STG(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, row_out + nc);
-
-        // ── Chunk nc+16 (buffer B) ──
-        s0=bp[nc+16]+pp[nc+16]; s1=bp[nc+17]+pp[nc+17];
-        s2=bp[nc+18]+pp[nc+18]; s3=bp[nc+19]+pp[nc+19];
-        s4=bp[nc+20]+pp[nc+20]; s5=bp[nc+21]+pp[nc+21];
-        s6=bp[nc+22]+pp[nc+22]; s7=bp[nc+23]+pp[nc+23];
-        s8=bp[nc+24]+pp[nc+24]; s9=bp[nc+25]+pp[nc+25];
-        s10=bp[nc+26]+pp[nc+26]; s11=bp[nc+27]+pp[nc+27];
-        s12=bp[nc+28]+pp[nc+28]; s13=bp[nc+29]+pp[nc+29];
-        s14=bp[nc+30]+pp[nc+30]; s15=bp[nc+31]+pp[nc+31];
-
-        TMEM_WAIT();
-        if (nc + 32 < TN)
-            TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, taddr_base + nc + 32);
-
-        b0+=s0; b1+=s1; b2+=s2; b3+=s3;
-        b4+=s4; b5+=s5; b6+=s6; b7+=s7;
-        b8+=s8; b9+=s9; b10+=s10; b11+=s11;
-        b12+=s12; b13+=s13; b14+=s14; b15+=s15;
-
-        CVT_STG(b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15, row_out + nc + 16);
-    }
-}
-
-// ── SMEM-sums epilogue: reads pre-computed bias+pos from SMEM ──
-// Used by overlapped epilogue (W2-5). Sums were prefetched into SMEM
-// during the previous tile's idle time. Layout: [ew][col][lane], stride 32.
-
-static __device__ __forceinline__
-void epilogue_store_smem(
-    uint32_t tmem_addr,
-    int ew,
-    int lane,
-    int gm_base,
-    int n_start,
-    const float* sums,  // smem + OFF_SUMS_BUF + ew*16384 + lane*4
+    const float* sums,  // smem + OFF_SUMS_BUF + ew*16384 + lane*4, stride 32
     __nv_bfloat16* __restrict__ C
 ) {
     __nv_bfloat16* row_out = C + (long long)(gm_base + lane) * N_DIM + n_start;
@@ -473,7 +403,7 @@ patch_embed_gemm(
                 const int gm_base = prev_m + ew * 32;
                 const float* sums = (const float*)(smem + OFF_SUMS_BUF + ew * 16384 + lane * 4);
 
-                epilogue_store_smem(prev_tmem, ew, lane, gm_base, prev_n, sums, C);
+                epilogue_store(prev_tmem, ew, lane, gm_base, prev_n, sums, C);
             }
 
             // Signal epilogue done (dummy on first tile to prime the mbarrier)
@@ -516,10 +446,16 @@ patch_embed_gemm(
         const int ew = warp;
         const int gm_base = last_m + ew * 32;
         const int pos_row = (gm_base + lane) % SEQ_LEN;
+
+        // Compute sums into SMEM (same warp reads them — no cross-warp sync needed)
+        float* sums_out = (float*)(smem + OFF_SUMS_BUF + ew * 16384 + lane * 4);
         const float* bp = bias + last_n;
         const float* pp = pos_embed + (long long)pos_row * N_DIM + last_n;
+        for (int j = 0; j < TN; j++)
+            sums_out[j * 32] = bp[j] + pp[j];
 
-        epilogue_store(last_tmem, ew, lane, gm_base, last_n, bp, pp, C);
+        epilogue_store(last_tmem, ew, lane, gm_base, last_n,
+                       (const float*)sums_out, C);
     }
 
     __syncthreads();  // all warps done before dealloc
