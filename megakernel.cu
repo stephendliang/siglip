@@ -1,6 +1,6 @@
-// Hand-tuned from gen.py output — TK=128, SWIZZLE_128B, 7-stage pipeline
+// Hand-tuned from gen.py output — TK=128, SWIZZLE_128B, 5-stage pipeline
 // Target: B200  Batch: 4736  GEMM: [928256,768]×[768,768]^T
-// Pipeline: 7-stage  K-iters: 6  MMA/iter: 4  idesc: 0x08200010
+// Pipeline: 5-stage  K-iters: 6  MMA/iter: 4  idesc: 0x08200010
 // Warps: 6 (192 threads)  cta_group::1
 // Warp-specialized: Load(W0) | MMA(W1,cta_group::1) | Epilogue(W2-5)  BF16 output
 // tcgen05.mma.cta_group::1.kind::f8f6f4  (E4M3 × E4M3 → FP32)
@@ -25,14 +25,15 @@
 #define TILES_N        6
 #define K_ITERS        6
 #define TOTAL_TILES    43512
-#define N_STAGES       6
-#define OFF_TMEM_0         196608
-#define OFF_TMEM_1         196612
-#define OFF_TMA_MBAR       196616
-#define OFF_MMA_MBAR       196664
-#define OFF_MAINLOOP_MBAR  196712
-#define OFF_EPILOGUE_MBAR  196720
-#define SMEM_BYTES         196736
+#define N_STAGES       5
+#define OFF_SUMS_BUF       163840
+#define OFF_TMEM_0         229376
+#define OFF_TMEM_1         229380
+#define OFF_TMA_MBAR       229384
+#define OFF_MMA_MBAR       229424
+#define OFF_MAINLOOP_MBAR  229464
+#define OFF_EPILOGUE_MBAR  229472
+#define SMEM_BYTES         229504
 #define TMEM_COLS      128
 #define IDESC          0x08200010U
 #define SBO            1024
@@ -228,6 +229,74 @@ void epilogue_store(
     }
 }
 
+// ── SMEM-sums epilogue: reads pre-computed bias+pos from SMEM ──
+// Used by overlapped epilogue (W2-5). Sums were prefetched into SMEM
+// during the previous tile's idle time. Layout: [ew][col][lane], stride 32.
+
+static __device__ __forceinline__
+void epilogue_store_smem(
+    uint32_t tmem_addr,
+    int ew,
+    int lane,
+    int gm_base,
+    int n_start,
+    const float* sums,  // smem + OFF_SUMS_BUF + ew*16384 + lane*4
+    __nv_bfloat16* __restrict__ C
+) {
+    __nv_bfloat16* row_out = C + (long long)(gm_base + lane) * N_DIM + n_start;
+    const int taddr_base = tmem_addr + (ew * 32 << 16);
+
+    // Double-buffered TMEM registers
+    float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
+    float b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15;
+
+    // Prefetch first chunk into buffer A
+    TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, taddr_base);
+
+    for (int nc = 0; nc < TN; nc += 32) {
+        // ── Chunk nc (buffer A) ──
+        float s0=sums[(nc+0)*32], s1=sums[(nc+1)*32];
+        float s2=sums[(nc+2)*32], s3=sums[(nc+3)*32];
+        float s4=sums[(nc+4)*32], s5=sums[(nc+5)*32];
+        float s6=sums[(nc+6)*32], s7=sums[(nc+7)*32];
+        float s8=sums[(nc+8)*32], s9=sums[(nc+9)*32];
+        float s10=sums[(nc+10)*32], s11=sums[(nc+11)*32];
+        float s12=sums[(nc+12)*32], s13=sums[(nc+13)*32];
+        float s14=sums[(nc+14)*32], s15=sums[(nc+15)*32];
+
+        TMEM_WAIT();
+        TMEM_LOAD(b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15, taddr_base + nc + 16);
+
+        a0+=s0; a1+=s1; a2+=s2; a3+=s3;
+        a4+=s4; a5+=s5; a6+=s6; a7+=s7;
+        a8+=s8; a9+=s9; a10+=s10; a11+=s11;
+        a12+=s12; a13+=s13; a14+=s14; a15+=s15;
+
+        CVT_STG(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, row_out + nc);
+
+        // ── Chunk nc+16 (buffer B) ──
+        s0=sums[(nc+16)*32]; s1=sums[(nc+17)*32];
+        s2=sums[(nc+18)*32]; s3=sums[(nc+19)*32];
+        s4=sums[(nc+20)*32]; s5=sums[(nc+21)*32];
+        s6=sums[(nc+22)*32]; s7=sums[(nc+23)*32];
+        s8=sums[(nc+24)*32]; s9=sums[(nc+25)*32];
+        s10=sums[(nc+26)*32]; s11=sums[(nc+27)*32];
+        s12=sums[(nc+28)*32]; s13=sums[(nc+29)*32];
+        s14=sums[(nc+30)*32]; s15=sums[(nc+31)*32];
+
+        TMEM_WAIT();
+        if (nc + 32 < TN)
+            TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, taddr_base + nc + 32);
+
+        b0+=s0; b1+=s1; b2+=s2; b3+=s3;
+        b4+=s4; b5+=s5; b6+=s6; b7+=s7;
+        b8+=s8; b9+=s9; b10+=s10; b11+=s11;
+        b12+=s12; b13+=s13; b14+=s14; b15+=s15;
+
+        CVT_STG(b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15, row_out + nc + 16);
+    }
+}
+
 // ═════════════════════════════════════════════════════════════
 // Patch embed GEMM — warp-specialized tcgen05 (cta_group::1)
 // ═════════════════════════════════════════════════════════════
@@ -248,8 +317,8 @@ patch_embed_gemm(
     const int lane  = tid % 32;
 
     // Per-stage SMEM offsets (codegen constants)
-    static constexpr int off_a[N_STAGES] = {0, 32768, 65536, 98304, 131072, 163840};
-    static constexpr int off_b[N_STAGES] = {16384, 49152, 81920, 114688, 147456, 180224};
+    static constexpr int off_a[N_STAGES] = {0, 32768, 65536, 98304, 131072};
+    static constexpr int off_b[N_STAGES] = {16384, 49152, 81920, 114688, 147456};
 
     // ── TMEM allocation: 2 buffers (cta_group::1) ──
     // One warp calls alloc (all lanes converged); other warps skip.
@@ -384,7 +453,9 @@ patch_embed_gemm(
                 mbar_arrive(mainloop_mbar_addr);
             }
         } else {
-            // ── OVERLAPPED EPILOGUE (W2-5): TMEM readback + bias/pos + store ──
+            // ── OVERLAPPED EPILOGUE (W2-5): TMEM readback + SMEM sums + store ──
+            const int ew = warp - 2;  // 0,1,2,3 for warps 2-5
+
             if (!first_tile) {
                 // Wait for MMA to finish — TMEM data ready
                 mbar_wait(mainloop_mbar_addr, mainloop_phase);
@@ -399,17 +470,26 @@ patch_embed_gemm(
                 const int prev_n = ptn * TN;
                 const uint32_t prev_tmem = tmem_base[buf ^ 1];
 
-                const int ew = warp - 2;  // 0,1,2,3 for warps 2-5
                 const int gm_base = prev_m + ew * 32;
-                const int pos_row = (gm_base + lane) % SEQ_LEN;
-                const float* bp = bias + prev_n;
-                const float* pp = pos_embed + (long long)pos_row * N_DIM + prev_n;
+                const float* sums = (const float*)(smem + OFF_SUMS_BUF + ew * 16384 + lane * 4);
 
-                epilogue_store(prev_tmem, ew, lane, gm_base, prev_n, bp, pp, C);
+                epilogue_store_smem(prev_tmem, ew, lane, gm_base, prev_n, sums, C);
             }
 
             // Signal epilogue done (dummy on first tile to prime the mbarrier)
             if (lane == 0) mbar_arrive(epilogue_mbar_addr);
+
+            // Prefetch bias+pos sums into SMEM for current tile
+            // (consumed by next iteration's overlapped epilogue — same warp/lane)
+            {
+                const int gm_base_cur = m_start + ew * 32;
+                const int pos_row = (gm_base_cur + lane) % SEQ_LEN;
+                float* sums_out = (float*)(smem + OFF_SUMS_BUF + ew * 16384 + lane * 4);
+                const float* bp_cur = bias + n_start;
+                const float* pp_cur = pos_embed + (long long)pos_row * N_DIM + n_start;
+                for (int j = 0; j < TN; j++)
+                    sums_out[j * 32] = bp_cur[j] + pp_cur[j];
+            }
         }
 
         first_tile = 0;
@@ -460,8 +540,8 @@ patch_embed_gemm(
 
 int main() {
     setbuf(stdout, NULL);  // unbuffered stdout for debugging
-    printf("SigLIP2 patch embed GEMM — tcgen05 cta_group::1 (4 warps)\n");
-    printf("  GEMM: [%d,%d] x [%d,%d]^T  6-stage pipeline  st.global stores  idesc: 0x%08X\n",
+    printf("SigLIP2 patch embed GEMM — tcgen05 cta_group::1 (6 warps)\n");
+    printf("  GEMM: [%d,%d] x [%d,%d]^T  5-stage pipeline  SMEM sums  st.global stores  idesc: 0x%08X\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, IDESC);
 
     uint8_t *d_A, *d_B;
