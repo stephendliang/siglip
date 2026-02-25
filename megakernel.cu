@@ -168,7 +168,7 @@ void tma_store_wait_1() {
 #define TMEM_WAIT() \
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory")
 
-#define CVT_STS(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15, SLANE, SLANE16) \
+#define CVT_STG(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15, GPTR) \
     asm volatile( \
         "{\n\t" \
         ".reg .b32 b0,b1,b2,b3,b4,b5,b6,b7;\n\t" \
@@ -180,37 +180,31 @@ void tma_store_wait_1() {
         "cvt.rn.bf16x2.f32 b5, %11, %10;\n\t" \
         "cvt.rn.bf16x2.f32 b6, %13, %12;\n\t" \
         "cvt.rn.bf16x2.f32 b7, %15, %14;\n\t" \
-        "st.shared.v4.b32 [%16], {b0,b1,b2,b3};\n\t" \
-        "st.shared.v4.b32 [%17], {b4,b5,b6,b7};\n\t" \
+        "st.global.v4.b32 [%16], {b0,b1,b2,b3};\n\t" \
+        "st.global.v4.b32 [%17], {b4,b5,b6,b7};\n\t" \
         "}" \
         :: "f"(r0),"f"(r1),"f"(r2),"f"(r3), \
            "f"(r4),"f"(r5),"f"(r6),"f"(r7), \
            "f"(r8),"f"(r9),"f"(r10),"f"(r11), \
            "f"(r12),"f"(r13),"f"(r14),"f"(r15), \
-           "r"(SLANE), "r"(SLANE16) \
+           "l"(GPTR), "l"((GPTR) + 8) \
         : "memory")
 
-// ── Shared epilogue: TMEM readback → bias+pos add → FP32→BF16 → TMA store ──
+// ── Shared epilogue: TMEM readback → bias+pos add → FP32→BF16 → st.global ──
 
 static __device__ __forceinline__
 void epilogue_store(
-    char* smem,
-    const CUtensorMap* tma_c_desc,
     uint32_t tmem_addr,
     int ew,
     int lane,
     int gm_base,
     int n_start,
     const float* __restrict__ bp,
-    const float* __restrict__ pp
+    const float* __restrict__ pp,
+    __nv_bfloat16* __restrict__ C
 ) {
-    uint32_t smem_lane[2], smem_base_addr[2];
-    smem_lane[0] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE) + lane * 32;
-    smem_lane[1] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE + TMA_BUF_SIZE) + lane * 32;
-    smem_base_addr[0] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE);
-    smem_base_addr[1] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE + TMA_BUF_SIZE);
+    __nv_bfloat16* row_out = C + (long long)(gm_base + lane) * N_DIM + n_start;
 
-    int bi = 0;
     for (int nc = 0; nc < TN; nc += 16) {
         float v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15;
         int taddr = tmem_addr + (ew * 32 << 16) + nc;
@@ -233,22 +227,8 @@ void epilogue_store(
         v8+=s8; v9+=s9; v10+=s10; v11+=s11;
         v12+=s12; v13+=s13; v14+=s14; v15+=s15;
 
-        CVT_STS(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, smem_lane[bi], smem_lane[bi] + 16);
-
-        tma_store_fence();
-        __syncwarp();
-
-        if (lane == 0) {
-            if (nc >= 32) tma_store_wait_1();
-            tma_store_2d(tma_c_desc, smem_base_addr[bi], n_start + nc, gm_base);
-            tma_store_commit();
-        }
-
-        bi ^= 1;
+        CVT_STG(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, row_out + nc);
     }
-
-    if (lane == 0) tma_store_wait_0();
-    __syncwarp();
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -429,7 +409,7 @@ patch_embed_gemm(
                 const float* bp = bias + prev_n;
                 const float* pp = pos_embed + (long long)pos_row * N_DIM + prev_n;
 
-                epilogue_store(smem, &tma_c, prev_tmem, ew, lane, gm_base, prev_n, bp, pp);
+                epilogue_store(prev_tmem, ew, lane, gm_base, prev_n, bp, pp, C);
             }
 
             // Signal epilogue done (dummy on first tile to prime the mbarrier)
@@ -463,7 +443,7 @@ patch_embed_gemm(
         const float* bp = bias + last_n;
         const float* pp = pos_embed + (long long)pos_row * N_DIM + last_n;
 
-        epilogue_store(smem, &tma_c, last_tmem, ew, lane, gm_base, last_n, bp, pp);
+        epilogue_store(last_tmem, ew, lane, gm_base, last_n, bp, pp, C);
     }
 
     __syncthreads();  // all warps done before dealloc
