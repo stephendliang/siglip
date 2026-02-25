@@ -159,6 +159,9 @@ void tma_load_2d(uint32_t smem_dst, const void* tma_desc,
         : "memory")
 
 // ── Shared epilogue: TMEM readback → bias+pos add → FP32→BF16 → st.global ──
+// Software-pipelined: double-buffered TMEM loads (A/B) across column pairs.
+// Next chunk's load is issued immediately after current wait returns,
+// so FADD+CVT+STG of current chunk overlaps with next TMEM load.
 
 static __device__ __forceinline__
 void epilogue_store(
@@ -172,13 +175,17 @@ void epilogue_store(
     __nv_bfloat16* __restrict__ C
 ) {
     __nv_bfloat16* row_out = C + (long long)(gm_base + lane) * N_DIM + n_start;
+    const int taddr_base = tmem_addr + (ew * 32 << 16);
 
-    for (int nc = 0; nc < TN; nc += 16) {
-        float v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15;
-        int taddr = tmem_addr + (ew * 32 << 16) + nc;
+    // Double-buffered TMEM registers
+    float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
+    float b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15;
 
-        TMEM_LOAD(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, taddr);
+    // Prefetch first chunk into buffer A
+    TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, taddr_base);
 
+    for (int nc = 0; nc < TN; nc += 32) {
+        // ── Chunk nc (buffer A) ──
         float s0=bp[nc]+pp[nc], s1=bp[nc+1]+pp[nc+1];
         float s2=bp[nc+2]+pp[nc+2], s3=bp[nc+3]+pp[nc+3];
         float s4=bp[nc+4]+pp[nc+4], s5=bp[nc+5]+pp[nc+5];
@@ -189,13 +196,35 @@ void epilogue_store(
         float s14=bp[nc+14]+pp[nc+14], s15=bp[nc+15]+pp[nc+15];
 
         TMEM_WAIT();
+        TMEM_LOAD(b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15, taddr_base + nc + 16);
 
-        v0+=s0; v1+=s1; v2+=s2; v3+=s3;
-        v4+=s4; v5+=s5; v6+=s6; v7+=s7;
-        v8+=s8; v9+=s9; v10+=s10; v11+=s11;
-        v12+=s12; v13+=s13; v14+=s14; v15+=s15;
+        a0+=s0; a1+=s1; a2+=s2; a3+=s3;
+        a4+=s4; a5+=s5; a6+=s6; a7+=s7;
+        a8+=s8; a9+=s9; a10+=s10; a11+=s11;
+        a12+=s12; a13+=s13; a14+=s14; a15+=s15;
 
-        CVT_STG(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, row_out + nc);
+        CVT_STG(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, row_out + nc);
+
+        // ── Chunk nc+16 (buffer B) ──
+        s0=bp[nc+16]+pp[nc+16]; s1=bp[nc+17]+pp[nc+17];
+        s2=bp[nc+18]+pp[nc+18]; s3=bp[nc+19]+pp[nc+19];
+        s4=bp[nc+20]+pp[nc+20]; s5=bp[nc+21]+pp[nc+21];
+        s6=bp[nc+22]+pp[nc+22]; s7=bp[nc+23]+pp[nc+23];
+        s8=bp[nc+24]+pp[nc+24]; s9=bp[nc+25]+pp[nc+25];
+        s10=bp[nc+26]+pp[nc+26]; s11=bp[nc+27]+pp[nc+27];
+        s12=bp[nc+28]+pp[nc+28]; s13=bp[nc+29]+pp[nc+29];
+        s14=bp[nc+30]+pp[nc+30]; s15=bp[nc+31]+pp[nc+31];
+
+        TMEM_WAIT();
+        if (nc + 32 < TN)
+            TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, taddr_base + nc + 32);
+
+        b0+=s0; b1+=s1; b2+=s2; b3+=s3;
+        b4+=s4; b5+=s5; b6+=s6; b7+=s7;
+        b8+=s8; b9+=s9; b10+=s10; b11+=s11;
+        b12+=s12; b13+=s13; b14+=s14; b15+=s15;
+
+        CVT_STG(b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15, row_out + nc + 16);
     }
 }
 
