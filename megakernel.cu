@@ -31,8 +31,10 @@
 #define OFF_TMEM_0     204800
 #define OFF_TMEM_1     204804
 #define OFF_TMA_MBAR   204808
-#define OFF_MMA_MBAR   204856
-#define SMEM_BYTES     204928
+#define OFF_MMA_MBAR       204856
+#define OFF_MAINLOOP_MBAR  204904
+#define OFF_EPILOGUE_MBAR  204912
+#define SMEM_BYTES         204928
 #define TMEM_COLS      128
 #define IDESC          0x08200010U
 #define SBO            1024
@@ -103,6 +105,12 @@ void mbar_arrive_expect_tx(uint32_t addr, uint32_t tx_count) {
     asm volatile(
         "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
         :: "r"(addr), "r"(tx_count) : "memory");
+}
+
+static __device__ __forceinline__
+void mbar_arrive(uint32_t addr) {
+    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+        :: "r"(addr) : "memory");
 }
 
 static __device__ __forceinline__
@@ -287,6 +295,8 @@ patch_embed_gemm(
             mbar_init(smem_to_uint(smem + OFF_TMA_MBAR + s * 8), 1);
             mbar_init(smem_to_uint(smem + OFF_MMA_MBAR + s * 8), 1);
         }
+        mbar_init(smem_to_uint(smem + OFF_MAINLOOP_MBAR), 1);   // W1 arrives once
+        mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR), 4);   // W2-5 each arrive once
     }
     __syncthreads();
 
@@ -298,12 +308,16 @@ patch_embed_gemm(
         smem_a[s]   = smem_to_uint(smem + off_a[s]);
         smem_b[s]   = smem_to_uint(smem + off_b[s]);
     }
+    const uint32_t mainloop_mbar_addr = smem_to_uint(smem + OFF_MAINLOOP_MBAR);
+    const uint32_t epilogue_mbar_addr = smem_to_uint(smem + OFF_EPILOGUE_MBAR);
 
     const int tile_start = (int)((long long)sm_id * TOTAL_TILES / SM_COUNT);
     const int tile_end   = (int)((long long)(sm_id + 1) * TOTAL_TILES / SM_COUNT);
 
     int tma_phase[N_STAGES] = {0};
     int mma_phase[N_STAGES] = {0};
+    int mainloop_phase = 0;
+    int epilogue_phase = 0;
     int first_tile = 1;
 
     for (int tile_idx = tile_start; tile_idx < tile_end; tile_idx++) {
@@ -335,6 +349,12 @@ patch_embed_gemm(
         } else if (warp == 1) {
             // ── MMA WARP (W1): tcgen05.mma.cta_group::1 → tmem_base[buf] ──
             if (lane == 0) {
+                // Wait for previous epilogue to release TMEM buffer
+                if (!first_tile) {
+                    mbar_wait(epilogue_mbar_addr, epilogue_phase);
+                    epilogue_phase ^= 1;
+                }
+
                 for (int ki = 0; ki < K_ITERS; ki++) {
                     const int s = ki % N_STAGES;
 
@@ -382,10 +402,19 @@ patch_embed_gemm(
                         "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
                         :: "r"(mma_mbar[s]) : "memory");
                 }
+
+                // Signal K-loop done — TMEM data ready for epilogue
+                asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+                mbar_arrive(mainloop_mbar_addr);
             }
         } else {
-            // ── OVERLAPPED EPILOGUE (W2-5): reordered TMEM load + bias prefetch ──
+            // ── OVERLAPPED EPILOGUE (W2-5): TMEM readback + bias/pos + store ──
             if (!first_tile) {
+                // Wait for MMA to finish — TMEM data ready
+                mbar_wait(mainloop_mbar_addr, mainloop_phase);
+                mainloop_phase ^= 1;
+                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+
                 const int prev_idx = tile_idx - 1;
                 const int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
@@ -402,16 +431,22 @@ patch_embed_gemm(
 
                 epilogue_store(smem, &tma_c, prev_tmem, ew, lane, gm_base, prev_n, bp, pp);
             }
+
+            // Signal epilogue done (dummy on first tile to prime the mbarrier)
+            if (lane == 0) mbar_arrive(epilogue_mbar_addr);
         }
 
-        // ── Fence + sync: drain MMA writes + block until epilogue done ──
-        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-        __syncthreads();
-        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
         first_tile = 0;
     }  // tile loop
 
     // ── Drain epilogue: warps 0-3 write the last tile ──
+    {
+        const int num_tiles = tile_end - tile_start;
+        const int drain_phase = (num_tiles - 1) & 1;
+        // Wait for last tile's MMA to finish
+        mbar_wait(mainloop_mbar_addr, drain_phase);
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    }
     if (warp < 4) {
         const int last_idx = tile_end - 1;
         const int last_buf = last_idx & 1;
