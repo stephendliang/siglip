@@ -182,6 +182,67 @@ void tma_store_wait_1() {
            "r"(SLANE), "r"(SLANE16) \
         : "memory")
 
+// ── Shared epilogue: TMEM readback → bias+pos add → FP32→BF16 → TMA store ──
+
+static __device__ __forceinline__
+void epilogue_store(
+    char* smem,
+    const CUtensorMap* tma_c_desc,
+    uint32_t tmem_addr,
+    int ew,
+    int lane,
+    int gm_base,
+    int n_start,
+    const float* __restrict__ bp,
+    const float* __restrict__ pp
+) {
+    uint32_t smem_lane[2], smem_base_addr[2];
+    smem_lane[0] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE) + lane * 32;
+    smem_lane[1] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE + TMA_BUF_SIZE) + lane * 32;
+    smem_base_addr[0] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE);
+    smem_base_addr[1] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE + TMA_BUF_SIZE);
+
+    int bi = 0;
+    for (int nc = 0; nc < TN; nc += 16) {
+        float v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15;
+        int taddr = tmem_addr + (ew * 32 << 16) + nc;
+
+        TMEM_LOAD(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, taddr);
+
+        float s0=bp[nc]+pp[nc], s1=bp[nc+1]+pp[nc+1];
+        float s2=bp[nc+2]+pp[nc+2], s3=bp[nc+3]+pp[nc+3];
+        float s4=bp[nc+4]+pp[nc+4], s5=bp[nc+5]+pp[nc+5];
+        float s6=bp[nc+6]+pp[nc+6], s7=bp[nc+7]+pp[nc+7];
+        float s8=bp[nc+8]+pp[nc+8], s9=bp[nc+9]+pp[nc+9];
+        float s10=bp[nc+10]+pp[nc+10], s11=bp[nc+11]+pp[nc+11];
+        float s12=bp[nc+12]+pp[nc+12], s13=bp[nc+13]+pp[nc+13];
+        float s14=bp[nc+14]+pp[nc+14], s15=bp[nc+15]+pp[nc+15];
+
+        TMEM_WAIT();
+
+        v0+=s0; v1+=s1; v2+=s2; v3+=s3;
+        v4+=s4; v5+=s5; v6+=s6; v7+=s7;
+        v8+=s8; v9+=s9; v10+=s10; v11+=s11;
+        v12+=s12; v13+=s13; v14+=s14; v15+=s15;
+
+        CVT_STS(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, smem_lane[bi], smem_lane[bi] + 16);
+
+        tma_store_fence();
+        __syncwarp();
+
+        if (lane == 0) {
+            if (nc >= 32) tma_store_wait_1();
+            tma_store_2d(tma_c_desc, smem_base_addr[bi], n_start + nc, gm_base);
+            tma_store_commit();
+        }
+
+        bi ^= 1;
+    }
+
+    if (lane == 0) tma_store_wait_0();
+    __syncwarp();
+}
+
 // ═════════════════════════════════════════════════════════════
 // Patch embed GEMM — warp-specialized tcgen05 (cta_group::1)
 // ═════════════════════════════════════════════════════════════
@@ -339,55 +400,7 @@ patch_embed_gemm(
                 const float* bp = bias + prev_n;
                 const float* pp = pos_embed + (long long)pos_row * N_DIM + prev_n;
 
-                uint32_t smem_lane[2], smem_base[2];
-                smem_lane[0] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE) + lane * 32;
-                smem_lane[1] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE + TMA_BUF_SIZE) + lane * 32;
-                smem_base[0] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE);
-                smem_base[1] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE + TMA_BUF_SIZE);
-
-                int bi = 0;
-                for (int nc = 0; nc < TN; nc += 16) {
-                    float v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15;
-                    int taddr = prev_tmem + (ew * 32 << 16) + nc;
-
-                    // Issue TMEM load (async)
-                    TMEM_LOAD(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, taddr);
-
-                    // Pre-compute bias+pos sums while TMEM load is in-flight
-                    float s0=bp[nc]+pp[nc], s1=bp[nc+1]+pp[nc+1];
-                    float s2=bp[nc+2]+pp[nc+2], s3=bp[nc+3]+pp[nc+3];
-                    float s4=bp[nc+4]+pp[nc+4], s5=bp[nc+5]+pp[nc+5];
-                    float s6=bp[nc+6]+pp[nc+6], s7=bp[nc+7]+pp[nc+7];
-                    float s8=bp[nc+8]+pp[nc+8], s9=bp[nc+9]+pp[nc+9];
-                    float s10=bp[nc+10]+pp[nc+10], s11=bp[nc+11]+pp[nc+11];
-                    float s12=bp[nc+12]+pp[nc+12], s13=bp[nc+13]+pp[nc+13];
-                    float s14=bp[nc+14]+pp[nc+14], s15=bp[nc+15]+pp[nc+15];
-
-                    // Wait for TMEM data
-                    TMEM_WAIT();
-
-                    // Apply pre-computed sums (just FADDs, no LDG)
-                    v0+=s0; v1+=s1; v2+=s2; v3+=s3;
-                    v4+=s4; v5+=s5; v6+=s6; v7+=s7;
-                    v8+=s8; v9+=s9; v10+=s10; v11+=s11;
-                    v12+=s12; v13+=s13; v14+=s14; v15+=s15;
-
-                    CVT_STS(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, smem_lane[bi], smem_lane[bi] + 16);
-
-                    tma_store_fence();
-                    __syncwarp();
-
-                    if (lane == 0) {
-                        if (nc >= 32) tma_store_wait_1();
-                        tma_store_2d(&tma_c, smem_base[bi], prev_n + nc, gm_base);
-                        tma_store_commit();
-                    }
-
-                    bi ^= 1;
-                }
-
-                if (lane == 0) tma_store_wait_0();
-                __syncwarp();
+                epilogue_store(smem, &tma_c, prev_tmem, ew, lane, gm_base, prev_n, bp, pp);
             }
         }
 
@@ -398,7 +411,7 @@ patch_embed_gemm(
         first_tile = 0;
     }  // tile loop
 
-    // ── Drain epilogue: warps 0-3 write the last tile, reordered ──
+    // ── Drain epilogue: warps 0-3 write the last tile ──
     if (warp < 4) {
         const int last_idx = tile_end - 1;
         const int last_buf = last_idx & 1;
@@ -415,55 +428,7 @@ patch_embed_gemm(
         const float* bp = bias + last_n;
         const float* pp = pos_embed + (long long)pos_row * N_DIM + last_n;
 
-        uint32_t smem_lane[2], smem_base[2];
-        smem_lane[0] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE) + lane * 32;
-        smem_lane[1] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE + TMA_BUF_SIZE) + lane * 32;
-        smem_base[0] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE);
-        smem_base[1] = smem_to_uint(smem + OFF_TMA_BUF + ew * 2 * TMA_BUF_SIZE + TMA_BUF_SIZE);
-
-        int bi = 0;
-        for (int nc = 0; nc < TN; nc += 16) {
-            float v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15;
-            int taddr = last_tmem + (ew * 32 << 16) + nc;
-
-            // Issue TMEM load (async)
-            TMEM_LOAD(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, taddr);
-
-            // Pre-compute bias+pos sums while TMEM load is in-flight
-            float s0=bp[nc]+pp[nc], s1=bp[nc+1]+pp[nc+1];
-            float s2=bp[nc+2]+pp[nc+2], s3=bp[nc+3]+pp[nc+3];
-            float s4=bp[nc+4]+pp[nc+4], s5=bp[nc+5]+pp[nc+5];
-            float s6=bp[nc+6]+pp[nc+6], s7=bp[nc+7]+pp[nc+7];
-            float s8=bp[nc+8]+pp[nc+8], s9=bp[nc+9]+pp[nc+9];
-            float s10=bp[nc+10]+pp[nc+10], s11=bp[nc+11]+pp[nc+11];
-            float s12=bp[nc+12]+pp[nc+12], s13=bp[nc+13]+pp[nc+13];
-            float s14=bp[nc+14]+pp[nc+14], s15=bp[nc+15]+pp[nc+15];
-
-            // Wait for TMEM data
-            TMEM_WAIT();
-
-            // Apply pre-computed sums (just FADDs, no LDG)
-            v0+=s0; v1+=s1; v2+=s2; v3+=s3;
-            v4+=s4; v5+=s5; v6+=s6; v7+=s7;
-            v8+=s8; v9+=s9; v10+=s10; v11+=s11;
-            v12+=s12; v13+=s13; v14+=s14; v15+=s15;
-
-            CVT_STS(v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15, smem_lane[bi], smem_lane[bi] + 16);
-
-            tma_store_fence();
-            __syncwarp();
-
-            if (lane == 0) {
-                if (nc >= 32) tma_store_wait_1();
-                tma_store_2d(&tma_c, smem_base[bi], last_n + nc, gm_base);
-                tma_store_commit();
-            }
-
-            bi ^= 1;
-        }
-
-        if (lane == 0) tma_store_wait_0();
-        __syncwarp();
+        epilogue_store(smem, &tma_c, last_tmem, ew, lane, gm_base, last_n, bp, pp);
     }
 
     __syncthreads();  // all warps done before dealloc
