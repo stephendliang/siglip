@@ -17,15 +17,15 @@ Warp-specialized, 6 warps (192 threads), `cta_group::1`:
 
 The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile N. After the tile loop, W0-W3 run a drain epilogue for the last tile.
 
-## Codegen workflow
+## Development workflow
 
-**Never edit `megakernel.cu` directly.** It is generated.
+**Edit `megakernel.cu` directly.** It is the hand-tuned source of truth.
 
 ```
-edit gen.py → python3 gen.py → make → run on GPU
+edit megakernel.cu → make → run on GPU
 ```
 
-`gen.py` emits the complete `.cu` from parameterized templates. SMEM offsets, barrier IDs, TMA descriptors, tile arithmetic — all computed from root constants.
+`gen.py` is outdated and does not reflect the current kernel. It still has the old 4-warp structure and wrong hyperparameters. Once the kernel is fully optimized and working, `gen.py` will be updated to match.
 
 ## File map
 
@@ -35,8 +35,8 @@ edit gen.py → python3 gen.py → make → run on GPU
 | `docs/tasks.md` | Active optimization action items with dependency order | Starting any implementation work |
 | `docs/profiling.md` | ncu/cuobjdump/compute-sanitizer commands per task | Before and after every change |
 | `docs/architecture.md` | Model specs, HW config, codegen structure, milestones | Understanding overall project scope |
-| `gen.py` | Codegen script — **the source of truth** | Implementing any kernel change |
-| `megakernel.cu` | Generated CUDA kernel — **do not edit** | Reading current kernel behavior |
+| `megakernel.cu` | Hand-tuned CUDA kernel — **the source of truth** | Implementing any kernel change |
+| `gen.py` | Codegen script — **outdated, do not use yet** | Later: backport final kernel design |
 | `Makefile` | Build rules (sm_100a, nvcc flags) | Building |
 | `bench_sweep.sh` | M-size benchmark sweep | Performance testing |
 | `docs/reference/model.txt` | PyTorch model architecture dump | Understanding model dimensions |
@@ -55,4 +55,5 @@ make dry-run            # print tile analysis without compiling
 - Target: `sm_100a` (B200 with 148 SMs, cluster-of-4)
 - SMEM: 228 KB per SM
 - All inline PTX — no CUTLASS dependency for the kernel itself
-- `megakernel.cu` is generated, not hand-edited (except for the current hand-tuned version being optimized)
+- `megakernel.cu` is hand-edited directly — it is the source of truth
+- `gen.py` is stale and will be updated after the kernel is finalized
