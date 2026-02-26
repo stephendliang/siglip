@@ -1,6 +1,6 @@
-// Hand-tuned from gen.py output — TK=128, SWIZZLE_128B, 5-stage pipeline
+// Hand-tuned from gen.py output — TK=128, SWIZZLE_128B, 6-stage pipeline
 // Target: B200  Batch: 4736  GEMM: [928256,768]×[768,768]^T
-// Pipeline: 5-stage  K-iters: 6  MMA/iter: 4  idesc: 0x08200010
+// Pipeline: 6-stage  K-iters: 6  MMA/iter: 4  idesc: 0x08200010
 // Warps: 6 (192 threads)  cta_group::1
 // Warp-specialized: Load(W0) | MMA(W1,cta_group::1) | Epilogue(W2-5)  BF16 output
 // tcgen05.mma.cta_group::1.kind::f8f6f4  (E4M3 × E4M3 → FP32)
@@ -25,15 +25,14 @@
 #define TILES_N        6
 #define K_ITERS        6
 #define TOTAL_TILES    43512
-#define N_STAGES       5
-#define OFF_SUMS_BUF       163840
-#define OFF_TMEM_0         229376
-#define OFF_TMEM_1         229380
-#define OFF_TMA_MBAR       229384
-#define OFF_MMA_MBAR       229424
-#define OFF_MAINLOOP_MBAR  229464  // 2 * 8 = 16 bytes (double-buffered)
-#define OFF_EPILOGUE_MBAR  229480  // 2 * 8 = 16 bytes (double-buffered)
-#define SMEM_BYTES         229504  // fits: 229480 + 16 = 229496 <= 229504
+#define N_STAGES       6
+#define OFF_TMEM_0         196608
+#define OFF_TMEM_1         196612
+#define OFF_TMA_MBAR       196616
+#define OFF_MMA_MBAR       196664
+#define OFF_MAINLOOP_MBAR  196712
+#define OFF_EPILOGUE_MBAR  196728
+#define SMEM_BYTES         196864
 #define TMEM_COLS      128
 #define IDESC          0x08200010U
 #define SBO            1024
@@ -112,32 +111,6 @@ void mbar_arrive(uint32_t addr) {
         :: "r"(addr) : "memory");
 }
 
-// Noinline prefetch: opaque function call prevents ptxas register allocation
-// from corrupting synchronization instructions in the main kernel body.
-// Computes bias[col] + pos_embed[row, col] for all TN columns,
-// storing to SMEM sums_out with stride-32 layout.
-// Address computation inside the noinline boundary to minimize caller register pressure.
-__attribute__((noinline)) static __device__
-void prefetch_sums_noinline(
-    float* sums_out,       // smem + OFF_SUMS_BUF + ew*16384 + lane*4, stride 32
-    const float* bias,
-    const float* pos_embed,
-    int n_start,
-    int pos_row
-) {
-    const float4* bp4 = reinterpret_cast<const float4*>(bias + n_start);
-    const float4* pp4 = reinterpret_cast<const float4*>(pos_embed + (long long)pos_row * N_DIM + n_start);
-    #pragma unroll 8
-    for (int c = 0; c < 32; c++) {
-        float4 b = bp4[c];
-        float4 p = pp4[c];
-        sums_out[(c*4+0) * 32] = b.x + p.x;
-        sums_out[(c*4+1) * 32] = b.y + p.y;
-        sums_out[(c*4+2) * 32] = b.z + p.z;
-        sums_out[(c*4+3) * 32] = b.w + p.w;
-    }
-}
-
 static __device__ __forceinline__
 void tma_load_2d(uint32_t smem_dst, const void* tma_desc,
                   int32_t c0, int32_t c1, uint32_t mbar) {
@@ -184,10 +157,18 @@ void tma_load_2d(uint32_t smem_dst, const void* tma_desc,
            "l"(GPTR) \
         : "memory")
 
-// ── Unified epilogue: TMEM readback → sums add → FP32→BF16 → st.global.v8 ──
+#define BF16X2_TO_F32(reg, flo, fhi) \
+    asm volatile("{\n\t" \
+        ".reg .b16 lo, hi;\n\t" \
+        "mov.b32 {lo, hi}, %2;\n\t" \
+        "cvt.rn.f32.bf16 %0, lo;\n\t" \
+        "cvt.rn.f32.bf16 %1, hi;\n\t" \
+        "}" : "=f"(flo), "=f"(fhi) : "r"(reg))
+
+// ── Unified epilogue: TMEM readback → inline BF16 combined add → FP32→BF16 → st.global.v8 ──
 // Software-pipelined: double-buffered TMEM loads (A/B) across column pairs.
-// Sums (bias+pos_embed) are pre-computed in SMEM with [ew][col][lane] layout,
-// stride 32 between columns. Both overlapped and drain paths use this function.
+// Combined (bias+pos_embed) loaded inline as BF16 from global memory,
+// overlapping with TMEM load latency. Both overlapped and drain paths use this function.
 
 static __device__ __forceinline__
 void epilogue_store(
@@ -196,11 +177,13 @@ void epilogue_store(
     int lane,
     int gm_base,
     int n_start,
-    const float* sums,  // smem + OFF_SUMS_BUF + ew*16384 + lane*4, stride 32
+    const __nv_bfloat16* __restrict__ combined,
+    int pos_row,
     __nv_bfloat16* __restrict__ C
 ) {
     __nv_bfloat16* row_out = C + (long long)(gm_base + lane) * N_DIM + n_start;
     const int taddr_base = tmem_addr + (ew * 32 << 16);
+    const __nv_bfloat16* comb_row = combined + (long long)pos_row * N_DIM + n_start;
 
     // Double-buffered TMEM registers
     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
@@ -211,14 +194,18 @@ void epilogue_store(
 
     for (int nc = 0; nc < TN; nc += 32) {
         // ── Chunk nc (buffer A) ──
-        float s0=sums[(nc+0)*32], s1=sums[(nc+1)*32];
-        float s2=sums[(nc+2)*32], s3=sums[(nc+3)*32];
-        float s4=sums[(nc+4)*32], s5=sums[(nc+5)*32];
-        float s6=sums[(nc+6)*32], s7=sums[(nc+7)*32];
-        float s8=sums[(nc+8)*32], s9=sums[(nc+9)*32];
-        float s10=sums[(nc+10)*32], s11=sums[(nc+11)*32];
-        float s12=sums[(nc+12)*32], s13=sums[(nc+13)*32];
-        float s14=sums[(nc+14)*32], s15=sums[(nc+15)*32];
+        // Issue BF16 combined loads BEFORE TMEM_WAIT (overlap with TMEM latency)
+        uint4 craw0 = *reinterpret_cast<const uint4*>(comb_row + nc);
+        uint4 craw1 = *reinterpret_cast<const uint4*>(comb_row + nc + 8);
+        float s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15;
+        BF16X2_TO_F32(craw0.x, s0, s1);
+        BF16X2_TO_F32(craw0.y, s2, s3);
+        BF16X2_TO_F32(craw0.z, s4, s5);
+        BF16X2_TO_F32(craw0.w, s6, s7);
+        BF16X2_TO_F32(craw1.x, s8, s9);
+        BF16X2_TO_F32(craw1.y, s10, s11);
+        BF16X2_TO_F32(craw1.z, s12, s13);
+        BF16X2_TO_F32(craw1.w, s14, s15);
 
         TMEM_WAIT();
         TMEM_LOAD(b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15, taddr_base + nc + 16);
@@ -231,14 +218,16 @@ void epilogue_store(
         CVT_STG(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, row_out + nc);
 
         // ── Chunk nc+16 (buffer B) ──
-        s0=sums[(nc+16)*32]; s1=sums[(nc+17)*32];
-        s2=sums[(nc+18)*32]; s3=sums[(nc+19)*32];
-        s4=sums[(nc+20)*32]; s5=sums[(nc+21)*32];
-        s6=sums[(nc+22)*32]; s7=sums[(nc+23)*32];
-        s8=sums[(nc+24)*32]; s9=sums[(nc+25)*32];
-        s10=sums[(nc+26)*32]; s11=sums[(nc+27)*32];
-        s12=sums[(nc+28)*32]; s13=sums[(nc+29)*32];
-        s14=sums[(nc+30)*32]; s15=sums[(nc+31)*32];
+        craw0 = *reinterpret_cast<const uint4*>(comb_row + nc + 16);
+        craw1 = *reinterpret_cast<const uint4*>(comb_row + nc + 24);
+        BF16X2_TO_F32(craw0.x, s0, s1);
+        BF16X2_TO_F32(craw0.y, s2, s3);
+        BF16X2_TO_F32(craw0.z, s4, s5);
+        BF16X2_TO_F32(craw0.w, s6, s7);
+        BF16X2_TO_F32(craw1.x, s8, s9);
+        BF16X2_TO_F32(craw1.y, s10, s11);
+        BF16X2_TO_F32(craw1.z, s12, s13);
+        BF16X2_TO_F32(craw1.w, s14, s15);
 
         TMEM_WAIT();
         if (nc + 32 < TN)
@@ -253,6 +242,21 @@ void epilogue_store(
     }
 }
 
+// ── Host precompute kernel: bias[c] + pos_embed[r,c] → BF16 combined[r,c] ──
+
+__global__ void precompute_combined(
+    const float* __restrict__ bias,
+    const float* __restrict__ pos_embed,
+    __nv_bfloat16* __restrict__ combined,
+    int seq_len, int n_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < seq_len * n_dim) {
+        int c = idx % n_dim;
+        combined[idx] = __float2bfloat16(bias[c] + pos_embed[idx]);
+    }
+}
+
 // ═════════════════════════════════════════════════════════════
 // Patch embed GEMM — warp-specialized tcgen05 (cta_group::1)
 // ═════════════════════════════════════════════════════════════
@@ -261,8 +265,7 @@ __global__ void __launch_bounds__(192, 1)
 patch_embed_gemm(
     const __grid_constant__ CUtensorMap tma_a,
     const __grid_constant__ CUtensorMap tma_b,
-    const float*   __restrict__ bias,
-    const float*   __restrict__ pos_embed,
+    const __nv_bfloat16* __restrict__ combined,
     __nv_bfloat16* __restrict__ C
 ) {
 
@@ -272,9 +275,9 @@ patch_embed_gemm(
     const int warp  = tid / 32;
     const int lane  = tid % 32;
 
-    // Per-stage SMEM offsets (codegen constants)
-    static constexpr int off_a[N_STAGES] = {0, 32768, 65536, 98304, 131072};
-    static constexpr int off_b[N_STAGES] = {16384, 49152, 81920, 114688, 147456};
+    // Per-stage SMEM offsets (6 stages, no sums buffer needed)
+    static constexpr int off_a[N_STAGES] = {0, 32768, 65536, 98304, 131072, 163840};
+    static constexpr int off_b[N_STAGES] = {16384, 49152, 81920, 114688, 147456, 180224};
 
     // ── TMEM allocation: 2 buffers (cta_group::1) ──
     // One warp calls alloc (all lanes converged); other warps skip.
@@ -427,7 +430,7 @@ patch_embed_gemm(
             ml_phase[prev_buf] ^= 1;
 
             if (tile_idx > tile_start) {
-                // Epilogue: read tmem[prev_buf], store to global
+                // Epilogue: read tmem[prev_buf], add inline BF16 combined, store to global
                 const int prev_idx = tile_idx - 1;
                 const int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
@@ -436,19 +439,11 @@ patch_embed_gemm(
                 const int prev_n = ptn * TN;
 
                 const int gm_base = prev_m + ew * 32;
-                const float* sums = (const float*)(smem + OFF_SUMS_BUF + ew * 16384 + lane * 4);
-                epilogue_store(tmem_base[prev_buf], ew, lane, gm_base, prev_n, sums, C);
+                const int pos_row = (gm_base + lane) % SEQ_LEN;
+                epilogue_store(tmem_base[prev_buf], ew, lane, gm_base, prev_n, combined, pos_row, C);
 
                 // Signal: done reading tmem[prev_buf]
                 mbar_arrive(epilogue_mbar_addr + prev_buf * 8);
-            }
-
-            // Prefetch bias+pos sums into SMEM for current tile
-            {
-                const int gm_base_cur = m_start + ew * 32;
-                const int pos_row = (gm_base_cur + lane) % SEQ_LEN;
-                float* sums_out = (float*)(smem + OFF_SUMS_BUF + ew * 16384 + lane * 4);
-                prefetch_sums_noinline(sums_out, bias, pos_embed, n_start, pos_row);
             }
         }
     }  // tile loop
@@ -466,7 +461,7 @@ patch_embed_gemm(
         asm volatile("bar.sync %0, %1;" :: "r"(1), "r"(4 * 32) : "memory");
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-        // Epilogue store for the last tile (sums already in SMEM from last prefetch)
+        // Epilogue store for the last tile (inline BF16 combined loads)
         const int last_idx = tile_end - 1;
         const int ltm = last_idx / TILES_N;
         int ltn = last_idx % TILES_N;
@@ -474,8 +469,8 @@ patch_embed_gemm(
         const int last_m = ltm * TM;
         const int last_n = ltn * TN;
         const int gm_base = last_m + ew * 32;
-        const float* sums = (const float*)(smem + OFF_SUMS_BUF + ew * 16384 + lane * 4);
-        epilogue_store(tmem_base[last_buf], ew, lane, gm_base, last_n, sums, C);
+        const int pos_row = (gm_base + lane) % SEQ_LEN;
+        epilogue_store(tmem_base[last_buf], ew, lane, gm_base, last_n, combined, pos_row, C);
 
         // Sync epilogue warps before dealloc
         asm volatile("bar.sync %0, %1;" :: "r"(1), "r"(4 * 32) : "memory");
@@ -497,16 +492,17 @@ patch_embed_gemm(
 int main() {
     setbuf(stdout, NULL);  // unbuffered stdout for debugging
     printf("SigLIP2 patch embed GEMM — tcgen05 cta_group::1 (6 warps)\n");
-    printf("  GEMM: [%d,%d] x [%d,%d]^T  5-stage pipeline  SMEM sums  st.global stores  idesc: 0x%08X\n",
+    printf("  GEMM: [%d,%d] x [%d,%d]^T  6-stage pipeline  inline BF16 combined  st.global stores  idesc: 0x%08X\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, IDESC);
 
     uint8_t *d_A, *d_B;
     float *d_bias, *d_pos;
-    __nv_bfloat16 *d_C;
+    __nv_bfloat16 *d_combined, *d_C;
     CUDA_CHECK(cudaMalloc(&d_A,    (size_t)M_TOTAL * K_DIM));
     CUDA_CHECK(cudaMalloc(&d_B,    (size_t)N_DIM   * K_DIM));
     CUDA_CHECK(cudaMalloc(&d_bias,  (size_t)N_DIM  * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_pos,   (size_t)SEQ_LEN * N_DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_combined, (size_t)SEQ_LEN * N_DIM * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&d_C,    (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16)));
 
     // Fill A, B with 0x3C (=1.5 in FP8 E4M3, a valid finite value)
@@ -514,7 +510,16 @@ int main() {
     CUDA_CHECK(cudaMemset(d_B, 0x3C, (size_t)N_DIM * K_DIM));
     CUDA_CHECK(cudaMemset(d_bias, 0, (size_t)N_DIM * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_pos,  0, (size_t)SEQ_LEN * N_DIM * sizeof(float)));
-    printf("  Alloc + RNG done\n");
+
+    // Precompute combined[r][c] = __float2bfloat16(bias[c] + pos_embed[r*N_DIM+c])
+    {
+        int n_elem = SEQ_LEN * N_DIM;
+        int tpb = 256;
+        int bpg = (n_elem + tpb - 1) / tpb;
+        precompute_combined<<<bpg, tpb>>>(d_bias, d_pos, d_combined, SEQ_LEN, N_DIM);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    printf("  Alloc + precompute done\n");
 
     CUtensorMap h_tma_a, h_tma_b;
 
@@ -556,7 +561,7 @@ int main() {
     // ── Warmup: 2 iterations ──
     printf("Launching warmup (2 iters)...\n");
     for (int _i = 0; _i < 2; _i++) {
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C);
     }
     printf("  Waiting for warmup sync...\n");
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -569,7 +574,7 @@ int main() {
     cudaEventCreate(&_t1);
     cudaEventRecord(_t0);
     for (int _i = 0; _i < 10; _i++) {
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C);
     }
     cudaEventRecord(_t1);
     cudaEventSynchronize(_t1);
@@ -582,7 +587,7 @@ int main() {
     cudaEventDestroy(_t1);
 
     // ── Checksum run ──
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_bias, d_pos, d_C);
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     __nv_bfloat16* h_C = (__nv_bfloat16*)malloc((size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16));
@@ -596,6 +601,7 @@ int main() {
            __bfloat162float(h_C[2]), __bfloat162float(h_C[3]));
 
     free(h_C);
-    cudaFree(d_A); cudaFree(d_B); cudaFree(d_bias); cudaFree(d_pos); cudaFree(d_C);
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_bias); cudaFree(d_pos);
+    cudaFree(d_combined); cudaFree(d_C);
     return 0;
 }
