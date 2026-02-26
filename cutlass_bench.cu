@@ -1,6 +1,7 @@
 // CUTLASS 4.x Blackwell MXFP8 (microscaling) GEMM benchmark
 // A[M,K] x B[N,K]^T -> C[M,N]   MXFP8 E4M3 inputs w/ UE8M0 block scales, FP32 accumulate, BF16 output
 // Uses OpClassBlockScaledTensorOp (tcgen05.mma.kind::mxf8f6f4.block_scale)
+// Reports both GEMM-only and GEMM + bias+pos_embed times for apples-to-apples comparison
 //
 // Usage: ./cutlass-bench [imgs_per_sm]
 
@@ -19,7 +20,68 @@
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
+#include <cuda_bf16.h>
+
 using namespace cute;
+
+// ── Post-processing kernels for bias+pos_embed ──
+
+// Precompute combined[r][c] = __float2bfloat16(bias[c] + pos_embed[r*N+c])
+__global__ void precompute_combined(
+    const float* __restrict__ bias,
+    const float* __restrict__ pos_embed,
+    __nv_bfloat16* __restrict__ combined,
+    int seq_len, int n_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < seq_len * n_dim) {
+        int c = idx % n_dim;
+        combined[idx] = __float2bfloat16(bias[c] + pos_embed[idx]);
+    }
+}
+
+// Post-processing: C[row, col] += combined[row % seq_len, col]
+// Vectorized: 8 BF16 per thread via 128-bit loads/stores
+__global__ void apply_combined(
+    __nv_bfloat16* __restrict__ C,
+    const __nv_bfloat16* __restrict__ combined,
+    long long total_v8, int N, int seq_len
+) {
+    long long vid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (vid >= total_v8) return;
+    long long base = vid * 8;
+    int row = (int)(base / N);
+    int col = (int)(base % N);
+    int pos_row = row % seq_len;
+
+    uint4 cv = *reinterpret_cast<uint4*>(C + base);
+    uint4 bv = *reinterpret_cast<const uint4*>(combined + (long long)pos_row * N + col);
+
+    uint32_t* cp = reinterpret_cast<uint32_t*>(&cv);
+    const uint32_t* bp = reinterpret_cast<const uint32_t*>(&bv);
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        float c0, c1, b0, b1;
+        asm("{\n\t"
+            ".reg .b16 lo, hi;\n\t"
+            "mov.b32 {lo, hi}, %2;\n\t"
+            "cvt.rn.f32.bf16 %0, lo;\n\t"
+            "cvt.rn.f32.bf16 %1, hi;\n\t"
+            "}" : "=f"(c0), "=f"(c1) : "r"(cp[i]));
+        asm("{\n\t"
+            ".reg .b16 lo, hi;\n\t"
+            "mov.b32 {lo, hi}, %2;\n\t"
+            "cvt.rn.f32.bf16 %0, lo;\n\t"
+            "cvt.rn.f32.bf16 %1, hi;\n\t"
+            "}" : "=f"(b0), "=f"(b1) : "r"(bp[i]));
+        c0 += b0;
+        c1 += b1;
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(cp[i]) : "f"(c0), "f"(c1));
+    }
+
+    *reinterpret_cast<uint4*>(C + base) = cv;
+}
 
 // ═══════════════════════════════════════════════════════════════
 // CUTLASS kernel configuration — MXFP8 (block-scaled)
@@ -187,7 +249,27 @@ int main(int argc, char** argv) {
     cudaMemset(d_SFA, 0x7F, sz_sfa);
     cudaMemset(d_SFB, 0x7F, sz_sfb);
 
-    printf("  Scale factors: SFA=%zu bytes, SFB=%zu bytes\n\n", sz_sfa, sz_sfb);
+    printf("  Scale factors: SFA=%zu bytes, SFB=%zu bytes\n", sz_sfa, sz_sfb);
+
+    // ── Allocate bias+pos_embed combined array ──
+    float *d_bias, *d_pos;
+    __nv_bfloat16 *d_combined;
+    cudaMalloc(&d_bias, (size_t)N * sizeof(float));
+    cudaMalloc(&d_pos, (size_t)SEQ_LEN * N * sizeof(float));
+    cudaMalloc(&d_combined, (size_t)SEQ_LEN * N * sizeof(__nv_bfloat16));
+    cudaMemset(d_bias, 0, (size_t)N * sizeof(float));
+    cudaMemset(d_pos, 0, (size_t)SEQ_LEN * N * sizeof(float));
+    {
+        int n_elem = SEQ_LEN * N;
+        int tpb = 256;
+        precompute_combined<<<(n_elem + tpb - 1) / tpb, tpb>>>(d_bias, d_pos, d_combined, SEQ_LEN, N);
+    }
+    printf("  Combined bias+pos: %zu bytes\n\n", (size_t)SEQ_LEN * N * sizeof(__nv_bfloat16));
+
+    // apply_combined launch config (vectorized: 8 BF16 per thread)
+    long long total_v8 = (long long)M * N / 8;
+    int ac_tpb = 256;
+    int ac_blocks = (int)((total_v8 + ac_tpb - 1) / ac_tpb);
 
     // Construct GEMM arguments
     typename Gemm::Arguments arguments{
@@ -235,6 +317,8 @@ int main(int argc, char** argv) {
             printf("ERROR: CUTLASS run failed on warmup iter %d (status %d)\n", i, (int)status);
             return 1;
         }
+        apply_combined<<<ac_blocks, ac_tpb>>>(
+            reinterpret_cast<__nv_bfloat16*>(d_D), d_combined, total_v8, N, SEQ_LEN);
     }
     cudaDeviceSynchronize();
 
@@ -248,9 +332,9 @@ int main(int argc, char** argv) {
         printf("  (expected %.1f)\n", expected);
     }
 
-    // Timed runs
+    // ── Timed: GEMM only ──
     const int ITERS = 20;
-    printf("  Timing (%d iters)...\n", ITERS);
+    printf("  Timing GEMM only (%d iters)...\n", ITERS);
 
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0);
@@ -263,14 +347,31 @@ int main(int argc, char** argv) {
     cudaEventRecord(t1);
     cudaEventSynchronize(t1);
 
-    float total_ms;
-    cudaEventElapsedTime(&total_ms, t0, t1);
-    float avg_ms = total_ms / ITERS;
+    float ms_gemm;
+    cudaEventElapsedTime(&ms_gemm, t0, t1);
+    ms_gemm /= ITERS;
 
     double flops = 2.0 * M * N * K;
-    double tflops = flops / (avg_ms * 1e9);
 
-    printf("\nCUTLASS MXFP8:  %.3f ms  %.2f TFLOPS\n", avg_ms, tflops);
+    // ── Timed: GEMM + bias+pos_embed ──
+    printf("  Timing GEMM + bias+pos (%d iters)...\n", ITERS);
+
+    cudaEventRecord(t0);
+    for (int i = 0; i < ITERS; i++) {
+        gemm.run();
+        apply_combined<<<ac_blocks, ac_tpb>>>(
+            reinterpret_cast<__nv_bfloat16*>(d_D), d_combined, total_v8, N, SEQ_LEN);
+    }
+    cudaEventRecord(t1);
+    cudaEventSynchronize(t1);
+
+    float ms_full;
+    cudaEventElapsedTime(&ms_full, t0, t1);
+    ms_full /= ITERS;
+
+    printf("\nCUTLASS MXFP8 (GEMM only):       %.3f ms  %.2f TFLOPS\n", ms_gemm, flops / ms_gemm / 1e9);
+    printf("CUTLASS MXFP8 (GEMM+bias+pos):   %.3f ms  %.2f TFLOPS\n", ms_full, flops / ms_full / 1e9);
+    printf("  bias+pos overhead: %.3f ms\n", ms_full - ms_gemm);
     printf("  M=%d  N=%d  K=%d\n", M, N, K);
 
     // Cleanup
@@ -283,6 +384,9 @@ int main(int argc, char** argv) {
     cudaFree(d_D);
     cudaFree(d_SFA);
     cudaFree(d_SFB);
+    cudaFree(d_bias);
+    cudaFree(d_pos);
+    cudaFree(d_combined);
 
     return 0;
 #endif
