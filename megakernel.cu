@@ -31,9 +31,9 @@
 #define OFF_TMEM_1         229380
 #define OFF_TMA_MBAR       229384
 #define OFF_MMA_MBAR       229424
-#define OFF_MAINLOOP_MBAR  229464
-#define OFF_EPILOGUE_MBAR  229472
-#define SMEM_BYTES         229504
+#define OFF_MAINLOOP_MBAR  229464  // 2 * 8 = 16 bytes (double-buffered)
+#define OFF_EPILOGUE_MBAR  229480  // 2 * 8 = 16 bytes (double-buffered)
+#define SMEM_BYTES         229504  // fits: 229480 + 16 = 229496 <= 229504
 #define TMEM_COLS      128
 #define IDESC          0x08200010U
 #define SBO            1024
@@ -110,6 +110,32 @@ static __device__ __forceinline__
 void mbar_arrive(uint32_t addr) {
     asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
         :: "r"(addr) : "memory");
+}
+
+// Noinline prefetch: opaque function call prevents ptxas register allocation
+// from corrupting synchronization instructions in the main kernel body.
+// Computes bias[col] + pos_embed[row, col] for all TN columns,
+// storing to SMEM sums_out with stride-32 layout.
+// Address computation inside the noinline boundary to minimize caller register pressure.
+__attribute__((noinline)) static __device__
+void prefetch_sums_noinline(
+    float* sums_out,       // smem + OFF_SUMS_BUF + ew*16384 + lane*4, stride 32
+    const float* bias,
+    const float* pos_embed,
+    int n_start,
+    int pos_row
+) {
+    const float4* bp4 = reinterpret_cast<const float4*>(bias + n_start);
+    const float4* pp4 = reinterpret_cast<const float4*>(pos_embed + (long long)pos_row * N_DIM + n_start);
+    #pragma unroll 8
+    for (int c = 0; c < 32; c++) {
+        float4 b = bp4[c];
+        float4 p = pp4[c];
+        sums_out[(c*4+0) * 32] = b.x + p.x;
+        sums_out[(c*4+1) * 32] = b.y + p.y;
+        sums_out[(c*4+2) * 32] = b.z + p.z;
+        sums_out[(c*4+3) * 32] = b.w + p.w;
+    }
 }
 
 static __device__ __forceinline__
@@ -270,8 +296,11 @@ patch_embed_gemm(
             mbar_init(smem_to_uint(smem + OFF_TMA_MBAR + s * 8), 1);
             mbar_init(smem_to_uint(smem + OFF_MMA_MBAR + s * 8), 1);
         }
-        mbar_init(smem_to_uint(smem + OFF_MAINLOOP_MBAR), 1);   // W1 arrives once
-        mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR), 4);   // W2-5 each arrive once
+        // Double-buffered mainloop/epilogue mbarriers (SUPERIOR pattern)
+        for (int i = 0; i < 2; i++) {
+            mbar_init(smem_to_uint(smem + OFF_MAINLOOP_MBAR + i * 8), 1);     // W1 arrives once
+            mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR + i * 8), 4 * 32); // all 128 epilogue threads
+        }
     }
     __syncthreads();
 
@@ -291,9 +320,14 @@ patch_embed_gemm(
 
     int tma_phase[N_STAGES] = {0};
     int mma_phase[N_STAGES] = {0};
-    int mainloop_phase = 0;
-    int epilogue_phase = 0;
-    int first_tile = 1;
+
+    // Double-buffered mbar phase tracking (SUPERIOR pattern).
+    // mbar[X] protects tmem[X]. Phase init 1 = "fresh mbar, skip first wait".
+    // W1: waits epilogue_mbar[buf] before writing tmem[buf]
+    // W2-5: waits mainloop_mbar[buf^1] before reading tmem[buf^1]
+    //        arrives epilogue_mbar[buf^1] after reading tmem[buf^1]
+    int epi_phase[2] = {1, 1};   // W1's epilogue wait phases (both fresh)
+    int ml_phase[2]  = {0, 1};   // W2-5's mainloop wait phases (buf^1=1 is fresh on first tile)
 
     for (int tile_idx = tile_start; tile_idx < tile_end; tile_idx++) {
         const int buf = tile_idx & 1;
@@ -303,7 +337,7 @@ patch_embed_gemm(
         const int m_start = tm * TM;
         const int n_start = tn * TN;
 
-        // ═══ K-LOOP (W0-1) + OVERLAPPED EPILOGUE (W2-3) ═══
+        // ═══ K-LOOP (W0-1) + OVERLAPPED EPILOGUE (W2-5) ═══
         if (warp == 0) {
             // ── LOAD WARP (W0): TMA async bulk copies ──
             if (lane == 0) {
@@ -311,7 +345,7 @@ patch_embed_gemm(
                     const int s = ki % N_STAGES;
                     const int k_start = ki * TK;
 
-                    if (!(first_tile && ki < N_STAGES)) {
+                    if (tile_idx > tile_start || ki >= N_STAGES) {
                         mbar_wait(mma_mbar[s], mma_phase[s]);
                         mma_phase[s] ^= 1;
                     }
@@ -322,13 +356,11 @@ patch_embed_gemm(
                 }
             }
         } else if (warp == 1) {
-            // ── MMA WARP (W1): tcgen05.mma.cta_group::1 → tmem_base[buf] ──
+            // ── MMA WARP (W1): tcgen05.mma → tmem_base[buf] ──
             if (lane == 0) {
-                // Wait for previous epilogue to release TMEM buffer
-                if (!first_tile) {
-                    mbar_wait(epilogue_mbar_addr, epilogue_phase);
-                    epilogue_phase ^= 1;
-                }
+                // Wait for epilogue to release tmem[buf]
+                mbar_wait(epilogue_mbar_addr + buf * 8, epi_phase[buf]);
+                epi_phase[buf] ^= 1;
 
                 for (int ki = 0; ki < K_ITERS; ki++) {
                     const int s = ki % N_STAGES;
@@ -340,7 +372,6 @@ patch_embed_gemm(
                     uint64_t desc_a = make_smem_desc(smem_a[s]);
                     uint64_t desc_b = make_smem_desc(smem_b[s]);
 
-                    // First sub-MMA: clear accum on ki==0, accumulate otherwise
                     {
                         uint32_t accumulate = (ki == 0) ? 0 : 1;
                         asm volatile(
@@ -356,9 +387,8 @@ patch_embed_gemm(
                               "r"(0), "r"(0), "r"(0), "r"(0));
                     }
 
-                    // Remaining sub-MMAs: advance desc by 32B, always accumulate
                     for (int sub = 1; sub < MMA_PER_KI; sub++) {
-                        desc_a += 2;  // 32 bytes / 16 = 2 descriptor units
+                        desc_a += 2;
                         desc_b += 2;
                         asm volatile(
                             "{\n\t"
@@ -378,95 +408,85 @@ patch_embed_gemm(
                         :: "r"(mma_mbar[s]) : "memory");
                 }
 
-                // Signal K-loop done — TMEM data ready for epilogue
-                asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-                mbar_arrive(mainloop_mbar_addr);
+                // Signal K-loop done: commit → mainloop_mbar[buf]
+                asm volatile(
+                    "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                    :: "r"(mainloop_mbar_addr + buf * 8) : "memory");
             }
         } else {
-            // ── OVERLAPPED EPILOGUE (W2-5): TMEM readback + SMEM sums + store ──
-            const int ew = warp - 2;  // 0,1,2,3 for warps 2-5
+            // ── OVERLAPPED EPILOGUE (W2-5) ──
+            const int ew = warp - 2;
+            const int prev_buf = buf ^ 1;
 
-            if (!first_tile) {
-                // Wait for MMA to finish — TMEM data ready
-                mbar_wait(mainloop_mbar_addr, mainloop_phase);
-                mainloop_phase ^= 1;
-                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+            // Wait for W1's K-loop on tmem[prev_buf] (from previous tile).
+            // Named barrier: only warp 2 polls mbar, bar.sync broadcasts.
+            if (warp == 2)
+                mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
+            asm volatile("bar.sync %0, %1;" :: "r"(1), "r"(4 * 32) : "memory");
+            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+            ml_phase[prev_buf] ^= 1;
 
+            if (tile_idx > tile_start) {
+                // Epilogue: read tmem[prev_buf], store to global
                 const int prev_idx = tile_idx - 1;
                 const int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
-                if (ptm & 1) ptn = TILES_N - 1 - ptn;  // snake
+                if (ptm & 1) ptn = TILES_N - 1 - ptn;
                 const int prev_m = ptm * TM;
                 const int prev_n = ptn * TN;
-                const uint32_t prev_tmem = tmem_base[buf ^ 1];
 
                 const int gm_base = prev_m + ew * 32;
                 const float* sums = (const float*)(smem + OFF_SUMS_BUF + ew * 16384 + lane * 4);
+                epilogue_store(tmem_base[prev_buf], ew, lane, gm_base, prev_n, sums, C);
 
-                epilogue_store(prev_tmem, ew, lane, gm_base, prev_n, sums, C);
+                // Signal: done reading tmem[prev_buf]
+                mbar_arrive(epilogue_mbar_addr + prev_buf * 8);
             }
 
-            // Signal epilogue done (dummy on first tile to prime the mbarrier)
-            if (lane == 0) mbar_arrive(epilogue_mbar_addr);
-
             // Prefetch bias+pos sums into SMEM for current tile
-            // (consumed by next iteration's overlapped epilogue — same warp/lane)
             {
                 const int gm_base_cur = m_start + ew * 32;
                 const int pos_row = (gm_base_cur + lane) % SEQ_LEN;
                 float* sums_out = (float*)(smem + OFF_SUMS_BUF + ew * 16384 + lane * 4);
-                const float* bp_cur = bias + n_start;
-                const float* pp_cur = pos_embed + (long long)pos_row * N_DIM + n_start;
-                for (int j = 0; j < TN; j++)
-                    sums_out[j * 32] = bp_cur[j] + pp_cur[j];
+                prefetch_sums_noinline(sums_out, bias, pos_embed, n_start, pos_row);
             }
         }
-
-        first_tile = 0;
     }  // tile loop
 
-    // ── Drain epilogue: warps 0-3 write the last tile ──
-    {
-        const int num_tiles = tile_end - tile_start;
-        const int drain_phase = (num_tiles - 1) & 1;
-        // Wait for last tile's MMA to finish
-        mbar_wait(mainloop_mbar_addr, drain_phase);
+    // ── DRAIN + DEALLOC (epilogue warps only, no __syncthreads) ──
+    // Following SUPERIOR.cu pattern: W0/W1 exit after tile loop,
+    // W2-5 drain the last tile via mbar_wait + named barrier, then dealloc TMEM.
+    if (warp >= 2) {
+        const int ew = warp - 2;
+        const int last_buf = (tile_end - 1) & 1;
+
+        // Wait for W1's K-loop on tmem[last_buf]
+        if (warp == 2)
+            mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
+        asm volatile("bar.sync %0, %1;" :: "r"(1), "r"(4 * 32) : "memory");
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-    }
-    if (warp < 4) {
+
+        // Epilogue store for the last tile (sums already in SMEM from last prefetch)
         const int last_idx = tile_end - 1;
-        const int last_buf = last_idx & 1;
         const int ltm = last_idx / TILES_N;
         int ltn = last_idx % TILES_N;
         if (ltm & 1) ltn = TILES_N - 1 - ltn;
         const int last_m = ltm * TM;
         const int last_n = ltn * TN;
-        const uint32_t last_tmem = tmem_base[last_buf];
-
-        const int ew = warp;
         const int gm_base = last_m + ew * 32;
-        const int pos_row = (gm_base + lane) % SEQ_LEN;
+        const float* sums = (const float*)(smem + OFF_SUMS_BUF + ew * 16384 + lane * 4);
+        epilogue_store(tmem_base[last_buf], ew, lane, gm_base, last_n, sums, C);
 
-        // Compute sums into SMEM (same warp reads them — no cross-warp sync needed)
-        float* sums_out = (float*)(smem + OFF_SUMS_BUF + ew * 16384 + lane * 4);
-        const float* bp = bias + last_n;
-        const float* pp = pos_embed + (long long)pos_row * N_DIM + last_n;
-        for (int j = 0; j < TN; j++)
-            sums_out[j * 32] = bp[j] + pp[j];
+        // Sync epilogue warps before dealloc
+        asm volatile("bar.sync %0, %1;" :: "r"(1), "r"(4 * 32) : "memory");
 
-        epilogue_store(last_tmem, ew, lane, gm_base, last_n,
-                       (const float*)sums_out, C);
-    }
-
-    __syncthreads();  // all warps done before dealloc
-
-
-    // ── TMEM dealloc: 2 buffers (warp 0 only, cta_group::1) ──
-    if (warp == 0) {
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-            :: "r"(tmem_base[0]), "r"(TMEM_COLS));
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-            :: "r"(tmem_base[1]), "r"(TMEM_COLS));
+        // TMEM dealloc (warp 2 only, cta_group::1)
+        if (warp == 2) {
+            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                :: "r"(tmem_base[0]), "r"(TMEM_COLS));
+            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                :: "r"(tmem_base[1]), "r"(TMEM_COLS));
+        }
     }
 }
 
