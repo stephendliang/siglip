@@ -326,7 +326,7 @@ void epilogue_store(
     constexpr int COLS_PER_THREAD = NC_COLS / 32;
     __nv_bfloat16* row_base = C + (long long)gm_base * N_DIM + n_start + NC_START;
 
-    #pragma unroll 4
+    #pragma unroll 8
     for (int r = 0; r < 32; r++) {
         uint32_t src = staging_saddr + r * STAGING_ROW_BYTES + lane * COLS_PER_THREAD * 2;
         __nv_bfloat16* dst = row_base + (long long)r * N_DIM + lane * COLS_PER_THREAD;
