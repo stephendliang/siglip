@@ -19,19 +19,39 @@ The kernel is correct (checksum validated) and stable.
 
 ## Current bottlenecks (from ncu profiling)
 
-The kernel is **epilogue-bound**. The MMA pipe is idle most of the time because the TMEM readback → add → convert → store chain takes longer than the K-loop.
+The kernel is **L1 throughput-bound** (82% of peak). After reducing pipeline stages (6→4) and register pressure (247→216), warps issue instructions more aggressively and L1 bandwidth is now the ceiling. The previous dominant bottleneck (TMEM stalls) has been substantially reduced.
 
-1. **TMEM load latency (`long_scoreboard`)** — dominant stall. Each `tcgen05.ld` is ~200 cycles. 5 epilogue warps partially hide it (improved from 4). Switching from x16 to x32 loads (halving instruction count) was perf-neutral — confirming the bottleneck is TMEM bandwidth, not instruction overhead.
+**Warp stall breakdown:**
 
-2. **Uncoalesced stores (49% excess L2 sectors)** — each warp writes 32 rows, so adjacent threads store to addresses 1536B apart (768×2). Every lane hits a different 128B sector. Inherent to row-major output with per-row TMEM readback. Same pattern exists in cuBLAS.
+| Stall | % of peak | Notes |
+|---|---|---|
+| long_scoreboard (TMEM) | 6.4% | Still largest stall (76% of stall cycles), but much reduced |
+| sleeping | 1.3% | Warps parked between tiles |
+| wait (TMA) | 0.9% | Pipeline wraparound stalls — minimal even with 4 stages |
+| barrier | 0.8% | Cluster sync |
+| selected (issuing) | 14.1% | Productive execution |
 
-3. **Register pressure (216 regs/thread, 0 spills)** — limits occupancy to 1 CTA/SM. Any approach requiring more live state will spill.
+**Memory throughput:**
+
+| Subsystem | Utilization |
+|---|---|
+| **L1 tex** | **82%** — primary bottleneck |
+| L2 | 60% |
+| DRAM write | 24% (1.38 GB written) |
+
+**Key findings:**
+
+1. **L1 throughput (82%)** — the dominant bottleneck. Driven by uncoalesced `st.global` stores: 32 sectors/request vs 16 ideal (100% excess). Each warp writes 32 rows with 1536B stride between lanes, scattering across 32 different 128B cache lines. Fixing this via SMEM staging would directly attack the ceiling.
+
+2. **TMEM load latency (`long_scoreboard`, 6.4%)** — still the biggest single stall reason, but much lower than the previous 56% relative share. 5 epilogue warps + lower register pressure hide latency well.
+
+3. **Register pressure (216 regs/thread, 0 spills)** — improved from 247 after 4-stage pipeline change. Still limits occupancy to 1 CTA/SM.
 
 ## Ideas for further improvement
 
 **Most promising:**
 
-- **Epilogue SMEM staging**: Instead of each warp independently loading from TMEM and writing to global, have warps cooperatively load TMEM into SMEM, then write from SMEM with coalesced access patterns. Could fix the 49% uncoalesced store problem. Cost: extra SMEM (have ~100 KB headroom with 4-stage pipeline) + sync overhead.
+- **Epilogue SMEM staging**: Instead of each warp independently loading from TMEM and writing to global, have warps cooperatively load TMEM into SMEM, then write from SMEM with coalesced access patterns. Would fix the 100% excess L1 store sectors (32→16 sectors/request) and directly attack the L1 throughput bottleneck (82% of peak). Cost: extra SMEM (have ~97 KB headroom with 4-stage pipeline) + sync overhead.
 
 - **Smaller output tile (TN=128, revisit)**: With x32 TMEM loads and other epilogue improvements applied, the shorter epilogue loop might tip the balance differently than when we last tried TN=128 (which was 1190 TFLOPS with x16 loads).
 
@@ -92,6 +112,7 @@ edit megakernel.cu -> make -> ./siglip_vision
 | `docs/profiling.md` | Profiling commands (ncu, cuobjdump, compute-sanitizer) |
 | `docs/architecture.md` | Model specs, HW config, milestones (partially stale) |
 | `gen.py` | Codegen script — **outdated, do not use** |
+| `compare.py` | ncu CSV diff tool — usage: `python compare.py a.csv b.csv` |
 | `Makefile` | Build rules (sm_100a, nvcc flags) |
 | `docs/reference/model.txt` | PyTorch model architecture dump |
 | `docs/reference/sass_dump.txt` | SASS disassembly (load on demand only) |
