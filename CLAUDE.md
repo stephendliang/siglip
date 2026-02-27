@@ -5,12 +5,12 @@ FP8 (E4M3) precision, tcgen05 WGMMA, TMA, `cta_group::2` with 2-CTA clusters. Cr
 
 ## Current state
 
-**0.764 ms** fused (GEMM + bias + pos_embed) — **9% faster** than cuBLAS end-to-end (0.835 ms = best GEMM + unfused pos_embed).
+**0.743 ms** fused (GEMM + bias + pos_embed) — **11% faster** than cuBLAS end-to-end (0.835 ms = best GEMM + unfused pos_embed).
 
 The kernel's value is **fusion**: the overlapped epilogue eliminates the 0.470 ms unfused pos_embed overhead entirely.
 
 cuBLAS pure GEMM is faster: 0.365 ms / 3001 TFLOPS (per-tensor FP8, best-of-8 algos, 256MB workspace).
-Our effective TFLOPS (1433) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
+Our effective TFLOPS (1475) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
 
 GEMM: `[928256, 768] x [768, 768]^T` with fused bias + positional embedding add, BF16 output.
 Batch = 4736 images x 196 patches = 928256 rows. Square weight matrix (768x768).
@@ -19,9 +19,9 @@ The kernel is correct (checksum validated) and stable.
 
 ## Current bottlenecks (from ncu profiling)
 
-The kernel is **epilogue-bound**. The MMA pipe is idle 2/3 of the time (33% SM compute) because the TMEM readback → add → convert → store chain takes ~2x longer than the K-loop.
+The kernel is **epilogue-bound**. The MMA pipe is idle most of the time because the TMEM readback → add → convert → store chain takes longer than the K-loop.
 
-1. **TMEM load latency (`long_scoreboard=4.69%`)** — dominant stall. Each `tcgen05.ld` is ~200 cycles. 4 epilogue warps can't fully hide it. Switching from x16 to x32 loads (halving instruction count) was perf-neutral — confirming the bottleneck is TMEM bandwidth, not instruction overhead.
+1. **TMEM load latency (`long_scoreboard`)** — dominant stall. Each `tcgen05.ld` is ~200 cycles. 4 epilogue warps can't fully hide it. Switching from x16 to x32 loads (halving instruction count) was perf-neutral — confirming the bottleneck is TMEM bandwidth, not instruction overhead.
 
 2. **Uncoalesced stores (49% excess L2 sectors)** — each warp writes 32 rows, so adjacent threads store to addresses 1536B apart (768×2). Every lane hits a different 128B sector. Inherent to row-major output with per-row TMEM readback. Same pattern exists in cuBLAS.
 
@@ -49,6 +49,7 @@ The kernel is **epilogue-bound**. The MMA pipe is idle 2/3 of the time (33% SM c
 
 - **x32 TMEM loads** (done, perf-neutral) — bandwidth-bound, not instruction-bound.
 - **SMEM prefetch of combined** (tried commit 4ff9644→892766c) — inline BF16 loads from global were faster, likely because L1 cache hits on the small combined tensor.
+- **Centralized bar.sync for mbar broadcast** (done, 0.764→0.743 ms) — warp 2 polling + bar.sync to W3-W5 cost 10.3% stall. All epilogue warps polling independently is faster.
 - **`cta_group::4`** — would need 1024 TMEM cols (exceeds 512/SM HW limit).
 
 ## Kernel structure
@@ -57,7 +58,7 @@ Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1
 
 - **W0**: TMA async bulk loads (A + B tiles, both CTAs load independently)
 - **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
-- **W2-W5**: Overlapped epilogue — `tcgen05.ld` from TMEM, inline BF16 bias+pos_embed add, FP32->BF16 convert, `st.global.v8`
+- **W2-W5**: Overlapped epilogue — each warp independently polls mainloop mbarrier, `tcgen05.ld` from TMEM, inline BF16 bias+pos_embed add, FP32->BF16 convert, `st.global.v8`
 
 The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile N (double-buffered TMEM, mbarrier-protected). After the tile loop, W2-5 run a drain epilogue for the last tile.
 

@@ -454,10 +454,8 @@ patch_embed_gemm(
             const int prev_buf = buf ^ 1;
 
             // Wait for W1's K-loop on tmem[prev_buf] (from previous tile).
-            // Named barrier: only warp 2 polls mbar, bar.sync broadcasts.
-            if (warp == 2)
-                mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
-            asm volatile("bar.sync %0, %1;" :: "r"(1), "r"(4 * 32) : "memory");
+            // All epilogue warps poll independently — no bar.sync broadcast needed.
+            mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             ml_phase[prev_buf] ^= 1;
 
@@ -487,9 +485,8 @@ patch_embed_gemm(
         const int last_buf = (tile_end - 1) & 1;
 
         // Wait for W1's K-loop on tmem[last_buf]
-        if (warp == 2)
-            mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
-        asm volatile("bar.sync %0, %1;" :: "r"(1), "r"(4 * 32) : "memory");
+        // All epilogue warps poll independently — no bar.sync broadcast needed.
+        mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
         // Epilogue store for the last tile
