@@ -1,121 +1,111 @@
-## Correctness: no bugs found
+# Performance Audit — 2026-02-27
 
-I walked through every nontrivial invariant — mbarrier phases, TMEM double-buffer sync, SMEM OOB, store alignment, race conditions, edge cases, tile coverage — and everything checks out. The 4-byte margin between the max sums access (byte 229372) and OFF_TMEM_0 (byte 229376) is tight but correct.
+Kernel: `patch_embed_gemm` (commit fca9178, cta_group::2)
+GEMM: [928256, 768] x [768, 768]^T, MXFP8 E4M3, BF16 output with fused bias+pos_embed
 
-## Severe issues: one real concern, two things to watch
+## Performance summary
 
-### 1. Scattered `st.global.v8` writes — the biggest unknown
+| Kernel | Time (ms) | TFLOPS | % of cuBLAS |
+|--------|-----------|--------|-------------|
+| **This kernel** | **0.917** | **1190** | **92%** |
+| cuBLAS (reference) | 0.845 | 1295 | 100% |
 
-This is the one thing I'd actually worry about. Every `st.global.v8.b32` from a warp scatters across 32 different L2 cache lines (1536-byte stride between lanes, each hitting a different row). That's 32 cache lines × 32 bytes = 1024 bytes written to 32 × 128-byte = 4096 bytes of L2 footprint per warp per store. 8 stores per tile per warp = 256 cache lines touched.
+### Optimization history
 
-With 4 epilogue warps firing simultaneously, that's 1024 cache line writes per tile's epilogue. The L2 write-back coalescing buffers on Blackwell can absorb this, but if they saturate, you'll see backpressure stalling the store instructions themselves, which chains back to stalling the entire epilogue pipeline you just worked hard to optimize.
+| Commit | Change | TFLOPS |
+|--------|--------|--------|
+| 6c327fe | Replace TMA stores with st.global.v4 | ~300 |
+| c5f6c8b | Software-pipeline TMEM loads (double-buffer A/B) | ~400 |
+| 4ff9644 | Prefetch bias+pos_embed into SMEM during K-loop | ~500 |
+| 4760f3b | Unified epilogue, 147 regs, 0 spills | 727 |
+| 892766c | Replace SMEM prefetch with inline BF16 loads | 1043 |
+| fca9178 | Upgrade cta_group::1 to cta_group::2 | 1190 |
 
-The old TMA store path had the same fundamental scatter pattern, but the TMA engine goes through a separate DMA path in the memory controller that can batch 2D writes more efficiently than individual store instructions. The tradeoff was correct (lane-0 serialization was worse), but the scatter efficiency might not be a free win.
+## Build stats (ptxas)
 
-**What to profile:**
-```bash
-# Tells you if store backpressure is a problem
-ncu --metrics \
-    smsp__warps_issue_stalled_mio_throttle.avg.pct_of_peak_sustained_active,\
-    smsp__warps_issue_stalled_drain.avg.pct_of_peak_sustained_active,\
-    l1tex__m_xbar2l1tex_write_bytes.sum,\
-    lts__throughput.avg.pct_of_peak_sustained_elapsed \
-    -k patch_embed_gemm ./siglip_vision
+```
+Registers:    168/thread (0 spills)
+Stack:        24 bytes
+SMEM:         147,712 bytes (144.25 KB of 228 KB)
+Barriers:     2
 ```
 
-If `stalled_mio_throttle` or `stalled_drain` is high, the scattered stores are the bottleneck and you'd need to rethink — either transpose through SMEM before storing (adds SMEM pressure and sync), or batch stores differently.
+## ncu: GPU Speed of Light
 
-### 2. TMEM latency might not be fully hidden
-
-Back-of-napkin math: each chunk between TMEM_LOAD and TMEM_WAIT has ~33 instructions (16 ld.shared + 16 FADD + CVT_STG). At ~1 IPC with 4-warp interleaving, that's ~132 cycles. TMEM load latency is ~200 cycles. There's a ~70-cycle gap where all 4 warps may be stalled on TMEM_WAIT simultaneously.
-
-The double-buffering helps but doesn't fully close the gap because the compute between a TMEM_LOAD and its corresponding TMEM_WAIT is split across two phases (A's compute, then B's load+compute), not all of it between the load and wait.
-
-**What to profile:**
-```bash
-ncu --metrics \
-    smsp__warps_issue_stalled_long_scoreboard.avg.pct_of_peak_sustained_active,\
-    smsp__warps_issue_stalled_not_selected.avg.pct_of_peak_sustained_active \
-    -k patch_embed_gemm ./siglip_vision
+```
+SM Frequency:           1111 MHz
+DRAM Frequency:         3996 MHz
+Elapsed Cycles:         ~1,655,000
+Compute (SM) Throughput: 34%
+Memory Throughput:       68.5%
 ```
 
-If `stalled_long_scoreboard` is the dominant stall, TMEM latency is still the bottleneck. If `not_selected` is high alongside it, the scheduler has eligible warps — meaning the interleaving is working and you just need more compute per chunk. If both are low, you've won and the bottleneck is elsewhere.
+The kernel is **memory-throughput bound** (68.5% vs 34% compute). The memory subsystem is 2x more utilized than the SM compute path.
 
-### 3. Bias+pos prefetch loop might be slower than expected
+## ncu: Warp stall breakdown
 
-Line 420-421:
-```c
-for (int j = 0; j < TN; j++)
-    sums_out[j * 32] = bp_cur[j] + pp_cur[j];
-```
+| Stall reason | % of peak | Interpretation |
+|---|---|---|
+| **long_scoreboard** | **5.12%** | **Dominant.** TMEM load latency (~200 cycles). The double-buffered epilogue helps but 4 warps can't fully hide it. |
+| barrier | 1.08% | `bar.sync` between epilogue warps (W2-5 named barrier). Low — warp specialization is working. |
+| wait | 1.02% | `cp.async.bulk.wait` in TMA load warp (W0). Expected for TMA pipeline. |
+| math_pipe_throttle | 0.02% | MMA pipe not a bottleneck (tcgen05 throughput is sufficient). |
+| not_selected | 0.03% | Almost zero — scheduler has very few eligible warps competing. |
+| short_scoreboard | 0.02% | No SMEM dependency issues (inline BF16 loads eliminated SMEM staging). |
+| mio_throttle | 0.00% | No store backpressure (st.global.v8 scatter pattern is not saturating L2). |
+| lg_throttle | 0.00% | No global load throttling. |
+| membar | 0.00% | mbarrier waits are not a significant stall source. |
 
-This does 128 iterations with 2 LDG (bias + pos_embed) and 1 STS (store to SMEM) per iteration. The LDG for `bias` is a broadcast (all 32 lanes in a warp load the same `bias[n_start + j]`), which coalesces into a single L2 read. But `pos_embed` access is `pos_embed[pos_row * 768 + n_start + j]` where pos_row varies per lane — 32 different rows, same column. That's 32 scattered L2 reads per j-iteration, same cache line scatter pattern as the stores.
+### Analysis
 
-128 iterations × 32 scattered reads = 4096 L2 reads per warp during the prefetch. This happens during the K-loop when W2-5 are "idle," but they're not truly idle — they're competing with W0's TMA loads for memory bandwidth. If the prefetch takes too long, it might not complete before the next epilogue needs the sums, introducing a hidden stall.
+The stall profile is clean. `long_scoreboard` at 5.1% is the only significant stall — this is TMEM load latency that the 4 epilogue warps can't fully hide. All other stall sources are <1.1%.
 
-**What to profile:**
-```bash
-# Source-level profiling to see if the prefetch loop is a hotspot
-ncu --set source --source-level all \
-    -k patch_embed_gemm -o source.ncu-rep ./siglip_vision
-```
+The old bottlenecks are gone:
+- `barrier` was dominant before warp specialization + mbarrier upgrade (now 1.08%)
+- `wait` was dominant before TMA store removal (now 1.02%)
+- `short_scoreboard` was significant before SMEM staging removal (now 0.02%)
 
-Look at per-instruction stall cycles in the prefetch loop vs. the epilogue proper.
+## ncu: Throughput breakdown
 
-## The exact profiling sequence to run when you get a B200
+| Subsystem | % of peak | Notes |
+|---|---|---|
+| L1/TEX | 68.4% | Epilogue-dominated (TMEM loads + global stores flow through L1) |
+| L2 (LTS) | 53.2% | Moderate — BF16 combined loads + output stores |
+| DRAM | 18.3% | Low — good L2 hit rate for bias+pos_embed (reused across M-tiles) |
+| SM Compute | 34% | Underutilized — epilogue overhead limits MMA pipe utilization |
 
-```bash
-# Build with lineinfo
-nvcc -gencode arch=compute_100a,code=sm_100a -O3 -lineinfo \
-    megakernel.cu -o siglip_vision -lcurand -lcuda
+## ncu: Instruction counts (per kernel invocation)
 
-# 1. Correctness first (catches mbarrier protocol bugs that would hang ncu)
-compute-sanitizer --tool synccheck ./siglip_vision
-compute-sanitizer --tool racecheck ./siglip_vision
-compute-sanitizer --tool memcheck ./siglip_vision
+| Metric | Count |
+|---|---|
+| Total instructions executed | 108.2M |
+| Total thread-instructions | 2,837M |
+| Global loads (LDG) | 2,784,768 |
+| Global stores (STG) | 1,392,384 |
 
-# 2. SASS dump — verify compiler output
-cuobjdump --dump-sass siglip_vision > /tmp/sass_new.txt
-# Check epilogue loop body: should see TCGEN05.LD → TCGEN05.WAIT → 
-# FADD×16 → CVT×8 → STG.E.V8 per chunk. No FENCE.PROXY.ASYNC, 
-# no BAR.SYNC.WARP, no CP.ASYNC.BULK.
-grep -c 'STG.E' /tmp/sass_new.txt      # expect 8 per epilogue invocation
-grep -c 'FENCE.PROXY' /tmp/sass_new.txt  # expect 0
-grep -c 'BAR.SYNC' /tmp/sass_new.txt     # expect only the __syncthreads ones
+Global store count: 1,392,384 = 21,756 tiles x 8 stores/warp x 4 warps x 2 CTAs. Each `st.global.v8.b32` writes 32 bytes (16 BF16 values). Total output: 1,392,384 x 32 = 44.6 MB = exactly 928,256 x 768 x 2 bytes.
 
-# 3. Full stall breakdown — THE key measurement
-ncu --set detailed \
-    -k patch_embed_gemm \
-    -o detailed.ncu-rep \
-    ./siglip_vision
+## ncu: Occupancy
 
-# 4. Targeted: the three concerns above
-ncu --metrics \
-    smsp__warps_issue_stalled_barrier.avg.pct_of_peak_sustained_active,\
-    smsp__warps_issue_stalled_membar.avg.pct_of_peak_sustained_active,\
-    smsp__warps_issue_stalled_wait.avg.pct_of_peak_sustained_active,\
-    smsp__warps_issue_stalled_long_scoreboard.avg.pct_of_peak_sustained_active,\
-    smsp__warps_issue_stalled_not_selected.avg.pct_of_peak_sustained_active,\
-    smsp__warps_issue_stalled_mio_throttle.avg.pct_of_peak_sustained_active,\
-    smsp__warps_issue_stalled_drain.avg.pct_of_peak_sustained_active,\
-    smsp__warps_issue_stalled_short_scoreboard.avg.pct_of_peak_sustained_active,\
-    smsp__warps_issue_stalled_lg_throttle.avg.pct_of_peak_sustained_active \
-    -k patch_embed_gemm ./siglip_vision
+| Metric | Value |
+|---|---|
+| Theoretical occupancy | 9.38% |
+| Achieved occupancy | 9.37% |
+| Registers/thread | 168 |
+| Waves per SM | 1 |
 
-# 5. Memory throughput — is L2 the bottleneck?
-ncu --metrics \
-    dram__throughput.avg.pct_of_peak_sustained_elapsed,\
-    lts__throughput.avg.pct_of_peak_sustained_elapsed,\
-    l1tex__throughput.avg.pct_of_peak_sustained_elapsed,\
-    smsp__inst_executed_op_global_st.sum,\
-    smsp__inst_executed_op_global_ld.sum,\
-    smsp__inst_executed_op_shared_ld.sum,\
-    smsp__inst_executed_op_shared_st.sum \
-    -k patch_embed_gemm ./siglip_vision
+Occupancy is 9.4% (1 CTA per SM, 192 of 2048 max threads). This is by design — persistent kernel with 1 wave, all SMs active. Low occupancy is expected and not a problem.
 
-# 6. Source-level hotspots (open in Nsight Compute GUI)
-ncu --set source --source-level all \
-    -k patch_embed_gemm -o source.ncu-rep ./siglip_vision
-```
-The answer to "is this code fast" is entirely in step 3 and 4. 
-The stall breakdown tells you what to fix next.
+## Remaining gap to cuBLAS (8%)
+
+cuBLAS achieves 0.845ms / 1295 TFLOPS with 256x192x128 tiles (confirmed by benchmarks in commit a0bfad4).
+
+### What cuBLAS likely does differently
+1. **Larger N tile (192 vs 128)**: Fewer tiles (14504 vs 21756), better per-tile amortization. However, we confirmed TMEM capacity limits us to N=128 with double-buffered TMEM on SM100 (2x128=256 cols = max capacity). TN=192 requires power-of-2 TMEM alloc (would need 256), and TN=256 with 2 buffers = 512 cols exceeds capacity (deadlocks).
+2. **Different TMEM strategy**: cuBLAS may use single-buffered TMEM (256 cols, no overlap) with a faster serialized epilogue, or split MMA passes targeting different TMEM column ranges.
+3. **Better epilogue pipelining**: May have more aggressive TMEM latency hiding via different warp scheduling or instruction ordering.
+
+### Constraints discovered
+- **TMEM capacity**: 256 columns/SM total. With double-buffered alloc, max N=128.
+- **tcgen05.alloc**: Must be power-of-2 in [32, 256]. 192 causes illegal instruction.
+- **tcgen05.alloc with 2x256**: Deadlocks — second alloc blocks forever (no TMEM available).
