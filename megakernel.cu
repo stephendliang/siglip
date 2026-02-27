@@ -1,8 +1,8 @@
 // Hand-tuned from gen.py output — TK=128, SWIZZLE_128B, 6-stage pipeline
 // Target: B200  Batch: 4736  GEMM: [928256,768]×[768,768]^T
 // Pipeline: 6-stage  K-iters: 6  MMA/iter: 4  idesc: 0x10400010
-// Warps: 6 (192 threads)  cta_group::2  __cluster_dims__(2,1,1)
-// Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2-5,x32 TMEM ld)  BF16 output
+// Warps: 2+NUM_EPI_WARPS  cta_group::2  __cluster_dims__(2,1,1)
+// Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2+,x32 TMEM ld,col-split)  BF16 output
 // tcgen05.mma.cta_group::2.kind::f8f6f4  (E4M3 × E4M3 → FP32)
 // Each CTA loads own A (128 rows) + half B (128 cols). MMA produces 256×256 output.
 
@@ -13,7 +13,8 @@
 #include <cstdio>
 
 #define SM_COUNT       148
-#define THREADS        192
+#define NUM_EPI_WARPS  5
+#define THREADS        (32 * (2 + NUM_EPI_WARPS))
 #define BATCH_SIZE     4736
 #define SEQ_LEN        196
 #define M_TOTAL        928256
@@ -191,10 +192,11 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
 // Single-buffer x32 TMEM loads (32 cols/load). All 4 BF16 combined uint4 loads
 // issued before TMEM_WAIT to overlap with TMEM latency. No A/B double-buffering needed.
 
+template<int NC_START, int NC_END>
 static __device__ __forceinline__
 void epilogue_store(
     uint32_t tmem_addr,
-    int ew,
+    int row_group,
     int lane,
     int gm_base,
     int n_start,
@@ -204,7 +206,7 @@ void epilogue_store(
     int cta_rank
 ) {
     __nv_bfloat16* row_out = C + (long long)(gm_base + lane) * N_DIM + n_start;
-    const int taddr_base = tmem_addr + ((cta_rank * 128 + ew * 32) << 16);
+    const int taddr_base = tmem_addr + ((cta_rank * 128 + row_group * 32) << 16);
     const __nv_bfloat16* comb_row = combined + (long long)pos_row * N_DIM + n_start;
 
     // Single buffer: 32 FP32 registers for x32 TMEM load
@@ -214,9 +216,9 @@ void epilogue_store(
     // Prefetch first 32-column chunk
     TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                   a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                  taddr_base);
+                  taddr_base + NC_START);
 
-    for (int nc = 0; nc < TN; nc += 32) {
+    for (int nc = NC_START; nc < NC_END; nc += 32) {
         // ── Load ALL BF16 combined before TMEM_WAIT (overlap with TMEM latency) ──
         // First 16 BF16 values (cols nc..nc+15)
         uint4 craw0 = *reinterpret_cast<const uint4*>(comb_row + nc);
@@ -265,7 +267,7 @@ void epilogue_store(
         CVT_STG(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31, row_out + nc + 16);
 
         // ── Prefetch next 32-column chunk ──
-        if (nc + 32 < TN)
+        if (nc + 32 < NC_END)
             TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                           a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                           taddr_base + nc + 32);
@@ -291,7 +293,7 @@ __global__ void precompute_combined(
 // Patch embed GEMM — warp-specialized tcgen05 (cta_group::2)
 // ═════════════════════════════════════════════════════════════
 
-__global__ void __launch_bounds__(192, 1)
+__global__ void __launch_bounds__(THREADS, 1)
 __cluster_dims__(2, 1, 1)
 patch_embed_gemm(
     const __grid_constant__ CUtensorMap tma_a,
@@ -325,7 +327,7 @@ patch_embed_gemm(
         // Double-buffered mainloop/epilogue mbarriers
         for (int i = 0; i < 2; i++) {
             mbar_init(smem_to_uint(smem + OFF_MAINLOOP_MBAR + i * 8), 1);          // CTA0 multicast commits
-            mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR + i * 8), 4 * 2 * 32); // 4 warps × 2 CTAs × 32 threads
+            mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR + i * 8), NUM_EPI_WARPS * 2 * 32); // NUM_EPI_WARPS warps × 2 CTAs × 32 threads
         }
     }
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
@@ -449,8 +451,12 @@ patch_embed_gemm(
                 tcgen05_commit_mcast(mainloop_mbar_addr + buf * 8, 0x3);
             }
         } else {
-            // ── OVERLAPPED EPILOGUE (W2-5) ──
+            // ── OVERLAPPED EPILOGUE (W2+) ──
             const int ew = warp - 2;
+            const int row_group = ew % 4;
+            const int is_split = (row_group < (NUM_EPI_WARPS - 4)) ? 1 : 0;
+            const int col_rank = ew / 4;
+
             const int prev_buf = buf ^ 1;
 
             // Wait for W1's K-loop on tmem[prev_buf] (from previous tile).
@@ -468,9 +474,16 @@ patch_embed_gemm(
                 const int prev_m = ptm * TM * 2 + cta_rank * TM;
                 const int prev_n = ptn * TN;
 
-                const int gm_base = prev_m + ew * 32;
+                const int gm_base = prev_m + row_group * 32;
                 const int pos_row = (gm_base + lane) % SEQ_LEN;
-                epilogue_store(prev_buf * TN, ew, lane, gm_base, prev_n, combined, pos_row, C, cta_rank);
+                if (is_split) {
+                    if (col_rank == 0)
+                        epilogue_store<0, TN/2>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank);
+                    else
+                        epilogue_store<TN/2, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank);
+                } else {
+                    epilogue_store<0, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank);
+                }
 
                 // Signal: done reading tmem[prev_buf] — arrive at CTA0's epilogue mbar
                 const uint32_t epi_mbar_masked = (epilogue_mbar_addr + prev_buf * 8) & 0xFEFFFFFF;
@@ -479,9 +492,13 @@ patch_embed_gemm(
         }
     }  // tile loop
 
-    // ── DRAIN (W2-5 only): epilogue for the last tile ──
+    // ── DRAIN (W2+ only): epilogue for the last tile ──
     if (warp >= 2) {
         const int ew = warp - 2;
+        const int row_group = ew % 4;
+        const int is_split = (row_group < (NUM_EPI_WARPS - 4)) ? 1 : 0;
+        const int col_rank = ew / 4;
+
         const int last_buf = (tile_end - 1) & 1;
 
         // Wait for W1's K-loop on tmem[last_buf]
@@ -496,9 +513,16 @@ patch_embed_gemm(
         if (ltm & 1) ltn = TILES_N - 1 - ltn;
         const int last_m = ltm * TM * 2 + cta_rank * TM;
         const int last_n = ltn * TN;
-        const int gm_base = last_m + ew * 32;
+        const int gm_base = last_m + row_group * 32;
         const int pos_row = (gm_base + lane) % SEQ_LEN;
-        epilogue_store(last_buf * TN, ew, lane, gm_base, last_n, combined, pos_row, C, cta_rank);
+        if (is_split) {
+            if (col_rank == 0)
+                epilogue_store<0, TN/2>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank);
+            else
+                epilogue_store<TN/2, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank);
+        } else {
+            epilogue_store<0, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank);
+        }
     }
 
     // ── Cluster sync + TMEM dealloc (all warps, both CTAs) ──
@@ -517,7 +541,8 @@ patch_embed_gemm(
 
 int main() {
     setbuf(stdout, NULL);  // unbuffered stdout for debugging
-    printf("SigLIP2 patch embed GEMM — tcgen05 cta_group::2 (6 warps, cluster of 2)\n");
+    printf("SigLIP2 patch embed GEMM — tcgen05 cta_group::2 (%d warps [%d epi], cluster of 2)\n",
+           2 + NUM_EPI_WARPS, NUM_EPI_WARPS);
     printf("  GEMM: [%d,%d] x [%d,%d]^T  6-stage pipeline  inline BF16 combined  st.global stores  idesc: 0x%08X\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, IDESC);
 
