@@ -5,12 +5,12 @@ FP8 (E4M3) precision, tcgen05 WGMMA, TMA, `cta_group::2` with 2-CTA clusters. Cr
 
 ## Current state
 
-**0.700 ms** fused (GEMM + bias + pos_embed) — **16% faster** than cuBLAS end-to-end (0.835 ms = best GEMM + unfused pos_embed).
+**0.633 ms** fused (GEMM + bias + pos_embed) — **24% faster** than cuBLAS end-to-end (0.835 ms = best GEMM + unfused pos_embed).
 
 The kernel's value is **fusion**: the overlapped epilogue eliminates the 0.470 ms unfused pos_embed overhead entirely.
 
 cuBLAS pure GEMM is faster: 0.365 ms / 3001 TFLOPS (per-tensor FP8, best-of-8 algos, 256MB workspace).
-Our effective TFLOPS (1564) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
+Our effective TFLOPS (1729) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
 
 GEMM: `[928256, 768] x [768, 768]^T` with fused bias + positional embedding add, BF16 output.
 Batch = 4736 images x 196 patches = 928256 rows. Square weight matrix (768x768).
@@ -19,45 +19,42 @@ The kernel is correct (checksum validated) and stable.
 
 ## Current bottlenecks (from ncu profiling)
 
-The kernel is **L1 throughput-bound** (82% of peak). After reducing pipeline stages (6→4) and register pressure (247→216), warps issue instructions more aggressively and L1 bandwidth is now the ceiling. The previous dominant bottleneck (TMEM stalls) has been substantially reduced.
+The kernel is **L1 throughput-bound** (85% of peak). SMEM-staged coalesced stores eliminated the uncoalesced store bottleneck (100% excess L2 sectors → 33%), boosting warp issue rate by 35%.
 
 **Warp stall breakdown:**
 
 | Stall | % of peak | Notes |
 |---|---|---|
-| long_scoreboard (TMEM) | 6.4% | Still largest stall (76% of stall cycles), but much reduced |
-| sleeping | 1.3% | Warps parked between tiles |
-| wait (TMA) | 0.9% | Pipeline wraparound stalls — minimal even with 4 stages |
+| long_scoreboard (TMEM) | 4.4% | Largest stall, reduced from 6.4% |
+| short_scoreboard (SMEM) | 1.1% | New: SMEM staging ld/st dependency chains |
+| wait (TMA) | 1.2% | Pipeline wraparound stalls |
+| sleeping | 1.1% | Warps parked between tiles |
 | barrier | 0.8% | Cluster sync |
-| selected (issuing) | 14.1% | Productive execution |
+| selected (issuing) | 19.1% | Productive execution (up from 14.1%) |
 
 **Memory throughput:**
 
 | Subsystem | Utilization |
 |---|---|
-| **L1 tex** | **82%** — primary bottleneck |
-| L2 | 60% |
-| DRAM write | 24% (1.38 GB written) |
+| **L1 tex** | **85%** — primary bottleneck |
+| L2 | 54% |
+| DRAM | 27% |
 
 **Key findings:**
 
-1. **L1 throughput (82%)** — the dominant bottleneck. Driven by uncoalesced `st.global` stores: 32 sectors/request vs 16 ideal (100% excess). Each warp writes 32 rows with 1536B stride between lanes, scattering across 32 different 128B cache lines. Fixing this via SMEM staging would directly attack the ceiling.
+1. **L1 throughput (85%)** — still the dominant bottleneck, but now with healthier instruction mix. SMEM staging eliminated L1 read-modify-write amplification from uncoalesced stores (L1 hit rate dropped 61.7% → 33.6%, confirming elimination of partial-line writes).
 
-2. **TMEM load latency (`long_scoreboard`, 6.4%)** — still the biggest single stall reason, but much lower than the previous 56% relative share. 5 epilogue warps + lower register pressure hide latency well.
+2. **TMEM load latency (`long_scoreboard`, 4.4%)** — reduced from 6.4%. Less L1 backpressure from coalesced stores means TMEM loads complete faster.
 
-3. **Register pressure (216 regs/thread, 0 spills)** — improved from 247 after 4-stage pipeline change. Still limits occupancy to 1 CTA/SM.
+3. **SMEM staging cost (`short_scoreboard`, 1.1%)** — new stall from SMEM ld/st chains in Phase 2. Acceptable tradeoff for the 9.6% speedup.
+
+4. **Register pressure (222 regs/thread, 0 spills)** — up from 216 due to Phase 2 loop variables. Still limits occupancy to 1 CTA/SM.
 
 ## Ideas for further improvement
 
 **Most promising:**
 
-- **Epilogue SMEM staging**: Instead of each warp independently loading from TMEM and writing to global, have warps cooperatively load TMEM into SMEM, then write from SMEM with coalesced access patterns. Would fix the 100% excess L1 store sectors (32→16 sectors/request) and directly attack the L1 throughput bottleneck (82% of peak). Cost: extra SMEM (have ~97 KB headroom with 4-stage pipeline) + sync overhead.
-
-- **Smaller output tile (TN=128, revisit)**: With x32 TMEM loads and other epilogue improvements applied, the shorter epilogue loop might tip the balance differently than when we last tried TN=128 (which was 1190 TFLOPS with x16 loads).
-
-**Speculative / higher-effort:**
-
-- **Two-pass output**: Write coalesced to a scratch buffer, then transpose. Eliminates uncoalesced stores but adds a second kernel pass. Only wins if store inefficiency > transpose cost.
+- **Smaller output tile (TN=128, revisit)**: With SMEM staging and other epilogue improvements applied, the shorter epilogue loop might tip the balance differently than when we last tried TN=128 (which was 1190 TFLOPS with x16 loads).
 
 - **Warp-specialized epilogue roles**: Instead of 5 identical epilogue warps, have some warps do TMEM→SMEM and others do SMEM→global. Decouples TMEM latency from store latency. Complex to implement.
 
@@ -65,6 +62,8 @@ The kernel is **L1 throughput-bound** (82% of peak). After reducing pipeline sta
 
 **Ruled out:**
 
+- **Epilogue SMEM staging** (done, 0.700→0.633 ms, +9.6%) — two-phase epilogue: Phase 1 writes TMEM+combined to per-warp SMEM staging buffer (row-per-thread), Phase 2 reads transposed and writes coalesced to global. Eliminated L1 read-modify-write amplification, reduced excess L2 sectors from 50% to 33%, boosted warp issue rate 35%. Cost: +84 KB SMEM (211 KB total), +6 registers (222), +1.1% short_scoreboard stalls.
+- **Two-pass output** — superseded by SMEM staging which achieves coalescing within the single kernel.
 - **6 epilogue warps** (tested, 0.747 ms) — TMEM bandwidth contention. 5 is the sweet spot; 6 warps issuing concurrent `tcgen05.ld` saturates bandwidth and regresses vs 5.
 - **5th epilogue warp with runtime loop bounds** (tested, 0.826 ms at 4 warps) — passing `nc_start`/`nc_end` as function args prevented loop unrolling. Fixed by templating `epilogue_store<NC_START, NC_END>`.
 - **x32 TMEM loads** (done, perf-neutral) — bandwidth-bound, not instruction-bound.
@@ -79,7 +78,7 @@ Warp-specialized, 7 warps (224 threads), `cta_group::2`, `__cluster_dims__(2,1,1
 
 - **W0**: TMA async bulk loads (A + B tiles, both CTAs load independently)
 - **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
-- **W2-W6**: Overlapped epilogue (5 warps) — each warp independently polls mainloop mbarrier, `tcgen05.ld` from TMEM, inline BF16 bias+pos_embed add, FP32->BF16 convert, `st.global.v8`
+- **W2-W6**: Overlapped epilogue (5 warps) — each warp independently polls mainloop mbarrier, then runs two-phase SMEM-staged store: Phase 1 (`tcgen05.ld` from TMEM, inline BF16 add, CVT, `st.shared` to per-warp staging buffer), `__syncwarp()`, Phase 2 (transposed `ld.shared` → coalesced `st.global.v4`/`st.global.v2`)
 
 TM=128 rows / 32 rows per warp = 4 row groups. W2-W5 each own a row group (all 256 cols). W6 column-splits with W2: both handle row_group 0, W2 does cols 0..127, W6 does cols 128..255. `epilogue_store` is templated on `<NC_START, NC_END>` so the compiler sees constant loop bounds and fully unrolls.
 
@@ -88,9 +87,9 @@ The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile 
 ### Tile config
 - Tile: 256x256x128 (M=2x128 from cta_group::2, N=256, K=128)
 - TMEM: single alloc of 512 cols (TN*2), double-buffered via column offset (buf*TN)
-- SMEM: 4-stage pipeline, 128 KB data + mbarriers = ~131 KB total (N_STAGES parameterized)
+- SMEM: 4-stage pipeline (131 KB) + epilogue staging (5 warps x 16,896 = 84 KB) = ~211 KB total of 228 KB
 - Tiles: 3626 M-tiles x 3 N-tiles = 10,878 total, snake ordering
-- 216 registers/thread, 0 spills
+- 222 registers/thread, 0 spills
 - `NUM_EPI_WARPS` controls epilogue warp count (currently 5); `THREADS` derived as `32*(2+NUM_EPI_WARPS)`
 
 ## Development workflow
@@ -129,7 +128,7 @@ make                    # compile megakernel.cu -> siglip_vision
 - Target: `sm_100a` (B200, 148 SMs)
 - `cta_group::2` with `__cluster_dims__(2,1,1)` — 74 clusters of 2 CTAs
 - TMEM: 512 cols/SM total, single alloc of TN*2 for double buffering (learned from matmul_v7: two separate allocs deadlock, single alloc works)
-- SMEM: 228 KB/SM — current usage ~131 KB (4-stage pipeline, ~97 KB free)
+- SMEM: 228 KB/SM — current usage ~211 KB (4-stage pipeline + epilogue staging, ~17 KB free)
 - All inline PTX — no CUTLASS dependency for the kernel itself
 - `megakernel.cu` is hand-edited directly
 - Expected checksum: 1769472.0, C[0,0..3] = 1728.0

@@ -1,17 +1,19 @@
 # Performance Audit — 2026-02-27
 
-Kernel: `patch_embed_gemm` (commit abf04a5, TN=256, x32 TMEM loads)
+Kernel: `patch_embed_gemm` (SMEM-staged coalesced stores, 4-stage pipeline, 5 epilogue warps)
 GEMM: [928256, 768] x [768, 768]^T, FP8 E4M3, BF16 output with fused bias+pos_embed
 
 ## Performance summary
 
 **End-to-end** (GEMM + bias + pos_embed — the actual workload):
 
-| Kernel | Time (ms) | Notes |
-|--------|-----------|-------|
-| **This kernel (fused)** | **0.764** | GEMM + bias + pos in overlapped epilogue |
-| cuBLAS best + unfused pos | 0.835 | Per-tensor FP8 GEMM + separate pos_embed kernel |
-| cuBLAS MXFP8 + unfused pos | 0.846 | MXFP8 GEMM + separate pos_embed kernel |
+| Kernel | Time (ms) | TFLOPS | Notes |
+|--------|-----------|--------|-------|
+| **This kernel (fused)** | **0.633** | **1729** | GEMM + bias + pos in overlapped epilogue |
+| Previous (st.global.v8) | 0.700 | 1564 | Same fused approach, uncoalesced stores |
+| cuBLAS best + unfused pos | 0.835 | — | Per-tensor FP8 GEMM + separate pos_embed kernel |
+
+**24% faster** than cuBLAS end-to-end (0.835 ms). **9.6% faster** than previous kernel (0.700 ms).
 
 **GEMM only** (cuBLAS benchmark, best-of-N algos, 256MB workspace):
 
@@ -20,133 +22,122 @@ GEMM: [928256, 768] x [768, 768]^T, FP8 E4M3, BF16 output with fused bias+pos_em
 | Per-tensor FP8 (best-of-8) | 0.365 | 3001 |
 | MXFP8 block-scaled (best-of-3) | 0.375 | 2920 |
 
-The kernel's advantage is **fusion**: the 0.470 ms unfused pos_embed overhead is eliminated by the overlapped epilogue. The "1433 TFLOPS" effective rate includes fused epilogue time in the denominator — it is not a GEMM-only metric.
-
 ### Optimization history
 
-| Commit | Change | TFLOPS |
-|--------|--------|--------|
-| 6c327fe | Replace TMA stores with st.global.v4 | ~300 |
-| c5f6c8b | Software-pipeline TMEM loads (double-buffer A/B) | ~400 |
-| 4ff9644 | Prefetch bias+pos_embed into SMEM during K-loop | ~500 |
-| 4760f3b | Unified epilogue, 147 regs, 0 spills | 727 |
-| 892766c | Replace SMEM prefetch with inline BF16 loads | 1043 |
-| fca9178 | Upgrade cta_group::1 to cta_group::2 | 1190 |
-| 9557e0b | TN=128→256, single TMEM alloc of 512 cols | 1433 |
-| **abf04a5** | **x16→x32 TMEM loads (no double-buffer)** | **1433 (perf-neutral)** |
+| Commit | Change | Time (ms) | TFLOPS |
+|--------|--------|-----------|--------|
+| 6c327fe | Replace TMA stores with st.global.v4 | — | ~300 |
+| c5f6c8b | Software-pipeline TMEM loads (double-buffer A/B) | — | ~400 |
+| 4ff9644 | Prefetch bias+pos_embed into SMEM during K-loop | — | ~500 |
+| 4760f3b | Unified epilogue, 147 regs, 0 spills | — | 727 |
+| 892766c | Replace SMEM prefetch with inline BF16 loads | — | 1043 |
+| fca9178 | Upgrade cta_group::1 to cta_group::2 | — | 1190 |
+| 9557e0b | TN=128→256, single TMEM alloc of 512 cols | — | 1433 |
+| abf04a5 | x16→x32 TMEM loads (no double-buffer) | 0.764 | 1433 |
+| 6319928 | Remove centralized mainloop_mbar bar.sync | 0.743 | — |
+| cefc59d | Reduce pipeline stages 6→4 | 0.700 | 1564 |
+| **current** | **Epilogue SMEM staging → coalesced stores** | **0.633** | **1729** |
 
-## A/B comparison: x16 vs x32 TMEM loads
+## Change: Epilogue SMEM staging
 
-This section compares the previous epilogue (double-buffered x16 TMEM loads, 216 regs) with the current epilogue (single-buffer x32 TMEM loads, 248 regs). Both profiled via `ncu --set detailed`, single kernel instance (skip 2 warmup), GPU reset between runs.
+### Problem
 
-Raw data: `profile_x16.csv`, `profile_x32.csv` (1203 ncu metrics each).
+Epilogue `st.global.v8.b32` stores were **uncoalesced**: each warp's 32 threads wrote to 32 different rows (1536B stride between lanes), producing 32 L1 sectors per store request (vs 16 ideal = 100% excess). This caused L1 read-modify-write amplification (each 128B cache line received only 32 bytes = 25% fill).
 
-### Duration / cycles
+### Solution
 
-| Metric | x16 | x32 | Delta |
-|--------|:---:|:---:|:-----:|
-| Duration (ncu) | 1.243 ms | 1.240 ms | -0.2% |
-| Active cycles | 1,353,248 | 1,349,029 | -0.3% |
+Two-phase epilogue via per-warp SMEM staging buffers:
 
-ncu duration (~1.24 ms) is higher than wall-clock timing (0.764 ms) due to profiling overhead — relative comparison is valid.
+1. **Phase 1**: Same TMEM + combined BF16 loop, but `CVT_STS` stores to SMEM (row-per-thread layout). Each thread writes its own row — no bank conflicts with 16-byte row padding.
+
+2. **`__syncwarp()`** barrier between phases.
+
+3. **Phase 2**: Transposed coalesced store. Loop over 32 rows; all 32 threads read from the same staging row (different column chunks) and write to the same global row. `st.global.v4.b32` for 256-col warps (W3-W5), `st.global.v2.b32` for 128-col split warps (W2/W6).
+
+### SMEM budget
+
+| Component | Bytes |
+|-----------|-------|
+| Pipeline (4 stages x 32KB) | 131,072 |
+| TMEM addr + mbarriers | 128 |
+| Staging (5 warps x 16,896) | 84,480 |
+| **Total (SMEM_BYTES)** | **215,808** |
+| SM limit | 233,472 (228 KB) |
+| **Headroom** | **~17 KB** |
+
+## A/B comparison: baseline (st.global.v8) vs SMEM staging
+
+Profiled via `ncu --set detailed`, single kernel instance, same GPU.
+
+Raw data: `baseline.csv` (pre-staging), `after.csv` (post-staging). Run `python compare.py baseline.csv after.csv` for full diff.
 
 ### Build stats (ptxas)
 
-| Metric | x16 | x32 |
-|--------|:---:|:---:|
-| Registers/thread | 216 | 248 |
+| Metric | Baseline | SMEM staging |
+|--------|:--------:|:------------:|
+| Registers/thread | 216 | 222 |
 | Spills | 0 | 0 |
 | Stack | 16 bytes | 16 bytes |
-| SMEM | 196,864 bytes | 196,864 bytes |
-| Barriers | 2 | 2 |
-| Achieved occupancy | 9.37% | 9.38% |
+| SMEM (dynamic) | ~131 KB | ~211 KB |
 
-248 regs still fits in the 256-reg budget for 1 CTA/SM. No occupancy change.
+### Warp stall breakdown (% of peak sustained active)
 
-### Warp stall breakdown (pcsamp sampling)
+| Stall reason | Baseline | Staging | Delta | Notes |
+|---|---:|---:|---:|---|
+| **selected (issuing)** | **14.1%** | **19.1%** | **+35%** | **Major win.** Warps spend 35% more time doing productive work. |
+| long_scoreboard (TMEM) | 6.4% | 4.4% | -30% | TMEM stalls reduced — less time wasted on L1 store backpressure. |
+| short_scoreboard (SMEM) | 0.1% | 1.1% | +1.0pp | New: SMEM staging ld/st dependency chains. Expected cost. |
+| sleeping | 1.3% | 1.1% | -15% | Less idle time between tiles. |
+| wait (TMA) | 0.9% | 1.2% | +0.3pp | Slightly more TMA pipeline pressure. |
+| barrier | 0.8% | 0.8% | unchanged | |
+| mio_throttle | 0.0% | 0.03% | negligible | Shared memory I/O backpressure, minimal. |
 
-SM100a uses PC-sampling-based stall attribution (`pcsamp`). Values are sample counts; percentages are share of total samples.
+### Memory throughput
 
-| Stall reason | x16 | x16% | x32 | x32% | Delta | Interpretation |
-|---|---:|---:|---:|---:|---:|---|
-| **long_scoreboard** | **27,024** | **55.3%** | **27,495** | **56.4%** | **+1.7%** | **Dominant.** TMEM load latency. x32 loads don't help — same bandwidth, fewer but equally slow loads. |
-| sleeping | 5,432 | 11.1% | 5,391 | 11.1% | -0.8% | Warp-specialized warps waiting for their role (TMA/MMA warps idle during epilogue). Unchanged. |
-| barrier | 5,171 | 10.6% | 5,008 | 10.3% | -3.2% | `bar.sync` between warp roles at tile boundaries. Slight improvement. |
-| wait | 4,961 | 10.1% | 4,146 | 8.5% | **-16.4%** | `cp.async.bulk.wait` in TMA warp. **Significant drop** — fewer TMEM loads means less TMA/TMEM contention. |
-| selected | 4,650 | 9.5% | 4,673 | 9.6% | +0.5% | Warp was selected to issue. Stable. |
-| branch_resolving | 882 | 1.8% | 874 | 1.8% | -0.9% | Warp-specialization branch dispatch. Stable. |
-| no_instructions | 276 | 0.6% | 285 | 0.6% | +3.3% | Instruction cache misses. Negligible. |
-| short_scoreboard | 232 | 0.5% | 582 | 1.2% | **+150.9%** | Register dependencies. **Notable increase** — x32 loads produce 32 output regs with longer dep chains. |
-| dispatch_stall | 79 | 0.2% | 91 | 0.2% | +15.2% | Scheduler dispatch contention. Negligible. |
-| math_pipe_throttle | 73 | 0.1% | 61 | 0.1% | -16.4% | MMA pipe not a bottleneck. |
-| not_selected | 71 | 0.1% | 94 | 0.2% | +32.4% | More warps eligible but not picked — consistent with shorter epilogue code having more scheduling opportunities. |
-| misc | 45 | 0.1% | 43 | 0.1% | -4.4% | Uncategorized. |
-| drain | 1 | 0.0% | 1 | 0.0% | +0.0% | End-of-kernel drain. |
-
-**Key finding**: `long_scoreboard` is 55-56% of all stall samples in both versions — completely dominant. The x32 change traded away `wait` stalls (-16.4%, from reduced TMA/TMEM contention) but gained `short_scoreboard` stalls (+150.9%, from longer register dependency chains in the 32-wide load). These cancel out, yielding identical wall-clock time.
-
-### Throughput
-
-| Subsystem | x16 | x32 | Delta |
+| Subsystem | Baseline | Staging | Delta |
 |---|:---:|:---:|:---:|
-| Memory (overall) | 84.0% | 84.2% | +0.3% |
-| L1/TEX (% active) | 85.6% | 85.9% | +0.4% |
-| L2 (LTS) | 58.2% | 58.3% | +0.1% |
-| DRAM | 25.3% | 25.3% | +0.2% |
-| SM Compute | 33.6% | 33.7% | +0.1% |
-
-All throughput metrics are identical within noise. The kernel remains **memory-throughput bound** (84% memory vs 34% compute).
-
-### Instruction counts
-
-| Metric | x16 | x32 | Delta |
-|---|---:|---:|:---:|
-| Instructions executed | 105,921,306 | 102,427,219 | **-3.3%** |
-| Global loads (LDG) | 2,784,768 | 2,784,768 | 0.0% |
-| Global stores (STG) | 1,392,384 | 1,392,384 | 0.0% |
-
-x32 saves 3.5M instructions (-3.3%) from halving TMEM load count (8 x32 loads vs 16 x16 loads per warp per tile). But instruction count was never the bottleneck — TMEM bandwidth is. Global load/store counts are identical — output size doesn't change.
-
-### Memory traffic
-
-| Metric | x16 | x32 | Delta |
-|---|---:|---:|:---:|
-| DRAM read | 715.4 MB | 715.2 MB | -0.0% |
-| DRAM write | 1.376 GB | 1.376 GB | +0.0% |
-
-Byte-identical memory traffic. Expected — same data, same access pattern.
+| **L1 tex** | **82%** | **85%** | +3% (still primary ceiling) |
+| L2 | 60% | 54% | -11% (less L2 pressure) |
+| DRAM | 24% | 27% | +13% |
 
 ### Uncoalesced access analysis
 
-| Metric | x16 | x32 |
+| Metric | Baseline | Staging |
 |---|---:|---:|
-| Excessive sectors | 44.56 MB | 44.56 MB |
-| % of total sectors | 49% | 50% |
+| Excessive L2 sectors | 44.56M | 44.56M |
+| % of total L2 sectors | **50%** | **33%** |
+| Global store instructions | 1,392,384 | 3,480,960 |
 
-Identical uncoalesced pattern. The 49→50% change is because x32 issues slightly fewer total sectors (89.5M vs 90.5M — from fewer TMEM load instructions generating L1 traffic) while the same absolute number of store sectors remain uncoalesced.
+The absolute excess sector count is unchanged (44.56M — from split warps' V2 stores and combined BF16 global loads). But excess as a fraction of total dropped from 50% to 33% because the coalesced V4/V2 stores generate more "good" sectors. Global store instruction count increased 2.5x because V4 stores (16 bytes) replace V8 stores (32 bytes), but each V4 store is fully coalesced.
+
+### Key compare.py findings (>5% relative change)
+
+| Metric | Baseline | Staging | Change |
+|--------|----------|---------|--------|
+| Inst executed per cycle (active) | 82.9 | 112.3 | **+35%** |
+| SMEM shared ld instructions | 666 | 3,481,626 | +523K% (Phase 2 reads) |
+| SMEM shared st instructions | 148 | 2,784,916 | +1.9M% (Phase 1 writes) |
+| Shared memory L1 wavefronts | 1,554 | 22,279,698 | +1.4M% (staging traffic) |
+| SMEM L1 pipe utilization | 0.1% | 20.6% | (new workload) |
+| L1 hit rate | 61.7% | 33.6% | -46% (fewer read-modify-write) |
+| Instruction cache requests | 849K | 3,510K | +314% (larger code) |
 
 ## Conclusions
 
-### Why x32 TMEM loads are perf-neutral
+### Why SMEM staging wins 9.6%
 
-The epilogue bottleneck is **TMEM bandwidth**, not instruction issue rate. `tcgen05.ld.sync.aligned.32x32b.x32.b32` reads 32 columns in one instruction, but the hardware still transfers the same 128 bytes per warp and the ~200-cycle latency is unchanged. Halving the instruction count saves 3.3% of instructions but buys zero wall-clock time because the scheduler was already stalled waiting for TMEM data, not waiting to issue the next load.
+The uncoalesced `st.global.v8` stores were causing two problems:
+1. **100% excess L2 sectors** — 32 sectors per store request vs 16 ideal
+2. **L1 read-modify-write** — each 128B cache line received only 32 bytes (25% fill), forcing L1 to read the line before writing
 
-The stall profile confirms this: `long_scoreboard` (TMEM latency) is 55%+ of all samples in both versions. The x32 version slightly reduced `wait` stalls (TMA contention) but introduced `short_scoreboard` stalls (register dependency chains), canceling out.
+SMEM staging fixes #2 completely (full 128B lines written in Phase 2) and makes #1 neutral (same absolute excess but lower fraction). The L1 hit rate drop (61.7% → 33.6%) confirms the read-modify-write elimination.
 
-### What would actually help
+The cost is SMEM traffic (20.6% L1 shared pipe utilization, 1.1% short_scoreboard stalls) and more global store instructions (2.5x). But the net effect is strongly positive: **warp issue rate up 35%, TMEM stalls down 30%**.
 
-1. **More epilogue warps**: long_scoreboard at 55% means 4 warps can't hide 200-cycle TMEM latency. Need 6-8 epilogue warps to fully interleave. Blocked by register pressure (248 regs × 256 threads = 63.5K, approaching 64K limit).
+### New bottleneck profile
 
-2. **Fix uncoalesced stores (49% excess sectors)**: 44.6 MB of wasted L2 sector traffic per invocation. Would require SMEM staging (cooperative store to SMEM → coalesced write to global) or output transposition.
-
-3. **Reduce epilogue work**: The fundamental ratio problem — 256×256×4 bytes of TMEM readback vs 256×128 FP8 MMA per K-iter. The epilogue is the long pole by 2x. Smaller tiles reduce epilogue per-tile cost but add more tile transitions.
-
-### What we learned about TMEM
-
-- **512 columns/SM total** (not 256 as previously believed)
-- Two separate `tcgen05.alloc` calls of 256 each deadlock — the hardware cannot satisfy the second alloc while the first holds its allocation
-- A single `tcgen05.alloc` of 512 works — like `mmap`, one large allocation succeeds where two half-size allocations fail
-- `tcgen05.alloc` requires power-of-2 column counts (192 → illegal instruction)
-- First alloc always returns column 0; double-buffering is just `buf * TN` as a column offset
-- Alloc should be placed in the MMA warp to avoid blocking TMA startup
-- **x16 vs x32 TMEM loads are bandwidth-equivalent** — instruction count doesn't matter, only total bytes transferred and latency per load
+The kernel is still **L1 throughput-bound** (85% of peak), but now with a healthier instruction mix:
+- More productive execution (19.1% selected vs 14.1%)
+- Less wasted time on TMEM stalls (4.4% vs 6.4%)
+- Small new SMEM cost (1.1% short_scoreboard)
+- TC pipeline utilization improved: 36.3% → 41.8%

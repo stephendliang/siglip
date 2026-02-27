@@ -34,7 +34,11 @@
 #define OFF_MMA_MBAR       (OFF_TMA_MBAR + N_STAGES * 8)
 #define OFF_MAINLOOP_MBAR  (OFF_MMA_MBAR + N_STAGES * 8)
 #define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
-#define SMEM_BYTES         ((OFF_EPILOGUE_MBAR + 16 + 127) & ~127)
+#define OFF_STAGING        ((OFF_EPILOGUE_MBAR + 16 + 127) & ~127)
+#define STAGING_ROW_PAD    16                                         // 16B-aligned rows for v4 ld/st; 4-way bank conflict on writes (acceptable)
+#define STAGING_ROW_BYTES  (TN * 2 + STAGING_ROW_PAD)                 // 528 bytes per row (16B-aligned)
+#define STAGING_WARP_BYTES (32 * STAGING_ROW_BYTES)                   // 16896 bytes per warp
+#define SMEM_BYTES         ((OFF_STAGING + NUM_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
 #define TMEM_COLS      512
 #define IDESC          0x10400010U
 #define SBO            1024
@@ -189,9 +193,49 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
         "cvt.rn.f32.bf16 %1, hi;\n\t" \
         "}" : "=f"(flo), "=f"(fhi) : "r"(reg))
 
-// ── Unified epilogue: x32 TMEM readback → inline BF16 combined add → FP32→BF16 → st.global.v8 ──
-// Single-buffer x32 TMEM loads (32 cols/load). All 4 BF16 combined uint4 loads
-// issued before TMEM_WAIT to overlap with TMEM latency. No A/B double-buffering needed.
+#define CVT_STS(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15, SADDR) \
+    asm volatile( \
+        "{\n\t" \
+        ".reg .b32 b0,b1,b2,b3,b4,b5,b6,b7;\n\t" \
+        "cvt.rn.bf16x2.f32 b0, %1, %0;\n\t" \
+        "cvt.rn.bf16x2.f32 b1, %3, %2;\n\t" \
+        "cvt.rn.bf16x2.f32 b2, %5, %4;\n\t" \
+        "cvt.rn.bf16x2.f32 b3, %7, %6;\n\t" \
+        "cvt.rn.bf16x2.f32 b4, %9, %8;\n\t" \
+        "cvt.rn.bf16x2.f32 b5, %11, %10;\n\t" \
+        "cvt.rn.bf16x2.f32 b6, %13, %12;\n\t" \
+        "cvt.rn.bf16x2.f32 b7, %15, %14;\n\t" \
+        "st.shared.v4.b32 [%16], {b0,b1,b2,b3};\n\t" \
+        "st.shared.v4.b32 [%16+16], {b4,b5,b6,b7};\n\t" \
+        "}" \
+        :: "f"(r0),"f"(r1),"f"(r2),"f"(r3), \
+           "f"(r4),"f"(r5),"f"(r6),"f"(r7), \
+           "f"(r8),"f"(r9),"f"(r10),"f"(r11), \
+           "f"(r12),"f"(r13),"f"(r14),"f"(r15), \
+           "r"(SADDR) \
+        : "memory")
+
+#define COALESCED_STORE_V4(SADDR, GPTR) \
+    asm volatile( \
+        "{\n\t" \
+        ".reg .b32 d0,d1,d2,d3;\n\t" \
+        "ld.shared.v4.b32 {d0,d1,d2,d3}, [%0];\n\t" \
+        "st.global.v4.b32 [%1], {d0,d1,d2,d3};\n\t" \
+        "}" \
+        :: "r"(SADDR), "l"(GPTR) : "memory")
+
+#define COALESCED_STORE_V2(SADDR, GPTR) \
+    asm volatile( \
+        "{\n\t" \
+        ".reg .b32 d0,d1;\n\t" \
+        "ld.shared.v2.b32 {d0,d1}, [%0];\n\t" \
+        "st.global.v2.b32 [%1], {d0,d1};\n\t" \
+        "}" \
+        :: "r"(SADDR), "l"(GPTR) : "memory")
+
+// ── Unified epilogue: x32 TMEM → inline BF16 add → CVT → SMEM staging → coalesced st.global ──
+// Phase 1: TMEM readback + combined add + CVT → st.shared (row-per-thread, uncoalesced OK)
+// Phase 2: ld.shared transposed → st.global (all threads write same row, coalesced)
 
 template<int NC_START, int NC_END>
 static __device__ __forceinline__
@@ -204,9 +248,9 @@ void epilogue_store(
     const __nv_bfloat16* __restrict__ combined,
     int pos_row,
     __nv_bfloat16* __restrict__ C,
-    int cta_rank
+    int cta_rank,
+    uint32_t staging_saddr
 ) {
-    __nv_bfloat16* row_out = C + (long long)(gm_base + lane) * N_DIM + n_start;
     const int taddr_base = tmem_addr + ((cta_rank * 128 + row_group * 32) << 16);
     const __nv_bfloat16* comb_row = combined + (long long)pos_row * N_DIM + n_start;
 
@@ -219,9 +263,9 @@ void epilogue_store(
                   a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                   taddr_base + NC_START);
 
+    // ── Phase 1: TMEM readback + combined add → SMEM staging (row-per-thread) ──
     for (int nc = NC_START; nc < NC_END; nc += 32) {
-        // ── Load ALL BF16 combined before TMEM_WAIT (overlap with TMEM latency) ──
-        // First 16 BF16 values (cols nc..nc+15)
+        // Load ALL BF16 combined before TMEM_WAIT (overlap with TMEM latency)
         uint4 craw0 = *reinterpret_cast<const uint4*>(comb_row + nc);
         uint4 craw1 = *reinterpret_cast<const uint4*>(comb_row + nc + 8);
         float s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15;
@@ -234,22 +278,22 @@ void epilogue_store(
         BF16X2_TO_F32(craw1.z, s12, s13);
         BF16X2_TO_F32(craw1.w, s14, s15);
 
-        // Second 16 BF16 values (cols nc+16..nc+31) — loaded but NOT converted yet
+        // Second 16 BF16 values — loaded but NOT converted yet
         craw0 = *reinterpret_cast<const uint4*>(comb_row + nc + 16);
         craw1 = *reinterpret_cast<const uint4*>(comb_row + nc + 24);
 
-        // ── Wait for TMEM data ──
         TMEM_WAIT();
 
-        // ── Process first 16 columns ──
+        // First 16 columns → SMEM
         a0+=s0; a1+=s1; a2+=s2; a3+=s3;
         a4+=s4; a5+=s5; a6+=s6; a7+=s7;
         a8+=s8; a9+=s9; a10+=s10; a11+=s11;
         a12+=s12; a13+=s13; a14+=s14; a15+=s15;
 
-        CVT_STG(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, row_out + nc);
+        uint32_t saddr = staging_saddr + lane * STAGING_ROW_BYTES + (nc - NC_START) * 2;
+        CVT_STS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, saddr);
 
-        // ── Convert second 16 BF16 (data already in craw regs from loads above) ──
+        // Convert second 16 BF16
         BF16X2_TO_F32(craw0.x, s0, s1);
         BF16X2_TO_F32(craw0.y, s2, s3);
         BF16X2_TO_F32(craw0.z, s4, s5);
@@ -259,19 +303,38 @@ void epilogue_store(
         BF16X2_TO_F32(craw1.z, s12, s13);
         BF16X2_TO_F32(craw1.w, s14, s15);
 
-        // ── Process second 16 columns ──
+        // Second 16 columns → SMEM
         a16+=s0; a17+=s1; a18+=s2; a19+=s3;
         a20+=s4; a21+=s5; a22+=s6; a23+=s7;
         a24+=s8; a25+=s9; a26+=s10; a27+=s11;
         a28+=s12; a29+=s13; a30+=s14; a31+=s15;
 
-        CVT_STG(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31, row_out + nc + 16);
+        CVT_STS(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31, saddr + 32);
 
-        // ── Prefetch next 32-column chunk ──
+        // Prefetch next 32-column chunk
         if (nc + 32 < NC_END)
             TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                           a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                           taddr_base + nc + 32);
+    }
+
+    // ── Warp sync: all SMEM writes visible before transposed read ──
+    __syncwarp();
+
+    // ── Phase 2: Transposed coalesced store (SMEM → global) ──
+    constexpr int NC_COLS = NC_END - NC_START;
+    constexpr int COLS_PER_THREAD = NC_COLS / 32;
+    __nv_bfloat16* row_base = C + (long long)gm_base * N_DIM + n_start + NC_START;
+
+    #pragma unroll 4
+    for (int r = 0; r < 32; r++) {
+        uint32_t src = staging_saddr + r * STAGING_ROW_BYTES + lane * COLS_PER_THREAD * 2;
+        __nv_bfloat16* dst = row_base + (long long)r * N_DIM + lane * COLS_PER_THREAD;
+
+        if (COLS_PER_THREAD == 8)
+            COALESCED_STORE_V4(src, dst);
+        else
+            COALESCED_STORE_V2(src, dst);
     }
 }
 
@@ -455,6 +518,7 @@ patch_embed_gemm(
             const int row_group = ew % 4;
             const int is_split = (row_group < (NUM_EPI_WARPS - 4)) ? 1 : 0;
             const int col_rank = ew / 4;
+            const uint32_t staging_saddr = smem_to_uint(smem + OFF_STAGING + ew * STAGING_WARP_BYTES);
 
             const int prev_buf = buf ^ 1;
 
@@ -477,11 +541,11 @@ patch_embed_gemm(
                 const int pos_row = (gm_base + lane) % SEQ_LEN;
                 if (is_split) {
                     if (col_rank == 0)
-                        epilogue_store<0, TN/2>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank);
+                        epilogue_store<0, TN/2>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr);
                     else
-                        epilogue_store<TN/2, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank);
+                        epilogue_store<TN/2, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr);
                 } else {
-                    epilogue_store<0, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank);
+                    epilogue_store<0, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr);
                 }
 
                 // Signal: done reading tmem[prev_buf] — arrive at CTA0's epilogue mbar
@@ -497,6 +561,7 @@ patch_embed_gemm(
         const int row_group = ew % 4;
         const int is_split = (row_group < (NUM_EPI_WARPS - 4)) ? 1 : 0;
         const int col_rank = ew / 4;
+        const uint32_t staging_saddr = smem_to_uint(smem + OFF_STAGING + ew * STAGING_WARP_BYTES);
 
         const int last_buf = (tile_end - 1) & 1;
 
@@ -516,11 +581,11 @@ patch_embed_gemm(
         const int pos_row = (gm_base + lane) % SEQ_LEN;
         if (is_split) {
             if (col_rank == 0)
-                epilogue_store<0, TN/2>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank);
+                epilogue_store<0, TN/2>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr);
             else
-                epilogue_store<TN/2, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank);
+                epilogue_store<TN/2, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr);
         } else {
-            epilogue_store<0, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank);
+            epilogue_store<0, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr);
         }
     }
 
@@ -542,8 +607,8 @@ int main() {
     setbuf(stdout, NULL);  // unbuffered stdout for debugging
     printf("SigLIP2 patch embed GEMM — tcgen05 cta_group::2 (%d warps [%d epi], cluster of 2)\n",
            2 + NUM_EPI_WARPS, NUM_EPI_WARPS);
-    printf("  GEMM: [%d,%d] x [%d,%d]^T  6-stage pipeline  inline BF16 combined  st.global stores  idesc: 0x%08X\n",
-           M_TOTAL, K_DIM, N_DIM, K_DIM, IDESC);
+    printf("  GEMM: [%d,%d] x [%d,%d]^T  %d-stage pipeline  inline BF16 combined  SMEM-staged coalesced stores  idesc: 0x%08X\n",
+           M_TOTAL, K_DIM, N_DIM, K_DIM, N_STAGES, IDESC);
 
     uint8_t *d_A, *d_B;
     float *d_bias, *d_pos;
