@@ -60,17 +60,7 @@ The kernel is **L1 throughput-bound** (85% of peak). SMEM-staged coalesced store
 
 - **Reduce TMEM traffic**: If accumulator precision could be BF16 instead of FP32, TMEM readback halves. But tcgen05.mma only accumulates to FP32 — would need explicit FP32→BF16 before TMEM store (not available in current ISA).
 
-**Ruled out:**
-
-- **Epilogue SMEM staging** (done, 0.700→0.633 ms, +9.6%) — two-phase epilogue: Phase 1 writes TMEM+combined to per-warp SMEM staging buffer (row-per-thread), Phase 2 reads transposed and writes coalesced to global. Eliminated L1 read-modify-write amplification, reduced excess L2 sectors from 50% to 33%, boosted warp issue rate 35%. Cost: +84 KB SMEM (211 KB total), +6 registers (222), +1.1% short_scoreboard stalls.
-- **Two-pass output** — superseded by SMEM staging which achieves coalescing within the single kernel.
-- **6 epilogue warps** (tested, 0.747 ms) — TMEM bandwidth contention. 5 is the sweet spot; 6 warps issuing concurrent `tcgen05.ld` saturates bandwidth and regresses vs 5.
-- **5th epilogue warp with runtime loop bounds** (tested, 0.826 ms at 4 warps) — passing `nc_start`/`nc_end` as function args prevented loop unrolling. Fixed by templating `epilogue_store<NC_START, NC_END>`.
-- **x32 TMEM loads** (done, perf-neutral) — bandwidth-bound, not instruction-bound.
-- **SMEM prefetch of combined** (tried commit 4ff9644→892766c) — inline BF16 loads from global were faster, likely because L1 cache hits on the small combined tensor.
-- **Centralized bar.sync for mbar broadcast** (done, 0.764→0.743 ms) — warp 2 polling + bar.sync to W3-W5 cost 10.3% stall. All epilogue warps polling independently is faster.
-- **6 pipeline stages** (was default) — 192 KB SMEM, 247 regs. Reduced to 4 stages: freed 64 KB SMEM, dropped to 216 regs, +3.1% faster (0.722→0.700 ms). 5 stages also tested (0.715 ms, 236 regs).
-- **`cta_group::4`** — would need 1024 TMEM cols (exceeds 512/SM HW limit).
+**Tested and ruled out:** See `EXPERIMENTS.md` for detailed experiment log with hypotheses, results, and analysis.
 
 ## Kernel structure
 
@@ -107,7 +97,7 @@ edit megakernel.cu -> make -> ./siglip_vision
 | File | What |
 |------|------|
 | `megakernel.cu` | **Source of truth** — hand-tuned CUDA kernel |
-| `LATEST_AUDIT.md` | ncu profiling data and performance analysis |
+| `EXPERIMENTS.md` | Experiment log, profiling data, and optimization history |
 | `docs/profiling.md` | Profiling commands (ncu, cuobjdump, compute-sanitizer) |
 | `docs/architecture.md` | Model specs, HW config, milestones (partially stale) |
 | `gen.py` | Codegen script — **outdated, do not use** |
