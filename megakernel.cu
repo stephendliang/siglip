@@ -2,7 +2,7 @@
 // Target: B200  Batch: 4736  GEMM: [928256,768]×[768,768]^T
 // Pipeline: 6-stage  K-iters: 6  MMA/iter: 4  idesc: 0x10400010
 // Warps: 6 (192 threads)  cta_group::2  __cluster_dims__(2,1,1)
-// Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2-5)  BF16 output
+// Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2-5,x32 TMEM ld)  BF16 output
 // tcgen05.mma.cta_group::2.kind::f8f6f4  (E4M3 × E4M3 → FP32)
 // Each CTA loads own A (128 rows) + half B (128 cols). MMA produces 256×256 output.
 
@@ -140,6 +140,21 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
           "=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15) \
         : "r"(TADDR))
 
+#define TMEM_LOAD_X32(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,r20,r21,r22,r23,r24,r25,r26,r27,r28,r29,r30,r31, TADDR) \
+    asm volatile( \
+        "tcgen05.ld.sync.aligned.32x32b.x32.b32 " \
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15," \
+        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, [%32];" \
+        : "=f"(r0),"=f"(r1),"=f"(r2),"=f"(r3), \
+          "=f"(r4),"=f"(r5),"=f"(r6),"=f"(r7), \
+          "=f"(r8),"=f"(r9),"=f"(r10),"=f"(r11), \
+          "=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15), \
+          "=f"(r16),"=f"(r17),"=f"(r18),"=f"(r19), \
+          "=f"(r20),"=f"(r21),"=f"(r22),"=f"(r23), \
+          "=f"(r24),"=f"(r25),"=f"(r26),"=f"(r27), \
+          "=f"(r28),"=f"(r29),"=f"(r30),"=f"(r31) \
+        : "r"(TADDR))
+
 #define TMEM_WAIT() \
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory")
 
@@ -172,10 +187,9 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
         "cvt.rn.f32.bf16 %1, hi;\n\t" \
         "}" : "=f"(flo), "=f"(fhi) : "r"(reg))
 
-// ── Unified epilogue: TMEM readback → inline BF16 combined add → FP32→BF16 → st.global.v8 ──
-// Software-pipelined: double-buffered TMEM loads (A/B) across column pairs.
-// Combined (bias+pos_embed) loaded inline as BF16 from global memory,
-// overlapping with TMEM load latency. Both overlapped and drain paths use this function.
+// ── Unified epilogue: x32 TMEM readback → inline BF16 combined add → FP32→BF16 → st.global.v8 ──
+// Single-buffer x32 TMEM loads (32 cols/load). All 4 BF16 combined uint4 loads
+// issued before TMEM_WAIT to overlap with TMEM latency. No A/B double-buffering needed.
 
 static __device__ __forceinline__
 void epilogue_store(
@@ -193,16 +207,18 @@ void epilogue_store(
     const int taddr_base = tmem_addr + ((cta_rank * 128 + ew * 32) << 16);
     const __nv_bfloat16* comb_row = combined + (long long)pos_row * N_DIM + n_start;
 
-    // Double-buffered TMEM registers
+    // Single buffer: 32 FP32 registers for x32 TMEM load
     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
-    float b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15;
+    float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
 
-    // Prefetch first chunk into buffer A
-    TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, taddr_base);
+    // Prefetch first 32-column chunk
+    TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                  taddr_base);
 
     for (int nc = 0; nc < TN; nc += 32) {
-        // ── Chunk nc (buffer A) ──
-        // Issue BF16 combined loads BEFORE TMEM_WAIT (overlap with TMEM latency)
+        // ── Load ALL BF16 combined before TMEM_WAIT (overlap with TMEM latency) ──
+        // First 16 BF16 values (cols nc..nc+15)
         uint4 craw0 = *reinterpret_cast<const uint4*>(comb_row + nc);
         uint4 craw1 = *reinterpret_cast<const uint4*>(comb_row + nc + 8);
         float s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15;
@@ -215,9 +231,14 @@ void epilogue_store(
         BF16X2_TO_F32(craw1.z, s12, s13);
         BF16X2_TO_F32(craw1.w, s14, s15);
 
-        TMEM_WAIT();
-        TMEM_LOAD(b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15, taddr_base + nc + 16);
+        // Second 16 BF16 values (cols nc+16..nc+31) — loaded but NOT converted yet
+        craw0 = *reinterpret_cast<const uint4*>(comb_row + nc + 16);
+        craw1 = *reinterpret_cast<const uint4*>(comb_row + nc + 24);
 
+        // ── Wait for TMEM data ──
+        TMEM_WAIT();
+
+        // ── Process first 16 columns ──
         a0+=s0; a1+=s1; a2+=s2; a3+=s3;
         a4+=s4; a5+=s5; a6+=s6; a7+=s7;
         a8+=s8; a9+=s9; a10+=s10; a11+=s11;
@@ -225,9 +246,7 @@ void epilogue_store(
 
         CVT_STG(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, row_out + nc);
 
-        // ── Chunk nc+16 (buffer B) ──
-        craw0 = *reinterpret_cast<const uint4*>(comb_row + nc + 16);
-        craw1 = *reinterpret_cast<const uint4*>(comb_row + nc + 24);
+        // ── Convert second 16 BF16 (data already in craw regs from loads above) ──
         BF16X2_TO_F32(craw0.x, s0, s1);
         BF16X2_TO_F32(craw0.y, s2, s3);
         BF16X2_TO_F32(craw0.z, s4, s5);
@@ -237,16 +256,19 @@ void epilogue_store(
         BF16X2_TO_F32(craw1.z, s12, s13);
         BF16X2_TO_F32(craw1.w, s14, s15);
 
-        TMEM_WAIT();
+        // ── Process second 16 columns ──
+        a16+=s0; a17+=s1; a18+=s2; a19+=s3;
+        a20+=s4; a21+=s5; a22+=s6; a23+=s7;
+        a24+=s8; a25+=s9; a26+=s10; a27+=s11;
+        a28+=s12; a29+=s13; a30+=s14; a31+=s15;
+
+        CVT_STG(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31, row_out + nc + 16);
+
+        // ── Prefetch next 32-column chunk ──
         if (nc + 32 < TN)
-            TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, taddr_base + nc + 32);
-
-        b0+=s0; b1+=s1; b2+=s2; b3+=s3;
-        b4+=s4; b5+=s5; b6+=s6; b7+=s7;
-        b8+=s8; b9+=s9; b10+=s10; b11+=s11;
-        b12+=s12; b13+=s13; b14+=s14; b15+=s15;
-
-        CVT_STG(b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15, row_out + nc + 16);
+            TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                          taddr_base + nc + 32);
     }
 }
 

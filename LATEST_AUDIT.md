@@ -1,14 +1,26 @@
 # Performance Audit — 2026-02-27
 
-Kernel: `patch_embed_gemm` (commit 9557e0b, TN=256, single TMEM alloc)
-GEMM: [928256, 768] x [768, 768]^T, MXFP8 E4M3, BF16 output with fused bias+pos_embed
+Kernel: `patch_embed_gemm` (commit abf04a5, TN=256, x32 TMEM loads)
+GEMM: [928256, 768] x [768, 768]^T, FP8 E4M3, BF16 output with fused bias+pos_embed
 
 ## Performance summary
 
-| Kernel | Time (ms) | TFLOPS | vs cuBLAS |
-|--------|-----------|--------|-----------|
-| **This kernel** | **0.764** | **1433** | **110%** |
-| cuBLAS (reference) | 0.845 | 1295 | 100% |
+**End-to-end** (GEMM + bias + pos_embed — the actual workload):
+
+| Kernel | Time (ms) | Notes |
+|--------|-----------|-------|
+| **This kernel (fused)** | **0.764** | GEMM + bias + pos in overlapped epilogue |
+| cuBLAS best + unfused pos | 0.835 | Per-tensor FP8 GEMM + separate pos_embed kernel |
+| cuBLAS MXFP8 + unfused pos | 0.846 | MXFP8 GEMM + separate pos_embed kernel |
+
+**GEMM only** (cuBLAS benchmark, best-of-N algos, 256MB workspace):
+
+| Mode | Time (ms) | TFLOPS |
+|------|-----------|--------|
+| Per-tensor FP8 (best-of-8) | 0.365 | 3001 |
+| MXFP8 block-scaled (best-of-3) | 0.375 | 2920 |
+
+The kernel's advantage is **fusion**: the 0.470 ms unfused pos_embed overhead is eliminated by the overlapped epilogue. The "1433 TFLOPS" effective rate includes fused epilogue time in the denominator — it is not a GEMM-only metric.
 
 ### Optimization history
 
@@ -21,102 +33,113 @@ GEMM: [928256, 768] x [768, 768]^T, MXFP8 E4M3, BF16 output with fused bias+pos_
 | 892766c | Replace SMEM prefetch with inline BF16 loads | 1043 |
 | fca9178 | Upgrade cta_group::1 to cta_group::2 | 1190 |
 | 9557e0b | TN=128→256, single TMEM alloc of 512 cols | 1433 |
+| **abf04a5** | **x16→x32 TMEM loads (no double-buffer)** | **1433 (perf-neutral)** |
 
-## Build stats (ptxas)
+## A/B comparison: x16 vs x32 TMEM loads
 
-```
-Registers:    216/thread (0 spills)
-Stack:        16 bytes
-SMEM:         196,864 bytes (192.25 KB of 228 KB)
-Barriers:     2
-```
+This section compares the previous epilogue (double-buffered x16 TMEM loads, 216 regs) with the current epilogue (single-buffer x32 TMEM loads, 248 regs). Both profiled via `ncu --set detailed`, single kernel instance (skip 2 warmup), GPU reset between runs.
 
-## ncu: GPU Speed of Light
+Raw data: `profile_x16.csv`, `profile_x32.csv` (1203 ncu metrics each).
 
-| Metric | Old (TN=128) | New (TN=256) |
+### Duration / cycles
+
+| Metric | x16 | x32 | Delta |
+|--------|:---:|:---:|:-----:|
+| Duration (ncu) | 1.243 ms | 1.240 ms | -0.2% |
+| Active cycles | 1,353,248 | 1,349,029 | -0.3% |
+
+ncu duration (~1.24 ms) is higher than wall-clock timing (0.764 ms) due to profiling overhead — relative comparison is valid.
+
+### Build stats (ptxas)
+
+| Metric | x16 | x32 |
 |--------|:---:|:---:|
-| Duration | 917 µs | **770 µs** |
-| Elapsed Cycles | ~1,655,000 | **1,407,154** |
-| Memory Throughput | 68.5% | **82.2%** |
-| L1/TEX Throughput | 68.4% | **84.0%** |
-| L2 Throughput | 53.2% | **55.4%** |
-| DRAM Throughput | 18.3% | **35.4%** |
-| SM Compute | 34.0% | **33.2%** |
+| Registers/thread | 216 | 248 |
+| Spills | 0 | 0 |
+| Stack | 16 bytes | 16 bytes |
+| SMEM | 196,864 bytes | 196,864 bytes |
+| Barriers | 2 | 2 |
+| Achieved occupancy | 9.37% | 9.38% |
 
-The kernel is **memory-throughput bound** (82% vs 33% compute). Wider tiles nearly doubled DRAM utilization (18→35%) by reducing per-tile mbar/sync overhead and amortizing TMA setup across more output columns.
+248 regs still fits in the 256-reg budget for 1 CTA/SM. No occupancy change.
 
-## ncu: Warp stall breakdown
+### Warp stall breakdown (pcsamp sampling)
 
-| Stall reason | Old | New | Interpretation |
-|---|:---:|:---:|---|
-| **long_scoreboard** | 5.12% | **4.69%** | **Dominant.** TMEM load latency (~200 cycles). 4 epilogue warps can't fully hide it. Slightly improved with wider tiles (better amortization). |
-| barrier | 1.08% | **1.14%** | `bar.sync` between epilogue warps. Stable — warp specialization working. |
-| wait | 1.02% | **0.95%** | `cp.async.bulk.wait` in TMA warp. Slightly better with fewer tiles. |
-| short_scoreboard | 0.02% | **0.04%** | Negligible. No SMEM dependency issues. |
-| math_pipe_throttle | 0.02% | **0.01%** | MMA pipe not a bottleneck. |
-| not_selected | 0.03% | **0.02%** | Near-zero — scheduler has few eligible warps competing. |
-| mio_throttle | 0.00% | **0.00%** | No store backpressure. |
-| lg_throttle | 0.00% | **0.00%** | No global load throttling. |
-| membar | 0.00% | **0.00%** | mbarrier waits not significant. |
+SM100a uses PC-sampling-based stall attribution (`pcsamp`). Values are sample counts; percentages are share of total samples.
 
-### Analysis
+| Stall reason | x16 | x16% | x32 | x32% | Delta | Interpretation |
+|---|---:|---:|---:|---:|---:|---|
+| **long_scoreboard** | **27,024** | **55.3%** | **27,495** | **56.4%** | **+1.7%** | **Dominant.** TMEM load latency. x32 loads don't help — same bandwidth, fewer but equally slow loads. |
+| sleeping | 5,432 | 11.1% | 5,391 | 11.1% | -0.8% | Warp-specialized warps waiting for their role (TMA/MMA warps idle during epilogue). Unchanged. |
+| barrier | 5,171 | 10.6% | 5,008 | 10.3% | -3.2% | `bar.sync` between warp roles at tile boundaries. Slight improvement. |
+| wait | 4,961 | 10.1% | 4,146 | 8.5% | **-16.4%** | `cp.async.bulk.wait` in TMA warp. **Significant drop** — fewer TMEM loads means less TMA/TMEM contention. |
+| selected | 4,650 | 9.5% | 4,673 | 9.6% | +0.5% | Warp was selected to issue. Stable. |
+| branch_resolving | 882 | 1.8% | 874 | 1.8% | -0.9% | Warp-specialization branch dispatch. Stable. |
+| no_instructions | 276 | 0.6% | 285 | 0.6% | +3.3% | Instruction cache misses. Negligible. |
+| short_scoreboard | 232 | 0.5% | 582 | 1.2% | **+150.9%** | Register dependencies. **Notable increase** — x32 loads produce 32 output regs with longer dep chains. |
+| dispatch_stall | 79 | 0.2% | 91 | 0.2% | +15.2% | Scheduler dispatch contention. Negligible. |
+| math_pipe_throttle | 73 | 0.1% | 61 | 0.1% | -16.4% | MMA pipe not a bottleneck. |
+| not_selected | 71 | 0.1% | 94 | 0.2% | +32.4% | More warps eligible but not picked — consistent with shorter epilogue code having more scheduling opportunities. |
+| misc | 45 | 0.1% | 43 | 0.1% | -4.4% | Uncategorized. |
+| drain | 1 | 0.0% | 1 | 0.0% | +0.0% | End-of-kernel drain. |
 
-The stall profile is clean and similar to TN=128. `long_scoreboard` dropped slightly (5.1→4.7%) — fewer tiles means fewer per-tile transitions, giving the epilogue more uninterrupted time to pipeline TMEM loads. All other stalls remain <1.2%.
+**Key finding**: `long_scoreboard` is 55-56% of all stall samples in both versions — completely dominant. The x32 change traded away `wait` stalls (-16.4%, from reduced TMA/TMEM contention) but gained `short_scoreboard` stalls (+150.9%, from longer register dependency chains in the 32-wide load). These cancel out, yielding identical wall-clock time.
 
-## ncu: Throughput breakdown
+### Throughput
 
-| Subsystem | Old | New | Notes |
-|---|:---:|:---:|---|
-| L1/TEX | 68.4% | **84.0%** | Epilogue-dominated: TMEM loads + global stores flow through L1. Near saturation. |
-| L2 (LTS) | 53.2% | **55.4%** | BF16 combined loads + output stores. Moderate. |
-| DRAM | 18.3% | **35.4%** | Nearly doubled — wider tiles reduce overhead, more sustained memory streaming. |
-| SM Compute | 34.0% | **33.2%** | Underutilized — epilogue overhead limits MMA pipe utilization. |
+| Subsystem | x16 | x32 | Delta |
+|---|:---:|:---:|:---:|
+| Memory (overall) | 84.0% | 84.2% | +0.3% |
+| L1/TEX (% active) | 85.6% | 85.9% | +0.4% |
+| L2 (LTS) | 58.2% | 58.3% | +0.1% |
+| DRAM | 25.3% | 25.3% | +0.2% |
+| SM Compute | 33.6% | 33.7% | +0.1% |
 
-## ncu: Uncoalesced access analysis
+All throughput metrics are identical within noise. The kernel remains **memory-throughput bound** (84% memory vs 34% compute).
 
-ncu flags **49% uncoalesced global accesses**: 44.6M excessive sectors out of 90.5M total. This is the epilogue's `st.global.v8` scatter pattern. Each warp writes 32 rows — adjacent threads store to addresses 1536 bytes apart (N_DIM × sizeof(BF16) = 768×2). Every lane hits a different 128-byte L2 sector.
+### Instruction counts
 
-This is **inherent to row-major output** with per-row TMEM readback. Cannot be fixed without output transposition or fundamentally different output tiling. The same pattern exists in cuBLAS.
+| Metric | x16 | x32 | Delta |
+|---|---:|---:|:---:|
+| Instructions executed | 105,921,306 | 102,427,219 | **-3.3%** |
+| Global loads (LDG) | 2,784,768 | 2,784,768 | 0.0% |
+| Global stores (STG) | 1,392,384 | 1,392,384 | 0.0% |
 
-## ncu: Instruction counts (per kernel invocation)
+x32 saves 3.5M instructions (-3.3%) from halving TMEM load count (8 x32 loads vs 16 x16 loads per warp per tile). But instruction count was never the bottleneck — TMEM bandwidth is. Global load/store counts are identical — output size doesn't change.
 
-| Metric | Old | New |
-|---|:---:|:---:|
-| Total instructions executed | 108.2M | **105.9M** |
-| Total thread-instructions | 2,837M | **3,058M** |
-| Global loads (LDG) | 2,784,768 | **2,784,768** |
-| Global stores (STG) | 1,392,384 | **1,392,384** |
+### Memory traffic
 
-Fewer total instructions (-2.1%) due to fewer tiles (10,878 vs 21,756) reducing per-tile overhead. More thread-instructions (+7.8%) because the epilogue inner loop does 8 column iterations (was 4 with TN=128).
+| Metric | x16 | x32 | Delta |
+|---|---:|---:|:---:|
+| DRAM read | 715.4 MB | 715.2 MB | -0.0% |
+| DRAM write | 1.376 GB | 1.376 GB | +0.0% |
 
-Global load/store counts are identical — output size is the same regardless of tile shape. Store count: 1,392,384 = 10,878 tiles × 16 stores/warp × 4 warps × 2 CTAs. Each `st.global.v8.b32` writes 32 bytes (16 BF16). Total: 1,392,384 × 32 = 44.6 MB = 928,256 × 768 × 2 bytes.
+Byte-identical memory traffic. Expected — same data, same access pattern.
 
-## ncu: Occupancy
+### Uncoalesced access analysis
 
-| Metric | Value |
-|---|---|
-| Theoretical occupancy | 9.38% |
-| Achieved occupancy | 9.51% |
-| Registers/thread | 216 |
-| Waves per SM | 1 |
-| Block limit: registers | 1 |
-| Block limit: shared mem | 1 |
+| Metric | x16 | x32 |
+|---|---:|---:|
+| Excessive sectors | 44.56 MB | 44.56 MB |
+| % of total sectors | 49% | 50% |
 
-Occupancy is 9.4% (1 CTA per SM, 192 of 2048 max threads). By design — persistent kernel with 1 wave. Both registers (216) and shared memory (192 KB) independently limit to 1 block per SM.
+Identical uncoalesced pattern. The 49→50% change is because x32 issues slightly fewer total sectors (89.5M vs 90.5M — from fewer TMEM load instructions generating L1 traffic) while the same absolute number of store sectors remain uncoalesced.
 
-## Remaining performance ceiling
+## Conclusions
 
-We are now **10% faster than cuBLAS**. The profile shows we are in diminishing returns territory:
+### Why x32 TMEM loads are perf-neutral
 
-### What's left on the table
+The epilogue bottleneck is **TMEM bandwidth**, not instruction issue rate. `tcgen05.ld.sync.aligned.32x32b.x32.b32` reads 32 columns in one instruction, but the hardware still transfers the same 128 bytes per warp and the ~200-cycle latency is unchanged. Halving the instruction count saves 3.3% of instructions but buys zero wall-clock time because the scheduler was already stalled waiting for TMEM data, not waiting to issue the next load.
 
-1. **Uncoalesced stores (49% excess sectors)**: The dominant source of wasted memory bandwidth. Inherent to row-major output — each lane in a warp writes to a different row. Would require output transposition or a two-pass scheme (write coalesced to scratch, then transpose). Not practical for a fused kernel.
+The stall profile confirms this: `long_scoreboard` (TMEM latency) is 55%+ of all samples in both versions. The x32 version slightly reduced `wait` stalls (TMA contention) but introduced `short_scoreboard` stalls (register dependency chains), canceling out.
 
-2. **TMEM load latency (long_scoreboard 4.7%)**: Still the #1 stall. 4 epilogue warps interleave loads but ~200-cycle latency needs ~6-8 warps to fully hide. Adding epilogue warps requires either reducing TMA/MMA warps (hurts pipeline) or increasing total thread count (hits register limits at 216 regs/thread).
+### What would actually help
 
-3. **SM compute at 33%**: The MMA pipe is idle 2/3 of the time. The epilogue (TMEM→add→convert→store) takes ~2x longer than the K-loop MMA. With overlapped execution, the epilogue is the long pole. This is the fundamental ratio problem: 256×256 output requires 256×256×4 bytes of TMEM readback but only 256×128×2 FLOPs of MMA per K-iteration.
+1. **More epilogue warps**: long_scoreboard at 55% means 4 warps can't hide 200-cycle TMEM latency. Need 6-8 epilogue warps to fully interleave. Blocked by register pressure (248 regs × 256 threads = 63.5K, approaching 64K limit).
 
-4. **Register pressure (216 regs)**: Up from 168 with TN=128. The wider epilogue loop keeps more BF16 combined data and TMEM values alive. Could try `--maxrregcount=192` but may cause spills that hurt more than they help.
+2. **Fix uncoalesced stores (49% excess sectors)**: 44.6 MB of wasted L2 sector traffic per invocation. Would require SMEM staging (cooperative store to SMEM → coalesced write to global) or output transposition.
+
+3. **Reduce epilogue work**: The fundamental ratio problem — 256×256×4 bytes of TMEM readback vs 256×128 FP8 MMA per K-iter. The epilogue is the long pole by 2x. Smaller tiles reduce epilogue per-tile cost but add more tile transitions.
 
 ### What we learned about TMEM
 
@@ -126,3 +149,4 @@ We are now **10% faster than cuBLAS**. The profile shows we are in diminishing r
 - `tcgen05.alloc` requires power-of-2 column counts (192 → illegal instruction)
 - First alloc always returns column 0; double-buffering is just `buf * TN` as a column offset
 - Alloc should be placed in the MMA warp to avoid blocking TMA startup
+- **x16 vs x32 TMEM loads are bandwidth-equivalent** — instruction count doesn't matter, only total bytes transferred and latency per load
