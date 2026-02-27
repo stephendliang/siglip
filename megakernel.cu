@@ -1,9 +1,10 @@
 // Hand-tuned from gen.py output — TK=128, SWIZZLE_128B, 6-stage pipeline
 // Target: B200  Batch: 4736  GEMM: [928256,768]×[768,768]^T
-// Pipeline: 6-stage  K-iters: 6  MMA/iter: 4  idesc: 0x08200010
-// Warps: 6 (192 threads)  cta_group::1
-// Warp-specialized: Load(W0) | MMA(W1,cta_group::1) | Epilogue(W2-5)  BF16 output
-// tcgen05.mma.cta_group::1.kind::f8f6f4  (E4M3 × E4M3 → FP32)
+// Pipeline: 6-stage  K-iters: 6  MMA/iter: 4  idesc: 0x10200010
+// Warps: 6 (192 threads)  cta_group::2  __cluster_dims__(2,1,1)
+// Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2-5)  BF16 output
+// tcgen05.mma.cta_group::2.kind::f8f6f4  (E4M3 × E4M3 → FP32)
+// Each CTA loads own A (128 rows) + half B (64 cols). MMA produces 256×128 output.
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -21,22 +22,22 @@
 #define TM             128
 #define TN             128
 #define TK             128
-#define TILES_M        7252
+#define TILES_M        3626
 #define TILES_N        6
 #define K_ITERS        6
-#define TOTAL_TILES    43512
+#define TOTAL_TILES    21756
 #define N_STAGES       6
-#define OFF_TMEM_0         196608
-#define OFF_TMEM_1         196612
-#define OFF_TMA_MBAR       196616
-#define OFF_MMA_MBAR       196664
-#define OFF_MAINLOOP_MBAR  196712
-#define OFF_EPILOGUE_MBAR  196728
-#define SMEM_BYTES         196864
+#define OFF_TMEM_0         147456
+#define OFF_TMEM_1         147460
+#define OFF_TMA_MBAR       147464
+#define OFF_MMA_MBAR       147512
+#define OFF_MAINLOOP_MBAR  147560
+#define OFF_EPILOGUE_MBAR  147576
+#define SMEM_BYTES         147712
 #define TMEM_COLS      128
-#define IDESC          0x08200010U
+#define IDESC          0x10200010U
 #define SBO            1024
-#define TMA_BYTES      32768
+#define TMA_BYTES      24576
 #define MMA_K          32
 #define MMA_PER_KI     4
 
@@ -101,13 +102,13 @@ void mbar_wait(uint32_t addr, uint32_t phase) {
 static __device__ __forceinline__
 void mbar_arrive_expect_tx(uint32_t addr, uint32_t tx_count) {
     asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
         :: "r"(addr), "r"(tx_count) : "memory");
 }
 
 static __device__ __forceinline__
 void mbar_arrive(uint32_t addr) {
-    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+    asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
         :: "r"(addr) : "memory");
 }
 
@@ -115,10 +116,17 @@ static __device__ __forceinline__
 void tma_load_2d(uint32_t smem_dst, const void* tma_desc,
                   int32_t c0, int32_t c1, uint32_t mbar) {
     asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+        "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2"
         " [%0], [%1, {%2, %3}], [%4];"
         :: "r"(smem_dst), "l"(tma_desc), "r"(c0), "r"(c1), "r"(mbar)
         : "memory");
+}
+
+static __device__ __forceinline__
+void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
+    asm volatile(
+        "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;"
+        :: "r"(mbar_addr), "h"(cta_mask) : "memory");
 }
 
 // ── Pipelined epilogue macros ────────────────────────────────
@@ -179,10 +187,11 @@ void epilogue_store(
     int n_start,
     const __nv_bfloat16* __restrict__ combined,
     int pos_row,
-    __nv_bfloat16* __restrict__ C
+    __nv_bfloat16* __restrict__ C,
+    int cta_rank
 ) {
     __nv_bfloat16* row_out = C + (long long)(gm_base + lane) * N_DIM + n_start;
-    const int taddr_base = tmem_addr + (ew * 32 << 16);
+    const int taddr_base = tmem_addr + ((cta_rank * 128 + ew * 32) << 16);
     const __nv_bfloat16* comb_row = combined + (long long)pos_row * N_DIM + n_start;
 
     // Double-buffered TMEM registers
@@ -258,10 +267,11 @@ __global__ void precompute_combined(
 }
 
 // ═════════════════════════════════════════════════════════════
-// Patch embed GEMM — warp-specialized tcgen05 (cta_group::1)
+// Patch embed GEMM — warp-specialized tcgen05 (cta_group::2)
 // ═════════════════════════════════════════════════════════════
 
 __global__ void __launch_bounds__(192, 1)
+__cluster_dims__(2, 1, 1)
 patch_embed_gemm(
     const __grid_constant__ CUtensorMap tma_a,
     const __grid_constant__ CUtensorMap tma_b,
@@ -275,20 +285,25 @@ patch_embed_gemm(
     const int warp  = tid / 32;
     const int lane  = tid % 32;
 
-    // Per-stage SMEM offsets (6 stages, no sums buffer needed)
-    static constexpr int off_a[N_STAGES] = {0, 32768, 65536, 98304, 131072, 163840};
-    static constexpr int off_b[N_STAGES] = {16384, 49152, 81920, 114688, 147456, 180224};
+    // CTA rank within 2-CTA cluster
+    int cta_rank;
+    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+    const int cluster_id = sm_id / 2;       // 0..73
+    const int num_clusters = SM_COUNT / 2;   // 74
 
-    // ── TMEM allocation: 2 buffers (cta_group::1) ──
-    // One warp calls alloc (all lanes converged); other warps skip.
-    // No relinquish needed — only required if other warps also want to alloc.
+    // Per-stage SMEM offsets (6 stages, A=16384 + B/2=8192 = 24576 per stage)
+    static constexpr int off_a[N_STAGES] = {0, 24576, 49152, 73728, 98304, 122880};
+    static constexpr int off_b[N_STAGES] = {16384, 40960, 65536, 90112, 114688, 139264};
+
+    // ── TMEM allocation: 2 buffers (cta_group::2, both CTAs cooperate) ──
     if (warp == 0) {
-        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+        asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
             :: "r"(smem_to_uint(smem + OFF_TMEM_0)), "r"(TMEM_COLS));
-        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+        asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
             :: "r"(smem_to_uint(smem + OFF_TMEM_1)), "r"(TMEM_COLS));
     }
-    __syncthreads();
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
     const uint32_t tmem_base0 = *(volatile uint32_t*)(smem + OFF_TMEM_0);
     const uint32_t tmem_base1 = *(volatile uint32_t*)(smem + OFF_TMEM_1);
     const uint32_t tmem_base[2] = {tmem_base0, tmem_base1};
@@ -296,16 +311,17 @@ patch_embed_gemm(
     // ── Mbarrier init ──
     if (tid == 0) {
         for (int s = 0; s < N_STAGES; s++) {
-            mbar_init(smem_to_uint(smem + OFF_TMA_MBAR + s * 8), 1);
-            mbar_init(smem_to_uint(smem + OFF_MMA_MBAR + s * 8), 1);
+            mbar_init(smem_to_uint(smem + OFF_TMA_MBAR + s * 8), 2);   // both CTAs arrive at CTA0's TMA mbar
+            mbar_init(smem_to_uint(smem + OFF_MMA_MBAR + s * 8), 1);   // CTA0 multicast commits → 1 arrival per CTA
         }
-        // Double-buffered mainloop/epilogue mbarriers (SUPERIOR pattern)
+        // Double-buffered mainloop/epilogue mbarriers
         for (int i = 0; i < 2; i++) {
-            mbar_init(smem_to_uint(smem + OFF_MAINLOOP_MBAR + i * 8), 1);     // W1 arrives once
-            mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR + i * 8), 4 * 32); // all 128 epilogue threads
+            mbar_init(smem_to_uint(smem + OFF_MAINLOOP_MBAR + i * 8), 1);          // CTA0 multicast commits
+            mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR + i * 8), 4 * 2 * 32); // 4 warps × 2 CTAs × 32 threads
         }
     }
-    __syncthreads();
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
 
     uint32_t tma_mbar[N_STAGES], mma_mbar[N_STAGES];
     uint32_t smem_a[N_STAGES], smem_b[N_STAGES];
@@ -318,8 +334,8 @@ patch_embed_gemm(
     const uint32_t mainloop_mbar_addr = smem_to_uint(smem + OFF_MAINLOOP_MBAR);
     const uint32_t epilogue_mbar_addr = smem_to_uint(smem + OFF_EPILOGUE_MBAR);
 
-    const int tile_start = (int)((long long)sm_id * TOTAL_TILES / SM_COUNT);
-    const int tile_end   = (int)((long long)(sm_id + 1) * TOTAL_TILES / SM_COUNT);
+    const int tile_start = (int)((long long)cluster_id * TOTAL_TILES / num_clusters);
+    const int tile_end   = (int)((long long)(cluster_id + 1) * TOTAL_TILES / num_clusters);
 
     int tma_phase[N_STAGES] = {0};
     int mma_phase[N_STAGES] = {0};
@@ -337,12 +353,12 @@ patch_embed_gemm(
         const int tm = tile_idx / TILES_N;
         int tn = tile_idx % TILES_N;
         if (tm & 1) tn = TILES_N - 1 - tn;  // snake: reverse odd M-rows
-        const int m_start = tm * TM;
+        const int m_start = tm * TM * 2 + cta_rank * TM;  // macro tile (256 rows) + CTA offset
         const int n_start = tn * TN;
 
         // ═══ K-LOOP (W0-1) + OVERLAPPED EPILOGUE (W2-5) ═══
         if (warp == 0) {
-            // ── LOAD WARP (W0): TMA async bulk copies ──
+            // ── LOAD WARP (W0): TMA async bulk copies (both CTAs) ──
             if (lane == 0) {
                 for (int ki = 0; ki < K_ITERS; ki++) {
                     const int s = ki % N_STAGES;
@@ -353,14 +369,16 @@ patch_embed_gemm(
                         mma_phase[s] ^= 1;
                     }
 
-                    mbar_arrive_expect_tx(tma_mbar[s], TMA_BYTES);
-                    tma_load_2d(smem_a[s], &tma_a, k_start, m_start, tma_mbar[s]);
-                    tma_load_2d(smem_b[s], &tma_b, k_start, n_start, tma_mbar[s]);
+                    // Both CTAs arrive at CTA0's TMA mbar (masked)
+                    const uint32_t tma_mbar_masked = tma_mbar[s] & 0xFEFFFFFF;
+                    tma_load_2d(smem_a[s], &tma_a, k_start, m_start, tma_mbar_masked);
+                    tma_load_2d(smem_b[s], &tma_b, k_start, n_start + cta_rank * (TN/2), tma_mbar_masked);
+                    mbar_arrive_expect_tx(tma_mbar_masked, TMA_BYTES);
                 }
             }
         } else if (warp == 1) {
-            // ── MMA WARP (W1): tcgen05.mma → tmem_base[buf] ──
-            if (lane == 0) {
+            // ── MMA WARP (W1): tcgen05.mma → tmem_base[buf] (CTA0 only) ──
+            if (lane == 0 && cta_rank == 0) {
                 // Wait for epilogue to release tmem[buf]
                 mbar_wait(epilogue_mbar_addr + buf * 8, epi_phase[buf]);
                 epi_phase[buf] ^= 1;
@@ -381,12 +399,13 @@ patch_embed_gemm(
                             "{\n\t"
                             ".reg .pred p;\n\t"
                             "setp.ne.b32 p, %4, 0;\n\t"
-                            "tcgen05.mma.cta_group::1.kind::f8f6f4 "
-                            "[%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t"
+                            "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                            "[%0], %1, %2, %3, {%5, %6, %7, %8, %9, %10, %11, %12}, p;\n\t"
                             "}"
                             :
                             : "r"(tmem_base[buf]), "l"(desc_a), "l"(desc_b), "r"(IDESC),
                               "r"(accumulate),
+                              "r"(0), "r"(0), "r"(0), "r"(0),
                               "r"(0), "r"(0), "r"(0), "r"(0));
                     }
 
@@ -397,24 +416,22 @@ patch_embed_gemm(
                             "{\n\t"
                             ".reg .pred p;\n\t"
                             "setp.ne.b32 p, %4, 0;\n\t"
-                            "tcgen05.mma.cta_group::1.kind::f8f6f4 "
-                            "[%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t"
+                            "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                            "[%0], %1, %2, %3, {%5, %6, %7, %8, %9, %10, %11, %12}, p;\n\t"
                             "}"
                             :
                             : "r"(tmem_base[buf]), "l"(desc_a), "l"(desc_b), "r"(IDESC),
                               "r"(1),
+                              "r"(0), "r"(0), "r"(0), "r"(0),
                               "r"(0), "r"(0), "r"(0), "r"(0));
                     }
 
-                    asm volatile(
-                        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
-                        :: "r"(mma_mbar[s]) : "memory");
+                    // Multicast commit → MMA mbar in both CTAs
+                    tcgen05_commit_mcast(mma_mbar[s], 0x3);
                 }
 
-                // Signal K-loop done: commit → mainloop_mbar[buf]
-                asm volatile(
-                    "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
-                    :: "r"(mainloop_mbar_addr + buf * 8) : "memory");
+                // Signal K-loop done: multicast commit → mainloop_mbar[buf] in both CTAs
+                tcgen05_commit_mcast(mainloop_mbar_addr + buf * 8, 0x3);
             }
         } else {
             // ── OVERLAPPED EPILOGUE (W2-5) ──
@@ -435,22 +452,21 @@ patch_embed_gemm(
                 const int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
                 if (ptm & 1) ptn = TILES_N - 1 - ptn;
-                const int prev_m = ptm * TM;
+                const int prev_m = ptm * TM * 2 + cta_rank * TM;
                 const int prev_n = ptn * TN;
 
                 const int gm_base = prev_m + ew * 32;
                 const int pos_row = (gm_base + lane) % SEQ_LEN;
-                epilogue_store(tmem_base[prev_buf], ew, lane, gm_base, prev_n, combined, pos_row, C);
+                epilogue_store(tmem_base[prev_buf], ew, lane, gm_base, prev_n, combined, pos_row, C, cta_rank);
 
-                // Signal: done reading tmem[prev_buf]
-                mbar_arrive(epilogue_mbar_addr + prev_buf * 8);
+                // Signal: done reading tmem[prev_buf] — arrive at CTA0's epilogue mbar
+                const uint32_t epi_mbar_masked = (epilogue_mbar_addr + prev_buf * 8) & 0xFEFFFFFF;
+                mbar_arrive(epi_mbar_masked);
             }
         }
     }  // tile loop
 
-    // ── DRAIN + DEALLOC (epilogue warps only, no __syncthreads) ──
-    // Following SUPERIOR.cu pattern: W0/W1 exit after tile loop,
-    // W2-5 drain the last tile via mbar_wait + named barrier, then dealloc TMEM.
+    // ── DRAIN (W2-5 only): epilogue for the last tile ──
     if (warp >= 2) {
         const int ew = warp - 2;
         const int last_buf = (tile_end - 1) & 1;
@@ -461,27 +477,27 @@ patch_embed_gemm(
         asm volatile("bar.sync %0, %1;" :: "r"(1), "r"(4 * 32) : "memory");
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-        // Epilogue store for the last tile (inline BF16 combined loads)
+        // Epilogue store for the last tile
         const int last_idx = tile_end - 1;
         const int ltm = last_idx / TILES_N;
         int ltn = last_idx % TILES_N;
         if (ltm & 1) ltn = TILES_N - 1 - ltn;
-        const int last_m = ltm * TM;
+        const int last_m = ltm * TM * 2 + cta_rank * TM;
         const int last_n = ltn * TN;
         const int gm_base = last_m + ew * 32;
         const int pos_row = (gm_base + lane) % SEQ_LEN;
-        epilogue_store(tmem_base[last_buf], ew, lane, gm_base, last_n, combined, pos_row, C);
+        epilogue_store(tmem_base[last_buf], ew, lane, gm_base, last_n, combined, pos_row, C, cta_rank);
+    }
 
-        // Sync epilogue warps before dealloc
-        asm volatile("bar.sync %0, %1;" :: "r"(1), "r"(4 * 32) : "memory");
+    // ── Cluster sync + TMEM dealloc (all warps, both CTAs) ──
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
 
-        // TMEM dealloc (warp 2 only, cta_group::1)
-        if (warp == 2) {
-            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-                :: "r"(tmem_base[0]), "r"(TMEM_COLS));
-            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-                :: "r"(tmem_base[1]), "r"(TMEM_COLS));
-        }
+    if (warp == 2) {
+        asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
+            :: "r"(tmem_base[0]), "r"(TMEM_COLS));
+        asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
+            :: "r"(tmem_base[1]), "r"(TMEM_COLS));
     }
 }
 
@@ -491,7 +507,7 @@ patch_embed_gemm(
 
 int main() {
     setbuf(stdout, NULL);  // unbuffered stdout for debugging
-    printf("SigLIP2 patch embed GEMM — tcgen05 cta_group::1 (6 warps)\n");
+    printf("SigLIP2 patch embed GEMM — tcgen05 cta_group::2 (6 warps, cluster of 2)\n");
     printf("  GEMM: [%d,%d] x [%d,%d]^T  6-stage pipeline  inline BF16 combined  st.global stores  idesc: 0x%08X\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, IDESC);
 
@@ -543,7 +559,7 @@ int main() {
     {
         uint64_t dims[2]    = {(uint64_t)K_DIM, (uint64_t)N_DIM};
         uint64_t strides[1] = {(uint64_t)K_DIM};
-        uint32_t box[2]     = {TK, TN};
+        uint32_t box[2]     = {TK, TN/2};   // each CTA loads half of B columns
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_b,
             CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (void*)d_B,
