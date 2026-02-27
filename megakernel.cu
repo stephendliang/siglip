@@ -1,6 +1,6 @@
-// Hand-tuned from gen.py output — TK=128, SWIZZLE_128B, 6-stage pipeline
+// Hand-tuned from gen.py output — TK=128, SWIZZLE_128B, 4-stage pipeline
 // Target: B200  Batch: 4736  GEMM: [928256,768]×[768,768]^T
-// Pipeline: 6-stage  K-iters: 6  MMA/iter: 4  idesc: 0x10400010
+// Pipeline: 4-stage (parameterized)  K-iters: 6  MMA/iter: 4  idesc: 0x10400010
 // Warps: 2+NUM_EPI_WARPS  cta_group::2  __cluster_dims__(2,1,1)
 // Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2+,x32 TMEM ld,col-split)  BF16 output
 // tcgen05.mma.cta_group::2.kind::f8f6f4  (E4M3 × E4M3 → FP32)
@@ -27,13 +27,14 @@
 #define TILES_N        3
 #define K_ITERS        6
 #define TOTAL_TILES    10878
-#define N_STAGES       6
-#define OFF_TMEM           196608
-#define OFF_TMA_MBAR       196616
-#define OFF_MMA_MBAR       196664
-#define OFF_MAINLOOP_MBAR  196712
-#define OFF_EPILOGUE_MBAR  196728
-#define SMEM_BYTES         196864
+#define N_STAGES       4                                          // change to 4 or 5 to test
+#define STAGE_BYTES    32768                                      // 16KB A + 16KB B per stage
+#define OFF_TMEM           (N_STAGES * STAGE_BYTES)
+#define OFF_TMA_MBAR       (OFF_TMEM + 8)
+#define OFF_MMA_MBAR       (OFF_TMA_MBAR + N_STAGES * 8)
+#define OFF_MAINLOOP_MBAR  (OFF_MMA_MBAR + N_STAGES * 8)
+#define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
+#define SMEM_BYTES         ((OFF_EPILOGUE_MBAR + 16 + 127) & ~127)
 #define TMEM_COLS      512
 #define IDESC          0x10400010U
 #define SBO            1024
@@ -314,9 +315,7 @@ patch_embed_gemm(
     const int cluster_id = sm_id / 2;       // 0..73
     const int num_clusters = SM_COUNT / 2;   // 74
 
-    // Per-stage SMEM offsets (6 stages, A=16384 + B/2=16384 = 32768 per stage)
-    static constexpr int off_a[N_STAGES] = {0, 32768, 65536, 98304, 131072, 163840};
-    static constexpr int off_b[N_STAGES] = {16384, 49152, 81920, 114688, 147456, 180224};
+    // Per-stage SMEM layout: A_tile(16KB) + B_tile(16KB) = 32KB per stage
 
     // ── Mbarrier init ──
     if (tid == 0) {
@@ -344,8 +343,8 @@ patch_embed_gemm(
     for (int s = 0; s < N_STAGES; s++) {
         tma_mbar[s] = smem_to_uint(smem + OFF_TMA_MBAR + s * 8);
         mma_mbar[s] = smem_to_uint(smem + OFF_MMA_MBAR + s * 8);
-        smem_a[s]   = smem_to_uint(smem + off_a[s]);
-        smem_b[s]   = smem_to_uint(smem + off_b[s]);
+        smem_a[s]   = smem_to_uint(smem + s * STAGE_BYTES);
+        smem_b[s]   = smem_to_uint(smem + s * STAGE_BYTES + 16384);
     }
     const uint32_t mainloop_mbar_addr = smem_to_uint(smem + OFF_MAINLOOP_MBAR);
     const uint32_t epilogue_mbar_addr = smem_to_uint(smem + OFF_EPILOGUE_MBAR);
