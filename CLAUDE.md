@@ -54,15 +54,19 @@ The kernel is **MMA/K-loop bound**. `selected` (productive issue) at 22.9% is 2.
 
 **Key findings:**
 
-1. **K-loop bound, not epilogue-bound** (confirmed F10/F11/F13/F14). The epilogue runs in the K-loop's shadow. All epilogue-only optimizations tested (software pipelining, L1 bypass, cache hints, SMEM staging of combined) either neutral or regressed.
+1. **TC pipe active only 50%** — tensor cores idle half the time. cuBLAS achieves ~79% on this shape. The 29pp gap is the primary optimization target. See `docs/make_better.md` for full analysis.
 
-2. **L1 no longer the ceiling** (67%, down from 85%). F13's blocked combined relayout eliminated L1 cache line scatter. The remaining L1 traffic is K-loop inherent (TMA fills, MMA). Combined loads are fully optimized with near-perfect L1 locality.
+2. **K-loop bound, not epilogue-bound** (confirmed F10/F11/F13/F14). The epilogue runs in the K-loop's shadow. All epilogue-only optimizations tested (software pipelining, L1 bypass, cache hints, SMEM staging of combined) either neutral or regressed.
 
-3. **TMEM readback (`long_scoreboard`, 4.7%)** — largest stall but only 1/5 of productive issue rate. Not a dominant bottleneck.
+3. **Zero TMA multicast** — B matrix loaded independently by each CTA. `dest_multicast = 0`, `dest_self = 133M sectors`. Enabling multicast for B loads would halve B bandwidth.
 
-4. **Register pressure (223 regs/thread, 0 spills)** — limits occupancy to 1 CTA/SM. Not actionable without major restructuring.
+4. **SMEM bank conflicts 32%/22%** (ld/st) — significant but hidden in K-loop shadow. STAGING_ROW_PAD doesn't fully prevent Phase 2 transposed read conflicts.
 
-**To go faster:** Must reduce K-loop time itself — fewer MMA instructions per tile, faster TMA loads, or reduced per-tile overhead. Epilogue is not on the critical path.
+5. **Warp latency dominated by TMEM** — `long_scoreboard` at 390K cycles/warp is 3.3× productive `selected` (119K). The scheduler hides this (only 4.7% in pct view) but it means epilogue warps spend most of their time waiting.
+
+6. **Register pressure (223 regs/thread, 0 spills)** — limits occupancy to 1 CTA/SM. Not actionable without major restructuring.
+
+**To go faster:** Reduce TC idle time — fewer tiles (larger TM), fewer K-iterations per tile, less per-tile overhead, or enable TMA multicast for B. See `docs/make_better.md`.
 
 **Tested and ruled out:** See `EXPERIMENTS.md` for 14 experiments with hypotheses, results, and analysis.
 
@@ -102,7 +106,8 @@ edit megakernel.cu -> make -> ./siglip_vision
 |------|------|
 | `megakernel.cu` | **Source of truth** — hand-tuned CUDA kernel |
 | `EXPERIMENTS.md` | Experiment log, profiling data, and optimization history |
-| `docs/profiling.md` | Profiling commands (ncu, cuobjdump, compute-sanitizer) |
+| `docs/make_better.md` | Advanced profiling — TC utilization, per-pipe breakdown, bank conflicts, TMA multicast |
+| `docs/whats_wrong.md` | Triage-level profiling — barrier stalls, TMA serialization, correctness |
 | `docs/architecture.md` | Model specs, HW config, milestones (partially stale) |
 | `gen.py` | Codegen script — **outdated, do not use** |
 | `compare.py` | ncu CSV diff tool — usage: `python compare.py a.csv b.csv` |
