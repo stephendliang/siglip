@@ -124,8 +124,6 @@ Impact estimate: 5.37M extra cycles from load conflicts. At ~936K cycles per SM:
 
 ## 4. TMA multicast utilization
 
-With `cta_group::2` and `__cluster_dims__(2,1,1)`, the B matrix tile is the same for both CTAs in the cluster. Multicast would let one TMA load serve both CTAs.
-
 ```bash
 ncu --metrics \
     l1tex__m_xbar2l1tex_read_sectors_mem_global_op_tma_ld.sum,\
@@ -142,9 +140,11 @@ ncu --metrics \
 | TMA load sectors (multicast) | **0** |
 | TMA load sectors (self) | 133,668,864 |
 
-**Every single TMA load is self — zero multicast.** Both CTAs load their own copy of the B matrix independently. Enabling multicast for B loads would halve the B matrix bandwidth, reducing L2 and DRAM pressure.
+**Every single TMA load is self — zero multicast.** This is correct and unavoidable with the current design.
 
-This is potentially actionable even though TMA `wait` stalls are only 1.5% — the bandwidth savings could indirectly speed up TMA loads for A.
+**Why multicast doesn't apply:** With `cta_group::2` and `__cluster_dims__(2,1,1)`, each CTA loads a DIFFERENT half of the B tile — CTA0 loads B[k, n:n+128], CTA1 loads B[k, n+128:n+256] (see `tma_b` box = `{TK, TN/2}` and column offset `n_start + cta_rank * (TN/2)`). The cta_group::2 MMA reads B from both CTAs' SMEM (`UTCMMA matrix_b scope_2cta`) and combines the halves for the full 256-col output. TMA multicast delivers identical data to the same SMEM offset in all target CTAs — since each CTA needs unique B data, multicast would produce duplicate output columns. A loads are also unique per CTA (different M rows). No intra-cluster multicast opportunity exists with this N-split distribution.
+
+Enabling multicast would require restructuring to replicate B (32KB/stage per CTA, reducing pipeline to 3 stages) or switching to TN=128 with cta_group::1, neither of which saves total DRAM bandwidth — the 768×768 B matrix has fixed unique data regardless of partitioning.
 
 ---
 
@@ -322,7 +322,7 @@ with open('source_counters.csv') as f:
 |-----------|----------|-------------|
 | TC idle 50% of the time | pipe_tc 50.1% | **Primary** — this IS the gap |
 | TC only 87% efficient when active | 1892 vs 2169 theoretical | ~13% within-active loss |
-| Zero TMA multicast for B | dest_multicast = 0 | Wastes L2/DRAM bandwidth |
+| Zero TMA multicast | dest_multicast = 0 | Not actionable — B is N-split across CTAs (see §4) |
 | SMEM bank conflicts 32% | epilogue-only, hidden | 0% (in K-loop shadow) |
 | Instruction cache | 0.22% | Negligible |
 
@@ -330,6 +330,6 @@ with open('source_counters.csv') as f:
 
 1. **Reduce TC idle time** — the 50% idle is tile transitions + pipeline fill + W1 overhead. Measure per-tile overhead with instrumentation (clock64 timestamps at MMA start/end).
 
-2. **Enable TMA multicast for B loads** — halves B matrix bandwidth, may reduce TMA `wait` stalls and L2 contention.
+2. ~~**Enable TMA multicast for B loads**~~ — **Not applicable.** B is N-split across CTAs (each loads different 128-col half). Multicast requires identical data. See §4.
 
 3. **Profile W1 specifically** — the aggregate stall data is dominated by W2-W6. Need source-level attribution to isolate what W1 (the sole MMA issuer) is stalled on between MMA instructions.

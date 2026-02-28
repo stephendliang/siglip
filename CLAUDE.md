@@ -58,7 +58,7 @@ The kernel is **epilogue-bound** (confirmed by clock64 F15 profiling). W1 stalls
 
 2. **Epilogue-bound** (confirmed by clock64 F15, partially mitigated by F18). Phase 1 (TMEM readback) still dominates at 83.3%. Double-buffered SMEM staging (F18) hides Phase 2A stores in TMEM stalls, reducing epilogue from 5,833 to 4,926 cycles (-15.6%). Direct global stores (F17) made Phase 1 19% slower due to L1 contention — SMEM staging is essential.
 
-3. **Zero TMA multicast** — B matrix loaded independently by each CTA. `dest_multicast = 0`, `dest_self = 133M sectors`. Enabling multicast for B loads would halve B bandwidth.
+3. **Zero TMA multicast** — not actionable. B is N-split across CTAs (CTA0 loads B[k, n:n+128], CTA1 loads B[k, n+128:n+256]). cta_group::2 MMA reads B from both CTAs (`scope_2cta`). Multicast requires identical data at the same SMEM offset — inapplicable to complementary B halves.
 
 4. **SMEM bank conflicts 32%/22%** (ld/st) — significant but hidden in K-loop shadow. STAGING_ROW_PAD doesn't fully prevent Phase 2 transposed read conflicts.
 
@@ -66,7 +66,7 @@ The kernel is **epilogue-bound** (confirmed by clock64 F15 profiling). W1 stalls
 
 6. **Register pressure (223 regs/thread, 0 spills)** — limits occupancy to 1 CTA/SM. Not actionable without major restructuring.
 
-**To go faster:** TMA multicast for B (frees L2/DRAM bandwidth), larger TM to amortize per-tile overhead, or further epilogue Phase 1 optimization. See `docs/make_better.md`.
+**To go faster:** Larger TM to amortize per-tile overhead, further epilogue Phase 1 optimization, or next-tile TMA prefetch (F20 showed ~0% — DRAM latency bottleneck, not scheduling). TMA multicast for B is not applicable (B is N-split across CTAs). See `docs/make_better.md`.
 
 **Tested and ruled out:** See `EXPERIMENTS.md` for 19 experiments with hypotheses, results, and analysis. F19 confirmed Phase 2B's LSU stores contend with K-loop (+170 cycles, +4.2%) when overlapped via early mbar signal — but TMA bulk stores (`cp.async.bulk`, 32×256B) are 3× slower than parallel manual stores due to per-instruction overhead. Padded SMEM (272-byte rows for bank-conflict-free Phase 1B) prevents single-shot TMA tensor stores.
 
