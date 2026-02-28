@@ -29,6 +29,7 @@ Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 | dbe8c72 | F15+F16: epilogue phase timing + 4 epilogue warps | 0.560 | 1955 | 219 | |
 | d1fc103 | F18: double-buffered SMEM epilogue overlap | 0.543 | 2018 | 223 | current best |
 | — | F19: early epilogue mbar + TMA Phase 2B stores | 0.542 | 2020 | 223 | early mbar neutral, TMA stores rejected |
+| — | F20: next-tile TMA prefetch | 0.544 | 2014 | 221 | rejected — ~0% improvement |
 
 Reference: cuBLAS per-tensor FP8 (best-of-8 algos, 256MB workspace) = 0.365 ms / 3001 TFLOPS (GEMM only, no fusion).
 cuBLAS + unfused pos_embed = 0.835 ms end-to-end.
@@ -603,3 +604,53 @@ Predicted speedup: ~7% (fixed-point analysis: epi_mbar_wait 1,530 → 1,119 → 
 The padded SMEM layout (STAGING_HALF_ROW_BYTES = 272 = 256 useful + 16 pad, needed for bank-conflict-free Phase 1B writes where consecutive lanes must map to different banks: lane 0 → bank 0, lane 1 → bank 4, lane 2 → bank 8 with 272-byte stride; without pad, 256-byte stride maps ALL lanes to bank 0) prevents using a single `cp.async.bulk.tensor.2d` TMA tensor store, which would amortize the overhead across the full 8 KB transfer. The tensor store requires SMEM layout to match the descriptor's swizzle mode (contiguous 256-byte rows with `CU_TENSOR_MAP_SWIZZLE_NONE`), incompatible with our 272-byte padded rows.
 
 **Key insight:** Phase 2B's L1/LSU contention with the K-loop is real (confirmed by K-loop improving 12.6% when Phase 2B uses TMA), but the only way to exploit this is a SMEM layout that's both bank-conflict-free for Phase 1B writes AND contiguous for TMA tensor stores. This requires swizzled SMEM (e.g., `CU_TENSOR_MAP_SWIZZLE_128B`), which would be a major restructuring of the staging buffer architecture.
+
+---
+
+### Experiment F20: Next-tile TMA prefetch
+
+**Date:** 2026-02-28
+**Baseline:** 0.542 ms / 2020 TFLOPS (F19a early mbar), 223 regs, 0 spills
+**Result:** 0.544 ms / 2014 TFLOPS, 221 regs, 0 spills (16-byte stack frame)
+**Verdict:** REJECTED — zero meaningful improvement
+
+**Hypothesis:** W1's TMA stage-0 wait (818 cycles) exists because the DRAM latency for loading tile N+1's A matrix exceeds the epilogue_mbar overlap window. By having W0 issue TMA loads for tile N+1's ki=0 at the END of tile N (after the K-loop), the TMA gets a head start. By the time W1 finishes epilogue_mbar wait for tile N+1, stage 0 data should already be in SMEM.
+
+**Changes:**
+- Separated W0's K-loop: ki=0 handled standalone (conditionally skipped if prefetched), ki=1..5 in a constant-bounds loop (preserves compiler unrolling)
+- After ki=5, W0 computes next tile's coordinates (snake ordering), waits for `mma_mbar[0]` (W1 consumed ki=4), issues TMA loads for next tile's ki=0 into stage 0
+- mbarrier phase tracking verified across multiple tiles: prefetch consumes `mma_mbar[0]` at end of tile N, so tile N+1 skips ki=0's mbar wait + TMA load; `tma_phase` unaffected (W1 consumer, not W0 producer)
+
+**Implementation note:** First attempt used `for (int ki = ki_start; ...)` with runtime `ki_start = prefetched`. This prevented loop unrolling: 196 regs (+96-byte stack frame) → 0.784 ms (44% regression). Fixed by splitting ki=0 from ki=1..5 with constant loop bounds: 221 regs, 16-byte stack frame.
+
+**Timing:**
+
+| Metric | F19a baseline | F20 prefetch | Delta |
+|---|---:|---:|:---:|
+| **Wall clock** | **0.542 ms** | **0.544 ms** | **~0%** |
+| Epilogue mbar wait | 1,122 cycles | 1,146 cycles | +24 (noise) |
+| TMA stage-0 wait | 818 cycles | 797 cycles | **-21 (noise)** |
+| K-loop | 4,187 cycles | 4,175 cycles | -12 (noise) |
+| Total tile | 6,128 cycles | 6,120 cycles | -8 (noise) |
+| Phase 1+2A | 4,133 cycles | 4,107 cycles | -26 (noise) |
+| Phase 2B | 825 cycles | 817 cycles | -8 (noise) |
+| Total epilogue | 4,958 cycles | 4,924 cycles | -34 (noise) |
+
+**Why it failed:** The prefetch provides essentially zero head start. The key insight is understanding the concurrent timeline:
+
+```
+Without prefetch (normal flow):
+  W0 enters tile N+1 → ~20 cycles overhead → mma_mbar[0] check (already passed) → issues TMA
+  W1 enters tile N+1 → epilogue_mbar wait (1,122 cycles) → tma_mbar[0] wait (818 cycles)
+  TMA had ~1,122 cycles of flight time during epi_mbar_wait
+  DRAM latency ≈ 1,122 + 818 ≈ 1,940 cycles
+
+With prefetch:
+  W0 end of tile N → mma_mbar[0] wait → issues TMA → ~20 cycles loop transition → enters tile N+1
+  The prefetch issues TMA only ~20-30 cycles before normal flow would have
+  TMA had ~1,142 cycles of flight time → TMA0_wait ≈ 1,940 - 1,142 = 798 (vs 818)
+```
+
+W0 already issues ki=0 TMA loads at the very start of each tile body, concurrently with W1's epilogue_mbar wait. The ~1,122-cycle overlap window is substantial but still insufficient to cover the ~1,940-cycle DRAM latency for the A matrix. The prefetch only shifts the TMA issue point by the tile loop transition overhead (~20-30 cycles) — negligible against the 818-cycle shortfall.
+
+**What would actually help TMA0_wait:** The 818-cycle gap is a DRAM bandwidth limitation, not a scheduling problem. Reducing it requires either: (1) TMA multicast for B matrix (halves B bandwidth, frees DRAM for A), (2) larger tile dimensions to amortize per-tile DRAM access, or (3) L2 residency controls to keep B cached.
