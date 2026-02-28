@@ -4,7 +4,7 @@ Kernel: `patch_embed_gemm` — persistent megakernel for SigLIP2 patch embed GEM
 GEMM: `[928256, 768] x [768, 768]^T`, FP8 E4M3 inputs, BF16 output with fused bias + positional embedding.
 Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 
-**Current best: 0.630 ms / 1739 TFLOPS** (fused end-to-end). 222 regs, 0 spills.
+**Current best: 0.579 ms / 1892 TFLOPS** (fused end-to-end). 223 regs, 0 spills.
 
 ---
 
@@ -24,7 +24,8 @@ Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 | 521ad55 | 5th epilogue warp via column-split | 0.722 | 1517 | — | |
 | cefc59d | Reduce pipeline stages 6→4 | 0.700 | 1564 | 216 | |
 | c32ab7a | Epilogue SMEM staging → coalesced stores | 0.633 | 1729 | 222 | |
-| d882aba | Phase 2 unroll 4→8 | 0.630 | 1739 | 222 | current best |
+| d882aba | Phase 2 unroll 4→8 | 0.630 | 1739 | 222 | |
+| 9bf658a | Blocked combined relayout | 0.579 | 1892 | 223 | current best |
 
 Reference: cuBLAS per-tensor FP8 (best-of-8 algos, 256MB workspace) = 0.365 ms / 3001 TFLOPS (GEMM only, no fusion).
 cuBLAS + unfused pos_embed = 0.835 ms end-to-end.
@@ -236,6 +237,72 @@ NUM_EPI_WARPS=5 was not viable: with TN=128, the column-split gives NC_COLS=64 �
 5. SMEM/TMEM savings (80 KB freed, TMEM 512→256) provided no benefit because the bottleneck is tile-level scheduling overhead, not memory capacity
 
 **Key insight:** TN=256 is fundamentally superior for this GEMM shape. The 256-wide tile amortizes per-tile overhead over 2× more compute. TN=128 is now ruled out definitively — tested under both old (1190 TFLOPS) and current (1560 TFLOPS peak) architectures, and loses both times for the same structural reason.
+
+---
+
+### Experiment F13: Blocked combined relayout (COMMITTED)
+
+**Date:** 2026-02-28
+**Baseline:** 0.630 ms / 1739 TFLOPS / 222 regs
+**Result:** 0.579 ms / 1892 TFLOPS (+8.1%), 223 regs, 0 spills
+**Verdict:** COMMITTED (9bf658a)
+
+**Hypothesis:** The combined tensor `[196, 768]` row-major forces each lane's `uint4` load to stride 1536 bytes across rows, scattering L1 cache lines. Relaying into a blocked `[7, 24, 32, 32]` format (32×32 blocks, rows padded to 224) makes each nc iteration read from a contiguous 2 KB block, improving L1 spatial locality. Since L1 tex is at 85%, reducing L1 pressure from combined loads should free bandwidth for K-loop TMA/MMA traffic.
+
+**Changes:**
+1. `precompute_combined` (host-side, outside timed region): outputs blocked layout. Rows padded to 224 (ceil(196/32)*32), padding rows wrap via `row % 196`.
+2. `epilogue_store`: blocked addressing replaces `comb_row = combined + pos_row * N_DIM + n_start`. New: `comb_base` points into the block row, `comb_ptr` per-nc steps by `COMB_BLOCK_ELEMS` (1024). Within each nc iteration, offsets +0/+8/+16/+24 read 32 contiguous BF16 values.
+3. Allocation: `SEQ_LEN * N_DIM` → `COMB_PADDED_ROWS * N_DIM` (+43 KB device memory).
+
+**ncu profiling (vs 0.630 ms baseline):**
+
+| Metric | Baseline | F13 | Delta |
+|---|---:|---:|:---:|
+| **L1 tex** | **85.0%** | **67.8%** | **-17.2%** |
+| L2 | 54.0% | 49.3% | -4.7% |
+| DRAM | 27.0% | 31.7% | +4.7% |
+| selected (issuing) | 19.1% | 22.9% | **+3.8%** |
+| long_scoreboard (TMEM) | 4.4% | 4.7% | +0.3% |
+| short_scoreboard (SMEM) | 1.1% | 0.57% | **-0.53%** |
+| wait (TMA) | 1.2% | 1.5% | +0.3% |
+| sleeping | 1.1% | 0.96% | -0.14% |
+| barrier | 0.8% | 0.81% | unchanged |
+
+**Why it worked:** L1 tex dropped 85% → 68% — the single largest L1 reduction from any change on this kernel. The blocked layout eliminated L1 cache line scatter: each nc iteration now touches 2 contiguous cache lines (64 bytes in a 2 KB block) instead of 32 scattered lines across a 49 KB address range. The freed L1 bandwidth directly accelerated the K-loop (shared L1 with TMA/MMA traffic), raising productive issue rate from 19.1% → 22.9%. SMEM stalls halved (1.1% → 0.57%) due to less L1 backpressure. DRAM up slightly because the kernel runs faster (same data, less time).
+
+---
+
+### Experiment F14: Combined load L1 bypass (3 variants, all failed)
+
+**Date:** 2026-02-28
+**Baseline:** 0.579 ms / 1892 TFLOPS / 223 regs (F13)
+**Verdict:** ALL REJECTED
+
+**Hypothesis:** F13 reduced L1 from 85% → 68%. Eliminating combined loads from L1 entirely (via SMEM staging or cache hints) would free additional L1 bandwidth for K-loop traffic.
+
+**Variant A — cp.async.cg SMEM staging:**
+- Preloaded combined data into the existing staging buffer via `cp.async.cg.shared.global` (bypasses L1, goes L2→SMEM). Issued all preloads before Phase 1, waited with `cp.async.wait_all`, then Phase 1 reads combined from SMEM via `ld.shared.v4`.
+- **Result:** 0.809 ms / 1353 TFLOPS (**+40% regression**), 184 regs, 0 spills.
+
+**Variant B — ld.global.cg (bypass L1, cache in L2 only):**
+- Replaced the 4 `reinterpret_cast<const uint4*>` combined loads with `ld.global.cg.v4.u32` inline PTX. Same code structure as F13, just a cache hint change.
+- **Result:** 0.615 ms / 1780 TFLOPS (**+6% regression**), 197 regs, 0 spills.
+
+**Variant C — ld.global.cs (streaming/evict-first in L1):**
+- Same as B but with `.cs` hint (keeps L1 access but uses evict-first policy).
+- **Result:** 0.743 ms / 1474 TFLOPS (**+28% regression**), 197 regs, 0 spills.
+
+**Why ALL variants failed — the same root cause:**
+
+F13's blocked layout already solved the combined load problem. After relayout, each nc iteration reads 64 contiguous bytes from a 2 KB block — near-perfect L1 locality with ~100% hit rate at ~30 cycle latency. These loads overlap with TMEM latency (~200 cycles) in the existing code: they're issued before `TMEM_WAIT`, so their 30-cycle L1 latency is fully hidden.
+
+Every L1-bypass approach breaks this overlap:
+
+- **Variant A:** The `cp.async.wait_all` serialized the preload — the epilogue couldn't start Phase 1 until all combined data arrived in SMEM (~300+ cycles). This pushed the epilogue past the K-loop shadow, making it the new critical path. Additionally, SMEM reads (~20 cycles) are *too fast* to fill the TMEM overlap window — `TMEM_WAIT` now stalls for the full ~200 cycles with nothing useful hiding the latency.
+- **Variant B:** Going from L1 (~30 cycles) to L2 (~100-200 cycles) increased per-load latency. The loads still overlap with TMEM, but the longer latency slightly extended the epilogue. Since the epilogue was already near the K-loop boundary, even a small extension spilled into wall clock.
+- **Variant C:** The streaming buffer has worse hit rates than the main L1 cache on Blackwell. Combined data that previously hit L1 at 30 cycles now thrashed in the streaming buffer, causing frequent L2 fallbacks. Worst of both worlds: still in L1 path (no bandwidth relief) but with worse latency.
+
+**Meta-lesson:** Once the blocked layout gives near-perfect L1 locality, there is nothing left to optimize on the combined load path. The L1 utilization drop (85% → 68%) was the blocked layout eliminating L1 *capacity pressure*, not leaving headroom for further improvement. L1 at 68% is the new equilibrium — the remaining L1 traffic is from the K-loop itself (TMA fills, MMA traffic), not from combined loads.
 
 ---
 
