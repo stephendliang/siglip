@@ -5,12 +5,12 @@ FP8 (E4M3) precision, tcgen05 WGMMA, TMA, `cta_group::2` with 2-CTA clusters. Cr
 
 ## Current state
 
-**0.633 ms** fused (GEMM + bias + pos_embed) — **24% faster** than cuBLAS end-to-end (0.835 ms = best GEMM + unfused pos_embed).
+**0.579 ms / 1892 TFLOPS** fused (GEMM + bias + pos_embed) — **31% faster** than cuBLAS end-to-end (0.835 ms = best GEMM + unfused pos_embed).
 
 The kernel's value is **fusion**: the overlapped epilogue eliminates the 0.470 ms unfused pos_embed overhead entirely.
 
 cuBLAS pure GEMM is faster: 0.365 ms / 3001 TFLOPS (per-tensor FP8, best-of-8 algos, 256MB workspace).
-Our effective TFLOPS (1729) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
+Our effective TFLOPS (1892) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
 
 GEMM: `[928256, 768] x [768, 768]^T` with fused bias + positional embedding add, BF16 output.
 Batch = 4736 images x 196 patches = 928256 rows. Square weight matrix (768x768).
@@ -19,48 +19,52 @@ The kernel is correct (checksum validated) and stable.
 
 ## Current bottlenecks (from ncu profiling)
 
-The kernel is **L1 throughput-bound** (85% of peak). SMEM-staged coalesced stores eliminated the uncoalesced store bottleneck (100% excess L2 sectors → 33%), boosting warp issue rate by 35%.
+The kernel is **MMA/K-loop bound**. `selected` (productive issue) at 22.9% is 2.5× the sum of all stall categories (~8.8%). No single stall dominates. The epilogue completes within the K-loop's shadow — epilogue optimizations are irrelevant unless they also speed up the K-loop.
 
 **Warp stall breakdown:**
 
 | Stall | % of peak | Notes |
 |---|---|---|
-| long_scoreboard (TMEM) | 4.4% | Largest stall, reduced from 6.4% |
-| short_scoreboard (SMEM) | 1.1% | New: SMEM staging ld/st dependency chains |
-| wait (TMA) | 1.2% | Pipeline wraparound stalls |
-| sleeping | 1.1% | Warps parked between tiles |
+| **selected (issuing)** | **22.9%** | Productive execution — dominant |
+| long_scoreboard (TMEM) | 4.7% | TMEM readback latency |
+| wait (TMA) | 1.5% | TMA pipeline stalls |
+| sleeping | 0.95% | Warps parked between tiles |
 | barrier | 0.8% | Cluster sync |
-| selected (issuing) | 19.1% | Productive execution (up from 14.1%) |
+| short_scoreboard (SMEM) | 0.57% | SMEM staging ld/st chains |
+| not_selected | 0.2% | Eligible but not picked |
+| mio_throttle | 0.04% | Memory I/O backpressure — negligible |
 
 **Memory throughput:**
 
 | Subsystem | Utilization |
 |---|---|
-| **L1 tex** | **85%** — primary bottleneck |
-| L2 | 54% |
-| DRAM | 27% |
+| L1 tex | 67% — no longer the ceiling |
+| L2 | 49% |
+| DRAM | 32% |
+
+**Instruction mix (per kernel invocation):**
+
+| Type | Count |
+|---|---|
+| Total | 122.6M |
+| Global loads | 2.78M |
+| Global stores | 3.48M |
+| Shared loads | 3.48M |
+| Shared stores | 2.79M |
 
 **Key findings:**
 
-1. **L1 throughput (85%)** — still the dominant bottleneck, but now with healthier instruction mix. SMEM staging eliminated L1 read-modify-write amplification from uncoalesced stores (L1 hit rate dropped 61.7% → 33.6%, confirming elimination of partial-line writes).
+1. **K-loop bound, not epilogue-bound** (confirmed F10/F11/F13/F14). The epilogue runs in the K-loop's shadow. All epilogue-only optimizations tested (software pipelining, L1 bypass, cache hints, SMEM staging of combined) either neutral or regressed.
 
-2. **TMEM load latency (`long_scoreboard`, 4.4%)** — reduced from 6.4%. Less L1 backpressure from coalesced stores means TMEM loads complete faster.
+2. **L1 no longer the ceiling** (67%, down from 85%). F13's blocked combined relayout eliminated L1 cache line scatter. The remaining L1 traffic is K-loop inherent (TMA fills, MMA). Combined loads are fully optimized with near-perfect L1 locality.
 
-3. **SMEM staging cost (`short_scoreboard`, 1.1%)** — new stall from SMEM ld/st chains in Phase 2. Acceptable tradeoff for the 9.6% speedup.
+3. **TMEM readback (`long_scoreboard`, 4.7%)** — largest stall but only 1/5 of productive issue rate. Not a dominant bottleneck.
 
-4. **Register pressure (222 regs/thread, 0 spills)** — up from 216 due to Phase 2 loop variables. Still limits occupancy to 1 CTA/SM.
+4. **Register pressure (223 regs/thread, 0 spills)** — limits occupancy to 1 CTA/SM. Not actionable without major restructuring.
 
-## Ideas for further improvement
+**To go faster:** Must reduce K-loop time itself — fewer MMA instructions per tile, faster TMA loads, or reduced per-tile overhead. Epilogue is not on the critical path.
 
-**Most promising:**
-
-- **Smaller output tile (TN=128, revisit)**: With SMEM staging and other epilogue improvements applied, the shorter epilogue loop might tip the balance differently than when we last tried TN=128 (which was 1190 TFLOPS with x16 loads).
-
-- **Warp-specialized epilogue roles**: Instead of 5 identical epilogue warps, have some warps do TMEM→SMEM and others do SMEM→global. Decouples TMEM latency from store latency. Complex to implement.
-
-- **Reduce TMEM traffic**: If accumulator precision could be BF16 instead of FP32, TMEM readback halves. But tcgen05.mma only accumulates to FP32 — would need explicit FP32→BF16 before TMEM store (not available in current ISA).
-
-**Tested and ruled out:** See `EXPERIMENTS.md` for detailed experiment log with hypotheses, results, and analysis.
+**Tested and ruled out:** See `EXPERIMENTS.md` for 14 experiments with hypotheses, results, and analysis.
 
 ## Kernel structure
 
@@ -79,7 +83,7 @@ The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile 
 - TMEM: single alloc of 512 cols (TN*2), double-buffered via column offset (buf*TN)
 - SMEM: 4-stage pipeline (131 KB) + epilogue staging (5 warps x 16,896 = 84 KB) = ~211 KB total of 228 KB
 - Tiles: 3626 M-tiles x 3 N-tiles = 10,878 total, snake ordering
-- 222 registers/thread, 0 spills
+- 223 registers/thread, 0 spills
 - `NUM_EPI_WARPS` controls epilogue warp count (currently 5); `THREADS` derived as `32*(2+NUM_EPI_WARPS)`
 
 ## Development workflow
