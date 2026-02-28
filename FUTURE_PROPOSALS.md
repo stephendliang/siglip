@@ -92,29 +92,6 @@ All active warps do 8 iterations. No idle time. W5 either becomes a 5th balanced
 
 ---
 
-### 5. TN=128 revisit with current epilogue stack
-
-**Problem:** TN=128 was last tested at 1190 TFLOPS under a completely different kernel: x16 TMEM loads, no SMEM staging, no 5th warp, 6 pipeline stages. The epilogue has fundamentally changed since then. TN=128 may behave differently under the current architecture.
-
-**What changes with TN=128:**
-- TILES_N: 3 → 6 (768/128), TOTAL_TILES: 10,878 → 21,756
-- TMEM_COLS: 512 → 256 (128×2 for double buffering)
-- Epilogue per tile: 4 nc iterations (128 cols / 32) instead of 8 — every warp finishes in half the time
-- Work balance improves: 4 row_groups × 4 iters = 16 units / 5 warps is more even than 32 units / 5 warps
-- SMEM staging per warp shrinks: (128×2 + 16 pad) × 32 rows = 8,448 bytes vs 16,896. Total staging: 42 KB vs 84 KB — frees ~42 KB
-- Freed SMEM + TMEM could enable deeper pipeline or other uses
-
-**What gets worse:**
-- 2× more tiles = 2× more tile transitions (mbarrier waits, TMEM prefetch setup, tile index computation)
-- K-loop is unchanged (6 iters) but MMA work per tile halves (128×128 instead of 256×128 per CTA) — MMA pipe utilization drops
-- Each tile produces less output per K-loop overhead — worse compute-to-overhead ratio
-
-**Sweep parameters:** Must co-sweep with N_STAGES (2/3/4) and NUM_EPI_WARPS (3/4/5) since the optimal balance point shifts. The smaller tile means less epilogue work, so fewer epilogue warps might suffice (freeing registers). Also check if register count drops enough for `__launch_bounds__(THREADS, 2)` — though at 222 regs this seems unlikely without significant code shrinkage.
-
-**Go/no-go:** Pure parameter sweep — low implementation risk. Keep if any sweep point beats 0.630 ms. F10 already confirmed the kernel is K-loop-bound — TN=128's value is now about whether a different tile shape improves K-loop throughput (fewer TMEM cols → less TMEM pressure, more tiles → better SM occupancy balance) rather than diagnosing the epilogue/K-loop balance.
-
----
-
 ## LAST RESORT
 
 ### 6. TMA stores for Phase 2

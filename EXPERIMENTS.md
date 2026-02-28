@@ -201,6 +201,44 @@ cuBLAS + unfused pos_embed = 0.835 ms end-to-end.
 
 ---
 
+### Experiment F12: TN=128 revisit with current epilogue stack
+
+**Date:** 2026-02-28
+**Baseline:** 0.630 ms / 1739 TFLOPS / 222 regs
+**Result:** Best = 0.702 ms / 1560 TFLOPS (N_STAGES=6, NUM_EPI_WARPS=4) — 11.4% regression
+**Verdict:** REJECTED
+
+**Hypothesis:** TN=128 was last tested at 1190 TFLOPS under a completely different kernel (x16 TMEM loads, no SMEM staging, no 5th warp). The current epilogue (SMEM-staged coalesced stores, x32 TMEM loads) might tip the balance differently. TN=128 halves TMEM cols (512→256), potentially reducing `long_scoreboard` stalls (4.4%). Freed SMEM (~80 KB) enables deeper pipelines (up to N_STAGES=6 with 4 epilogue warps).
+
+**Changes:**
+- TN: 256→128, TILES_N: 3→6, TOTAL_TILES: 10,878→21,756
+- TMEM_COLS: 512→256 (single alloc, double-buffered)
+- IDESC: 0x10400010→0x10200010 (N=128 encoding, from old commit fca9178)
+- STAGE_BYTES: 32,768→24,576 (A=16KB, B=8KB)
+- NUM_EPI_WARPS: 5→4 (4 row_groups map perfectly to 4 warps, no column-split)
+
+**Sweep results (NUM_EPI_WARPS=4):**
+
+| N_STAGES | ms | TFLOPS | Regs | vs baseline |
+|---|---|---|---|---|
+| 4 | 0.763 | 1436 | 215 | -21% |
+| 5 | 0.765 | 1432 | 235 | -21% |
+| 6 | 0.702 | 1560 | 242 | -11.4% |
+
+NUM_EPI_WARPS=5 was not viable: with TN=128, the column-split gives NC_COLS=64 → COLS_PER_THREAD=2, which breaks the V2 store path (ld.shared.v2.b32 reads 8 bytes but each thread owns only 4 bytes → overlapping writes). NUM_EPI_WARPS=3 also not viable: only 3 warps for 4 row_groups leaves row_group 3 unprocessed.
+
+**Why it failed:** The regression is caused by **tile transition overhead dominance**, not registers (regs actually dropped to 215 at 4-stage):
+
+1. **2× more tiles** (21,756 vs 10,878) with the **same per-tile overhead** (mbarrier wait + phase flip + tile index computation + snake reorder + TMEM prefetch setup + epilogue mbar signal)
+2. **Half the compute per tile** — each MMA accumulates into 128 TMEM cols instead of 256. Same 24 MMA instructions per tile (6 K-iters × 4 MMAs), but each does less useful work
+3. **Compute-to-overhead ratio ~2× worse** — the total FLOP count is identical, just spread across 2× more tiles with fixed per-tile cost
+4. Deeper pipelines recovered some loss (6-stage: 0.763→0.702 ms) by pre-buffering all 6 K-iterations, but N_STAGES=6=K_ITERS is the ceiling — no further hiding possible
+5. SMEM/TMEM savings (80 KB freed, TMEM 512→256) provided no benefit because the bottleneck is tile-level scheduling overhead, not memory capacity
+
+**Key insight:** TN=256 is fundamentally superior for this GEMM shape. The 256-wide tile amortizes per-tile overhead over 2× more compute. TN=128 is now ruled out definitively — tested under both old (1190 TFLOPS) and current (1560 TFLOPS peak) architectures, and loses both times for the same structural reason.
+
+---
+
 ## Profiling data — SMEM staging A/B comparison
 
 Profiled via `ncu --set detailed`, single kernel instance.
