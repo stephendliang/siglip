@@ -530,10 +530,11 @@ patch_embed_gemm(
     long long min_total = 0x7FFFFFFFFFFFFFFFLL, max_total = 0;
     int tile_count = 0;
     // Epilogue warp (W3/ew=1) phase timing
-    long long epi_t0 = 0, epi_t1 = 0, epi_t2 = 0;
-    long long epi_sum_p1 = 0, epi_sum_p2 = 0;
+    long long epi_t_before_ml = 0, epi_t0 = 0, epi_t1 = 0, epi_t2 = 0;
+    long long epi_sum_p1 = 0, epi_sum_p2 = 0, epi_sum_ml = 0;
     long long epi_min_p1 = 0x7FFFFFFFFFFFFFFFLL, epi_max_p1 = 0;
     long long epi_min_p2 = 0x7FFFFFFFFFFFFFFFLL, epi_max_p2 = 0;
+    long long epi_min_ml = 0x7FFFFFFFFFFFFFFFLL, epi_max_ml = 0;
     int epi_count = 0;
 #endif
 
@@ -661,6 +662,10 @@ patch_embed_gemm(
 
             // Wait for W1's K-loop on tmem[prev_buf] (from previous tile).
             // All epilogue warps poll independently — no bar.sync broadcast needed.
+#ifdef TIMING
+            if (ew == 1 && lane == 0 && cta_rank == 0)
+                epi_t_before_ml = clock64();
+#endif
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             ml_phase[prev_buf] ^= 1;
@@ -705,10 +710,14 @@ patch_embed_gemm(
 #ifdef TIMING
                 if (ew == 1 && lane == 0 && cta_rank == 0) {
                     epi_t2 = clock64();
+                    long long ml = epi_t0 - epi_t_before_ml;
                     long long p1 = epi_t1 - epi_t0;
                     long long p2 = epi_t2 - epi_t1;
+                    epi_sum_ml += ml;
                     epi_sum_p1 += p1;
                     epi_sum_p2 += p2;
+                    if (ml < epi_min_ml) epi_min_ml = ml;
+                    if (ml > epi_max_ml) epi_max_ml = ml;
                     if (p1 < epi_min_p1) epi_min_p1 = p1;
                     if (p1 > epi_max_p1) epi_max_p1 = p1;
                     if (p2 < epi_min_p2) epi_min_p2 = p2;
@@ -723,7 +732,7 @@ patch_embed_gemm(
 #ifdef TIMING
     // Write timing data — W1 (CTA0, lane 0) writes per-cluster stats
     if (warp == 1 && lane == 0 && cta_rank == 0) {
-        long long* out = timing_buf + cluster_id * 16;
+        long long* out = timing_buf + cluster_id * 24;
         out[0] = sum_epi_wait;
         out[1] = sum_tma0_wait;
         out[2] = sum_kloop;
@@ -735,7 +744,7 @@ patch_embed_gemm(
     }
     // Write epilogue phase timing — W3 (ew=1, CTA0, lane 0)
     if (warp == 3 && lane == 0 && cta_rank == 0) {
-        long long* out = timing_buf + cluster_id * 16 + 8;
+        long long* out = timing_buf + cluster_id * 24 + 8;
         out[0] = epi_sum_p1;
         out[1] = epi_sum_p2;
         out[2] = epi_min_p1;
@@ -743,6 +752,9 @@ patch_embed_gemm(
         out[4] = epi_min_p2;
         out[5] = epi_max_p2;
         out[6] = epi_count;
+        out[7] = epi_sum_ml;
+        out[8] = epi_min_ml;
+        out[9] = epi_max_ml;
     }
 #endif
 
@@ -881,8 +893,8 @@ int main() {
 
 #ifdef TIMING
     long long *d_timing;
-    CUDA_CHECK(cudaMalloc(&d_timing, 74 * 16 * sizeof(long long)));
-    CUDA_CHECK(cudaMemset(d_timing, 0, 74 * 16 * sizeof(long long)));
+    CUDA_CHECK(cudaMalloc(&d_timing, 74 * 24 * sizeof(long long)));
+    CUDA_CHECK(cudaMemset(d_timing, 0, 74 * 24 * sizeof(long long)));
 #endif
 
     // ── Warmup: 2 iterations ──
@@ -941,8 +953,8 @@ int main() {
 
 #ifdef TIMING
     // Read and print timing data
-    long long h_timing[74 * 16];
-    CUDA_CHECK(cudaMemcpy(h_timing, d_timing, 74 * 16 * sizeof(long long), cudaMemcpyDeviceToHost));
+    long long h_timing[74 * 24];
+    CUDA_CHECK(cudaMemcpy(h_timing, d_timing, 74 * 24 * sizeof(long long), cudaMemcpyDeviceToHost));
 
     // Aggregate W1 data across clusters
     long long g_epi = 0, g_tma0 = 0, g_kloop = 0, g_total = 0;
@@ -950,13 +962,14 @@ int main() {
     long long g_min_total = 0x7FFFFFFFFFFFFFFFLL, g_max_total = 0;
     int total_tiles = 0;
     // Aggregate epilogue phase data across clusters
-    long long g_ep1 = 0, g_ep2 = 0;
+    long long g_ep1 = 0, g_ep2 = 0, g_eml = 0;
     long long g_min_p1 = 0x7FFFFFFFFFFFFFFFLL, g_max_p1 = 0;
     long long g_min_p2 = 0x7FFFFFFFFFFFFFFFLL, g_max_p2 = 0;
+    long long g_min_ml = 0x7FFFFFFFFFFFFFFFLL, g_max_ml = 0;
     int total_epi_tiles = 0;
 
     for (int c = 0; c < 74; c++) {
-        long long* d = h_timing + c * 16;
+        long long* d = h_timing + c * 24;
         int tiles_this = (int)((long long)(c + 1) * TOTAL_TILES / 74) - (int)((long long)c * TOTAL_TILES / 74);
         g_epi += d[0];
         g_tma0 += d[1];
@@ -976,6 +989,9 @@ int main() {
         if (e[4] < g_min_p2) g_min_p2 = e[4];
         if (e[5] > g_max_p2) g_max_p2 = e[5];
         total_epi_tiles += (int)e[6];
+        g_eml += e[7];
+        if (e[8] < g_min_ml) g_min_ml = e[8];
+        if (e[9] > g_max_ml) g_max_ml = e[9];
     }
 
     double clock_ghz = 2.1; // B200 SM clock approx
@@ -996,16 +1012,23 @@ int main() {
 
     printf("\n=== EPILOGUE PHASE TIMING (W3/ew=1, %d tiles across 74 clusters) ===\n", total_epi_tiles);
     if (total_epi_tiles > 0) {
+        long long avg_ml = g_eml / total_epi_tiles;
         long long avg_p1 = g_ep1 / total_epi_tiles;
         long long avg_p2 = g_ep2 / total_epi_tiles;
-        long long avg_total = avg_p1 + avg_p2;
+        long long avg_total = avg_ml + avg_p1 + avg_p2;
         printf("  Per-tile averages (cycles / ns at %.1f GHz):\n", clock_ghz);
+        printf("    Mainloop mbar wait:    %7lld cycles / %6.1f ns  (%.1f%%)\n",
+               avg_ml, (double)avg_ml / clock_ghz, 100.0 * avg_ml / avg_total);
         printf("    Phase 1 (TMEM->SMEM):  %7lld cycles / %6.1f ns  (%.1f%%)\n",
                avg_p1, (double)avg_p1 / clock_ghz, 100.0 * avg_p1 / avg_total);
         printf("    Phase 2 (SMEM->global): %7lld cycles / %6.1f ns  (%.1f%%)\n",
                avg_p2, (double)avg_p2 / clock_ghz, 100.0 * avg_p2 / avg_total);
-        printf("    Total epilogue:        %7lld cycles / %6.1f ns\n",
+        printf("    Total (wait+work):     %7lld cycles / %6.1f ns\n",
                avg_total, (double)avg_total / clock_ghz);
+        printf("    Work only (P1+P2):     %7lld cycles / %6.1f ns\n",
+               avg_p1 + avg_p2, (double)(avg_p1 + avg_p2) / clock_ghz);
+        printf("  Mainloop wait range: min=%lld max=%lld (%.1fx spread)\n", g_min_ml, g_max_ml,
+               g_min_ml > 0 ? (double)g_max_ml / g_min_ml : 0.0);
         printf("  Phase 1 range: min=%lld max=%lld (%.1fx spread)\n", g_min_p1, g_max_p1,
                g_min_p1 > 0 ? (double)g_max_p1 / g_min_p1 : 0.0);
         printf("  Phase 2 range: min=%lld max=%lld (%.1fx spread)\n", g_min_p2, g_max_p2,

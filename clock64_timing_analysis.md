@@ -1,129 +1,155 @@
-# clock64() Timing Analysis — W1 Per-Tile Breakdown
+# clock64() Timing Analysis — Current Kernel State
+
+**Kernel version:** Post-F19 (4 epilogue warps, double-buffered SMEM staging, early mbar signal)
+**Baseline:** 0.542 ms / 2020 TFLOPS, 223 regs, 0 spills
+**Timing build:** 0.535 ms / 2045 TFLOPS, 254 regs, 0 spills (16B stack)
 
 ## Setup
 
-Added `clock64()` timestamps to W1 (CTA0, lane 0) at 4 points per tile:
-- `t_tile_start`: After previous tile's mainloop_mbar commit (before loop increment)
+**W1 timestamps** (CTA0, lane 0) at 4 points per tile:
+- `t_tile_start`: After previous tile's mainloop_mbar commit
 - `t_after_epi`: After epilogue_mbar wait (W1 has TMEM buffer)
 - `t_after_tma0`: After first TMA mbar wait (ki=0 data ready)
 - `t_kloop_end`: After last MMA commit + mainloop_mbar commit
 
-Instrumentation: 237 regs (vs 223 baseline), 0 spills, no performance impact (0.576 ms vs 0.579 ms baseline).
+**W3 timestamps** (ew=1, CTA0, lane 0) at 4 points per tile:
+- `epi_t_before_ml`: Before mainloop_mbar wait
+- `epi_t0`: After mainloop_mbar wait (epilogue work starts)
+- `epi_t1`: After Phase 1A + Phase 1B/2A interleaved (before syncwarp + early mbar arrive)
+- `epi_t2`: After Phase 2B completes
 
-## Results
-
-```
-Kernel: 0.576 ms / 1902 TFLOPS (baseline: 0.579 ms / 1892 TFLOPS)
-Checksum: 1769472.0 ✓
-
-Per-tile averages (10,878 tiles across 74 clusters):
-  Epilogue mbar wait:     2,466 cycles / 1,175 ns   (36.2%)
-  TMA stage-0 wait:         292 cycles /   139 ns   ( 4.3%)
-  K-loop (6 ki × 4 MMA):  4,046 cycles / 1,927 ns  (59.5%)
-  Total tile:              6,805 cycles / 3,241 ns
-  Overhead (epi+tma0):     2,759 cycles / 1,314 ns  (40.5% of tile)
-
-K-loop range:  min=2,343  max=9,464  (4.0× spread)
-Total range:   min=3,114  max=15,375 (4.9× spread)
-```
-
-## Critical Finding: EPILOGUE IS THE BOTTLENECK
-
-**The epilogue mbar wait is 36% of W1's tile time.** This directly contradicts the earlier F10 conclusion that "the kernel is K-loop-bound." The epilogue takes longer than one tile's worth of time to drain, causing W1 to stall waiting for TMEM buffer availability.
-
-### Timing decomposition
+## Results (5-run average, last run of checksum iteration)
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    W1 Tile Timeline                          │
-│                                                              │
-│  ███████████████         ██         ████████████████████████  │
-│  epi_mbar wait          TMA0       K-loop (6ki × 4mma)      │
-│     36.2%               4.3%            59.5%                │
-│                                                              │
-│  ├── OVERHEAD (40.5%) ──┤├──── PRODUCTIVE (59.5%) ─────────┤ │
-└──────────────────────────────────────────────────────────────┘
+Kernel: 0.535 ms / 2045 TFLOPS (baseline: 0.542 ms / 2020 TFLOPS)
+Checksum: 1769472.0
+
+=== W1 PER-TILE ===
+  Epilogue mbar wait:     1,052 cycles /  501 ns   (17.3%)
+  TMA stage-0 wait:         856 cycles /  408 ns   (14.1%)
+  K-loop (6 ki x 4 MMA):  4,155 cycles / 1979 ns   (68.5%)
+  Total tile:              6,063 cycles / 2887 ns
+  Overhead (epi+tma0):     1,908 cycles /  909 ns   (31.5%)
+
+  K-loop range:  min=2,425  max=11,100  (4.6x spread)
+  Total range:   min=3,120  max=13,400  (4.3x spread)
+
+=== EPILOGUE WARP (W3/ew=1) PER-TILE ===
+  Mainloop mbar wait:      1,123 cycles /  535 ns   (18.2%)
+  Phase 1 (TMEM->SMEM):    4,140 cycles / 1971 ns   (67.2%)
+  Phase 2B (SMEM->global):   899 cycles /  428 ns   (14.6%)
+  Total (wait+work):       6,162 cycles / 2934 ns
+  Work only (P1+P2):       5,039 cycles / 2400 ns
+
+  Mainloop wait range: min=329  max=10,000 (30x spread)
+  Phase 1 range:       min=2,960  max=8,300 (2.8x spread)
+  Phase 2 range:       min=470  max=1,300  (2.8x spread)
 ```
 
-### Why the epilogue is slow
+## System Equilibrium
 
-With double-buffered TMEM, the epilogue for tile N has exactly one tile time (tile N+1) to complete before W1 needs tmem[buf] again for tile N+2:
+The kernel is in a balanced producer-consumer steady state. W1 and the epilogue warps wait for each other in roughly equal measure:
 
 ```
-Tile N:    W1 writes tmem[0] → signals mainloop_mbar[0]
-Tile N+1:  Epilogue reads tmem[0]. W1 writes tmem[1].
-Tile N+2:  W1 needs tmem[0]. Waits on epilogue_mbar[0].
-           Wait = max(0, epilogue_time - tile_N+1_time)
+W1 cycle:      epi_wait(1,052) + TMA0(856) + K-loop(4,155) = 6,063
+W3 cycle:      ml_wait(1,123)  + Phase1(4,140) + Phase2B(899) = 6,162
+                                                     (close match — same throughput)
 ```
 
-Measured: epilogue_mbar wait = 2,466 cycles
-Therefore: epilogue_time ≈ tile_time + 2,466 ≈ 6,805 + 2,466 ≈ **9,271 cycles**
+### Timeline (steady state, one tile period)
 
-The epilogue takes **2.3× the K-loop time** (9,271 vs 4,046). It cannot hide in the K-loop shadow. This is because:
-- 5 warps do TMEM readback (tcgen05.ld) → 390K cycles/warp of long_scoreboard stalls
-- Each warp processes 4-8 nc iterations with: TMEM load → BF16 add → CVT → SMEM store → syncwarp → Phase 2 coalesced stores
-- TMEM readback latency dominates (long_scoreboard at 3.3× productive time in average_warp_latency)
+```
+W1:  ████████░░░░░░░░░░░░░░░░░░░░░░████████████████████████████████████████████████████████████████████
+     epi_wait(17%)    TMA0(14%)                    K-loop (69%)
+     ←─ WAITING ─→                           ←── PRODUCTIVE ──→
+                                                               ↓ commit mainloop_mbar
 
-### Impact analysis
+W3:  ████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░██████████████░░░░░░░░░░░░░░░░
+     ml_wait(18%)           Phase 1: TMEM readback (67%)      ↑mbar      Phase 2B (15%)
+     ←─ WAITING ─→         ←── TMEM + combined add + CVT → SMEM ──→    ←─ SMEM → global ─→
+                                                                arrive epi_mbar
+                                                                (early — before Phase 2B)
+```
 
-If we eliminated the epilogue mbar wait entirely (perfect overlap):
-- Tile time: 4,046 + 292 = **4,338 cycles** (vs 6,805)
-- Speedup: 6,805 / 4,338 = **1.57×**
-- Projected TFLOPS: 1,900 × 1.57 = **2,983 TFLOPS** (≈ cuBLAS's 3,001)
+### Why both warps wait ~1,100 cycles
 
-Even halving the epilogue mbar wait would give:
-- Tile time: 4,338 + 1,233 = **5,571 cycles**
-- Speedup: 6,805 / 5,571 = **1.22×**
-- Projected TFLOPS: **2,318 TFLOPS**
+The double-buffered TMEM pipeline creates a 2-tile lag:
+- W1 commits mainloop_mbar[buf] at end of tile N
+- W3 reads tmem[buf] during tile N+1
+- W3 arrives epilogue_mbar[buf] during tile N+1 (after Phase 1, before Phase 2B)
+- W1 needs epilogue_mbar[buf] at start of tile N+2
 
-### K-loop variability
+The "effective epilogue time" (what W1 cares about) = ml_wait + Phase 1 + syncwarp ≈ 1,123 + 4,140 + 20 ≈ 5,283 cycles. This exceeds W1's productive time (856 + 4,155 = 5,011) by ~272 cycles. With double-buffer amplification, this small ~272-cycle imbalance creates the ~1,052-cycle W1 wait.
 
-The 4.0× spread in K-loop time (min=2,343, max=9,464) is significant:
-- **min=2,343**: TC pipeline perfectly primed, all TMA data ready, zero inter-K-iter waits
-- **max=9,464**: Likely DRAM latency spikes on TMA loads, possibly first tile of cluster
-- The max K-loop (9,464) exceeds the average total tile time (6,805) — some tiles are dominated by K-loop
-- This suggests occasional data starvation on individual tiles, even though the AVERAGE tma0 wait is only 292 cycles
+Additionally, W1 waits on epilogue_mbar which requires ALL 4 warps to arrive. We measure W3, but the slowest warp determines the mbar completion. Inter-warp TMEM contention likely makes some warps slower than W3.
+
+## Key Findings
+
+### 1. Epilogue still the bottleneck (67% of epilogue time is Phase 1 TMEM readback)
+
+F18 (double-buffered SMEM) and F19 (early mbar signal) reduced W1's epi_wait from 2,466 → 1,052 cycles (57% reduction). But Phase 1 TMEM readback still dominates at 4,140 cycles per tile — 81% of the epilogue's work time.
+
+### 2. TMA stage-0 wait is NOT negligible
+
+TMA0_wait = 856 cycles (14% of tile), up from 292 cycles in the 5-warp baseline. This is not a scheduling issue — F20 (next-tile TMA prefetch) showed ~0% improvement. It's DRAM bandwidth: A matrix loads need ~16KB from DRAM per tile, and the 4-stage pipeline can't always hide the ~1,940-cycle DRAM latency.
+
+### 3. K-loop jitter is significant
+
+The 4.6x spread in K-loop time (min=2,425, max=11,100) reflects DRAM latency variation. The max K-loop (11,100) is 1.8x the average (6,063 total tile). Individual tiles occasionally suffer data starvation.
+
+### 4. Phase 2B is small and overlapped
+
+Phase 2B (SMEM→global stores) takes only 899 cycles (15% of epilogue cycle). It runs AFTER the early mbar signal, so it overlaps with W1's next K-loop. This is free — F19's early mbar successfully hides Phase 2B.
 
 ### What SourceCounters told us vs what clock64 reveals
 
-| Finding | SourceCounters | clock64 |
-|---------|---------------|---------|
-| W1 stalled on tma_mbar? | No (0 stalls) | Correct — only 292 cycles avg |
-| W1 stalled on epilogue_mbar? | No (0 stalls)* | **YES — 2,466 cycles (36%)** |
-| W1 stalled on anything? | 1,329 total (0.026%) | 40% of tile is overhead |
+| Finding | SourceCounters (stale, 5-warp) | clock64 (current, 4-warp) |
+|---------|-------------------------------|---------------------------|
+| W1 stalled on tma_mbar? | No (0 stalls) | 856 cycles avg (14%) |
+| W1 stalled on epilogue_mbar? | No (0 stalls)* | 1,052 cycles (17%) |
+| W1 stalled on anything? | 0.026% | 31.5% of tile is waiting |
 
-*The SourceCounters paradox: W1's epilogue_mbar SYNCS.PHASECHK shows 0 stalls because the mbar_wait is a spin-loop with NANOSLEEP. The warp "sleeps" (which SourceCounters counts as sleep, not as a stall at the SYNCS instruction). The stall attribution goes to the NANOSLEEP, not the TRYWAIT. clock64 correctly captures the total wait time regardless of how it's attributed.
+*SourceCounters paradox: mbar_wait spin-loop uses NANOSLEEP. SourceCounters attributes stalls to NANOSLEEP (as "sleeping"), not to the try_wait instruction. clock64 correctly captures total wait time regardless of attribution.
 
-### SourceCounters found W1 has 475 instructions/tile, only 24 are MMA (5.1%)
+## Impact Analysis
 
-This remains true but is NOT the bottleneck explanation. The 437 non-MMA instructions take ~437 cycles on W1's SMSP (if no competition). That's only 6.4% of the 6,805 cycle tile time. The real issue is the 2,466 cycle epilogue wait.
+### Eliminating epi_wait entirely (perfect overlap)
 
-## Optimization Paths (re-evaluated)
+- Tile time: 856 + 4,155 = **5,011 cycles** (vs 6,063)
+- Speedup: 6,063 / 5,011 = **1.21x**
+- Projected TFLOPS: 2,020 x 1.21 = **2,444 TFLOPS**
 
-### 1. Faster epilogue — HIGHEST PRIORITY
+### Also eliminating TMA0_wait
 
-The epilogue takes ~9,271 cycles (2.3× K-loop). Reducing it to ≤ 6,805 cycles (1 tile time) would eliminate the mbar wait entirely.
+- Tile time: 4,155 cycles
+- Speedup: 6,063 / 4,155 = **1.46x**
+- Projected TFLOPS: 2,020 x 1.46 = **2,949 TFLOPS** (≈ cuBLAS's 3,001)
 
-Options:
-- **Reduce TMEM readback latency**: tcgen05.ld.x32 takes ~390K cycles per warp in long_scoreboard. If we could overlap TMEM reads better (prefetch next chunk while processing current), or use x16 loads with better interleaving.
-- **Fewer epilogue warps doing more each**: Counter-intuitive — F3 showed more warps regress (TMEM contention). But 4 warps instead of 5 might reduce contention while keeping enough parallelism.
-- **Reduce Phase 2 work**: Phase 2 (SMEM → global stores) is ~3.5M instructions. TMA stores could eliminate these entirely but have staging reuse problems (Proposal 6).
-- **Eliminate __syncwarp**: The syncwarp between Phase 1 and Phase 2 serializes within each warp. If we could overlap Phase 1 of chunk N+1 with Phase 2 of chunk N (double-buffered within-warp), the epilogue could pipeline better.
+### Current ceiling analysis
 
-### 2. Larger TK (256) — reduces K-loop time, may expose epilogue MORE
+cuBLAS achieves 3,001 TFLOPS on this shape. Our gap: 3,001 / 2,020 = 1.49x.
+Eliminating ALL overhead (epi_wait + TMA0_wait) would give 1.46x — almost closes the gap.
+The remaining 0.03x is K-loop efficiency (W1 instruction overhead between MMAs).
 
-With TK=256: 3 K-iterations instead of 6. K-loop time roughly halves (~2,023 cycles). But if the epilogue doesn't speed up, the mbar wait INCREASES:
-- New epi_wait ≈ 9,271 - (2,023 + 146) ≈ 7,102 cycles
-- Total tile: 2,023 + 146 + 7,102 = 9,271 cycles → SAME total because the epilogue is the bottleneck regardless
-- This would help ONLY if combined with epilogue improvements
+## Optimization Paths (current priority)
 
-### 3. TMA multicast for B — reduces L2/DRAM pressure
+### 1. Faster Phase 1 TMEM readback — PRIMARY TARGET
 
-Halves B matrix bandwidth. May indirectly speed up both K-loop and epilogue (less L2 contention for combined loads and Phase 2 stores). Worth trying but unlikely to be transformative alone.
+Phase 1 = 4,140 cycles (67% of epilogue cycle). TMEM readback (`tcgen05.ld.x32`) dominates.
 
-## Next Steps
+Options tried and rejected:
+- F17: Direct global stores (skip SMEM staging) — 19% slower Phase 1 due to L1 contention
+- F19: TMA bulk stores for Phase 2B — 3x slower per-instruction than manual stores
+- F20: Next-tile TMA prefetch — ~0% (DRAM bandwidth, not scheduling)
 
-1. **Profile the epilogue in detail**: Which phase (Phase 1 TMEM readback vs Phase 2 SMEM→global) dominates? Add clock64 to epilogue warps at syncwarp boundary.
-2. **Try 4 epilogue warps** (`NUM_EPI_WARPS=4`): Reduces TMEM contention. Each warp does more work but with less inter-warp interference.
-3. **Try 3 epilogue warps**: Even less contention, but each warp processes 128 cols (no column splitting needed).
-4. **Investigate within-warp pipelining**: Can Phase 1 and Phase 2 overlap using double-buffered SMEM staging?
+Remaining options:
+- **Reduce TMEM contention**: 4 warps reading TMEM simultaneously. If Phase 1 scales sub-linearly with warps, 3 warps might be faster per-warp (each doing 2 row_groups). Trade-off: more work per warp vs less contention.
+- **Deeper Phase 1 pipelining**: Currently prefetches chunk N+1 while processing chunk N. Could try x16 loads for finer interleaving.
+
+### 2. Larger TM (256) — amortizes overhead
+
+With TM=256 (each CTA processes 256 rows): 1,813 M-tiles instead of 3,626. Halves tile count → halves per-tile overhead. K-loop stays the same (same K). But needs 2x more TMEM cols (1024 — exceeds 512-col limit) or creative sub-tiling.
+
+### 3. Accept current performance
+
+At 2,020 TFLOPS for a FUSED kernel (GEMM + bias + pos_embed), we're already 35% faster than the cuBLAS end-to-end path (0.835 ms). The remaining gap to cuBLAS pure GEMM (3,001 TFLOPS) is the cost of fusion — the epilogue does real work (BF16 add + CVT) that cuBLAS doesn't.

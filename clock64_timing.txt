@@ -1,4 +1,4 @@
-SigLIP2 patch embed GEMM — tcgen05 cta_group::2 (7 warps [5 epi], cluster of 2)
+SigLIP2 patch embed GEMM — tcgen05 cta_group::2 (6 warps [4 epi], cluster of 2)
   GEMM: [928256,768] x [768,768]^T  4-stage pipeline  inline BF16 combined  SMEM-staged coalesced stores  idesc: 0x10400010
   Alloc + precompute done
   TMA descriptors + func attr done
@@ -6,17 +6,28 @@ Launching warmup (2 iters)...
   Waiting for warmup sync...
   Warmup done.
 Timing: 10 iterations...
-Custom kernel: 0.573 ms  1911.98 TFLOPS
+Custom kernel: 0.533 ms  2052.90 TFLOPS
 Checksum (first 1024): 1769472.000000
 C[0,0..3] = 1728.0 1728.0 1728.0 1728.0
 
 === W1 TIMING (clock64, 10878 tiles across 74 clusters) ===
   Per-tile averages (cycles / ns at 2.1 GHz):
-    Epilogue mbar wait:     2466 cycles / 1174.6 ns
-    TMA stage-0 wait:        292 cycles /  139.3 ns
-    K-loop (6 ki × 4 MMA):    4046 cycles / 1926.9 ns
-    Total tile:             6805 cycles / 3240.7 ns
-    Overhead (epi+tma0):    2759 cycles / 1313.8 ns  (40.5% of tile)
-  K-loop range: min=2343 max=9464 (4.0x spread)
-  Total tile range: min=3114 max=15375 (4.9x spread)
-  Expected total cycles (wall clock): 1202699
+    Epilogue mbar wait:     1056 cycles /  502.9 ns
+    TMA stage-0 wait:        857 cycles /  408.4 ns
+    K-loop (6 ki × 4 MMA):    4154 cycles / 1978.1 ns
+    Total tile:             6067 cycles / 2889.4 ns
+    Overhead (epi+tma0):    1913 cycles /  911.3 ns  (31.5% of tile)
+  K-loop range: min=2450 max=11290 (4.6x spread)
+  Total tile range: min=3081 max=13505 (4.4x spread)
+  Expected total cycles (wall clock): 1120137
+
+=== EPILOGUE PHASE TIMING (W3/ew=1, 10804 tiles across 74 clusters) ===
+  Per-tile averages (cycles / ns at 2.1 GHz):
+    Mainloop mbar wait:       1139 cycles /  542.4 ns  (18.5%)
+    Phase 1 (TMEM->SMEM):     4129 cycles / 1966.2 ns  (67.0%)
+    Phase 2 (SMEM->global):     899 cycles /  428.1 ns  (14.6%)
+    Total (wait+work):        6167 cycles / 2936.7 ns
+    Work only (P1+P2):        5028 cycles / 2394.3 ns
+  Mainloop wait range: min=325 max=10007 (30.8x spread)
+  Phase 1 range: min=3094 max=8306 (2.7x spread)
+  Phase 2 range: min=505 max=1294 (2.6x spread)
