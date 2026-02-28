@@ -17,58 +17,29 @@ Batch = 4736 images x 196 patches = 928256 rows. Square weight matrix (768x768).
 
 The kernel is correct (checksum validated) and stable.
 
-## Current bottlenecks (from ncu profiling)
+## Current bottlenecks (clock64 timing build, post-F19)
 
-The kernel is **epilogue-bound** (confirmed by clock64 F15 profiling). W1 stalls 1,530 cycles/tile (25% of tile time) waiting for the epilogue to release the TMEM buffer. The epilogue takes ~4,926 cycles (Phase 1+2A interleaved: 4,102 cycles 83.3%, Phase 2B: 824 cycles 16.7%), overrunning the K-loop's 4,017 cycles by ~909 cycles. Double-buffered SMEM staging (F18) reduced the overrun from ~1,760 to ~909 cycles by hiding Phase 2A stores inside Phase 1B's TMEM_WAIT stalls.
+The kernel is **epilogue-bound** in a balanced producer-consumer equilibrium. Per-tile cycle budget:
 
-**Warp stall breakdown:**
+```
+W1:       epi_wait(1,056) + TMA0(857) + K-loop(4,154) = 6,067
+Epilogue: ml_wait(1,139) + Phase1(4,129) + Phase2B(899) = 6,167
+```
 
-| Stall | % of peak | Notes |
-|---|---|---|
-| **selected (issuing)** | **22.9%** | Productive execution — dominant |
-| long_scoreboard (TMEM) | 4.7% | TMEM readback latency |
-| wait (TMA) | 1.5% | TMA pipeline stalls |
-| sleeping | 0.95% | Warps parked between tiles |
-| barrier | 0.8% | Cluster sync |
-| short_scoreboard (SMEM) | 0.57% | SMEM staging ld/st chains |
-| not_selected | 0.2% | Eligible but not picked |
-| mio_throttle | 0.04% | Memory I/O backpressure — negligible |
+Equilibrium deficit: ~257 cycles (epilogue slightly slower). Double-buffer lag amplifies this to 1,056-cycle epi_wait (4.1x amplification).
 
-**Memory throughput:**
+**Key facts:**
+- TC pipe active ~50% (cuBLAS: ~79%). Gap = epilogue wait (17pp) + TMA0 DRAM latency (7pp) + K-loop overhead (5pp).
+- Phase 1 TMEM readback = 67% of epilogue cycle. Primary target.
+- K-loop: 411 instructions/tile, only 24 MMA (5.8%). R2UR (42%), PLOP3 (23%), ELECT (8%) dominate overhead.
+- TMA multicast not applicable (B is N-split across CTAs).
+- 223 regs/thread, 0 spills. Limits occupancy to 1 CTA/SM.
 
-| Subsystem | Utilization |
-|---|---|
-| L1 tex | 67% — no longer the ceiling |
-| L2 | 49% |
-| DRAM | 32% |
+**Ceiling:** Eliminate epi_wait → 2,486 TFLOPS. Also TMA0 → 2,998 TFLOPS (≈ cuBLAS 3,001).
 
-**Instruction mix (per kernel invocation):**
-
-| Type | Count |
-|---|---|
-| Total | 122.6M |
-| Global loads | 2.78M |
-| Global stores | 3.48M |
-| Shared loads | 3.48M |
-| Shared stores | 2.79M |
-
-**Key findings:**
-
-1. **TC pipe active only 50%** — tensor cores idle half the time. cuBLAS achieves ~79% on this shape. The 29pp gap is the primary optimization target. See `docs/make_better.md` for full analysis.
-
-2. **Epilogue-bound** (confirmed by clock64 F15, partially mitigated by F18). Phase 1 (TMEM readback) still dominates at 83.3%. Double-buffered SMEM staging (F18) hides Phase 2A stores in TMEM stalls, reducing epilogue from 5,833 to 4,926 cycles (-15.6%). Direct global stores (F17) made Phase 1 19% slower due to L1 contention — SMEM staging is essential.
-
-3. **Zero TMA multicast** — not actionable. B is N-split across CTAs (CTA0 loads B[k, n:n+128], CTA1 loads B[k, n+128:n+256]). cta_group::2 MMA reads B from both CTAs (`scope_2cta`). Multicast requires identical data at the same SMEM offset — inapplicable to complementary B halves.
-
-4. **SMEM bank conflicts 32%/22%** (ld/st) — significant but hidden in K-loop shadow. STAGING_ROW_PAD doesn't fully prevent Phase 2 transposed read conflicts.
-
-5. **Warp latency dominated by TMEM** — `long_scoreboard` at 390K cycles/warp is 3.3× productive `selected` (119K). The scheduler hides this (only 4.7% in pct view) but it means epilogue warps spend most of their time waiting.
-
-6. **Register pressure (223 regs/thread, 0 spills)** — limits occupancy to 1 CTA/SM. Not actionable without major restructuring.
-
-**To go faster:** Larger TM to amortize per-tile overhead, further epilogue Phase 1 optimization, or next-tile TMA prefetch (F20 showed ~0% — DRAM latency bottleneck, not scheduling). TMA multicast for B is not applicable (B is N-split across CTAs). See `docs/make_better.md`.
-
-**Tested and ruled out:** See `EXPERIMENTS.md` for 19 experiments with hypotheses, results, and analysis. F19 confirmed Phase 2B's LSU stores contend with K-loop (+170 cycles, +4.2%) when overlapped via early mbar signal — but TMA bulk stores (`cp.async.bulk`, 32×256B) are 3× slower than parallel manual stores due to per-instruction overhead. Padded SMEM (272-byte rows for bank-conflict-free Phase 1B) prevents single-shot TMA tensor stores.
+Run `python3 analyze_timing.py clock64_timing.txt` for full equilibrium analysis and what-if projections.
+Run `python3 analyze_source_counters.py source_counters_raw.csv` for per-instruction stall breakdown.
+See `EXPERIMENTS.md` for 20 experiments (F1-F20) with hypotheses, results, and analysis. See `FUTURE_PROPOSALS.md` for active optimization roadmap.
 
 ## Kernel structure
 
@@ -98,24 +69,27 @@ The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile 
 edit megakernel.cu -> make -> ./siglip_vision
 ```
 
-`gen.py` is outdated (old 4-warp structure). Will be updated after kernel is finalized.
+`gen.py` is outdated — do not use.
 
 ## File map
 
 | File | What |
 |------|------|
 | `megakernel.cu` | **Source of truth** — hand-tuned CUDA kernel |
-| `EXPERIMENTS.md` | Experiment log, profiling data, and optimization history |
-| `docs/make_better.md` | Advanced profiling — TC utilization, per-pipe breakdown, bank conflicts, TMA multicast |
-| `docs/whats_wrong.md` | Triage-level profiling — barrier stalls, TMA serialization, correctness |
-| `docs/architecture.md` | Model specs, HW config, milestones (partially stale) |
-| `gen.py` | Codegen script — **outdated, do not use** |
+| `EXPERIMENTS.md` | Experiment log (F1-F20), profiling data, optimization history |
+| `FUTURE_PROPOSALS.md` | Active optimization roadmap (F21-F28) with execution order |
+| `Makefile` | Build rules (sm_100a, nvcc flags). `make timing` for clock64 build |
+| **Analysis scripts** | |
+| `analyze_timing.py` | Parses `clock64_timing.txt` → equilibrium analysis, ceiling projections, what-if scenarios |
+| `analyze_source_counters.py` | Parses ncu SourceCounters CSV → stall breakdown, MMA stats, W1 budget, instruction mix |
 | `compare.py` | ncu CSV diff tool — usage: `python compare.py a.csv b.csv` |
-| `Makefile` | Build rules (sm_100a, nvcc flags) |
-| `clock64_timing.txt` | W1 clock64 timing output (5-warp baseline) |
-| `clock64_timing_analysis.md` | Analysis of clock64 W1 timing — epilogue IS the bottleneck |
-| `source_counters_analysis.md` | SourceCounters per-instruction analysis — W1 stall isolation |
-| `source_counters_raw.csv` | Raw SourceCounters CSV data |
+| **Raw profiling data** | |
+| `clock64_timing.txt` | Kernel printf from timing build (34 lines). Analyze with `analyze_timing.py` |
+| `source_counters_raw.csv` | Raw ncu `--set source --csv` data (4K lines). Analyze with `analyze_source_counters.py` |
+| `clock64_timing_analysis.md` | Historical prose analysis — **superseded by `analyze_timing.py`** |
+| `source_counters_analysis.md` | Historical prose analysis — **superseded by `analyze_source_counters.py`** |
+| **Reference docs** | |
+| `docs/make_better.md` | Deep ncu profiling — TC utilization, per-pipe breakdown, bank conflicts |
 | `docs/reference/model.txt` | PyTorch model architecture dump |
 | `docs/reference/sass_dump.txt` | SASS disassembly (load on demand only) |
 
@@ -124,6 +98,8 @@ edit megakernel.cu -> make -> ./siglip_vision
 ```bash
 make                    # compile megakernel.cu -> siglip_vision
 ./siglip_vision         # run on B200, prints timing + TFLOPS + checksum
+make timing && ./siglip_timing | tee clock64_timing.txt | python3 analyze_timing.py
+ncu --set source --csv ./siglip_vision > source_counters_raw.csv && python3 analyze_source_counters.py source_counters_raw.csv
 ```
 
 ## Key constraints
