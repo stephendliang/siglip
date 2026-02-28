@@ -258,7 +258,8 @@ void epilogue_store(
     int pos_row,
     __nv_bfloat16* __restrict__ C,
     int cta_rank,
-    uint32_t staging_saddr
+    uint32_t staging_saddr,
+    uint32_t epi_mbar_addr
 #ifdef TIMING
     , long long& t_phase1_end
 #endif
@@ -407,6 +408,9 @@ void epilogue_store(
     t_phase1_end = clock64();
 #endif
     __syncwarp();  // Phase 1B SMEM writes visible for Phase 2B reads
+
+    // Signal: done reading TMEM — W1 can reuse buffer. Phase 2B only uses SMEM + global.
+    if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
 
     // ═══ Phase 2B: staging_b → global ═══
     __nv_bfloat16* row_base_b = C + (long long)gm_base * N_DIM + n_start + NC_MID;
@@ -676,21 +680,23 @@ patch_embed_gemm(
 
                 const int gm_base = prev_m + row_group * 32;
                 const int pos_row = (gm_base + lane) % SEQ_LEN;
+                // Early mbar: signal W1 after Phase 1B (TMEM done), Phase 2B overlaps with K-loop
+                const uint32_t epi_mbar_masked = (epilogue_mbar_addr + prev_buf * 8) & 0xFEFFFFFF;
                 if (is_split) {
                     if (col_rank == 0)
-                        epilogue_store<0, TN/2>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr
+                        epilogue_store<0, TN/2>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr, epi_mbar_masked
 #ifdef TIMING
                             , epi_t1
 #endif
                         );
                     else
-                        epilogue_store<TN/2, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr
+                        epilogue_store<TN/2, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr, epi_mbar_masked
 #ifdef TIMING
                             , epi_t1
 #endif
                         );
                 } else {
-                    epilogue_store<0, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr
+                    epilogue_store<0, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr, epi_mbar_masked
 #ifdef TIMING
                         , epi_t1
 #endif
@@ -710,10 +716,6 @@ patch_embed_gemm(
                     epi_count++;
                 }
 #endif
-
-                // Signal: done reading tmem[prev_buf] — arrive at CTA0's epilogue mbar
-                const uint32_t epi_mbar_masked = (epilogue_mbar_addr + prev_buf * 8) & 0xFEFFFFFF;
-                mbar_arrive(epi_mbar_masked);
             }
         }
     }  // tile loop
@@ -773,19 +775,19 @@ patch_embed_gemm(
 #endif
         if (is_split) {
             if (col_rank == 0)
-                epilogue_store<0, TN/2>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr
+                epilogue_store<0, TN/2>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr, 0
 #ifdef TIMING
                     , drain_t1
 #endif
                 );
             else
-                epilogue_store<TN/2, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr
+                epilogue_store<TN/2, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr, 0
 #ifdef TIMING
                     , drain_t1
 #endif
                 );
         } else {
-            epilogue_store<0, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr
+            epilogue_store<0, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr, 0
 #ifdef TIMING
                 , drain_t1
 #endif

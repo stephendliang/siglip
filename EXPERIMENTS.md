@@ -27,7 +27,8 @@ Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 | d882aba | Phase 2 unroll 4→8 | 0.630 | 1739 | 222 | |
 | 9bf658a | Blocked combined relayout | 0.579 | 1892 | 223 | |
 | dbe8c72 | F15+F16: epilogue phase timing + 4 epilogue warps | 0.560 | 1955 | 219 | |
-| — | F18: double-buffered SMEM epilogue overlap | 0.543 | 2018 | 223 | current best |
+| d1fc103 | F18: double-buffered SMEM epilogue overlap | 0.543 | 2018 | 223 | current best |
+| — | F19: early epilogue mbar + TMA Phase 2B stores | 0.542 | 2020 | 223 | early mbar neutral, TMA stores rejected |
 
 Reference: cuBLAS per-tensor FP8 (best-of-8 algos, 256MB workspace) = 0.365 ms / 3001 TFLOPS (GEMM only, no fusion).
 cuBLAS + unfused pos_embed = 0.835 ms end-to-end.
@@ -535,3 +536,70 @@ The increased TMA stage-0 wait (318→576) is expected: with faster tiles, W1 re
 | **Total (SMEM_BYTES)** | **~201 KB** |
 | SM limit | 228 KB |
 | **Headroom** | **~27 KB** |
+
+---
+
+### Experiment F19: Early epilogue mbar signal + TMA Phase 2B stores
+
+**Date:** 2026-02-28
+**Baseline:** 0.543 ms / 2018 TFLOPS / 223 regs (F18)
+**Result:** Early mbar alone: 0.542 ms (~0% change). TMA stores: 0.573 ms (+5.5% regression, reverted).
+**Verdict:** Early mbar KEPT (structurally sound, neutral performance). TMA stores REJECTED.
+
+#### Motivation
+
+The epilogue overruns the K-loop by ~909 cycles (epilogue 4,926 vs K-loop 4,017). Phase 2B (staging_b → global via `ld.shared.v2 + st.global.v2`, 824 cycles) doesn't touch TMEM — only SMEM reads and global stores. Moving the `epilogue_mbar` arrive from after Phase 2B to after Phase 1B's `__syncwarp()` should let W1 reclaim TMEM sooner, with Phase 2B running overlapped with the next K-loop.
+
+Predicted speedup: ~7% (fixed-point analysis: epi_mbar_wait 1,530 → 1,119 → tile time 6,124 → 5,712).
+
+#### F19a: Early epilogue mbar signal (KEPT)
+
+**Change:** Pass `epi_mbar_addr` into `epilogue_store`. Call `mbar_arrive()` after Phase 1B's `__syncwarp()` (after all TMEM reads, before Phase 2B). Drain epilogue passes 0 (no signal needed). Removed standalone `mbar_arrive` from caller.
+
+**Timing:**
+
+| Metric | F18 baseline | F19a early mbar | Delta |
+|---|---:|---:|:---:|
+| **Wall clock** | **0.543 ms** | **0.542 ms** | **~0%** |
+| Epilogue mbar wait | 1,530 cycles | 1,122 cycles | **-26.7%** |
+| TMA stage-0 wait | 576 cycles | 818 cycles | +42.0% |
+| K-loop | 4,017 cycles | 4,187 cycles | +4.2% |
+| Total tile | 6,124 cycles | 6,128 cycles | ~0% |
+| Overhead (epi+tma0) | 2,107 cycles | 1,941 cycles | -7.9% |
+| Phase 1 | 4,102 cycles | 4,133 cycles | +0.8% |
+| Phase 2B | 824 cycles | 825 cycles | +0.1% |
+| Total epilogue | 4,926 cycles | 4,958 cycles | +0.6% |
+
+**Why it's neutral:** The early mbar signal works exactly as designed — epi_mbar_wait dropped 408 cycles (26.7%). But Phase 2B's 128-thread parallel `ld.shared.v2 + st.global.v2` stores now overlap with the K-loop and add L1/LSU contention (+170 cycles to K-loop). The remaining 242-cycle improvement shifted to TMA stage-0 wait (W1 arrives sooner, TMA data isn't ready yet — moving idle time from one mbar to another). Net: overhead dropped 166 cycles, K-loop grew 170 cycles. Perfect cancellation.
+
+**Kept because:** Structurally correct, no performance cost, and would pay off if Phase 2B's LSU contention could be eliminated (motivating F19b).
+
+#### F19b: TMA bulk stores for Phase 2B (REJECTED)
+
+**Hypothesis:** Replace Phase 2B's 32-thread manual stores with `cp.async.bulk.global.shared::cta.bulk_group` TMA stores (lane 0 only, 32 × 256B per warp). The TMA/DMA engine uses an independent hardware path from the SMSP's LSU, eliminating the K-loop contention that made F19a neutral.
+
+**Changes:**
+- Replaced Phase 2B's `COALESCED_STORE_V2` loop with 32 × `cp.async.bulk.global.shared::cta.bulk_group` stores (lane 0 only, 256 bytes each = 128 BF16 cols per row)
+- Added `cp.async.bulk.commit_group` after the 32 stores
+- Added `cp.async.bulk.wait_group 0` before Phase 1B+2A loop (protects staging_b from being overwritten while TMA reads are in flight)
+- Added `cp.async.bulk.wait_group 0` after drain epilogue (ensures completion before kernel exit)
+- 226 regs (+3), 0 spills
+
+**Timing:**
+
+| Metric | F18 baseline | F19b TMA stores | Delta |
+|---|---:|---:|:---:|
+| **Wall clock** | **0.543 ms** | **0.573 ms** | **+5.5%** |
+| Epilogue mbar wait | 1,530 cycles | 2,714 cycles | +77.4% |
+| TMA stage-0 wait | 576 cycles | 160 cycles | -72.2% |
+| K-loop | 4,017 cycles | 3,509 cycles | **-12.6%** |
+| Total tile | 6,124 cycles | 6,384 cycles | +4.2% |
+| Phase 1 | 4,102 cycles | 3,590 cycles | -12.5% |
+| Phase 2B | 824 cycles | 2,455 cycles | **+198%** |
+| Total epilogue | 4,926 cycles | 6,045 cycles | **+22.7%** |
+
+**Why it regressed:** `cp.async.bulk.global.shared::cta` has ~70 cycles per-instruction overhead. With 32 stores × ~70 cycles = ~2,240 cycles, the TMA approach is 3× slower than 32 threads doing parallel v2 stores (~825 cycles). TMA bulk copies are designed for large transfers (128 KB tile loads), not many small 256-byte row copies. The K-loop DID improve (-12.6%), confirming the LSU contention hypothesis — but the epilogue regression more than offset it.
+
+The padded SMEM layout (STAGING_HALF_ROW_BYTES = 272 = 256 useful + 16 pad, needed for bank-conflict-free Phase 1B writes where consecutive lanes must map to different banks: lane 0 → bank 0, lane 1 → bank 4, lane 2 → bank 8 with 272-byte stride; without pad, 256-byte stride maps ALL lanes to bank 0) prevents using a single `cp.async.bulk.tensor.2d` TMA tensor store, which would amortize the overhead across the full 8 KB transfer. The tensor store requires SMEM layout to match the descriptor's swizzle mode (contiguous 256-byte rows with `CU_TENSOR_MAP_SWIZZLE_NONE`), incompatible with our 272-byte padded rows.
+
+**Key insight:** Phase 2B's L1/LSU contention with the K-loop is real (confirmed by K-loop improving 12.6% when Phase 2B uses TMA), but the only way to exploit this is a SMEM layout that's both bank-conflict-free for Phase 1B writes AND contiguous for TMA tensor stores. This requires swizzled SMEM (e.g., `CU_TENSOR_MAP_SWIZZLE_128B`), which would be a major restructuring of the staging buffer architecture.

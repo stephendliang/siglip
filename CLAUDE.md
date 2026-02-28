@@ -68,7 +68,7 @@ The kernel is **epilogue-bound** (confirmed by clock64 F15 profiling). W1 stalls
 
 **To go faster:** TMA multicast for B (frees L2/DRAM bandwidth), larger TM to amortize per-tile overhead, or further epilogue Phase 1 optimization. See `docs/make_better.md`.
 
-**Tested and ruled out:** See `EXPERIMENTS.md` for 18 experiments with hypotheses, results, and analysis.
+**Tested and ruled out:** See `EXPERIMENTS.md` for 19 experiments with hypotheses, results, and analysis. F19 confirmed Phase 2B's LSU stores contend with K-loop (+170 cycles, +4.2%) when overlapped via early mbar signal — but TMA bulk stores (`cp.async.bulk`, 32×256B) are 3× slower than parallel manual stores due to per-instruction overhead. Padded SMEM (272-byte rows for bank-conflict-free Phase 1B) prevents single-shot TMA tensor stores.
 
 ## Kernel structure
 
@@ -76,7 +76,7 @@ Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1
 
 - **W0**: TMA async bulk loads (A + B tiles, both CTAs load independently)
 - **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
-- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs double-buffered SMEM-staged store: Phase 1A (first 128 cols: `tcgen05.ld` → BF16 add → CVT → `st.shared` to staging_a), `__syncwarp()`, Phase 1B+2A interleaved (second 128 cols → staging_b, with Phase 2A coalesced `ld.shared`+`st.global.v2` from staging_a hiding in TMEM stalls), `__syncwarp()`, Phase 2B (`ld.shared` → `st.global.v2` from staging_b)
+- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs double-buffered SMEM-staged store: Phase 1A (first 128 cols: `tcgen05.ld` → BF16 add → CVT → `st.shared` to staging_a), `__syncwarp()`, Phase 1B+2A interleaved (second 128 cols → staging_b, with Phase 2A coalesced `ld.shared`+`st.global.v2` from staging_a hiding in TMEM stalls), `__syncwarp()` + **early mbar_arrive** (signals TMEM free — W1 can start next K-loop while Phase 2B runs), Phase 2B (`ld.shared` → `st.global.v2` from staging_b, overlapped with K-loop)
 
 TM=128 rows / 32 rows per warp = 4 row groups. W2-W5 each own a row group (all 256 cols). No column splitting (is_split always 0). `epilogue_store` is templated on `<NC_START, NC_END>` so the compiler sees constant loop bounds and fully unrolls.
 
