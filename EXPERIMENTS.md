@@ -4,7 +4,7 @@ Kernel: `patch_embed_gemm` — persistent megakernel for SigLIP2 patch embed GEM
 GEMM: `[928256, 768] x [768, 768]^T`, FP8 E4M3 inputs, BF16 output with fused bias + positional embedding.
 Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 
-**Current best: 0.560 ms / 1955 TFLOPS** (fused end-to-end). 219 regs, 0 spills.
+**Current best: 0.543 ms / 2018 TFLOPS** (fused end-to-end). 223 regs, 0 spills.
 
 ---
 
@@ -26,7 +26,8 @@ Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 | c32ab7a | Epilogue SMEM staging → coalesced stores | 0.633 | 1729 | 222 | |
 | d882aba | Phase 2 unroll 4→8 | 0.630 | 1739 | 222 | |
 | 9bf658a | Blocked combined relayout | 0.579 | 1892 | 223 | |
-| dbe8c72 | F15+F16: epilogue phase timing + 4 epilogue warps | 0.560 | 1955 | 219 | current best |
+| dbe8c72 | F15+F16: epilogue phase timing + 4 epilogue warps | 0.560 | 1955 | 219 | |
+| — | F18: double-buffered SMEM epilogue overlap | 0.543 | 2018 | 223 | current best |
 
 Reference: cuBLAS per-tensor FP8 (best-of-8 algos, 256MB workspace) = 0.365 ms / 3001 TFLOPS (GEMM only, no fusion).
 cuBLAS + unfused pos_embed = 0.835 ms end-to-end.
@@ -475,6 +476,62 @@ Timing parameter `long long& t_phase1_end` added to `epilogue_store` under `#ifd
 **Key insight:** SMEM staging is not just an optimization for store coalescing — it isolates TMEM reads from global store traffic on the L1 bus. Phase 1's `st.shared` stores use the SMEM path (no L1 contention), while Phase 2's coalesced `st.global.v4` stores are bandwidth-efficient when they do hit L1. Replacing both with uncoalesced `st.global.v8` removes this isolation, causing TMEM and store traffic to contend on L1.
 
 **Lessons for future experiments:** Any epilogue optimization must preserve the SMEM staging architecture. Approaches that might still help:
-- Double-buffered SMEM staging (overlap Phase 2 of first half with Phase 1 of second half)
+- Double-buffered SMEM staging (overlap Phase 2 of first half with Phase 1 of second half) → **implemented as F18**
 - TMA multicast for B matrix (frees L2/DRAM bandwidth, indirectly reduces contention)
 - Larger TM (e.g., 192 or 256) to amortize per-tile overhead over more compute
+
+---
+
+### Experiment F18: Double-buffered SMEM epilogue overlap (COMMITTED)
+
+**Date:** 2026-02-28
+**Baseline:** 0.560 ms / 1955 TFLOPS / 219 regs (F16, 4 epilogue warps)
+**Result:** 0.543 ms / 2018 TFLOPS (+3.2%), 223 regs, 0 spills
+**Verdict:** COMMITTED
+
+**Hypothesis:** F15 showed Phase 1 (TMEM→SMEM) takes 4,762 cycles (81.6%) and Phase 2 (SMEM→global) takes 1,071 cycles (18.4%). During Phase 1, each TMEM_WAIT stalls ~200 cycles waiting for `tcgen05.ld.x32` to complete. If we split the 256-col epilogue into two 128-col halves with separate staging buffers, we can interleave Phase 2 stores from the first half into Phase 1's TMEM_WAIT stall windows during the second half — hiding Phase 2A latency behind TMEM readback latency.
+
+**Changes:**
+
+SMEM layout:
+- `STAGING_HALF_ROW_BYTES = 128 * 2 + 16 = 272` (was `STAGING_ROW_BYTES = 528`)
+- Two half-buffers per warp: `staging_a` and `staging_b = staging_a + 8704`
+- `STAGING_WARP_BYTES = 2 × 8704 = 17,408` (was 16,896)
+- Total epilogue staging: 4 × 17,408 = 69,632 bytes (+2,048 vs baseline)
+
+Three-phase pipeline in `epilogue_store`:
+1. **Phase 1A**: TMEM readback cols 0–127 → staging_a (4 iterations, same code as before but half-width)
+2. **Overlap**: Issue TMEM_LOAD for second half before `__syncwarp()`. Then interleave: each of 4 Phase 1B iterations processes 8 Phase 2A rows (ld.shared.v2 + st.global.v2 from staging_a) before TMEM_WAIT, filling the TMEM latency window. Phase 1B writes to staging_b.
+3. **Phase 2B**: 32 rows coalesced stores from staging_b (same as old Phase 2 but half-width, v2 instead of v4)
+
+Phase 2 stores use `COALESCED_STORE_V2` (128 cols / 32 lanes = 4 BF16 per thread = 8 bytes = v2) instead of `COALESCED_STORE_V4` (256 cols → 8 per thread → v4).
+
+**Timing comparison:**
+
+| Metric | F16 baseline | F18 overlap | Delta |
+|---|---:|---:|:---:|
+| **Wall clock** | **0.560 ms** | **0.543 ms** | **-3.0%** |
+| **TFLOPS** | **1955** | **2018** | **+3.2%** |
+| Epilogue mbar wait | 2,381 cycles | 1,530 cycles | **-35.7%** |
+| TMA stage-0 wait | 318 cycles | 576 cycles | +81% |
+| K-loop | 4,073 cycles | 4,017 cycles | -1.4% |
+| Total tile | 6,773 cycles | 6,124 cycles | **-9.6%** |
+| Epilogue Phase 1 | 4,762 cycles | 4,102 cycles | **-13.9%** |
+| Epilogue Phase 2 | 1,071 cycles | 824 cycles | -23.1% |
+| **Total epilogue** | **5,833 cycles** | **4,926 cycles** | **-15.6%** |
+| Regs | 219 | 223 | +4 |
+
+**Why it worked:** The overlap hides Phase 2A's coalesced global stores (ld.shared + st.global, using SMEM port + LSU) inside Phase 1B's TMEM_WAIT stalls (waiting on TMEM port — different hardware path). 8 Phase 2A rows (~264 cycles) inserted per TMEM iteration fill the ~200-cycle TMEM stall window. Total epilogue dropped 907 cycles (15.6%). The epi_mbar_wait — the time W1 blocks waiting for epilogue to release TMEM — dropped 851 cycles (35.7%), directly reducing tile time by 649 cycles (9.6%).
+
+The increased TMA stage-0 wait (318→576) is expected: with faster tiles, W1 reaches the TMA wait sooner, occasionally before TMA data arrives. This is a secondary effect, not a regression — it means the K-loop's compute budget is better utilized.
+
+**SMEM budget:**
+
+| Component | Bytes |
+|---|---|
+| Pipeline (4 stages × 32 KB) | 131,072 |
+| TMEM addr + mbarriers | 128 |
+| Staging (4 warps × 17,408) | 69,632 |
+| **Total (SMEM_BYTES)** | **~201 KB** |
+| SM limit | 228 KB |
+| **Headroom** | **~27 KB** |

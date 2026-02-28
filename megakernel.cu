@@ -35,10 +35,11 @@
 #define OFF_MAINLOOP_MBAR  (OFF_MMA_MBAR + N_STAGES * 8)
 #define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
 #define OFF_STAGING        ((OFF_EPILOGUE_MBAR + 16 + 127) & ~127)
-#define STAGING_ROW_PAD    16                                         // 16B-aligned rows for v4 ld/st; 4-way bank conflict on writes (acceptable)
-#define STAGING_ROW_BYTES  (TN * 2 + STAGING_ROW_PAD)                 // 528 bytes per row (16B-aligned)
-#define STAGING_WARP_BYTES (32 * STAGING_ROW_BYTES)                   // 16896 bytes per warp
-#define SMEM_BYTES         ((OFF_STAGING + NUM_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
+#define STAGING_ROW_PAD         16                                                  // 16B pad for alignment
+#define STAGING_HALF_ROW_BYTES  ((TN / 2) * 2 + STAGING_ROW_PAD)                    // 272 bytes per half-row (128 BF16 cols + pad)
+#define STAGING_HALF_WARP_BYTES (32 * STAGING_HALF_ROW_BYTES)                        // 8704 bytes per half-buffer
+#define STAGING_WARP_BYTES      (2 * STAGING_HALF_WARP_BYTES)                        // 17408 bytes per warp (double-buffered A/B)
+#define SMEM_BYTES              ((OFF_STAGING + NUM_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
 #define TMEM_COLS      512
 #define IDESC          0x10400010U
 #define SBO            1024
@@ -240,9 +241,10 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
         "}" \
         :: "r"(SADDR), "l"(GPTR) : "memory")
 
-// ── Epilogue: x32 TMEM → inline BF16 add → CVT → SMEM staging → coalesced st.global ──
-// Phase 1: TMEM readback + combined add + CVT → st.shared (row-per-thread, uncoalesced OK)
-// Phase 2: ld.shared transposed → st.global (all threads write same row, coalesced)
+// ── Epilogue: x32 TMEM → inline BF16 add → CVT → double-buffered SMEM staging → coalesced st.global ──
+// Phase 1A: TMEM readback (first 128 cols) + combined add + CVT → staging_a
+// Phase 1B + Phase 2A: TMEM readback (second 128 cols) → staging_b, interleaved with coalesced stores from staging_a
+// Phase 2B: coalesced stores from staging_b
 
 template<int NC_START, int NC_END>
 static __device__ __forceinline__
@@ -268,18 +270,20 @@ void epilogue_store(
         + (long long)comb_block_row * COMB_COL_BLOCKS * COMB_BLOCK_ELEMS
         + comb_row_in_blk * COMB_BLOCK_COLS;
 
-    // Single buffer: 32 FP32 registers for x32 TMEM load
+    constexpr int NC_MID = (NC_START + NC_END) / 2;
+    constexpr int HALF_CPT = (NC_MID - NC_START) / 32;  // 4 cols per thread per half
+    const uint32_t staging_a = staging_saddr;
+    const uint32_t staging_b = staging_saddr + STAGING_HALF_WARP_BYTES;
+
     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
     float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
 
-    // Prefetch first 32-column chunk
+    // ═══ Phase 1A: cols NC_START..NC_MID-1 → staging_a ═══
     TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                   a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                   taddr_base + NC_START);
 
-    // ── Phase 1: TMEM readback + combined add → SMEM staging (row-per-thread) ──
-    for (int nc = NC_START; nc < NC_END; nc += 32) {
-        // Load ALL BF16 combined before TMEM_WAIT (overlap with TMEM latency)
+    for (int nc = NC_START; nc < NC_MID; nc += 32) {
         const __nv_bfloat16* comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
         uint4 craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
         uint4 craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
@@ -293,22 +297,19 @@ void epilogue_store(
         BF16X2_TO_F32(craw1.z, s12, s13);
         BF16X2_TO_F32(craw1.w, s14, s15);
 
-        // Second 16 BF16 values — loaded but NOT converted yet
         craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
         craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
 
         TMEM_WAIT();
 
-        // First 16 columns → SMEM
         a0+=s0; a1+=s1; a2+=s2; a3+=s3;
         a4+=s4; a5+=s5; a6+=s6; a7+=s7;
         a8+=s8; a9+=s9; a10+=s10; a11+=s11;
         a12+=s12; a13+=s13; a14+=s14; a15+=s15;
 
-        uint32_t saddr = staging_saddr + lane * STAGING_ROW_BYTES + (nc - NC_START) * 2;
+        uint32_t saddr = staging_a + lane * STAGING_HALF_ROW_BYTES + (nc - NC_START) * 2;
         CVT_STS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, saddr);
 
-        // Convert second 16 BF16
         BF16X2_TO_F32(craw0.x, s0, s1);
         BF16X2_TO_F32(craw0.y, s2, s3);
         BF16X2_TO_F32(craw0.z, s4, s5);
@@ -318,7 +319,6 @@ void epilogue_store(
         BF16X2_TO_F32(craw1.z, s12, s13);
         BF16X2_TO_F32(craw1.w, s14, s15);
 
-        // Second 16 columns → SMEM
         a16+=s0; a17+=s1; a18+=s2; a19+=s3;
         a20+=s4; a21+=s5; a22+=s6; a23+=s7;
         a24+=s8; a25+=s9; a26+=s10; a27+=s11;
@@ -326,7 +326,77 @@ void epilogue_store(
 
         CVT_STS(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31, saddr + 32);
 
-        // Prefetch next 32-column chunk
+        if (nc + 32 < NC_MID)
+            TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                          taddr_base + nc + 32);
+    }
+
+    // Prefetch first chunk of second half (async, starts loading during syncwarp)
+    TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                  taddr_base + NC_MID);
+
+    __syncwarp();  // Phase 1A SMEM writes visible for Phase 2A reads
+
+    // ═══ Phase 1B (cols NC_MID..NC_END-1 → staging_b) + Phase 2A (staging_a → global) ═══
+    __nv_bfloat16* row_base_a = C + (long long)gm_base * N_DIM + n_start + NC_START;
+
+    for (int nc = NC_MID; nc < NC_END; nc += 32) {
+        // Phase 2A: 8 rows from staging_a (fills TMEM latency window)
+        {
+            const int r_base = ((nc - NC_MID) / 32) * 8;
+            #pragma unroll
+            for (int r = r_base; r < r_base + 8; r++) {
+                uint32_t src = staging_a + r * STAGING_HALF_ROW_BYTES + lane * HALF_CPT * 2;
+                __nv_bfloat16* dst = row_base_a + (long long)r * N_DIM + lane * HALF_CPT;
+                COALESCED_STORE_V2(src, dst);
+            }
+        }
+
+        // Combined loads (further fills TMEM latency window)
+        const __nv_bfloat16* comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
+        uint4 craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
+        uint4 craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
+        float s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15;
+        BF16X2_TO_F32(craw0.x, s0, s1);
+        BF16X2_TO_F32(craw0.y, s2, s3);
+        BF16X2_TO_F32(craw0.z, s4, s5);
+        BF16X2_TO_F32(craw0.w, s6, s7);
+        BF16X2_TO_F32(craw1.x, s8, s9);
+        BF16X2_TO_F32(craw1.y, s10, s11);
+        BF16X2_TO_F32(craw1.z, s12, s13);
+        BF16X2_TO_F32(craw1.w, s14, s15);
+
+        craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
+        craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
+
+        TMEM_WAIT();
+
+        a0+=s0; a1+=s1; a2+=s2; a3+=s3;
+        a4+=s4; a5+=s5; a6+=s6; a7+=s7;
+        a8+=s8; a9+=s9; a10+=s10; a11+=s11;
+        a12+=s12; a13+=s13; a14+=s14; a15+=s15;
+
+        uint32_t saddr = staging_b + lane * STAGING_HALF_ROW_BYTES + (nc - NC_MID) * 2;
+        CVT_STS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, saddr);
+
+        BF16X2_TO_F32(craw0.x, s0, s1);
+        BF16X2_TO_F32(craw0.y, s2, s3);
+        BF16X2_TO_F32(craw0.z, s4, s5);
+        BF16X2_TO_F32(craw0.w, s6, s7);
+        BF16X2_TO_F32(craw1.x, s8, s9);
+        BF16X2_TO_F32(craw1.y, s10, s11);
+        BF16X2_TO_F32(craw1.z, s12, s13);
+        BF16X2_TO_F32(craw1.w, s14, s15);
+
+        a16+=s0; a17+=s1; a18+=s2; a19+=s3;
+        a20+=s4; a21+=s5; a22+=s6; a23+=s7;
+        a24+=s8; a25+=s9; a26+=s10; a27+=s11;
+        a28+=s12; a29+=s13; a30+=s14; a31+=s15;
+
+        CVT_STS(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31, saddr + 32);
+
         if (nc + 32 < NC_END)
             TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                           a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
@@ -336,23 +406,16 @@ void epilogue_store(
 #ifdef TIMING
     t_phase1_end = clock64();
 #endif
-    // ── Warp sync: all SMEM writes visible before transposed read ──
-    __syncwarp();
+    __syncwarp();  // Phase 1B SMEM writes visible for Phase 2B reads
 
-    // ── Phase 2: Transposed coalesced store (SMEM → global) ──
-    constexpr int NC_COLS = NC_END - NC_START;
-    constexpr int COLS_PER_THREAD = NC_COLS / 32;
-    __nv_bfloat16* row_base = C + (long long)gm_base * N_DIM + n_start + NC_START;
+    // ═══ Phase 2B: staging_b → global ═══
+    __nv_bfloat16* row_base_b = C + (long long)gm_base * N_DIM + n_start + NC_MID;
 
     #pragma unroll 8
     for (int r = 0; r < 32; r++) {
-        uint32_t src = staging_saddr + r * STAGING_ROW_BYTES + lane * COLS_PER_THREAD * 2;
-        __nv_bfloat16* dst = row_base + (long long)r * N_DIM + lane * COLS_PER_THREAD;
-
-        if (COLS_PER_THREAD == 8)
-            COALESCED_STORE_V4(src, dst);
-        else
-            COALESCED_STORE_V2(src, dst);
+        uint32_t src = staging_b + r * STAGING_HALF_ROW_BYTES + lane * HALF_CPT * 2;
+        __nv_bfloat16* dst = row_base_b + (long long)r * N_DIM + lane * HALF_CPT;
+        COALESCED_STORE_V2(src, dst);
     }
 }
 
