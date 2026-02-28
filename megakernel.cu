@@ -13,7 +13,7 @@
 #include <cstdio>
 
 #define SM_COUNT       148
-#define NUM_EPI_WARPS  5
+#define NUM_EPI_WARPS  4
 #define THREADS        (32 * (2 + NUM_EPI_WARPS))
 #define BATCH_SIZE     4736
 #define SEQ_LEN        196
@@ -240,7 +240,7 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
         "}" \
         :: "r"(SADDR), "l"(GPTR) : "memory")
 
-// ── Unified epilogue: x32 TMEM → inline BF16 add → CVT → SMEM staging → coalesced st.global ──
+// ── Epilogue: x32 TMEM → inline BF16 add → CVT → SMEM staging → coalesced st.global ──
 // Phase 1: TMEM readback + combined add + CVT → st.shared (row-per-thread, uncoalesced OK)
 // Phase 2: ld.shared transposed → st.global (all threads write same row, coalesced)
 
@@ -257,6 +257,9 @@ void epilogue_store(
     __nv_bfloat16* __restrict__ C,
     int cta_rank,
     uint32_t staging_saddr
+#ifdef TIMING
+    , long long& t_phase1_end
+#endif
 ) {
     const int taddr_base = tmem_addr + ((cta_rank * 128 + row_group * 32) << 16);
     const int comb_block_row = pos_row / COMB_BLOCK_ROWS;
@@ -330,6 +333,9 @@ void epilogue_store(
                           taddr_base + nc + 32);
     }
 
+#ifdef TIMING
+    t_phase1_end = clock64();
+#endif
     // ── Warp sync: all SMEM writes visible before transposed read ──
     __syncwarp();
 
@@ -384,6 +390,9 @@ patch_embed_gemm(
     const __grid_constant__ CUtensorMap tma_b,
     const __nv_bfloat16* __restrict__ combined,
     __nv_bfloat16* __restrict__ C
+#ifdef TIMING
+    , long long* __restrict__ timing_buf  // [74 clusters × 16 values]
+#endif
 ) {
 
     extern __shared__ __align__(128) char smem[];
@@ -447,6 +456,20 @@ patch_embed_gemm(
     int epi_phase[2] = {1, 1};           // W1's epilogue wait phases (both fresh)
     int ml_phase[2]  = {start_buf, 1 - start_buf};  // W2-5: prev_buf on first tile must be fresh(1)
 
+#ifdef TIMING
+    long long t_tile_start = 0, t_after_epi = 0, t_after_tma0 = 0, t_kloop_end = 0;
+    long long sum_epi_wait = 0, sum_tma0_wait = 0, sum_kloop = 0, sum_total = 0;
+    long long min_kloop = 0x7FFFFFFFFFFFFFFFLL, max_kloop = 0;
+    long long min_total = 0x7FFFFFFFFFFFFFFFLL, max_total = 0;
+    int tile_count = 0;
+    // Epilogue warp (W3/ew=1) phase timing
+    long long epi_t0 = 0, epi_t1 = 0, epi_t2 = 0;
+    long long epi_sum_p1 = 0, epi_sum_p2 = 0;
+    long long epi_min_p1 = 0x7FFFFFFFFFFFFFFFLL, epi_max_p1 = 0;
+    long long epi_min_p2 = 0x7FFFFFFFFFFFFFFFLL, epi_max_p2 = 0;
+    int epi_count = 0;
+#endif
+
     for (int tile_idx = tile_start; tile_idx < tile_end; tile_idx++) {
         const int buf = tile_idx & 1;
         const int tm = tile_idx / TILES_N;
@@ -479,14 +502,23 @@ patch_embed_gemm(
             // ── MMA WARP (W1): tcgen05.mma → tmem_base + buf*TN (CTA0 only) ──
             if (lane == 0 && cta_rank == 0) {
                 // Wait for epilogue to release tmem[buf]
+#ifdef TIMING
+                t_tile_start = clock64();
+#endif
                 mbar_wait(epilogue_mbar_addr + buf * 8, epi_phase[buf]);
                 epi_phase[buf] ^= 1;
+#ifdef TIMING
+                t_after_epi = clock64();
+#endif
 
                 for (int ki = 0; ki < K_ITERS; ki++) {
                     const int s = ki % N_STAGES;
 
                     mbar_wait(tma_mbar[s], tma_phase[s]);
                     tma_phase[s] ^= 1;
+#ifdef TIMING
+                    if (ki == 0) t_after_tma0 = clock64();
+#endif
                     asm volatile("tcgen05.fence::after_thread_sync;");
 
                     uint64_t desc_a = make_smem_desc(smem_a[s]);
@@ -531,6 +563,24 @@ patch_embed_gemm(
 
                 // Signal K-loop done: multicast commit → mainloop_mbar[buf] in both CTAs
                 tcgen05_commit_mcast(mainloop_mbar_addr + buf * 8, 0x3);
+#ifdef TIMING
+                t_kloop_end = clock64();
+                long long dt_epi = t_after_epi - t_tile_start;
+                long long dt_tma0 = t_after_tma0 - t_after_epi;
+                long long dt_kloop = t_kloop_end - t_after_tma0;
+                long long dt_total = t_kloop_end - t_tile_start;
+                sum_epi_wait += dt_epi;
+                sum_tma0_wait += dt_tma0;
+                sum_kloop += dt_kloop;
+                sum_total += dt_total;
+                if (dt_kloop < min_kloop) min_kloop = dt_kloop;
+                if (dt_kloop > max_kloop) max_kloop = dt_kloop;
+                if (dt_total < min_total) min_total = dt_total;
+                if (dt_total > max_total) max_total = dt_total;
+                tile_count++;
+                // Setup for next tile's t_tile_start
+                t_tile_start = clock64();
+#endif
             }
         } else {
             // ── OVERLAPPED EPILOGUE (W2+) ──
@@ -547,6 +597,10 @@ patch_embed_gemm(
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             ml_phase[prev_buf] ^= 1;
+#ifdef TIMING
+            if (ew == 1 && lane == 0 && cta_rank == 0)
+                epi_t0 = clock64();
+#endif
 
             if (tile_idx > tile_start) {
                 // Epilogue: read tmem[prev_buf], add inline BF16 combined, store to global
@@ -561,12 +615,38 @@ patch_embed_gemm(
                 const int pos_row = (gm_base + lane) % SEQ_LEN;
                 if (is_split) {
                     if (col_rank == 0)
-                        epilogue_store<0, TN/2>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr);
+                        epilogue_store<0, TN/2>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr
+#ifdef TIMING
+                            , epi_t1
+#endif
+                        );
                     else
-                        epilogue_store<TN/2, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr);
+                        epilogue_store<TN/2, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr
+#ifdef TIMING
+                            , epi_t1
+#endif
+                        );
                 } else {
-                    epilogue_store<0, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr);
+                    epilogue_store<0, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr
+#ifdef TIMING
+                        , epi_t1
+#endif
+                    );
                 }
+#ifdef TIMING
+                if (ew == 1 && lane == 0 && cta_rank == 0) {
+                    epi_t2 = clock64();
+                    long long p1 = epi_t1 - epi_t0;
+                    long long p2 = epi_t2 - epi_t1;
+                    epi_sum_p1 += p1;
+                    epi_sum_p2 += p2;
+                    if (p1 < epi_min_p1) epi_min_p1 = p1;
+                    if (p1 > epi_max_p1) epi_max_p1 = p1;
+                    if (p2 < epi_min_p2) epi_min_p2 = p2;
+                    if (p2 > epi_max_p2) epi_max_p2 = p2;
+                    epi_count++;
+                }
+#endif
 
                 // Signal: done reading tmem[prev_buf] — arrive at CTA0's epilogue mbar
                 const uint32_t epi_mbar_masked = (epilogue_mbar_addr + prev_buf * 8) & 0xFEFFFFFF;
@@ -574,6 +654,32 @@ patch_embed_gemm(
             }
         }
     }  // tile loop
+
+#ifdef TIMING
+    // Write timing data — W1 (CTA0, lane 0) writes per-cluster stats
+    if (warp == 1 && lane == 0 && cta_rank == 0) {
+        long long* out = timing_buf + cluster_id * 16;
+        out[0] = sum_epi_wait;
+        out[1] = sum_tma0_wait;
+        out[2] = sum_kloop;
+        out[3] = sum_total;
+        out[4] = min_kloop;
+        out[5] = max_kloop;
+        out[6] = min_total;
+        out[7] = max_total;
+    }
+    // Write epilogue phase timing — W3 (ew=1, CTA0, lane 0)
+    if (warp == 3 && lane == 0 && cta_rank == 0) {
+        long long* out = timing_buf + cluster_id * 16 + 8;
+        out[0] = epi_sum_p1;
+        out[1] = epi_sum_p2;
+        out[2] = epi_min_p1;
+        out[3] = epi_max_p1;
+        out[4] = epi_min_p2;
+        out[5] = epi_max_p2;
+        out[6] = epi_count;
+    }
+#endif
 
     // ── DRAIN (W2+ only): epilogue for the last tile ──
     if (warp >= 2) {
@@ -599,13 +705,28 @@ patch_embed_gemm(
         const int last_n = ltn * TN;
         const int gm_base = last_m + row_group * 32;
         const int pos_row = (gm_base + lane) % SEQ_LEN;
+#ifdef TIMING
+        long long drain_t1 = 0;
+#endif
         if (is_split) {
             if (col_rank == 0)
-                epilogue_store<0, TN/2>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr);
+                epilogue_store<0, TN/2>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr
+#ifdef TIMING
+                    , drain_t1
+#endif
+                );
             else
-                epilogue_store<TN/2, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr);
+                epilogue_store<TN/2, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr
+#ifdef TIMING
+                    , drain_t1
+#endif
+                );
         } else {
-            epilogue_store<0, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr);
+            epilogue_store<0, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr
+#ifdef TIMING
+                , drain_t1
+#endif
+            );
         }
     }
 
@@ -693,10 +814,20 @@ int main() {
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     printf("  TMA descriptors + func attr done\n");
 
+#ifdef TIMING
+    long long *d_timing;
+    CUDA_CHECK(cudaMalloc(&d_timing, 74 * 16 * sizeof(long long)));
+    CUDA_CHECK(cudaMemset(d_timing, 0, 74 * 16 * sizeof(long long)));
+#endif
+
     // ── Warmup: 2 iterations ──
     printf("Launching warmup (2 iters)...\n");
     for (int _i = 0; _i < 2; _i++) {
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C);
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C
+#ifdef TIMING
+        , d_timing
+#endif
+    );
     }
     printf("  Waiting for warmup sync...\n");
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -709,7 +840,11 @@ int main() {
     cudaEventCreate(&_t1);
     cudaEventRecord(_t0);
     for (int _i = 0; _i < 10; _i++) {
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C);
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C
+#ifdef TIMING
+        , d_timing
+#endif
+    );
     }
     cudaEventRecord(_t1);
     cudaEventSynchronize(_t1);
@@ -722,7 +857,11 @@ int main() {
     cudaEventDestroy(_t1);
 
     // ── Checksum run ──
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C);
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C
+#ifdef TIMING
+        , d_timing
+#endif
+    );
     CUDA_CHECK(cudaDeviceSynchronize());
 
     __nv_bfloat16* h_C = (__nv_bfloat16*)malloc((size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16));
@@ -734,6 +873,82 @@ int main() {
     printf("C[0,0..3] = %.1f %.1f %.1f %.1f\n",
            __bfloat162float(h_C[0]), __bfloat162float(h_C[1]),
            __bfloat162float(h_C[2]), __bfloat162float(h_C[3]));
+
+#ifdef TIMING
+    // Read and print timing data
+    long long h_timing[74 * 16];
+    CUDA_CHECK(cudaMemcpy(h_timing, d_timing, 74 * 16 * sizeof(long long), cudaMemcpyDeviceToHost));
+
+    // Aggregate W1 data across clusters
+    long long g_epi = 0, g_tma0 = 0, g_kloop = 0, g_total = 0;
+    long long g_min_kloop = 0x7FFFFFFFFFFFFFFFLL, g_max_kloop = 0;
+    long long g_min_total = 0x7FFFFFFFFFFFFFFFLL, g_max_total = 0;
+    int total_tiles = 0;
+    // Aggregate epilogue phase data across clusters
+    long long g_ep1 = 0, g_ep2 = 0;
+    long long g_min_p1 = 0x7FFFFFFFFFFFFFFFLL, g_max_p1 = 0;
+    long long g_min_p2 = 0x7FFFFFFFFFFFFFFFLL, g_max_p2 = 0;
+    int total_epi_tiles = 0;
+
+    for (int c = 0; c < 74; c++) {
+        long long* d = h_timing + c * 16;
+        int tiles_this = (int)((long long)(c + 1) * TOTAL_TILES / 74) - (int)((long long)c * TOTAL_TILES / 74);
+        g_epi += d[0];
+        g_tma0 += d[1];
+        g_kloop += d[2];
+        g_total += d[3];
+        if (d[4] < g_min_kloop) g_min_kloop = d[4];
+        if (d[5] > g_max_kloop) g_max_kloop = d[5];
+        if (d[6] < g_min_total) g_min_total = d[6];
+        if (d[7] > g_max_total) g_max_total = d[7];
+        total_tiles += tiles_this;
+        // Epilogue phase data
+        long long* e = d + 8;
+        g_ep1 += e[0];
+        g_ep2 += e[1];
+        if (e[2] < g_min_p1) g_min_p1 = e[2];
+        if (e[3] > g_max_p1) g_max_p1 = e[3];
+        if (e[4] < g_min_p2) g_min_p2 = e[4];
+        if (e[5] > g_max_p2) g_max_p2 = e[5];
+        total_epi_tiles += (int)e[6];
+    }
+
+    double clock_ghz = 2.1; // B200 SM clock approx
+    printf("\n=== W1 TIMING (clock64, %d tiles across 74 clusters) ===\n", total_tiles);
+    printf("  Per-tile averages (cycles / ns at %.1f GHz):\n", clock_ghz);
+    printf("    Epilogue mbar wait:  %7lld cycles / %6.1f ns\n", g_epi / total_tiles, (double)g_epi / total_tiles / clock_ghz);
+    printf("    TMA stage-0 wait:    %7lld cycles / %6.1f ns\n", g_tma0 / total_tiles, (double)g_tma0 / total_tiles / clock_ghz);
+    printf("    K-loop (6 ki × 4 MMA): %7lld cycles / %6.1f ns\n", g_kloop / total_tiles, (double)g_kloop / total_tiles / clock_ghz);
+    printf("    Total tile:          %7lld cycles / %6.1f ns\n", g_total / total_tiles, (double)g_total / total_tiles / clock_ghz);
+    printf("    Overhead (epi+tma0): %7lld cycles / %6.1f ns  (%.1f%% of tile)\n",
+           (g_epi + g_tma0) / total_tiles, (double)(g_epi + g_tma0) / total_tiles / clock_ghz,
+           100.0 * (g_epi + g_tma0) / g_total);
+    printf("  K-loop range: min=%lld max=%lld (%.1fx spread)\n", g_min_kloop, g_max_kloop,
+           g_min_kloop > 0 ? (double)g_max_kloop / g_min_kloop : 0.0);
+    printf("  Total tile range: min=%lld max=%lld (%.1fx spread)\n", g_min_total, g_max_total,
+           g_min_total > 0 ? (double)g_max_total / g_min_total : 0.0);
+    printf("  Expected total cycles (wall clock): %.0f\n", _ms * 1e-3 * clock_ghz * 1e9);
+
+    printf("\n=== EPILOGUE PHASE TIMING (W3/ew=1, %d tiles across 74 clusters) ===\n", total_epi_tiles);
+    if (total_epi_tiles > 0) {
+        long long avg_p1 = g_ep1 / total_epi_tiles;
+        long long avg_p2 = g_ep2 / total_epi_tiles;
+        long long avg_total = avg_p1 + avg_p2;
+        printf("  Per-tile averages (cycles / ns at %.1f GHz):\n", clock_ghz);
+        printf("    Phase 1 (TMEM->SMEM):  %7lld cycles / %6.1f ns  (%.1f%%)\n",
+               avg_p1, (double)avg_p1 / clock_ghz, 100.0 * avg_p1 / avg_total);
+        printf("    Phase 2 (SMEM->global): %7lld cycles / %6.1f ns  (%.1f%%)\n",
+               avg_p2, (double)avg_p2 / clock_ghz, 100.0 * avg_p2 / avg_total);
+        printf("    Total epilogue:        %7lld cycles / %6.1f ns\n",
+               avg_total, (double)avg_total / clock_ghz);
+        printf("  Phase 1 range: min=%lld max=%lld (%.1fx spread)\n", g_min_p1, g_max_p1,
+               g_min_p1 > 0 ? (double)g_max_p1 / g_min_p1 : 0.0);
+        printf("  Phase 2 range: min=%lld max=%lld (%.1fx spread)\n", g_min_p2, g_max_p2,
+               g_min_p2 > 0 ? (double)g_max_p2 / g_min_p2 : 0.0);
+    }
+
+    cudaFree(d_timing);
+#endif
 
     free(h_C);
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_bias); cudaFree(d_pos);

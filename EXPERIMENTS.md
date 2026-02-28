@@ -4,7 +4,7 @@ Kernel: `patch_embed_gemm` — persistent megakernel for SigLIP2 patch embed GEM
 GEMM: `[928256, 768] x [768, 768]^T`, FP8 E4M3 inputs, BF16 output with fused bias + positional embedding.
 Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 
-**Current best: 0.579 ms / 1892 TFLOPS** (fused end-to-end). 223 regs, 0 spills.
+**Current best: 0.560 ms / 1955 TFLOPS** (fused end-to-end). 219 regs, 0 spills.
 
 ---
 
@@ -25,7 +25,8 @@ Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 | cefc59d | Reduce pipeline stages 6→4 | 0.700 | 1564 | 216 | |
 | c32ab7a | Epilogue SMEM staging → coalesced stores | 0.633 | 1729 | 222 | |
 | d882aba | Phase 2 unroll 4→8 | 0.630 | 1739 | 222 | |
-| 9bf658a | Blocked combined relayout | 0.579 | 1892 | 223 | current best |
+| 9bf658a | Blocked combined relayout | 0.579 | 1892 | 223 | |
+| dbe8c72 | F15+F16: epilogue phase timing + 4 epilogue warps | 0.560 | 1955 | 219 | current best |
 
 Reference: cuBLAS per-tensor FP8 (best-of-8 algos, 256MB workspace) = 0.365 ms / 3001 TFLOPS (GEMM only, no fusion).
 cuBLAS + unfused pos_embed = 0.835 ms end-to-end.
@@ -380,3 +381,100 @@ The uncoalesced `st.global.v8` stores caused:
 2. **L1 read-modify-write** — each 128B cache line received only 32 bytes (25% fill)
 
 SMEM staging fixes #2 completely and makes #1 neutral. L1 hit rate drop (61.7% → 33.6%) confirms RMW elimination. Cost: SMEM traffic (20.6% L1 shared pipe), 1.1% short_scoreboard stalls, 2.5x store instructions. Net: **warp issue rate +35%, TMEM stalls -30%**.
+
+---
+
+### Experiment F15: Epilogue phase profiling (DIAGNOSTIC)
+
+**Date:** 2026-02-28
+**Baseline:** 0.579 ms / 1892 TFLOPS / 223 regs (5 epilogue warps)
+**Build:** `make timing` (`-DTIMING`), 240 regs, 0 spills — timing build only, no baseline change
+**Verdict:** DIAGNOSTIC — data used to guide F16 and F17
+
+**Goal:** Determine whether Phase 1 (TMEM readback + BF16 add + CVT → SMEM) or Phase 2 (SMEM transpose → coalesced global store) dominates the 9,271-cycle epilogue overrun identified by clock64 W1 timing.
+
+**Instrumentation:** Added `clock64()` timestamps to W3 (ew=1, full 256-col warp, representative of the bottleneck warps W3-W5). Three points:
+- `t0`: After `mainloop_mbar` wait (start of epilogue work)
+- `t1`: Just before `__syncwarp()` inside `epilogue_store` (end of Phase 1)
+- `t2`: After `epilogue_store` returns (end of Phase 2)
+
+Timing parameter `long long& t_phase1_end` added to `epilogue_store` under `#ifdef TIMING`. Accumulates min/max/sum per cluster for both phases. Timing buffer expanded from [74×8] to [74×16] values.
+
+**Results (with F16 applied — NUM_EPI_WARPS=4):**
+
+```
+=== EPILOGUE PHASE TIMING (W3/ew=1, 10804 tiles across 74 clusters) ===
+  Per-tile averages:
+    Phase 1 (TMEM→SMEM):   4,762 cycles / 2,268 ns  (81.6%)
+    Phase 2 (SMEM→global): 1,071 cycles /   510 ns  (18.4%)
+    Total epilogue:         5,833 cycles / 2,778 ns
+  Phase 1 range: min=3,115 max=10,542 (3.4× spread)
+  Phase 2 range: min=669   max=2,276  (3.4× spread)
+```
+
+**Conclusion:** **Phase 1 dominates at 81.6%.** TMEM readback (`tcgen05.ld.x32` + `tcgen05.wait::ld`) is the epilogue bottleneck. Phase 2 (coalesced global stores via SMEM) is only 18.4% — not worth optimizing in isolation. This triggered Path A (TMEM contention reduction → F16) and ruled out Phase 2-focused optimizations.
+
+---
+
+### Experiment F16: NUM_EPI_WARPS 5→4 (COMMITTED)
+
+**Date:** 2026-02-28
+**Baseline:** 0.579 ms / 1892 TFLOPS / 223 regs (5 epilogue warps)
+**Result:** 0.560 ms / 1955 TFLOPS (+3.3%), 219 regs, 0 spills
+**Verdict:** COMMITTED
+
+**Hypothesis:** With 5 warps, W2 and W6 split row_group 0 (128 cols each), while W3-W5 each handle a full row_group (256 cols). The split warps finish early, but the epilogue mbar only fires when the LAST warp arrives. The 5th warp adds TMEM read contention without helping the critical path. With 4 warps, each handles exactly one row_group with full 256 cols — equal work, no wasted early-finish, less TMEM contention.
+
+**Changes:** Single-line: `#define NUM_EPI_WARPS 4` (was 5). Everything auto-derives:
+- `THREADS`: 32 × (2+4) = 192 (was 224)
+- `SMEM_BYTES`: saves 16,896 bytes (one fewer staging buffer)
+- `epilogue_mbar` expected arrivals: 4 × 2 × 32 = 256 (was 320)
+- `is_split`: `(row_group < (4-4))` = always 0 → all warps call `epilogue_store<0, TN>` (full 256 cols, no column splitting)
+
+**W1 timing (F16 vs baseline):**
+
+| Metric | Baseline (5 warps) | F16 (4 warps) | Delta |
+|---|---:|---:|:---:|
+| Epilogue mbar wait | 2,466 cycles | 2,381 cycles | -3.4% |
+| TMA stage-0 wait | 292 cycles | 318 cycles | +8.9% |
+| K-loop | 4,046 cycles | 4,073 cycles | +0.7% |
+| Total tile | 6,805 cycles | 6,773 cycles | -0.5% |
+| Wall clock | 0.579 ms | 0.560 ms | **-3.3%** |
+
+**Why it worked:** Removing the 5th warp reduced TMEM read port contention during Phase 1. The epilogue mbar wait dropped 85 cycles (-3.4%), and register pressure dropped (223→219, freeing 4 regs). The wall clock improvement (3.3%) exceeds the tile-level improvement (0.5%) because reduced TMEM contention also improves tail-latency tiles (max K-loop dropped from 9,464 to the same range, and max tile time spread tightened from 4.9× to 4.8×).
+
+---
+
+### Experiment F17: Direct CVT_STG stores (eliminate Phase 2)
+
+**Date:** 2026-02-28
+**Baseline:** 0.560 ms / 1955 TFLOPS / 219 regs (F16, 4 epilogue warps)
+**Result:** 0.568 ms / 1929 TFLOPS (-1.4% regression), 215 regs, 0 spills
+**Verdict:** REJECTED
+
+**Hypothesis:** F15 showed Phase 2 (SMEM→global) takes only 1,071 cycles (18.4%). Eliminating it entirely by reverting to direct `CVT_STG` (`st.global.v8`) stores would cut the epilogue from 5,833 to ~4,762 cycles — potentially fitting within the K-loop shadow (tile time = 6,773 cycles). The L1 headroom from F13's blocked layout (68% vs old 85%) should absorb the uncoalesced store pressure.
+
+**Changes:**
+1. Replaced `CVT_STS` (st.shared) with `CVT_STG` (st.global.v8) in `epilogue_store`
+2. Added `row_ptr = C + (gm_base + lane) * N_DIM + n_start` for direct addressing
+3. Removed `__syncwarp()` and Phase 2 loop entirely
+4. Removed `staging_saddr` parameter from all call sites
+
+**Timing comparison:**
+
+| Metric | F16 (SMEM staging) | F17 (direct stores) | Delta |
+|---|---:|---:|:---:|
+| Phase 1 (TMEM→store) | 4,762 cycles | 5,688 cycles | **+19.4%** |
+| Phase 2 (SMEM→global) | 1,071 cycles | 18 cycles | -98.3% |
+| Total epilogue | 5,833 cycles | 5,706 cycles | -2.2% |
+| Epilogue mbar wait | 2,381 cycles | 2,503 cycles | +5.1% |
+| Wall clock | 0.560 ms | 0.568 ms | **+1.4%** |
+
+**Why it failed:** The uncoalesced `st.global.v8` stores compete with TMEM reads for L1 bandwidth. Each warp's 32-byte store scatters across 32 different cache lines (one per thread, each thread writes to a different row with 1536-byte stride). This generates 4KB of L1 traffic for 1KB of useful data — 4× amplification. The L1 pressure backs up into the TMEM readback pipeline, inflating Phase 1 from 4,762 to 5,688 cycles (+926). This nearly cancels the Phase 2 elimination (1,071 cycles saved), netting only a 127-cycle (2.2%) epilogue reduction — but the increased L1 contention also slows the K-loop's TMA traffic, causing a net regression.
+
+**Key insight:** SMEM staging is not just an optimization for store coalescing — it isolates TMEM reads from global store traffic on the L1 bus. Phase 1's `st.shared` stores use the SMEM path (no L1 contention), while Phase 2's coalesced `st.global.v4` stores are bandwidth-efficient when they do hit L1. Replacing both with uncoalesced `st.global.v8` removes this isolation, causing TMEM and store traffic to contend on L1.
+
+**Lessons for future experiments:** Any epilogue optimization must preserve the SMEM staging architecture. Approaches that might still help:
+- Double-buffered SMEM staging (overlap Phase 2 of first half with Phase 1 of second half)
+- TMA multicast for B matrix (frees L2/DRAM bandwidth, indirectly reduces contention)
+- Larger TM (e.g., 192 or 256) to amortize per-tile overhead over more compute

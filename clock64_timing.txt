@@ -1,0 +1,22 @@
+SigLIP2 patch embed GEMM — tcgen05 cta_group::2 (7 warps [5 epi], cluster of 2)
+  GEMM: [928256,768] x [768,768]^T  4-stage pipeline  inline BF16 combined  SMEM-staged coalesced stores  idesc: 0x10400010
+  Alloc + precompute done
+  TMA descriptors + func attr done
+Launching warmup (2 iters)...
+  Waiting for warmup sync...
+  Warmup done.
+Timing: 10 iterations...
+Custom kernel: 0.573 ms  1911.98 TFLOPS
+Checksum (first 1024): 1769472.000000
+C[0,0..3] = 1728.0 1728.0 1728.0 1728.0
+
+=== W1 TIMING (clock64, 10878 tiles across 74 clusters) ===
+  Per-tile averages (cycles / ns at 2.1 GHz):
+    Epilogue mbar wait:     2466 cycles / 1174.6 ns
+    TMA stage-0 wait:        292 cycles /  139.3 ns
+    K-loop (6 ki × 4 MMA):    4046 cycles / 1926.9 ns
+    Total tile:             6805 cycles / 3240.7 ns
+    Overhead (epi+tma0):    2759 cycles / 1313.8 ns  (40.5% of tile)
+  K-loop range: min=2343 max=9464 (4.0x spread)
+  Total tile range: min=3114 max=15375 (4.9x spread)
+  Expected total cycles (wall clock): 1202699

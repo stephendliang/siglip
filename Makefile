@@ -9,12 +9,15 @@ CU       = megakernel.cu
 CUTLASS_DIR = third_party/cutlass
 CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 
-.PHONY: all gen clean dry-run
+.PHONY: all gen clean dry-run timing
 
 all: $(TARGET)
 
 $(TARGET): $(CU)
 	$(NVCC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+timing: $(CU)
+	$(NVCC) $(CFLAGS) -DTIMING $< -o siglip_timing $(LDFLAGS)
 
 cutlass-bench: cutlass_bench.cu
 	$(NVCC) $(CFLAGS) $(CUTLASS_INC) -std=c++17 --expt-relaxed-constexpr $< -o $@ $(LDFLAGS)
