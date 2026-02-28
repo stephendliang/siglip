@@ -158,6 +158,49 @@ cuBLAS + unfused pos_embed = 0.835 ms end-to-end.
 
 ---
 
+### Experiment F10: Software-pipeline combined tensor loads
+
+**Date:** 2026-02-28
+**Baseline:** 0.630 ms / 1739 TFLOPS / 222 regs
+**Result:** 0.630 ms / 1738 TFLOPS (neutral), 224 regs, 0 spills
+**Verdict:** NEUTRAL — no improvement, reverted
+
+**Hypothesis:** The 4 uncoalesced global `uint4` loads for the combined tensor in Phase 1 are issued and immediately consumed by `BF16X2_TO_F32`, causing ~100-200 cycle stalls per load before the warp even reaches `TMEM_WAIT()`. Software-pipelining — issuing iteration N+1's loads at the start of iteration N — would hide these stalls behind the previous iteration's TMEM_WAIT + FADD + CVT_STS work.
+
+**Changes:**
+1. Prologue: declared `uint4 next_c0..next_c3`, issued 4 global loads for the first iteration's combined data before `TMEM_LOAD_X32`
+2. Loop body: `c0..c3 = next_c0..c3` (register rename in unrolled code), then issue NEXT iteration's 4 loads guarded by `if (nc + 32 < NC_END)`, then convert from `c0..c3` (no stall — data arrived during previous iteration)
+3. Both halves of the combined data (cols 0-15 from `c0,c1` and cols 16-31 from `c2,c3`) use the same pipeline — all 4 loads prefetched together, eliminating the original code's reuse of `craw0/craw1` across halves
+
+**Register cost:** +2 regs (222→224). The proposal estimated +16 to +24, but the compiler performed effective register renaming across the fully-unrolled iterations (8 iters for `<0,256>`, 4 for `<0,128>`/`<128,256>`). No spills, 31 regs below the 255 ISA ceiling.
+
+**Why it didn't help:** The combined load stalls are **not on the critical path**. The epilogue is overlapped with the K-loop via double-buffered TMEM and mainloop mbarriers. The K-loop (6 iterations × 4 MMAs × TMA loads) takes longer than the epilogue (8 nc iterations of TMEM readback + add + store). Epilogue warps finish and wait at `mainloop_mbar` regardless — the combined load stalls were occurring inside this slack time, so eliminating them saves nothing on the wall clock.
+
+**Key insight:** This confirms the kernel is **K-loop-bound, not epilogue-bound**. Epilogue optimizations (proposals 2, 3, 4) targeting combined load efficiency or warp balance are unlikely to improve wall time unless they also reduce K-loop latency or eliminate the epilogue entirely. The only epilogue improvement that would help is one that makes the epilogue so much faster that it fits within a single tile's K-loop with room to spare — currently there's slack, but the epilogue is already inside it.
+
+---
+
+### Experiment F11: Combined loads bypass L1 via `.cg` (on top of F10 pipelining)
+
+**Date:** 2026-02-28
+**Baseline:** 0.630 ms / 1739 TFLOPS / 222 regs (F10 pipelined: 0.630 ms / 224 regs)
+**Result:** 0.908 ms / 1206 TFLOPS (44% regression), 216 regs, 0 spills
+**Verdict:** REJECTED
+
+**Hypothesis:** L1 tex throughput at 85% is the primary bottleneck. The combined tensor (196×768×2B = 294 KB) slightly exceeds L1 capacity. Replacing the 4 uncoalesced `uint4` combined loads with `ld.global.cg.v4.b32` (cache-global, bypass L1) would route them through L2 (at 54% utilization) instead, relieving L1 pressure for Phase 2's coalesced stores. Software pipelining from F10 would hide the longer L2 latency (~200 cycles vs ~50 for L1 hits).
+
+**Changes (on top of F10):**
+1. Added `LDG_CG_V4(reg, ptr)` macro wrapping `ld.global.cg.v4.b32` inline PTX
+2. Replaced all 8 combined load sites (4 in prologue + 4 in loop body) with `LDG_CG_V4`
+
+**Register note:** Regs dropped from 224 (F10) to 216 — the `.cg` qualifier gives the compiler more scheduling freedom since these loads don't interact with L1 cache state, allowing tighter register live ranges. Compile time also dropped 210ms → 143ms.
+
+**Why it failed catastrophically:** The proposal's own risk analysis was exactly right. `.cg` does not fix the uncoalesced access pattern — it moves 128 scattered cache line fetches per warp from L1 to L2. With 148 SMs × 5 epilogue warps × 4 loads/iteration × 8 iterations, the aggregate L2 scatter traffic is enormous: each warp's 4 `uint4` loads generate 128 scattered L2 accesses (16 KB of traffic for 2 KB of useful data, 8× amplification). The 54% L2 headroom was completely inadequate for this traffic pattern. The combined tensor was getting good L1 cache hits in the baseline (294 KB fits marginally, and access patterns have temporal locality within a tile), so bypassing L1 traded fast cache hits for slow L2 scatter — and the pipelining couldn't hide the aggregate L2 contention across all SMs.
+
+**Compounding factor:** Since F10 showed the epilogue isn't on the critical path anyway, the `.cg` regression doesn't just slow the epilogue — it makes the epilogue **longer than the K-loop**, flipping the overlap balance. The epilogue becomes the new critical path, and the 44% regression reflects the full exposed epilogue cost.
+
+---
+
 ## Profiling data — SMEM staging A/B comparison
 
 Profiled via `ncu --set detailed`, single kernel instance.

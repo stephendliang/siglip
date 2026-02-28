@@ -3,82 +3,7 @@
 Baseline: **0.630 ms / 1739 TFLOPS**, 222 regs, 0 spills. L1 tex at 85% (primary ceiling).
 Reference: cuBLAS GEMM-only = 0.365 ms / 3001 TFLOPS. cuBLAS + unfused pos_embed = 0.835 ms.
 
----
-
-## MUST TRY
-
-### 1a. Software-pipeline combined tensor loads
-
-**Problem:** In the Phase 1 epilogue loop, the 4 global `uint4` loads for the combined (bias+pos_embed) tensor are issued and immediately consumed by `BF16X2_TO_F32` conversions. These loads are uncoalesced (32 lanes × different rows, 1536B stride), so each takes ~50-200 cycles. The warp stalls waiting for the data before it even reaches `TMEM_WAIT()`, burning latency-hiding time that should be spent under the TMEM fence.
-
-```
-// Current: load → immediate consume → STALL → TMEM_WAIT (arrives late)
-craw0 = *(comb_row + nc);           // issue uncoalesced global load
-BF16X2_TO_F32(craw0.x, s0, s1);    // STALL here waiting for craw0
-...
-TMEM_WAIT();                         // warp already burned 100+ stall cycles getting here
-```
-
-**Fix:** Issue loads for iteration N+1 at the end of iteration N. By the time they're consumed in iteration N+1, they've had the entire TMEM_WAIT + FADD + CVT_STS + prefetch duration to complete.
-
-```
-// PROLOGUE: issue first TMEM prefetch + first 4 combined loads
-TMEM_LOAD_X32(..., taddr + NC_START);
-next_craw0 = *(comb_row + NC_START);
-next_craw1 = *(comb_row + NC_START + 8);
-next_craw2 = *(comb_row + NC_START + 16);
-next_craw3 = *(comb_row + NC_START + 24);
-
-for (nc = NC_START; nc < NC_END; nc += 32) {
-    curr_craw0..3 = next_craw0..3;   // register rename (free)
-
-    if (nc + 32 < NC_END) {           // issue NEXT iteration's loads NOW
-        next_craw0 = *(comb_row + nc + 32);
-        next_craw1 = *(comb_row + nc + 40);
-        next_craw2 = *(comb_row + nc + 48);
-        next_craw3 = *(comb_row + nc + 56);
-    }
-
-    BF16X2_TO_F32(curr_craw0..3);     // no stall — data loaded last iteration
-    TMEM_WAIT();                       // next_craw loading in background
-    FADD + CVT_STS ...
-    if (nc + 32 < NC_END)
-        TMEM_LOAD_X32(...);            // issued sooner (no prior stall)
-}
-```
-
-**Register cost:** +16 to +24 regs. Current code uses 2 × `uint4` (8 regs) with reuse across first/second halves. Pipelining requires 4 × `uint4` for next-iteration data (16 regs) live across the loop boundary, plus 4 × `uint4` for current-iteration data (16 regs) during consumption — peak 32 regs for combined data vs current 8. Compiler register renaming in the fully-unrolled loop may reduce the effective cost. Hard per-thread ceiling is **255 regs** (ISA encoding limit). At 222 + 24 = 246, that's 9 regs of headroom — tight if the compiler extends other live ranges.
-
-**Icache note:** The `<0, 256>` template unrolls to 8 iterations. Software pipelining adds ~4 LDGs per unrolled iteration = 32 extra instructions in the unrolled body. Icache requests already went +314% from SMEM staging. Monitor `l1tex__t_requests_pipe_lsu_mem_global_op_ld` and instruction cache hit rate.
-
-**Expected effect:** TMEM_LOAD_X32 issued earlier each iteration → better TMEM overlap. Combined load stalls moved out of the critical path. Measurable even without `.cg`.
-
-**Go/no-go:** Keep if spills = 0 and runtime improves. Kill immediately if spills appear or runtime regresses > 1%. Check `ptxas` register count before running.
-
----
-
-### 1b. Combined loads bypass L1 via `.cg` (sweep alongside 1a)
-
-**Problem:** L1 tex throughput is at **85%** — the primary bottleneck. Phase 1's uncoalesced combined loads and Phase 2's coalesced `st.global` stores compete for the same L1 bandwidth. The combined tensor (196 × 768 × 2B = 294 KB) barely exceeds L1 capacity (~256 KB), causing thrashing under multi-warp access.
-
-**Fix:** Replace standard loads with `ld.global.cg` (cache-global, bypass L1):
-
-```c
-#define LDG_CG_V4(reg, ptr) \
-    asm volatile("ld.global.cg.v4.b32 {%0,%1,%2,%3}, [%4];" \
-        : "=r"(reg.x), "=r"(reg.y), "=r"(reg.z), "=r"(reg.w) \
-        : "l"(ptr))
-```
-
-**Relationship to 1a:** `.cg` without pipelining is actively harmful — bypassing L1 increases per-access latency from ~50 to ~200 cycles (L2 path), making the existing pre-`TMEM_WAIT()` stall worse. With pipelining, the latency is hidden behind the previous iteration's TMEM + compute work. However, 1b is NOT a hard dependency on 1a — it should be tested as a **2-point sweep**: `1a alone` vs `1a + .cg`.
-
-**Why it might work:** The combined tensor fits trivially in L2 (48+ MB on B200). L2 is at 54% utilization. Routing combined loads through L2 instead of L1 drops L1 pressure, giving Phase 2's coalesced stores uncontested L1 access.
-
-**Why it might not:** `.cg` does NOT fix the uncoalesced access pattern — it just moves scatter from L1 to L2. Each lane's `uint4` load still generates a separate 128B cache line fetch. A single warp's 4 loads generate 128 scattered L2 accesses (16 KB of L2 traffic for 2 KB of useful data, 8× amplification). All 148 SMs × 5 warps × 8 iterations doing this simultaneously puts real pressure on L2 — the 54% headroom may not be as generous as it looks.
-
-**Zero register cost** beyond 1a.
-
-**Go/no-go:** Test `1a alone` vs `1a + .cg`. Monitor `l1tex__throughput`, `lts__throughput`, `long_scoreboard`, and wall time. Keep `.cg` only if time improves AND L2 throughput stays below ~75%. Kill if L2 becomes the new limiter.
+**Critical finding (F10/F11):** The kernel is **K-loop-bound, not epilogue-bound**. The epilogue completes within the K-loop's shadow — combined load stalls occur in slack time and don't affect wall clock. Epilogue-only optimizations are unlikely to help unless they also affect K-loop throughput or are large enough to flip the overlap balance (dangerous — see F11's 44% regression when `.cg` made the epilogue the new critical path).
 
 ---
 
@@ -98,11 +23,11 @@ for (nc = NC_START; nc < NC_END; nc += 32) {
 - Block dimensions: 32×32 (matches nc iteration and row_group size) is natural, but needs the epilogue `comb_row` indexing to change from `pos_row * N_DIM + col` to a block-offset calculation
 - The `pos_row` for each lane is `(gm_base + lane) % 196` — adjacent lanes DO get adjacent rows. The blocking exploits this by making adjacent rows contiguous within each column chunk
 - **Wraparound hazard:** 196 / 32 = 6.125 — the last block has only 4 rows (196 - 192 = 4), requiring padding or special handling. Near the 196 boundary, 32 lanes can span two non-contiguous pos_row ranges (e.g., gm_base=180 → lanes 0-15 get rows 180-195, lanes 16-31 get rows 0-15). The block indexing must handle this correctly.
-- With `.cg` (proposal 1b), the relayout may be redundant — if combined loads bypass L1 anyway, their access pattern through L2 matters less. Test 1b first; if L1 drops well below 85%, this becomes lower priority
+- ~~With `.cg` (proposal 1b), the relayout may be redundant~~ — F11 killed `.cg` (44% regression). L1 bypass is not viable for scattered combined loads. Relayout remains the only path to fixing the access pattern.
 
 **Interaction with other proposals:** Pairs naturally with #3 (TMA-load combined). A blocked layout can be made TMA-compatible (swizzled), enabling a single TMA bulk copy of each 32×256 block into SMEM instead of 4 scattered `uint4` loads per nc iteration.
 
-**Priority:** First SHOULD TRY. Becomes MUST TRY if 1b fails to relieve L1 pressure (L1 stays above ~80% after 1a+1b sweep).
+**Priority:** Lower than before. F10 proved the epilogue is K-loop-bound — combined load stalls are in slack time. This optimization only helps if combined loads contribute enough L1 traffic to indirectly slow the K-loop (possible via shared L1 bandwidth with TMA/MMA), but that's speculative.
 
 **Go/no-go:** Zero runtime cost (offline relayout). Keep unless the indexing change introduces bugs or the blocked layout doesn't improve L1/L2 sector efficiency in ncu.
 
@@ -120,9 +45,9 @@ for (nc = NC_START; nc < NC_END; nc += 32) {
 
 **New coordination required:** W0 currently only synchronizes with W1 (via TMA mbarriers). Loading combined for the epilogue means W0 needs a new mbarrier path to signal W2-W6 that the combined data is ready in SMEM. Adds complexity to the warp synchronization protocol.
 
-**Interaction with 1a/1b:** If software-pipelined `.cg` loads (1a+1b) drop L1 below 85% and eliminate the combined load stalls, TMA-loading combined becomes less valuable. Test 1a+1b first.
+**Interaction with F10/F11:** F10 (software pipelining) was neutral — epilogue stalls aren't on the critical path. F11 (`.cg`) regressed 44% by saturating L2. TMA-loading combined into SMEM remains a viable alternative to reduce L1 traffic from combined loads, but only matters if that L1 traffic indirectly contends with K-loop TMA loads (speculative).
 
-**Go/no-go:** Only pursue if 1a/1b leave L1 above ~80% and combined loads remain a significant contributor to L1 traffic. Kill if mbarrier coordination cost exceeds the L1 relief.
+**Go/no-go:** Lower priority given F10's finding that the epilogue is K-loop-bound. Only pursue if ncu profiling shows combined loads contributing significant L1 contention with TMA pipe. Kill if mbarrier coordination cost exceeds the L1 relief.
 
 ---
 
@@ -156,13 +81,14 @@ All active warps do 8 iterations. No idle time. W5 either becomes a 5th balanced
 
 **Does NOT increase TMEM concurrency:** W2/W6 process their second row_group sequentially after the first, not concurrently. This avoids the TMEM bandwidth saturation seen in F3 (6 concurrent warps regressed).
 
-**Risk (medium-high):**
-- The idle time may not be on the critical path. The epilogue is overlapped with the K-loop. If K-loop time > max(warp epilogue time), W2/W6 finishing early is irrelevant — they wait for mainloop_mbar anyway. The imbalance only matters if the epilogue is the longer leg.
+**Risk (HIGH — likely dead end):**
+- **F10 confirmed the idle time is NOT on the critical path.** The epilogue completes within the K-loop's shadow. W2/W6 finishing early is irrelevant — they wait for `mainloop_mbar` anyway. Redistributing work only matters if the epilogue becomes the longer leg, which it currently isn't.
 - Two `epilogue_store` calls per warp means two TMEM prefetch setups and two `__syncwarp` barriers. W2/W6 arrive at `epilogue_mbar` later, delaying W1's next MMA start.
 - Reducing active warps from 5 to 4 (W5 freed) reduces TMEM contention (good, per F3) but also reduces parallelism for hiding TMEM latency (bad).
 - Similar structural risk profile to F3/F7 — past experiments show TMEM/synchronization changes have unpredictable effects.
+- **Danger:** Making the epilogue take *longer* per warp (two sequential `epilogue_store` calls) risks flipping the overlap balance, as F11 demonstrated catastrophically.
 
-**Go/no-go:** Exploratory only, pursue after 1a/1b/2. Kill immediately if TMEM-related stalls (`long_scoreboard`) increase or if no clear wall-time improvement.
+**Go/no-go:** Likely not worth pursuing given F10's K-loop-bound finding. Only reconsider if a future change (e.g., TN=128) makes the epilogue the longer leg.
 
 ---
 
@@ -185,7 +111,7 @@ All active warps do 8 iterations. No idle time. W5 either becomes a 5th balanced
 
 **Sweep parameters:** Must co-sweep with N_STAGES (2/3/4) and NUM_EPI_WARPS (3/4/5) since the optimal balance point shifts. The smaller tile means less epilogue work, so fewer epilogue warps might suffice (freeing registers). Also check if register count drops enough for `__launch_bounds__(THREADS, 2)` — though at 222 regs this seems unlikely without significant code shrinkage.
 
-**Go/no-go:** Pure parameter sweep — low implementation risk. Keep if any sweep point beats 0.630 ms. The main value is diagnostic: if TN=128 with fewer epilogue warps is competitive, it reveals that the current epilogue is K-loop-bottlenecked (not epilogue-bottlenecked), which informs whether proposals 2/4 are worth pursuing.
+**Go/no-go:** Pure parameter sweep — low implementation risk. Keep if any sweep point beats 0.630 ms. F10 already confirmed the kernel is K-loop-bound — TN=128's value is now about whether a different tile shape improves K-loop throughput (fewer TMEM cols → less TMEM pressure, more tiles → better SM occupancy balance) rather than diagnosing the epilogue/K-loop balance.
 
 ---
 
