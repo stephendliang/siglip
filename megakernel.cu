@@ -46,6 +46,13 @@
 #define MMA_K          32
 #define MMA_PER_KI     4
 
+#define COMB_PADDED_ROWS   224          // ceil(196/32)*32 = 7*32
+#define COMB_BLOCK_ROWS    32
+#define COMB_BLOCK_COLS    32
+#define COMB_ROW_BLOCKS    7            // 224/32
+#define COMB_COL_BLOCKS    24           // 768/32
+#define COMB_BLOCK_ELEMS   1024         // 32*32
+
 #define CUDA_CHECK(x) do { \
     cudaError_t e_ = (x); \
     if (e_ != cudaSuccess) { \
@@ -252,7 +259,11 @@ void epilogue_store(
     uint32_t staging_saddr
 ) {
     const int taddr_base = tmem_addr + ((cta_rank * 128 + row_group * 32) << 16);
-    const __nv_bfloat16* comb_row = combined + (long long)pos_row * N_DIM + n_start;
+    const int comb_block_row = pos_row / COMB_BLOCK_ROWS;
+    const int comb_row_in_blk = pos_row % COMB_BLOCK_ROWS;
+    const __nv_bfloat16* comb_base = combined
+        + (long long)comb_block_row * COMB_COL_BLOCKS * COMB_BLOCK_ELEMS
+        + comb_row_in_blk * COMB_BLOCK_COLS;
 
     // Single buffer: 32 FP32 registers for x32 TMEM load
     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
@@ -266,8 +277,9 @@ void epilogue_store(
     // ── Phase 1: TMEM readback + combined add → SMEM staging (row-per-thread) ──
     for (int nc = NC_START; nc < NC_END; nc += 32) {
         // Load ALL BF16 combined before TMEM_WAIT (overlap with TMEM latency)
-        uint4 craw0 = *reinterpret_cast<const uint4*>(comb_row + nc);
-        uint4 craw1 = *reinterpret_cast<const uint4*>(comb_row + nc + 8);
+        const __nv_bfloat16* comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
+        uint4 craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
+        uint4 craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
         float s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15;
         BF16X2_TO_F32(craw0.x, s0, s1);
         BF16X2_TO_F32(craw0.y, s2, s3);
@@ -279,8 +291,8 @@ void epilogue_store(
         BF16X2_TO_F32(craw1.w, s14, s15);
 
         // Second 16 BF16 values — loaded but NOT converted yet
-        craw0 = *reinterpret_cast<const uint4*>(comb_row + nc + 16);
-        craw1 = *reinterpret_cast<const uint4*>(comb_row + nc + 24);
+        craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
+        craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
 
         TMEM_WAIT();
 
@@ -347,9 +359,17 @@ __global__ void precompute_combined(
     int seq_len, int n_dim
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < seq_len * n_dim) {
-        int c = idx % n_dim;
-        combined[idx] = __float2bfloat16(bias[c] + pos_embed[idx]);
+    if (idx < COMB_PADDED_ROWS * n_dim) {
+        int row = idx / n_dim;
+        int col = idx % n_dim;
+        int real_row = row % seq_len;
+        int block_row = row / COMB_BLOCK_COLS;
+        int block_col = col / COMB_BLOCK_COLS;
+        int row_in_block = row % COMB_BLOCK_ROWS;
+        int col_in_block = col % COMB_BLOCK_COLS;
+        int blocked_idx = (block_row * COMB_COL_BLOCKS + block_col) * COMB_BLOCK_ELEMS
+                        + row_in_block * COMB_BLOCK_COLS + col_in_block;
+        combined[blocked_idx] = __float2bfloat16(bias[col] + pos_embed[real_row * n_dim + col]);
     }
 }
 
@@ -617,7 +637,7 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_B,    (size_t)N_DIM   * K_DIM));
     CUDA_CHECK(cudaMalloc(&d_bias,  (size_t)N_DIM  * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_pos,   (size_t)SEQ_LEN * N_DIM * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_combined, (size_t)SEQ_LEN * N_DIM * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&d_combined, (size_t)COMB_PADDED_ROWS * N_DIM * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&d_C,    (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16)));
 
     // Fill A, B with 0x3C (=1.5 in FP8 E4M3, a valid finite value)
@@ -628,7 +648,7 @@ int main() {
 
     // Precompute combined[r][c] = __float2bfloat16(bias[c] + pos_embed[r*N_DIM+c])
     {
-        int n_elem = SEQ_LEN * N_DIM;
+        int n_elem = COMB_PADDED_ROWS * N_DIM;
         int tpb = 256;
         int bpg = (n_elem + tpb - 1) / tpb;
         precompute_combined<<<bpg, tpb>>>(d_bias, d_pos, d_combined, SEQ_LEN, N_DIM);
