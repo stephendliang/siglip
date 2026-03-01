@@ -654,3 +654,41 @@ With prefetch:
 W0 already issues ki=0 TMA loads at the very start of each tile body, concurrently with W1's epilogue_mbar wait. The ~1,122-cycle overlap window is substantial but still insufficient to cover the ~1,940-cycle DRAM latency for the A matrix. The prefetch only shifts the TMA issue point by the tile loop transition overhead (~20-30 cycles) — negligible against the 818-cycle shortfall.
 
 **What would actually help TMA0_wait:** The 818-cycle gap is a DRAM bandwidth limitation, not a scheduling problem. Reducing it requires either: (1) TMA multicast for B matrix (halves B bandwidth, frees DRAM for A), (2) larger tile dimensions to amortize per-tile DRAM access, or (3) L2 residency controls to keep B cached.
+
+---
+
+### Experiment F21: L2 promotion for B matrix
+
+**Date:** 2026-03-01
+**Baseline:** 0.543 ms / 2018 TFLOPS / 223 regs (F18+F19a)
+**Result:** No change (TMA0_wait: 787 avg vs 794 avg baseline, within noise)
+**Verdict:** REJECTED — B is already L2-resident
+
+**Hypothesis:** B matrix is 576 KB (768×768 FP8) with high reuse (only 3 N-tiles, all 74 clusters read the same B data). A matrix is 680 MB streaming with zero reuse. A's streaming traffic may evict B from L2. Setting `CU_TENSOR_MAP_L2_PROMOTION_L2_128B` on the B TMA descriptor should hint the hardware to keep B lines in L2, reducing TMA0_wait.
+
+**Change:** Single line in B TMA descriptor setup:
+```c
+CU_TENSOR_MAP_L2_PROMOTION_NONE  →  CU_TENSOR_MAP_L2_PROMOTION_L2_128B
+```
+A descriptor unchanged (`_NONE` — promoting 680 MB streaming A would evict B).
+
+**Build verification:** 223 regs, 0 spills (production). 252 regs, 0 spills (timing). Checksum 1769472.0 correct.
+
+**Timing (3 runs each, timing build):**
+
+| Run | Baseline TMA0 | L2_128B TMA0 |
+|-----|---:|---:|
+| 1 | 787 | 766 |
+| 2 | 780 | 804 |
+| 3 | 814 | 791 |
+| **avg** | **794** | **787** |
+
+Difference: 7 cycles — pure noise. Wall clock identical (0.535 ms timing build both variants).
+
+**Why it failed:** B is already fully L2-resident without any hint. B200 has 48 MB L2 cache; B matrix is 576 KB (1.2% of L2). Despite A's 680 MB streaming traffic, the hardware LRU policy keeps B hot — B's high reuse rate (every cluster reads it every 3 tiles) ensures it's always recently-accessed and never evicted.
+
+TMA0_wait (~790 cycles) is pure A-matrix DRAM latency: each tile loads 16 KB of A from a 680 MB streaming dataset with zero reuse. No L2 policy can help — A misses are mandatory.
+
+**Implications:**
+- **F26 (L2 persistence window): DEAD** — per fail-fast rule, if F21 shows zero change, B is already L2-hot and reserving L2 capacity via `cudaAccessPropertyPersisting` adds nothing.
+- TMA0_wait is confirmed as a pure DRAM bandwidth cost for A, not an L2 eviction problem.

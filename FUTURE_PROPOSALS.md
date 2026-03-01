@@ -1,8 +1,8 @@
 # Future Proposals
 
-**Kernel state (2026-02-28):** F18 best fused path = 0.543 ms / 2018 TFLOPS. F19a early-mbar variant = 0.542 ms / 2020 TFLOPS (performance-neutral, structurally kept). 223 regs, 0 spills.
+**Kernel state (2026-03-01):** F18 best fused path = 0.543 ms / 2018 TFLOPS. F19a early-mbar variant = 0.542 ms / 2020 TFLOPS (performance-neutral, structurally kept). 223 regs, 0 spills.
 **Reference:** cuBLAS pure GEMM = 0.365 ms / 3001 TFLOPS | cuBLAS + unfused pos_embed = 0.835 ms
-**Bottleneck:** Epilogue-bound producer-consumer equilibrium. 403-cycle deficit (epilogue slower), amplified to ~1,162 epi_wait. Phase 1 TMEM readback (4,288 cycles, 68% of epilogue) is the binding constraint. F25 confirmed all 4 epilogue warps are equally bound (symmetric, 172-cycle spread).
+**Bottleneck:** Epilogue-bound producer-consumer equilibrium. ~300-cycle deficit (epilogue slower), amplified to ~1,080 epi_wait. Phase 1 TMEM readback (~4,200 cycles, 68% of epilogue) is the binding constraint. F25 confirmed all 4 epilogue warps are equally bound (symmetric, 172-cycle spread). F21 confirmed B matrix is already L2-resident — TMA0_wait (~790 cycles) is pure A-matrix DRAM latency.
 
 ### Execution order
 
@@ -10,17 +10,17 @@
 Dependencies:
   F25 ✅ (diagnostic) ──→ F23 (warp count sweep, low priority)
                       └──→ F27 ✗ (skipped: symmetric)
-  F21 (L2 promotion) ─→ F26 (L2 persistence)
+  F21 ✗ (L2 promotion) ─→ F26 ✗ (killed: B already L2-resident)
   F22 (BF16 math) ────→ F24 (swizzled staging)
   F28 (K-loop) ────────→ best combined with F22 (attacks both sides of equilibrium)
 
 Recommended serial order:
-  F25 ✅ → F21 → F22 → F28 → F23C → (conditional: F26, F24)
-  │         │      │      │      │
-  │         │      │      │      └─ low priority (F25: symmetric, bandwidth-limited)
-  │         │      │      └──────── pair with F22: K-loop + epilogue = both sides
-  │         │      └──────────────── highest expected value, attacks 403-cycle deficit
-  │         └─────────────────────── 30 min, confirms/eliminates L2 hypothesis
+  F25 ✅ → F21 ✗ → F22 → F28 → F23C → (conditional: F24)
+  │         │        │      │      │
+  │         │        │      │      └─ low priority (F25: symmetric, bandwidth-limited)
+  │         │        │      └──────── pair with F22: K-loop + epilogue = both sides
+  │         │        └──────────────── highest expected value, attacks ~300-cycle deficit
+  │         └──────────────────────── DONE: B already L2-hot, F26 killed
   └────────────────────────────────── DONE: symmetric + mild fat tail → F27 skipped
 ```
 
@@ -91,30 +91,15 @@ All 4 warps are essentially equal (172-cycle spread < 200-cycle threshold). No s
 
 ---
 
-## F21: L2 promotion for B matrix
+## F21: L2 promotion for B matrix — ✗ REJECTED
 
 **Effort:** Low (single line change)
-**Expected impact:** Small-to-medium reduction in TMA0_wait (currently 856 cycles, 14% of tile)
+**Expected impact:** Small-to-medium reduction in TMA0_wait (currently ~790 cycles, 13% of tile)
 **Risk:** Near zero
 
-**Rationale:** B = 576 KB (768×768 FP8). Only 3 N-tiles, so all 74 clusters reuse the same B data. B should already be mostly L2-hot, but A streaming (680 MB, zero reuse) may evict B entries. TMA0_wait = 856 cycles reflects ~1,940-cycle DRAM latency minus the ~1,100-cycle epilogue overlap window. If B consistently hits L2, DRAM bandwidth is freed for A loads.
+**Result: NO CHANGE.** B is already fully L2-resident. TMA0_wait averaged 787 cycles with `_L2_128B` vs 794 baseline (7-cycle difference = noise, 3 runs each). B200's 48 MB L2 easily holds B's 576 KB, and the hardware LRU keeps it hot despite A's 680 MB streaming traffic. `_L2_256B` skipped per fail-fast (no point if `_L2_128B` shows zero change).
 
-**Change:** In the B TMA descriptor:
-```c
-CU_TENSOR_MAP_L2_PROMOTION_NONE  →  CU_TENSOR_MAP_L2_PROMOTION_L2_128B
-```
-
-Also try `_L2_256B` on B. Do **not** try L2 promotion on A — A is 680 MB streaming with zero reuse; promoting A cache lines actively evicts B and other L2-resident data.
-
-**Why it might not help:** B may already be fully L2-resident given its small size and high reuse. The 856-cycle TMA0_wait could be entirely from A loads (16 KB per tile from 680 MB, pure streaming). In that case, L2 promotion changes nothing.
-
-**Measurement:** Compare TMA stage-0 wait in clock64 timing. Wall clock change may be small since TMA0_wait is only 14% of tile.
-
-**Go/no-go:**
-- Success: TMA0_wait drops ≥50 cycles (currently 856)
-- Fail-fast: if TMA0_wait is unchanged with `_L2_128B` on B, B is already L2-resident — skip `_L2_256B` and skip F26
-- Max effort: 30 minutes
-- Rollback: revert descriptor constant
+**Implication:** TMA0_wait (~790 cycles) is confirmed as pure A-matrix DRAM latency — not L2 misses. No L2 policy change can reduce it. F26 killed.
 
 ---
 
@@ -255,33 +240,9 @@ Do not hardcode a guessed XOR formula. Derive the exact addressing from the Blac
 
 ---
 
-## F26: L2 persistence window for B (stream access-policy)
+## F26: L2 persistence window for B (stream access-policy) — ✗ KILLED (F21 prerequisite failed)
 
-**Effort:** Low (host-side `cudaStreamAttrValue` setup)
-**Expected impact:** Small — only relevant if F21 shows partial improvement
-**Risk:** Near zero
-**Prerequisite:** F21 must show partial TMA0_wait improvement (B is sometimes evicted). If F21 shows zero change, skip F26 entirely.
-
-**Rationale:** `CU_TENSOR_MAP_L2_PROMOTION_*` (F21) is a TMA hint — it promotes fetched lines to L2 but doesn't prevent eviction. `cudaAccessPropertyPersisting` with `cudaStreamAttrValue.accessPolicyWindow` reserves actual L2 capacity for a specific address range. B = 576 KB (1.6% of B200's 36 MB L2). If A's 680 MB streaming traffic intermittently evicts B despite L2 promotion hints, hard persistence guarantees B stays resident.
-
-**Change:**
-```c
-cudaStreamAttrValue attr;
-attr.accessPolicyWindow.base_ptr = d_B;
-attr.accessPolicyWindow.num_bytes = 768 * 768;  // 768*768 FP8 = 576 KB
-attr.accessPolicyWindow.hitRatio = 1.0f;
-attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
-```
-
-**Why it might not help:** If F21 shows zero TMA0_wait change, B is already fully L2-resident and the 856 cycles are pure A DRAM latency. No amount of L2 policy changes will help — the bottleneck is A's 680 MB streaming through DRAM, not B eviction.
-
-**Go/no-go:**
-- Success: TMA0_wait drops ≥50 cycles beyond F21's improvement
-- Fail-fast: if F21 shows zero TMA0_wait change, skip F26 entirely — B is already L2-hot
-- Max effort: 30 minutes
-- Rollback: remove `cudaStreamSetAttribute` call
+**Status:** Dead. F21 confirmed B is already fully L2-resident — TMA0_wait is pure A-matrix DRAM latency. Reserving L2 capacity via `cudaAccessPropertyPersisting` would change nothing. No implementation attempted.
 
 ---
 
@@ -653,6 +614,8 @@ Skip B initially (fighting `ptxas` UR allocation) — inspect SASS after A+C to 
 | cp.async.bulk Phase 2B stores (F19b) | 3× slower than manual stores. 32 × 256B at ~70 cycles/instruction overhead. |
 | 5-stage pipeline | Would need SMEM freed and register impact validated. Current 4-stage at 131 KB leaves 27 KB headroom. 5-stage = 163 KB → only 65 KB for staging (needs 70 KB). |
 | TMA multicast for B | B is N-split across CTAs (each loads different half). Zero redundancy. dest_multicast=0 is correct. |
+| L2 promotion for B (F21) | B already fully L2-resident. TMA0_wait unchanged (794 vs 787 cycles, noise). 576 KB B fits easily in 48 MB L2. |
+| L2 persistence for B (F26) | Killed by F21. B already L2-hot — reserving L2 capacity adds nothing. |
 | TN=128 | 2× tiles, same per-tile overhead, 11.4% regression. Definitively ruled out at both 1190 and 1560 TFLOPS. |
 | Combined load L1 bypass | F13 relayout already solved combined loads. L1 at ~67% is equilibrium — remaining L1 is mostly K-loop traffic. |
 | Direct CVT_STG stores (F17) | Uncoalesced st.global.v8 contends with TMEM reads on L1. Phase 1 +19%, net regression. |

@@ -6,40 +6,40 @@ Launching warmup (2 iters)...
   Waiting for warmup sync...
   Warmup done.
 Timing: 10 iterations...
-Custom kernel: 0.536 ms  2041.12 TFLOPS
+Custom kernel: 0.534 ms  2049.89 TFLOPS
 Checksum (first 1024): 1769472.000000
 C[0,0..3] = 1728.0 1728.0 1728.0 1728.0
 
 === W1 TIMING (clock64, 10878 tiles across 74 clusters) ===
   Per-tile averages (cycles / ns at 2.1 GHz):
-    Epilogue mbar wait:     1162 cycles /  553.4 ns
-    TMA stage-0 wait:        761 cycles /  362.8 ns
-    K-loop (6 ki × 4 MMA):    4238 cycles / 2018.3 ns
-    Total tile:             6162 cycles / 2934.5 ns
-    Overhead (epi+tma0):    1924 cycles /  916.3 ns  (31.2% of tile)
-  K-loop range: min=2431 max=11397 (4.7x spread)
-  Total tile range: min=3099 max=14485 (4.7x spread)
-  Expected total cycles (wall clock): 1126601
+    Epilogue mbar wait:     1099 cycles /  523.7 ns
+    TMA stage-0 wait:        786 cycles /  374.7 ns
+    K-loop (6 ki × 4 MMA):    4223 cycles / 2011.1 ns
+    Total tile:             6110 cycles / 2909.5 ns
+    Overhead (epi+tma0):    1886 cycles /  898.4 ns  (30.9% of tile)
+  K-loop range: min=2446 max=10950 (4.5x spread)
+  Total tile range: min=3153 max=13649 (4.3x spread)
+  Expected total cycles (wall clock): 1121783
 
 === EPILOGUE PER-WARP PHASE 1 TIMING (W2-W5, 10804 tiles across 74 clusters) ===
   Per-warp Phase 1 (cycles):
-    W2 (ew=0, rg=0):  avg=4252  min=3066  max=9571  p95=5589
-    W3 (ew=1, rg=1):  avg=4288  min=3054  max=9907  p95=5599
-    W4 (ew=2, rg=2):  avg=4424  min=2815  max=9559  p95=5618
-    W5 (ew=3, rg=3):  avg=4392  min=3114  max=10426  p95=5673
-  Spread of per-warp averages: 172 cycles (max_avg - min_avg)
+    W2 (ew=0, rg=0):  avg=4197  min=3019  max=9309  p95=5349
+    W3 (ew=1, rg=1):  avg=4222  min=3080  max=8977  p95=5301
+    W4 (ew=2, rg=2):  avg=4382  min=2997  max=9023  p95=5400
+    W5 (ew=3, rg=3):  avg=4345  min=2935  max=10218  p95=5350
+  Spread of per-warp averages: 185 cycles (max_avg - min_avg)
   Inter-warp spread per tile (max-min Phase 1 across warps):
-    Average: 615 cycles
-    Min: 5  Max: 5358  P95: 1606 cycles
-  => ASYMMETRIC (>=615 cyc): port-queued or bank-conflict bias, F27 has a target
+    Average: 559 cycles
+    Min: 3  Max: 5515  P95: 1355 cycles
+  => SYMMETRIC (avg spread 185 < 200 cyc): bandwidth-limited, F27 dephasing won't help
 
 === EPILOGUE PHASE TIMING (W3/ew=1, 10804 tiles across 74 clusters) ===
   Per-tile averages (cycles / ns at 2.1 GHz):
-    Mainloop mbar wait:       1114 cycles /  530.5 ns  (17.7%)
-    Phase 1 (TMEM->SMEM):     4288 cycles / 2041.9 ns  (68.2%)
-    Phase 2 (SMEM->global):     882 cycles /  420.0 ns  (14.0%)
-    Total (wait+work):        6284 cycles / 2992.4 ns
-    Work only (P1+P2):        5170 cycles / 2461.9 ns
-  Mainloop wait range: min=330 max=10131 (30.7x spread)
-  Phase 1 range: min=3054 max=9907 (3.2x spread)
-  Phase 2 range: min=545 max=1379 (2.5x spread)
+    Mainloop mbar wait:       1120 cycles /  533.3 ns  (18.0%)
+    Phase 1 (TMEM->SMEM):     4222 cycles / 2010.5 ns  (67.7%)
+    Phase 2 (SMEM->global):     890 cycles /  423.8 ns  (14.3%)
+    Total (wait+work):        6232 cycles / 2967.6 ns
+    Work only (P1+P2):        5112 cycles / 2434.3 ns
+  Mainloop wait range: min=326 max=9879 (30.3x spread)
+  Phase 1 range: min=3080 max=8977 (2.9x spread)
+  Phase 2 range: min=543 max=1389 (2.6x spread)
