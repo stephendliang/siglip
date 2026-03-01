@@ -2,7 +2,7 @@
 // Target: B200  Batch: 4736  GEMM: [928256,768]×[768,768]^T
 // Pipeline: 4-stage (parameterized)  K-iters: 6  MMA/iter: 4  idesc: 0x10400010
 // Warps: 2+NUM_EPI_WARPS  cta_group::2  __cluster_dims__(2,1,1)
-// Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2+,x32 TMEM ld,col-split)  BF16 output
+// Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2+,x32 TMEM ld,TMA stores)  BF16 output
 // tcgen05.mma.cta_group::2.kind::f8f6f4  (E4M3 × E4M3 → FP32)
 // Each CTA loads own A (128 rows) + half B (128 cols). MMA produces 256×256 output.
 
@@ -40,12 +40,9 @@
 #define OFF_MAINLOOP_MBAR  (OFF_MMA_MBAR + N_STAGES * 8)
 #define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
 #define OFF_STAGING        ((OFF_EPILOGUE_MBAR + 16 + 127) & ~127)
-#define STAGING_A_ROW_BYTES       272                                                // 128 BF16 cols = 256B + 16B pad (stride/4=68, gcd(68,32)=4 → 4-way, same as pre-F24)
-#define STAGING_A_BYTES           (32 * STAGING_A_ROW_BYTES)                         // 8704 bytes (= 68×128, 128B-aligned)
-#define STAGING_B_REGION_ROW_BYTES 128                                               // 64 BF16 cols = 128 bytes per region row (SWIZZLE_128B)
-#define STAGING_B_REGION_BYTES    (32 * STAGING_B_REGION_ROW_BYTES)                  // 4096 bytes per region
-#define STAGING_B_HALF_BYTES      (2 * STAGING_B_REGION_BYTES)                       // 8192 bytes (lo + hi regions)
-#define STAGING_WARP_BYTES        (STAGING_A_BYTES + STAGING_B_HALF_BYTES)            // 16512 bytes per warp
+#define STAGING_REGION_ROW_BYTES  128                                               // 64 BF16 cols = 128 bytes (SWIZZLE_128B)
+#define STAGING_REGION_BYTES      (32 * STAGING_REGION_ROW_BYTES)                   // 4096 bytes per region (32 rows x 128B)
+#define STAGING_WARP_BYTES        (4 * STAGING_REGION_BYTES)                         // 16384 bytes per warp (4 regions x 4096)
 #define SMEM_BYTES                ((OFF_STAGING + NUM_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
 #define TMEM_COLS      512
 #define IDESC          0x10400010U
@@ -260,27 +257,6 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
 #define TMEM_WAIT() \
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory")
 
-#define CVT_STG(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15, GPTR) \
-    asm volatile( \
-        "{\n\t" \
-        ".reg .b32 b0,b1,b2,b3,b4,b5,b6,b7;\n\t" \
-        "cvt.rn.bf16x2.f32 b0, %1, %0;\n\t" \
-        "cvt.rn.bf16x2.f32 b1, %3, %2;\n\t" \
-        "cvt.rn.bf16x2.f32 b2, %5, %4;\n\t" \
-        "cvt.rn.bf16x2.f32 b3, %7, %6;\n\t" \
-        "cvt.rn.bf16x2.f32 b4, %9, %8;\n\t" \
-        "cvt.rn.bf16x2.f32 b5, %11, %10;\n\t" \
-        "cvt.rn.bf16x2.f32 b6, %13, %12;\n\t" \
-        "cvt.rn.bf16x2.f32 b7, %15, %14;\n\t" \
-        "st.global.v8.b32 [%16], {b0,b1,b2,b3,b4,b5,b6,b7};\n\t" \
-        "}" \
-        :: "f"(r0),"f"(r1),"f"(r2),"f"(r3), \
-           "f"(r4),"f"(r5),"f"(r6),"f"(r7), \
-           "f"(r8),"f"(r9),"f"(r10),"f"(r11), \
-           "f"(r12),"f"(r13),"f"(r14),"f"(r15), \
-           "l"(GPTR) \
-        : "memory")
-
 #define BF16X2_TO_F32(reg, flo, fhi) \
     asm volatile("{\n\t" \
         ".reg .b16 lo, hi;\n\t" \
@@ -326,28 +302,9 @@ __device__ __forceinline__ uint32_t cvt_add_bf16x2(float lo, float hi, uint32_t 
         "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" \
         :: "r"(SADDR), "r"(b0), "r"(b1), "r"(b2), "r"(b3) : "memory")
 
-#define COALESCED_STORE_V4(SADDR, GPTR) \
-    asm volatile( \
-        "{\n\t" \
-        ".reg .b32 d0,d1,d2,d3;\n\t" \
-        "ld.shared.v4.b32 {d0,d1,d2,d3}, [%0];\n\t" \
-        "st.global.v4.b32 [%1], {d0,d1,d2,d3};\n\t" \
-        "}" \
-        :: "r"(SADDR), "l"(GPTR) : "memory")
-
-#define COALESCED_STORE_V2(SADDR, GPTR) \
-    asm volatile( \
-        "{\n\t" \
-        ".reg .b32 d0,d1;\n\t" \
-        "ld.shared.v2.b32 {d0,d1}, [%0];\n\t" \
-        "st.global.v2.b32 [%1], {d0,d1};\n\t" \
-        "}" \
-        :: "r"(SADDR), "l"(GPTR) : "memory")
-
-// ── Epilogue: x32 TMEM → inline BF16 add → CVT → double-buffered SMEM staging → coalesced st.global ──
-// Phase 1A: TMEM readback (first 128 cols) + combined add + CVT → staging_a
-// Phase 1B + Phase 2A: TMEM readback (second 128 cols) → staging_b, interleaved with coalesced stores from staging_a
-// Phase 2B: coalesced stores from staging_b
+// ── Epilogue: TMEM → inline BF16 add → CVT → 4 swizzle SMEM regions → TMA tensor stores ──
+// Phase 1: TMEM readback (all 256 cols) + combined add + CVT → 4 swizzle regions (SWIZZLE_128B)
+// Phase 2: 4 TMA tensor stores from swizzle regions → global C
 
 template<int NC_START, int NC_END>
 static __device__ __forceinline__
@@ -375,18 +332,22 @@ void epilogue_store(
         + (long long)comb_block_row * COMB_COL_BLOCKS * COMB_BLOCK_ELEMS
         + comb_row_in_blk * COMB_BLOCK_COLS;
 
-    constexpr int NC_MID = (NC_START + NC_END) / 2;
-    constexpr int HALF_CPT = (NC_MID - NC_START) / 32;  // 4 cols per thread per half
-    const uint32_t staging_a = staging_saddr;                                          // linear (260B/row, 0 bank conflicts)
-    const uint32_t staging_b_lo = staging_saddr + STAGING_A_BYTES;                     // swizzled SWIZZLE_128B
-    const uint32_t staging_b_hi = staging_saddr + STAGING_A_BYTES + STAGING_B_REGION_BYTES;
+    // 4 swizzle regions per warp, each 32 rows x 64 cols BF16 (SWIZZLE_128B)
+    const uint32_t staging_r0 = staging_saddr;
+    const uint32_t staging_r1 = staging_saddr + STAGING_REGION_BYTES;
+    const uint32_t staging_r2 = staging_saddr + 2 * STAGING_REGION_BYTES;
+    const uint32_t staging_r3 = staging_saddr + 3 * STAGING_REGION_BYTES;
 
-    // Remedy B: Wait for previous tile's Phase 2B TMA stores before overwriting staging_b.
+    // Wait for previous tile's Phase 2 TMA stores before overwriting staging.
     // After ml_wait (~1,342 cycles), TMA stores are long done — this is a true no-op.
     if (lane == 0) {
         asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
     }
     __syncwarp();
+
+    // Swizzle constants (loop-invariant)
+    const uint32_t xor_val = (lane & 7) << 4;
+    const uint32_t srow_base = staging_saddr + lane * STAGING_REGION_ROW_BYTES;
 
 #if TMEM_LOAD_WIDTH == 64
     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
@@ -394,7 +355,7 @@ void epilogue_store(
     float a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47;
     float a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63;
 
-    // ═══ Phase 1A: cols NC_START..NC_MID-1 → staging_a (linear layout), x64 stride ═══
+    // ═══ Phase 1: all 256 cols → 4 swizzle regions, x64 stride ═══
     TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                   a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                   a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47,
@@ -402,29 +363,31 @@ void epilogue_store(
                   taddr_base + NC_START);
 
     #pragma unroll 1
-    for (int nc = NC_START; nc < NC_MID; nc += 64) {
+    for (int nc = NC_START; nc < NC_END; nc += 64) {
+        const uint32_t srow = srow_base + ((nc - NC_START) >> 6) * STAGING_REGION_BYTES;
+
+        // Combined loads (fills TMEM latency window)
         const __nv_bfloat16* comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
         uint4 craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
         uint4 craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
 
         TMEM_WAIT();
 
-        // First 32 cols: a0..a31
+        // First 32 cols: a0..a31 → swizzle region (bytes 0-63)
         {
-            uint32_t saddr = staging_a + lane * STAGING_A_ROW_BYTES + (nc - NC_START) * 2;
             {
                 uint32_t b0 = cvt_add_bf16x2(a0, a1, craw0.x);
                 uint32_t b1 = cvt_add_bf16x2(a2, a3, craw0.y);
                 uint32_t b2 = cvt_add_bf16x2(a4, a5, craw0.z);
                 uint32_t b3 = cvt_add_bf16x2(a6, a7, craw0.w);
-                STS_V4(b0, b1, b2, b3, saddr);
+                STS_V4(b0, b1, b2, b3, srow + (0 ^ xor_val));
             }
             {
                 uint32_t b0 = cvt_add_bf16x2(a8, a9, craw1.x);
                 uint32_t b1 = cvt_add_bf16x2(a10, a11, craw1.y);
                 uint32_t b2 = cvt_add_bf16x2(a12, a13, craw1.z);
                 uint32_t b3 = cvt_add_bf16x2(a14, a15, craw1.w);
-                STS_V4(b0, b1, b2, b3, saddr + 16);
+                STS_V4(b0, b1, b2, b3, srow + (16 ^ xor_val));
             }
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
             craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
@@ -433,36 +396,35 @@ void epilogue_store(
                 uint32_t b1 = cvt_add_bf16x2(a18, a19, craw0.y);
                 uint32_t b2 = cvt_add_bf16x2(a20, a21, craw0.z);
                 uint32_t b3 = cvt_add_bf16x2(a22, a23, craw0.w);
-                STS_V4(b0, b1, b2, b3, saddr + 32);
+                STS_V4(b0, b1, b2, b3, srow + (32 ^ xor_val));
             }
             {
                 uint32_t b0 = cvt_add_bf16x2(a24, a25, craw1.x);
                 uint32_t b1 = cvt_add_bf16x2(a26, a27, craw1.y);
                 uint32_t b2 = cvt_add_bf16x2(a28, a29, craw1.z);
                 uint32_t b3 = cvt_add_bf16x2(a30, a31, craw1.w);
-                STS_V4(b0, b1, b2, b3, saddr + 48);
+                STS_V4(b0, b1, b2, b3, srow + (48 ^ xor_val));
             }
         }
 
-        // Second 32 cols: a32..a63
+        // Second 32 cols: a32..a63 → swizzle region (bytes 64-127)
         {
             const __nv_bfloat16* comb_ptr2 = comb_base + (long long)((n_start + nc + 32) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr2);
             craw1 = *reinterpret_cast<const uint4*>(comb_ptr2 + 8);
-            uint32_t saddr = staging_a + lane * STAGING_A_ROW_BYTES + (nc - NC_START + 32) * 2;
             {
                 uint32_t b0 = cvt_add_bf16x2(a32, a33, craw0.x);
                 uint32_t b1 = cvt_add_bf16x2(a34, a35, craw0.y);
                 uint32_t b2 = cvt_add_bf16x2(a36, a37, craw0.z);
                 uint32_t b3 = cvt_add_bf16x2(a38, a39, craw0.w);
-                STS_V4(b0, b1, b2, b3, saddr);
+                STS_V4(b0, b1, b2, b3, srow + (64 ^ xor_val));
             }
             {
                 uint32_t b0 = cvt_add_bf16x2(a40, a41, craw1.x);
                 uint32_t b1 = cvt_add_bf16x2(a42, a43, craw1.y);
                 uint32_t b2 = cvt_add_bf16x2(a44, a45, craw1.z);
                 uint32_t b3 = cvt_add_bf16x2(a46, a47, craw1.w);
-                STS_V4(b0, b1, b2, b3, saddr + 16);
+                STS_V4(b0, b1, b2, b3, srow + (80 ^ xor_val));
             }
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr2 + 16);
             craw1 = *reinterpret_cast<const uint4*>(comb_ptr2 + 24);
@@ -471,136 +433,14 @@ void epilogue_store(
                 uint32_t b1 = cvt_add_bf16x2(a50, a51, craw0.y);
                 uint32_t b2 = cvt_add_bf16x2(a52, a53, craw0.z);
                 uint32_t b3 = cvt_add_bf16x2(a54, a55, craw0.w);
-                STS_V4(b0, b1, b2, b3, saddr + 32);
+                STS_V4(b0, b1, b2, b3, srow + (96 ^ xor_val));
             }
             {
                 uint32_t b0 = cvt_add_bf16x2(a56, a57, craw1.x);
                 uint32_t b1 = cvt_add_bf16x2(a58, a59, craw1.y);
                 uint32_t b2 = cvt_add_bf16x2(a60, a61, craw1.z);
                 uint32_t b3 = cvt_add_bf16x2(a62, a63, craw1.w);
-                STS_V4(b0, b1, b2, b3, saddr + 48);
-            }
-        }
-
-        if (nc + 64 < NC_MID) {
-            TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                          a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47,
-                          a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
-                          taddr_base + nc + 64);
-        }
-    }
-
-    // Prefetch first 64 cols of second half
-    TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                  a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47,
-                  a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
-                  taddr_base + NC_MID);
-
-    __syncwarp();  // Phase 1A SMEM writes visible for Phase 2A reads
-
-    // ═══ Phase 1B (x64 stride) + Phase 2A (staging_a → global) ═══
-    __nv_bfloat16* row_base_a = C + (long long)gm_base * N_DIM + n_start + NC_START;
-
-    const uint32_t xor_val_b = (lane & 7) << 4;
-    const uint32_t saddr_row_b_lo = staging_b_lo + lane * STAGING_B_REGION_ROW_BYTES;
-    const uint32_t saddr_row_b_hi = staging_b_hi + lane * STAGING_B_REGION_ROW_BYTES;
-
-    #pragma unroll 1
-    for (int nc = NC_MID; nc < NC_END; nc += 64) {
-        // Phase 2A: 16 rows from staging_a (fills TMEM latency window)
-        {
-            const int r_base = ((nc - NC_MID) / 64) * 16;
-            #pragma unroll
-            for (int r = r_base; r < r_base + 16; r++) {
-                uint32_t src = staging_a + r * STAGING_A_ROW_BYTES + lane * HALF_CPT * 2;
-                __nv_bfloat16* dst = row_base_a + (long long)r * N_DIM + lane * HALF_CPT;
-                COALESCED_STORE_V2(src, dst);
-            }
-        }
-
-        // Combined loads for first chunk (fills TMEM latency window)
-        const __nv_bfloat16* comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
-        uint4 craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
-        uint4 craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
-
-        TMEM_WAIT();
-
-        // First 32 cols: a0..a31 → staging_b (swizzled)
-        {
-            int col_in_half_b = nc - NC_MID;
-            uint32_t saddr_row_b = (col_in_half_b < 64) ? saddr_row_b_lo : saddr_row_b_hi;
-            int byte_base_b = (col_in_half_b & 63) * 2;
-            {
-                uint32_t b0 = cvt_add_bf16x2(a0, a1, craw0.x);
-                uint32_t b1 = cvt_add_bf16x2(a2, a3, craw0.y);
-                uint32_t b2 = cvt_add_bf16x2(a4, a5, craw0.z);
-                uint32_t b3 = cvt_add_bf16x2(a6, a7, craw0.w);
-                STS_V4(b0, b1, b2, b3, saddr_row_b + (byte_base_b ^ xor_val_b));
-            }
-            {
-                uint32_t b0 = cvt_add_bf16x2(a8, a9, craw1.x);
-                uint32_t b1 = cvt_add_bf16x2(a10, a11, craw1.y);
-                uint32_t b2 = cvt_add_bf16x2(a12, a13, craw1.z);
-                uint32_t b3 = cvt_add_bf16x2(a14, a15, craw1.w);
-                STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 16) ^ xor_val_b));
-            }
-            craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
-            craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
-            {
-                uint32_t b0 = cvt_add_bf16x2(a16, a17, craw0.x);
-                uint32_t b1 = cvt_add_bf16x2(a18, a19, craw0.y);
-                uint32_t b2 = cvt_add_bf16x2(a20, a21, craw0.z);
-                uint32_t b3 = cvt_add_bf16x2(a22, a23, craw0.w);
-                STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 32) ^ xor_val_b));
-            }
-            {
-                uint32_t b0 = cvt_add_bf16x2(a24, a25, craw1.x);
-                uint32_t b1 = cvt_add_bf16x2(a26, a27, craw1.y);
-                uint32_t b2 = cvt_add_bf16x2(a28, a29, craw1.z);
-                uint32_t b3 = cvt_add_bf16x2(a30, a31, craw1.w);
-                STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 48) ^ xor_val_b));
-            }
-        }
-
-        // Second 32 cols: a32..a63 → staging_b (swizzled)
-        {
-            const __nv_bfloat16* comb_ptr2 = comb_base + (long long)((n_start + nc + 32) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
-            craw0 = *reinterpret_cast<const uint4*>(comb_ptr2);
-            craw1 = *reinterpret_cast<const uint4*>(comb_ptr2 + 8);
-            int col_in_half_b = nc + 32 - NC_MID;
-            uint32_t saddr_row_b = (col_in_half_b < 64) ? saddr_row_b_lo : saddr_row_b_hi;
-            int byte_base_b = (col_in_half_b & 63) * 2;
-            {
-                uint32_t b0 = cvt_add_bf16x2(a32, a33, craw0.x);
-                uint32_t b1 = cvt_add_bf16x2(a34, a35, craw0.y);
-                uint32_t b2 = cvt_add_bf16x2(a36, a37, craw0.z);
-                uint32_t b3 = cvt_add_bf16x2(a38, a39, craw0.w);
-                STS_V4(b0, b1, b2, b3, saddr_row_b + (byte_base_b ^ xor_val_b));
-            }
-            {
-                uint32_t b0 = cvt_add_bf16x2(a40, a41, craw1.x);
-                uint32_t b1 = cvt_add_bf16x2(a42, a43, craw1.y);
-                uint32_t b2 = cvt_add_bf16x2(a44, a45, craw1.z);
-                uint32_t b3 = cvt_add_bf16x2(a46, a47, craw1.w);
-                STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 16) ^ xor_val_b));
-            }
-            craw0 = *reinterpret_cast<const uint4*>(comb_ptr2 + 16);
-            craw1 = *reinterpret_cast<const uint4*>(comb_ptr2 + 24);
-            {
-                uint32_t b0 = cvt_add_bf16x2(a48, a49, craw0.x);
-                uint32_t b1 = cvt_add_bf16x2(a50, a51, craw0.y);
-                uint32_t b2 = cvt_add_bf16x2(a52, a53, craw0.z);
-                uint32_t b3 = cvt_add_bf16x2(a54, a55, craw0.w);
-                STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 32) ^ xor_val_b));
-            }
-            {
-                uint32_t b0 = cvt_add_bf16x2(a56, a57, craw1.x);
-                uint32_t b1 = cvt_add_bf16x2(a58, a59, craw1.y);
-                uint32_t b2 = cvt_add_bf16x2(a60, a61, craw1.z);
-                uint32_t b3 = cvt_add_bf16x2(a62, a63, craw1.w);
-                STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 48) ^ xor_val_b));
+                STS_V4(b0, b1, b2, b3, srow + (112 ^ xor_val));
             }
         }
 
@@ -616,33 +456,34 @@ void epilogue_store(
     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
     float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
 
-    // ═══ Phase 1A: cols NC_START..NC_MID-1 → staging_a (linear layout) ═══
+    // ═══ Phase 1: all 256 cols → 4 swizzle regions, x32 stride ═══
     LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                  taddr_base + NC_START);
 
     #pragma unroll 2
-    for (int nc = NC_START; nc < NC_MID; nc += 32) {
+    for (int nc = NC_START; nc < NC_END; nc += 32) {
         const __nv_bfloat16* comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
         uint4 craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
         uint4 craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
 
         TMEM_WAIT();
 
-        uint32_t saddr = staging_a + lane * STAGING_A_ROW_BYTES + (nc - NC_START) * 2;
+        const uint32_t srow = srow_base + ((nc - NC_START) >> 6) * STAGING_REGION_BYTES;
+        const int byte_base = ((nc - NC_START) & 63) * 2;
         {
             uint32_t b0 = cvt_add_bf16x2(a0, a1, craw0.x);
             uint32_t b1 = cvt_add_bf16x2(a2, a3, craw0.y);
             uint32_t b2 = cvt_add_bf16x2(a4, a5, craw0.z);
             uint32_t b3 = cvt_add_bf16x2(a6, a7, craw0.w);
-            STS_V4(b0, b1, b2, b3, saddr);
+            STS_V4(b0, b1, b2, b3, srow + (byte_base ^ xor_val));
         }
         {
             uint32_t b0 = cvt_add_bf16x2(a8, a9, craw1.x);
             uint32_t b1 = cvt_add_bf16x2(a10, a11, craw1.y);
             uint32_t b2 = cvt_add_bf16x2(a12, a13, craw1.z);
             uint32_t b3 = cvt_add_bf16x2(a14, a15, craw1.w);
-            STS_V4(b0, b1, b2, b3, saddr + 16);
+            STS_V4(b0, b1, b2, b3, srow + ((byte_base + 16) ^ xor_val));
         }
 
         craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
@@ -652,92 +493,14 @@ void epilogue_store(
             uint32_t b1 = cvt_add_bf16x2(a18, a19, craw0.y);
             uint32_t b2 = cvt_add_bf16x2(a20, a21, craw0.z);
             uint32_t b3 = cvt_add_bf16x2(a22, a23, craw0.w);
-            STS_V4(b0, b1, b2, b3, saddr + 32);
+            STS_V4(b0, b1, b2, b3, srow + ((byte_base + 32) ^ xor_val));
         }
         {
             uint32_t b0 = cvt_add_bf16x2(a24, a25, craw1.x);
             uint32_t b1 = cvt_add_bf16x2(a26, a27, craw1.y);
             uint32_t b2 = cvt_add_bf16x2(a28, a29, craw1.z);
             uint32_t b3 = cvt_add_bf16x2(a30, a31, craw1.w);
-            STS_V4(b0, b1, b2, b3, saddr + 48);
-        }
-
-        if (nc + 32 < NC_MID) {
-            LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-                         a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                         taddr_base + nc + 32);
-        }
-    }
-
-    // Prefetch first chunk of second half (async, starts loading during syncwarp)
-    LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-                 a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                 taddr_base + NC_MID);
-
-    __syncwarp();  // Phase 1A SMEM writes visible for Phase 2A reads
-
-    // ═══ Phase 1B (cols NC_MID..NC_END-1 → staging_b) + Phase 2A (staging_a → global) ═══
-    __nv_bfloat16* row_base_a = C + (long long)gm_base * N_DIM + n_start + NC_START;
-
-    // Precompute swizzle constants for Phase 1B (loop-invariant)
-    const uint32_t xor_val_b = (lane & 7) << 4;
-    const uint32_t saddr_row_b_lo = staging_b_lo + lane * STAGING_B_REGION_ROW_BYTES;
-    const uint32_t saddr_row_b_hi = staging_b_hi + lane * STAGING_B_REGION_ROW_BYTES;
-
-    #pragma unroll 2
-    for (int nc = NC_MID; nc < NC_END; nc += 32) {
-        // Phase 2A: 8 rows from staging_a (linear layout, fills TMEM latency window)
-        {
-            const int r_base = ((nc - NC_MID) / 32) * 8;
-            #pragma unroll
-            for (int r = r_base; r < r_base + 8; r++) {
-                uint32_t src = staging_a + r * STAGING_A_ROW_BYTES + lane * HALF_CPT * 2;
-                __nv_bfloat16* dst = row_base_a + (long long)r * N_DIM + lane * HALF_CPT;
-                COALESCED_STORE_V2(src, dst);
-            }
-        }
-
-        // Combined loads (further fills TMEM latency window)
-        const __nv_bfloat16* comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
-        uint4 craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
-        uint4 craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
-
-        TMEM_WAIT();
-
-        // Swizzled SMEM write to staging_b
-        int col_in_half_b = nc - NC_MID;
-        uint32_t saddr_row_b = (col_in_half_b < 64) ? saddr_row_b_lo : saddr_row_b_hi;
-        int byte_base_b = (col_in_half_b & 63) * 2;
-        {
-            uint32_t b0 = cvt_add_bf16x2(a0, a1, craw0.x);
-            uint32_t b1 = cvt_add_bf16x2(a2, a3, craw0.y);
-            uint32_t b2 = cvt_add_bf16x2(a4, a5, craw0.z);
-            uint32_t b3 = cvt_add_bf16x2(a6, a7, craw0.w);
-            STS_V4(b0, b1, b2, b3, saddr_row_b + (byte_base_b ^ xor_val_b));
-        }
-        {
-            uint32_t b0 = cvt_add_bf16x2(a8, a9, craw1.x);
-            uint32_t b1 = cvt_add_bf16x2(a10, a11, craw1.y);
-            uint32_t b2 = cvt_add_bf16x2(a12, a13, craw1.z);
-            uint32_t b3 = cvt_add_bf16x2(a14, a15, craw1.w);
-            STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 16) ^ xor_val_b));
-        }
-
-        craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
-        craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
-        {
-            uint32_t b0 = cvt_add_bf16x2(a16, a17, craw0.x);
-            uint32_t b1 = cvt_add_bf16x2(a18, a19, craw0.y);
-            uint32_t b2 = cvt_add_bf16x2(a20, a21, craw0.z);
-            uint32_t b3 = cvt_add_bf16x2(a22, a23, craw0.w);
-            STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 32) ^ xor_val_b));
-        }
-        {
-            uint32_t b0 = cvt_add_bf16x2(a24, a25, craw1.x);
-            uint32_t b1 = cvt_add_bf16x2(a26, a27, craw1.y);
-            uint32_t b2 = cvt_add_bf16x2(a28, a29, craw1.z);
-            uint32_t b3 = cvt_add_bf16x2(a30, a31, craw1.w);
-            STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 48) ^ xor_val_b));
+            STS_V4(b0, b1, b2, b3, srow + ((byte_base + 48) ^ xor_val));
         }
 
         if (nc + 32 < NC_END) {
@@ -751,22 +514,26 @@ void epilogue_store(
 #ifdef TIMING
     t_phase1_end = clock64();
 #endif
-    __syncwarp();  // Phase 1B SMEM writes visible for Phase 2B TMA reads
+    __syncwarp();  // Phase 1 SMEM writes visible for Phase 2 TMA reads
 
-    // Signal: done reading TMEM — W1 can reuse buffer. Phase 2B only uses SMEM + global.
+    // Signal: done reading TMEM — W1 can reuse buffer. Phase 2 only uses SMEM + global.
     if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
 
-    // ═══ Phase 2B: TMA tensor store staging_b → global ═══
+    // ═══ Phase 2: 4 TMA tensor stores → global ═══
     if (lane == 0) {
-        int col_lo = n_start + NC_MID;
-        int col_hi = n_start + NC_MID + 64;
         int row = gm_base;
         asm volatile(
             "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
-            :: "l"(tma_c_desc), "r"(col_lo), "r"(row), "r"(staging_b_lo) : "memory");
+            :: "l"(tma_c_desc), "r"(n_start + NC_START), "r"(row), "r"(staging_r0) : "memory");
         asm volatile(
             "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
-            :: "l"(tma_c_desc), "r"(col_hi), "r"(row), "r"(staging_b_hi) : "memory");
+            :: "l"(tma_c_desc), "r"(n_start + NC_START + 64), "r"(row), "r"(staging_r1) : "memory");
+        asm volatile(
+            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+            :: "l"(tma_c_desc), "r"(n_start + NC_START + 128), "r"(row), "r"(staging_r2) : "memory");
+        asm volatile(
+            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+            :: "l"(tma_c_desc), "r"(n_start + NC_START + 192), "r"(row), "r"(staging_r3) : "memory");
         asm volatile("cp.async.bulk.commit_group;" ::: "memory");
     }
 }
