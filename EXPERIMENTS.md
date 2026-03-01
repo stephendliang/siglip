@@ -35,6 +35,7 @@ Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 | — | F24: Swizzled staging + TMA tensor stores | 0.532 | 2059 | 235 | asymmetric layout, Phase 2B -626 cyc |
 | — | F30: Staging_b swizzle address precomputation | 0.532 | 2059 | 235 | no-op — compiler already hoisted; source cleanup only |
 | ef2aa9c | F31: Per-warp Phase 1 stagger | 0.530 | 2067 | 236 | clock64 spin, STAGGER=80, contention-based |
+| — | F34: Parallel TMEM load diagnostic | 0.531 | 2064 | 248 | 2×x16 before single WAIT — loads pipeline |
 
 Reference: cuBLAS per-tensor FP8 (best-of-8 algos, 256MB workspace) = 0.365 ms / 3001 TFLOPS (GEMM only, no fusion).
 cuBLAS + unfused pos_embed = 0.835 ms end-to-end.
@@ -1032,6 +1033,48 @@ All warps improved, not just W4/W5 — confirms pervasive contention across all 
 
 ---
 
+## F32: TMEM x16 granularity re-evaluation — REJECTED (10.6% regression)
+
+**Date:** 2026-03-01
+**Hypothesis:** `tcgen05.ld.x16` (16 cols per load) could improve Phase 1 by creating finer-grained TMEM_WAIT windows for interleaving compute. The original x16-vs-x32 comparison (F8, commit `abf04a5`) was done at 1433 TFLOPS with no double-buffered staging, no Phase 2A interleaving, no BF16 math — a fundamentally different operating point.
+
+**Key question:** Is TMEM load latency proportional to data volume (x16 ≈ 100 cycles → total unchanged) or fixed per instruction (x16 ≈ 200 cycles → 2× worse)?
+
+### Changes
+
+Single file `megakernel.cu`, `epilogue_store` function only:
+
+1. Removed `a16..a31` register declarations (32→16 float regs)
+2. Phase 1A: `TMEM_LOAD_X32` → `TMEM_LOAD` (x16), loop stride 32→16, 2 STS_V4 per iter instead of 4
+3. Phase 1A→1B transition: `TMEM_LOAD_X32` → `TMEM_LOAD`
+4. Phase 1B + Phase 2A: loop stride 32→16, Phase 2A interleaving 8→4 rows per iter (8 iters × 4 rows = 32 total), 2 STS_V4 per iter instead of 4
+5. Combined data addressing: `+ (nc & 31)` to select correct half of 32-col COMB blocks when stepping by 16
+
+### Results
+
+| Metric | Baseline (x32) | F32 (x16) | Delta |
+|--------|----------------|-----------|-------|
+| Wall clock | 0.530 ms | 0.586 ms | **+10.6% regression** |
+| TFLOPS | 2067 | 1868 | -9.6% |
+| Registers | 236 | 174 | -62 |
+| Spills | 0 | 0 | — |
+| Checksum | 1769472.0 | 1769472.0 | Match |
+
+### Analysis
+
+**TMEM load latency is fixed per instruction, not proportional to data volume.** Doubling the number of loads (8→16 per phase) adds ~56 µs wall clock despite halving data per load. The 62-register savings (236→174) from eliminating `a16..a31` do not compensate — in fact, the massive register drop suggests the compiler fully unrolled the simpler loop body but couldn't hide the additional TMEM latency.
+
+This definitively answers the key question from F8: the `tcgen05.ld` ~200-cycle latency is a fixed cost per instruction. x32 is optimal — it maximizes data per fixed-cost load. x16 pays the same ~200-cycle penalty per load but moves half the data.
+
+**Implications:**
+- x32 is the correct TMEM load granularity. This is now confirmed at two very different operating points (1433 TFLOPS and 2067 TFLOPS).
+- Phase 1 optimization cannot come from finer TMEM load granularity. The binding constraint is the number of `tcgen05.ld` instructions × fixed latency per instruction.
+- The 62-register savings are real but useless — no register-gated optimization exists that could overcome the 10.6% regression.
+
+Rolled back to baseline. No code changes committed.
+
+---
+
 ## F33: tcgen05.cp TMEM→SMEM async copy — RULED OUT
 
 **Date:** 2026-03-01
@@ -1047,3 +1090,54 @@ All warps improved, not just W4/W5 — confirms pervasive contention across all 
 **Conclusion:** The only way to read accumulators out of TMEM is `tcgen05.ld` (TMEM→registers). Phase 1 optimization must work within this constraint — no DMA shortcut exists.
 
 No code changes. No timing data.
+
+---
+
+## F34: Parallel TMEM load diagnostic — loads pipeline (confirmed)
+
+**Date:** 2026-03-01
+**Baseline:** 0.530 ms / 2067 TFLOPS / 236 regs (F31)
+**Result:** 0.531 ms / 2064 TFLOPS / 248 regs — **within noise of baseline**
+**Verdict:** DIAGNOSTIC SUCCESS — 2 `tcgen05.ld.x16` loads pipeline before a single `TMEM_WAIT()`
+
+**Hypothesis:** F32 showed `tcgen05.ld` has a fixed ~200-cycle latency per instruction, but tested only sequential loads (load→wait→process→load→wait). F1 tested split x32→2×x16, but with a WAIT between each pair (the two loads were never simultaneously outstanding). **Neither tested whether 2 `tcgen05.ld` instructions issued before a single `tcgen05.wait::ld` execute in parallel on the TMEM read port.**
+
+**How this differs from F1 and F32:**
+- **F1** (split x32→2×x16): Issued first x16, then WAIT, then second x16, then WAIT. Two loads never simultaneously in-flight. Tested earlier issue time — no benefit.
+- **F32** (pure x16): Changed loop stride to 16, one load + one WAIT per iteration. Tested x16 latency — same ~200 cycles as x32.
+- **F34** (this): Issues 2 x16 loads back-to-back before a single WAIT. Tests concurrent outstanding loads.
+
+**Changes:**
+
+Replaced all 4 `TMEM_LOAD_X32` call sites with pairs of `TMEM_LOAD` (x16):
+
+```c
+// Before (1 x32 load):
+TMEM_LOAD_X32(a0,...,a31, addr);
+
+// After (2 x16 loads, same WAIT):
+TMEM_LOAD(a0,...,a15, addr);
+TMEM_LOAD(a16,...,a31, addr + 16);
+```
+
+4 sites modified: Phase 1A initial load, Phase 1A prefetch, Phase 1A→1B transition, Phase 1B prefetch. Same `a0..a31` declarations, same `TMEM_WAIT()` positions, same processing. The ONLY difference is whether 32 columns arrive via 1 instruction or 2 instructions before the same fence.
+
+**Build:** 248 regs (+12 from baseline), 0 spills. The 12 extra registers come from having both x16 loads' destination registers simultaneously live (compiler can't reuse across two `asm volatile` blocks). Still fits 1 CTA/SM (248 × 192 = 47,616 < 65,536 register file).
+
+**Result:**
+
+| Metric | Baseline (x32) | F34 (2×x16, same WAIT) | Delta |
+|--------|----------------|------------------------|-------|
+| Wall clock | 0.530 ms | 0.531 ms | +0.2% (noise) |
+| TFLOPS | 2067 | 2064 | -0.1% (noise) |
+| Registers | 236 | 248 | +12 |
+| Checksum | 1769472.0 | 1769472.0 | Match |
+
+**Conclusion: Loads pipeline.** Two x16 loads issued before a single WAIT complete in essentially the same time as one x32 load. The TMEM read port can process 2 outstanding loads concurrently — they overlap rather than serializing.
+
+If loads had serialized, wall clock would have been ~0.586 ms (matching F32's regression from doubling load count). Instead, 0.531 ms = baseline, proving the hardware pipelines concurrent loads.
+
+**Implications:**
+- Opens the door to software-pipelined TMEM readback: issue next iteration's TMEM loads early (before current WAIT), overlapping them with CVT+add+STS compute from the current iteration.
+- The +12 register cost (248 vs 236) is the price of parallelism — both loads' destinations must be live simultaneously. A software-pipelined design would need careful register budgeting.
+- Combined with F32's finding (fixed ~200-cycle latency per load), this means x32 remains optimal for sequential access, but parallel x16 loads are viable when register budget allows overlapping compute with TMEM reads.

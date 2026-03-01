@@ -349,9 +349,10 @@ void epilogue_store(
     float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
 
     // ═══ Phase 1A: cols NC_START..NC_MID-1 → staging_a (linear layout) ═══
-    TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                  taddr_base + NC_START);
+    TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+              taddr_base + NC_START);
+    TMEM_LOAD(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+              taddr_base + NC_START + 16);
 
     #pragma unroll 2
     for (int nc = NC_START; nc < NC_MID; nc += 32) {
@@ -394,16 +395,19 @@ void epilogue_store(
             STS_V4(b0, b1, b2, b3, saddr + 48);
         }
 
-        if (nc + 32 < NC_MID)
-            TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                          taddr_base + nc + 32);
+        if (nc + 32 < NC_MID) {
+            TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                      taddr_base + nc + 32);
+            TMEM_LOAD(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                      taddr_base + nc + 32 + 16);
+        }
     }
 
     // Prefetch first chunk of second half (async, starts loading during syncwarp)
-    TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                  taddr_base + NC_MID);
+    TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+              taddr_base + NC_MID);
+    TMEM_LOAD(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+              taddr_base + NC_MID + 16);
 
     __syncwarp();  // Phase 1A SMEM writes visible for Phase 2A reads
 
@@ -471,10 +475,12 @@ void epilogue_store(
             STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 48) ^ xor_val_b));
         }
 
-        if (nc + 32 < NC_END)
-            TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                          taddr_base + nc + 32);
+        if (nc + 32 < NC_END) {
+            TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                      taddr_base + nc + 32);
+            TMEM_LOAD(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                      taddr_base + nc + 32 + 16);
+        }
     }
 
 #ifdef TIMING
