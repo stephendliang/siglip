@@ -49,9 +49,9 @@ Tier 1 (attack Phase 1 directly):
 
 Tier 2 (secondary targets):
   F32 (x16 TMEM granularity) ──→ re-test at new operating point
-  F33 (tcgen05.cp diagnostic) ──→ speculative but potentially transformative
+  F33 (tcgen05.cp diagnostic) ──→ RULED OUT (SMEM→TMEM only)
 
-Recommended next: F32 → F33
+Recommended next: F32
 ```
 
 ---
@@ -165,38 +165,16 @@ With x16 TMEM loads:
 
 ---
 
-## F33: tcgen05.cp TMEM→SMEM async copy — SPECULATIVE DIAGNOSTIC
+## F33: tcgen05.cp TMEM→SMEM async copy — RULED OUT (SMEM→TMEM only)
 
-**Effort:** Medium (unfamiliar instruction, ISA validation needed)
-**Expected impact:** Potentially transformative — could bypass the register file entirely for TMEM→SMEM data movement. If it works, Phase 1 becomes: async TMEM→SMEM copy, then SMEM→register load + BF16 math + global store.
-**Risk:** High. `tcgen05.cp` is primarily documented for loading *inputs* INTO TMEM for MMA consumption, not for reading accumulators out. Its applicability to epilogue readback is undocumented. No public kernel uses it this way.
+**Result:** Killed by ISA research. `tcgen05.cp` is architecturally SMEM→TMEM only — no hardware path exists for TMEM→SMEM. No code changes.
 
-**Rationale:** The PTX ISA includes `tcgen05.cp.cta_group::N.SZ` instructions that copy data between TMEM and shared memory. If this instruction can copy FROM TMEM TO SMEM (reading accumulators out), it would use a DMA path that bypasses the register file entirely. The epilogue flow would become:
+**Evidence (3 independent sources):**
+1. **CUTLASS**: Has `make_s2t_copy()` (SMEM-to-TMEM) but NO `make_t2s_copy()`. No `SM100_TMEM_LOAD` copy traits use `tcgen05.cp`. All epilogue code uses `tcgen05.ld`.
+2. **Colfax tutorial**: "data gets _into_ TMEM via UMMA operations, and is explicitly moved _out_ to registers using `tcgen05.ld`." Explicitly skips `tcgen05.cp` as irrelevant to epilogue.
+3. **JAX/Pallas docs**: "only way to move data out from tensor memory is through `tcgen05.ld`"
 
-```
-Current:     TMEM → registers (tcgen05.ld) → BF16 math → SMEM (st.shared) → global
-With cp:     TMEM → SMEM (tcgen05.cp, async) → registers (ld.shared) → BF16 math → global
-```
-
-The async copy would run concurrently with other work. The register pressure for TMEM readback drops to zero (data goes directly to SMEM). The subsequent `ld.shared` + BF16 math can be software-pipelined more easily than `tcgen05.ld` + wait (SMEM loads are fast, ~20 cycles, vs TMEM loads at ~200 cycles).
-
-**Key unknowns:**
-1. Does `tcgen05.cp` support reading FROM TMEM? (direction may be SMEM→TMEM only)
-2. What is the SMEM layout of the copied data? (must match our staging buffer organization)
-3. What is the throughput? (could be slower than `tcgen05.ld` if the DMA path is optimized for input loading)
-4. Is the FP32→BF16 conversion included, or must it happen after the copy?
-
-**Implementation plan:**
-1. Write a minimal test: `tcgen05.cp` from the TMEM accumulator region to a scratch SMEM buffer
-2. Verify the copy produces correct FP32 data in SMEM
-3. If correct: measure latency, compare with `tcgen05.ld` path
-4. If faster: redesign Phase 1 around the async copy path
-
-**Go/no-go:**
-- Success: `tcgen05.cp` produces correct data from TMEM to SMEM AND total Phase 1 improves ≥10%
-- Fail-fast: if `tcgen05.cp` doesn't support TMEM→SMEM direction, or produces incorrect data, abort immediately
-- Max effort: 4 hours (mostly ISA validation)
-- Rollback: no production code change (diagnostic only)
+**Conclusion:** The only way to read accumulators out of TMEM is `tcgen05.ld` (TMEM→registers). Phase 1 optimization must work within this constraint.
 
 ---
 
@@ -212,6 +190,7 @@ The async copy would run concurrently with other work. The register pressure for
 | F24 ✅ | Swizzled staging + TMA tensor stores | +0.7%, Phase 2B -626 cycles, Phase 1 +440 cycles |
 | F30 — | Swizzle address precomputation | no-op — compiler already hoisted; source cleanup only |
 | F31 ✅ | Per-warp Phase 1 stagger | +0.4%, STAGGER=80, contention confirmed via rg-swap diagnostic |
+| F33 ✗ | tcgen05.cp is SMEM→TMEM only | No code — ruled out by ISA research |
 
 ---
 
@@ -232,6 +211,7 @@ The async copy would run concurrently with other work. The register pressure for
 | Split TMEM loads x32→2×x16 (F1) | tcgen05.wait::ld is a global fence — waits for ALL loads. Split adds overhead without reducing wait. |
 | Register-staged transpose (warp shuffle) | Would need 32+ extra registers (exceeds 255 limit). 160 shuffles per 32-col chunk ≈ SMEM staging cost. |
 | SMEM staging elimination | F17 proved L1 contention. SMEM transpose is mandatory for coalesced global stores. |
+| tcgen05.cp epilogue readback (F33) | tcgen05.cp is SMEM→TMEM only. No hardware path for TMEM→SMEM. Only tcgen05.ld (TMEM→registers) can read accumulators out. |
 | Tile shape changes (TM, TN, TK) | All directions hardware-limited: TMEM (512 col) caps TN, SMEM (228 KB) caps TM and TK. |
 | Split-K | TMEM double-buffering precludes second accumulator. GPU already fully occupied (10,878 tiles on 74 clusters). |
 | Warp role restructuring (W1 helps epilogue) | TMEM is per-SM (CTA0 can't read CTA1's TMEM). Register pressure. Late arrival timing. |

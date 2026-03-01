@@ -1029,3 +1029,21 @@ All warps improved, not just W4/W5 — confirms pervasive contention across all 
 3. Drain epilogue (line 884): identical stagger
 
 236 regs (+1 for clock64 spin variable), 0 spills. Checksum = 1769472.0.
+
+---
+
+## F33: tcgen05.cp TMEM→SMEM async copy — RULED OUT
+
+**Date:** 2026-03-01
+**Hypothesis:** `tcgen05.cp` could bypass the register file with async TMEM→SMEM copy, replacing the `tcgen05.ld` (TMEM→registers) → CVT → add → `st.shared` path and dramatically reducing Phase 1 latency.
+
+**Result: KILLED BY ISA RESEARCH.** `tcgen05.cp` is architecturally SMEM→TMEM only. No hardware path exists for TMEM→SMEM direction.
+
+**Evidence (3 independent sources):**
+1. **CUTLASS**: Has `make_s2t_copy()` (SMEM-to-TMEM) but NO `make_t2s_copy()`. All epilogue code uses `tcgen05.ld`.
+2. **Colfax tutorial**: "data gets _into_ TMEM via UMMA operations, and is explicitly moved _out_ to registers using `tcgen05.ld`."
+3. **JAX/Pallas docs**: "only way to move data out from tensor memory is through `tcgen05.ld`"
+
+**Conclusion:** The only way to read accumulators out of TMEM is `tcgen05.ld` (TMEM→registers). Phase 1 optimization must work within this constraint — no DMA shortcut exists.
+
+No code changes. No timing data.
