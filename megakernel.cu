@@ -388,6 +388,231 @@ void epilogue_store(
     }
     __syncwarp();
 
+#if TMEM_LOAD_WIDTH == 64
+    float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
+    float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
+    float a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47;
+    float a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63;
+
+    // ═══ Phase 1A: cols NC_START..NC_MID-1 → staging_a (linear layout), x64 stride ═══
+    TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                  a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47,
+                  a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
+                  taddr_base + NC_START);
+
+    #pragma unroll 1
+    for (int nc = NC_START; nc < NC_MID; nc += 64) {
+        const __nv_bfloat16* comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
+        uint4 craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
+        uint4 craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
+
+        TMEM_WAIT();
+
+        // First 32 cols: a0..a31
+        {
+            uint32_t saddr = staging_a + lane * STAGING_A_ROW_BYTES + (nc - NC_START) * 2;
+            {
+                uint32_t b0 = cvt_add_bf16x2(a0, a1, craw0.x);
+                uint32_t b1 = cvt_add_bf16x2(a2, a3, craw0.y);
+                uint32_t b2 = cvt_add_bf16x2(a4, a5, craw0.z);
+                uint32_t b3 = cvt_add_bf16x2(a6, a7, craw0.w);
+                STS_V4(b0, b1, b2, b3, saddr);
+            }
+            {
+                uint32_t b0 = cvt_add_bf16x2(a8, a9, craw1.x);
+                uint32_t b1 = cvt_add_bf16x2(a10, a11, craw1.y);
+                uint32_t b2 = cvt_add_bf16x2(a12, a13, craw1.z);
+                uint32_t b3 = cvt_add_bf16x2(a14, a15, craw1.w);
+                STS_V4(b0, b1, b2, b3, saddr + 16);
+            }
+            craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
+            craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
+            {
+                uint32_t b0 = cvt_add_bf16x2(a16, a17, craw0.x);
+                uint32_t b1 = cvt_add_bf16x2(a18, a19, craw0.y);
+                uint32_t b2 = cvt_add_bf16x2(a20, a21, craw0.z);
+                uint32_t b3 = cvt_add_bf16x2(a22, a23, craw0.w);
+                STS_V4(b0, b1, b2, b3, saddr + 32);
+            }
+            {
+                uint32_t b0 = cvt_add_bf16x2(a24, a25, craw1.x);
+                uint32_t b1 = cvt_add_bf16x2(a26, a27, craw1.y);
+                uint32_t b2 = cvt_add_bf16x2(a28, a29, craw1.z);
+                uint32_t b3 = cvt_add_bf16x2(a30, a31, craw1.w);
+                STS_V4(b0, b1, b2, b3, saddr + 48);
+            }
+        }
+
+        // Second 32 cols: a32..a63
+        {
+            const __nv_bfloat16* comb_ptr2 = comb_base + (long long)((n_start + nc + 32) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
+            craw0 = *reinterpret_cast<const uint4*>(comb_ptr2);
+            craw1 = *reinterpret_cast<const uint4*>(comb_ptr2 + 8);
+            uint32_t saddr = staging_a + lane * STAGING_A_ROW_BYTES + (nc - NC_START + 32) * 2;
+            {
+                uint32_t b0 = cvt_add_bf16x2(a32, a33, craw0.x);
+                uint32_t b1 = cvt_add_bf16x2(a34, a35, craw0.y);
+                uint32_t b2 = cvt_add_bf16x2(a36, a37, craw0.z);
+                uint32_t b3 = cvt_add_bf16x2(a38, a39, craw0.w);
+                STS_V4(b0, b1, b2, b3, saddr);
+            }
+            {
+                uint32_t b0 = cvt_add_bf16x2(a40, a41, craw1.x);
+                uint32_t b1 = cvt_add_bf16x2(a42, a43, craw1.y);
+                uint32_t b2 = cvt_add_bf16x2(a44, a45, craw1.z);
+                uint32_t b3 = cvt_add_bf16x2(a46, a47, craw1.w);
+                STS_V4(b0, b1, b2, b3, saddr + 16);
+            }
+            craw0 = *reinterpret_cast<const uint4*>(comb_ptr2 + 16);
+            craw1 = *reinterpret_cast<const uint4*>(comb_ptr2 + 24);
+            {
+                uint32_t b0 = cvt_add_bf16x2(a48, a49, craw0.x);
+                uint32_t b1 = cvt_add_bf16x2(a50, a51, craw0.y);
+                uint32_t b2 = cvt_add_bf16x2(a52, a53, craw0.z);
+                uint32_t b3 = cvt_add_bf16x2(a54, a55, craw0.w);
+                STS_V4(b0, b1, b2, b3, saddr + 32);
+            }
+            {
+                uint32_t b0 = cvt_add_bf16x2(a56, a57, craw1.x);
+                uint32_t b1 = cvt_add_bf16x2(a58, a59, craw1.y);
+                uint32_t b2 = cvt_add_bf16x2(a60, a61, craw1.z);
+                uint32_t b3 = cvt_add_bf16x2(a62, a63, craw1.w);
+                STS_V4(b0, b1, b2, b3, saddr + 48);
+            }
+        }
+
+        if (nc + 64 < NC_MID) {
+            TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                          a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47,
+                          a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
+                          taddr_base + nc + 64);
+        }
+    }
+
+    // Prefetch first 64 cols of second half
+    TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                  a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47,
+                  a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
+                  taddr_base + NC_MID);
+
+    __syncwarp();  // Phase 1A SMEM writes visible for Phase 2A reads
+
+    // ═══ Phase 1B (x64 stride) + Phase 2A (staging_a → global) ═══
+    __nv_bfloat16* row_base_a = C + (long long)gm_base * N_DIM + n_start + NC_START;
+
+    const uint32_t xor_val_b = (lane & 7) << 4;
+    const uint32_t saddr_row_b_lo = staging_b_lo + lane * STAGING_B_REGION_ROW_BYTES;
+    const uint32_t saddr_row_b_hi = staging_b_hi + lane * STAGING_B_REGION_ROW_BYTES;
+
+    #pragma unroll 1
+    for (int nc = NC_MID; nc < NC_END; nc += 64) {
+        // Phase 2A: 16 rows from staging_a (fills TMEM latency window)
+        {
+            const int r_base = ((nc - NC_MID) / 64) * 16;
+            #pragma unroll
+            for (int r = r_base; r < r_base + 16; r++) {
+                uint32_t src = staging_a + r * STAGING_A_ROW_BYTES + lane * HALF_CPT * 2;
+                __nv_bfloat16* dst = row_base_a + (long long)r * N_DIM + lane * HALF_CPT;
+                COALESCED_STORE_V2(src, dst);
+            }
+        }
+
+        // Combined loads for first chunk (fills TMEM latency window)
+        const __nv_bfloat16* comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
+        uint4 craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
+        uint4 craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
+
+        TMEM_WAIT();
+
+        // First 32 cols: a0..a31 → staging_b (swizzled)
+        {
+            int col_in_half_b = nc - NC_MID;
+            uint32_t saddr_row_b = (col_in_half_b < 64) ? saddr_row_b_lo : saddr_row_b_hi;
+            int byte_base_b = (col_in_half_b & 63) * 2;
+            {
+                uint32_t b0 = cvt_add_bf16x2(a0, a1, craw0.x);
+                uint32_t b1 = cvt_add_bf16x2(a2, a3, craw0.y);
+                uint32_t b2 = cvt_add_bf16x2(a4, a5, craw0.z);
+                uint32_t b3 = cvt_add_bf16x2(a6, a7, craw0.w);
+                STS_V4(b0, b1, b2, b3, saddr_row_b + (byte_base_b ^ xor_val_b));
+            }
+            {
+                uint32_t b0 = cvt_add_bf16x2(a8, a9, craw1.x);
+                uint32_t b1 = cvt_add_bf16x2(a10, a11, craw1.y);
+                uint32_t b2 = cvt_add_bf16x2(a12, a13, craw1.z);
+                uint32_t b3 = cvt_add_bf16x2(a14, a15, craw1.w);
+                STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 16) ^ xor_val_b));
+            }
+            craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
+            craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
+            {
+                uint32_t b0 = cvt_add_bf16x2(a16, a17, craw0.x);
+                uint32_t b1 = cvt_add_bf16x2(a18, a19, craw0.y);
+                uint32_t b2 = cvt_add_bf16x2(a20, a21, craw0.z);
+                uint32_t b3 = cvt_add_bf16x2(a22, a23, craw0.w);
+                STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 32) ^ xor_val_b));
+            }
+            {
+                uint32_t b0 = cvt_add_bf16x2(a24, a25, craw1.x);
+                uint32_t b1 = cvt_add_bf16x2(a26, a27, craw1.y);
+                uint32_t b2 = cvt_add_bf16x2(a28, a29, craw1.z);
+                uint32_t b3 = cvt_add_bf16x2(a30, a31, craw1.w);
+                STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 48) ^ xor_val_b));
+            }
+        }
+
+        // Second 32 cols: a32..a63 → staging_b (swizzled)
+        {
+            const __nv_bfloat16* comb_ptr2 = comb_base + (long long)((n_start + nc + 32) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
+            craw0 = *reinterpret_cast<const uint4*>(comb_ptr2);
+            craw1 = *reinterpret_cast<const uint4*>(comb_ptr2 + 8);
+            int col_in_half_b = nc + 32 - NC_MID;
+            uint32_t saddr_row_b = (col_in_half_b < 64) ? saddr_row_b_lo : saddr_row_b_hi;
+            int byte_base_b = (col_in_half_b & 63) * 2;
+            {
+                uint32_t b0 = cvt_add_bf16x2(a32, a33, craw0.x);
+                uint32_t b1 = cvt_add_bf16x2(a34, a35, craw0.y);
+                uint32_t b2 = cvt_add_bf16x2(a36, a37, craw0.z);
+                uint32_t b3 = cvt_add_bf16x2(a38, a39, craw0.w);
+                STS_V4(b0, b1, b2, b3, saddr_row_b + (byte_base_b ^ xor_val_b));
+            }
+            {
+                uint32_t b0 = cvt_add_bf16x2(a40, a41, craw1.x);
+                uint32_t b1 = cvt_add_bf16x2(a42, a43, craw1.y);
+                uint32_t b2 = cvt_add_bf16x2(a44, a45, craw1.z);
+                uint32_t b3 = cvt_add_bf16x2(a46, a47, craw1.w);
+                STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 16) ^ xor_val_b));
+            }
+            craw0 = *reinterpret_cast<const uint4*>(comb_ptr2 + 16);
+            craw1 = *reinterpret_cast<const uint4*>(comb_ptr2 + 24);
+            {
+                uint32_t b0 = cvt_add_bf16x2(a48, a49, craw0.x);
+                uint32_t b1 = cvt_add_bf16x2(a50, a51, craw0.y);
+                uint32_t b2 = cvt_add_bf16x2(a52, a53, craw0.z);
+                uint32_t b3 = cvt_add_bf16x2(a54, a55, craw0.w);
+                STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 32) ^ xor_val_b));
+            }
+            {
+                uint32_t b0 = cvt_add_bf16x2(a56, a57, craw1.x);
+                uint32_t b1 = cvt_add_bf16x2(a58, a59, craw1.y);
+                uint32_t b2 = cvt_add_bf16x2(a60, a61, craw1.z);
+                uint32_t b3 = cvt_add_bf16x2(a62, a63, craw1.w);
+                STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 48) ^ xor_val_b));
+            }
+        }
+
+        if (nc + 64 < NC_END) {
+            TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                          a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47,
+                          a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
+                          taddr_base + nc + 64);
+        }
+    }
+#else  // TMEM_LOAD_WIDTH 16 or 32
     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
     float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
 
@@ -521,6 +746,7 @@ void epilogue_store(
                          taddr_base + nc + 32);
         }
     }
+#endif
 
 #ifdef TIMING
     t_phase1_end = clock64();
