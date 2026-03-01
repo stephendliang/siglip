@@ -76,6 +76,7 @@ edit megakernel.cu -> make -> ./siglip_vision
 | File | What |
 |------|------|
 | `megakernel.cu` | **Source of truth** — hand-tuned CUDA kernel |
+| `cutlass_bench.cu` | CUTLASS grid search — sweeps 12 tile/cluster configs × FP32/BF16 epilogue. Single binary, no `-D` flags |
 | `EXPERIMENTS.md` | Experiment log (F1-F24), profiling data, optimization history |
 | `FUTURE_PROPOSALS.md` | Optimization roadmap (F21-F28, all executed) with results |
 | `Makefile` | Build rules (sm_100a, nvcc flags). `make timing` for clock64 build |
@@ -100,7 +101,21 @@ make                    # compile megakernel.cu -> siglip_vision
 ./siglip_vision         # run on B200, prints timing + TFLOPS + checksum
 make timing && ./siglip_timing | tee clock64_timing.txt | python3 analyze_timing.py
 ncu --set source --csv ./siglip_vision > source_counters_raw.csv && python3 analyze_source_counters.py source_counters_raw.csv
+
+# CUTLASS grid search (single binary, sweeps all tile/cluster configs)
+make cutlass-bench      # ~1-2 min compile (24 CUTLASS template instantiations)
+./cutlass-bench         # full sweep (4736 imgs, ~5 min runtime)
+./cutlass-bench 1       # quick test (148 imgs, ~30s)
 ```
+
+### CUTLASS bench details
+
+`cutlass_bench.cu` is a self-contained grid search over 12 tile/cluster configs. For each config, it measures:
+1. **GEMM-only** (beta=0, FP32 epilogue) — pure compute baseline
+2. **Fused FP32** (beta=1, FP32 epilogue) — `D = float(acc) + float(C)`
+3. **Fused BF16** (beta=1, BF16 epilogue) — `D = bf16(acc) + C` (matches custom kernel's cvt_add_bf16x2)
+
+Core template: `GemmInstance<TM, TN, TK, CM, CN, EpiCompute>` — full CUTLASS type chain parameterized on tile shape, cluster shape, and epilogue compute type (`float` or `cutlass::bfloat16_t`). Invalid configs return -1.0f via `can_implement` check. Results sorted by fused BF16 ms.
 
 ## Key constraints
 
