@@ -36,11 +36,13 @@
 #define OFF_MAINLOOP_MBAR  (OFF_MMA_MBAR + N_STAGES * 8)
 #define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
 #define OFF_STAGING        ((OFF_EPILOGUE_MBAR + 16 + 127) & ~127)
-#define STAGING_ROW_PAD         16                                                  // 16B pad for alignment
-#define STAGING_HALF_ROW_BYTES  ((TN / 2) * 2 + STAGING_ROW_PAD)                    // 272 bytes per half-row (128 BF16 cols + pad)
-#define STAGING_HALF_WARP_BYTES (32 * STAGING_HALF_ROW_BYTES)                        // 8704 bytes per half-buffer
-#define STAGING_WARP_BYTES      (2 * STAGING_HALF_WARP_BYTES)                        // 17408 bytes per warp (double-buffered A/B)
-#define SMEM_BYTES              ((OFF_STAGING + NUM_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
+#define STAGING_A_ROW_BYTES       272                                                // 128 BF16 cols = 256B + 16B pad (stride/4=68, gcd(68,32)=4 → 4-way, same as pre-F24)
+#define STAGING_A_BYTES           (32 * STAGING_A_ROW_BYTES)                         // 8704 bytes (= 68×128, 128B-aligned)
+#define STAGING_B_REGION_ROW_BYTES 128                                               // 64 BF16 cols = 128 bytes per region row (SWIZZLE_128B)
+#define STAGING_B_REGION_BYTES    (32 * STAGING_B_REGION_ROW_BYTES)                  // 4096 bytes per region
+#define STAGING_B_HALF_BYTES      (2 * STAGING_B_REGION_BYTES)                       // 8192 bytes (lo + hi regions)
+#define STAGING_WARP_BYTES        (STAGING_A_BYTES + STAGING_B_HALF_BYTES)            // 16512 bytes per warp
+#define SMEM_BYTES                ((OFF_STAGING + NUM_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
 #define TMEM_COLS      512
 #define IDESC          0x10400010U
 #define SBO            1024
@@ -316,7 +318,8 @@ void epilogue_store(
     __nv_bfloat16* __restrict__ C,
     int cta_rank,
     uint32_t staging_saddr,
-    uint32_t epi_mbar_addr
+    uint32_t epi_mbar_addr,
+    const CUtensorMap* tma_c_desc
 #ifdef TIMING
     , long long& t_phase1_end
 #endif
@@ -330,13 +333,21 @@ void epilogue_store(
 
     constexpr int NC_MID = (NC_START + NC_END) / 2;
     constexpr int HALF_CPT = (NC_MID - NC_START) / 32;  // 4 cols per thread per half
-    const uint32_t staging_a = staging_saddr;
-    const uint32_t staging_b = staging_saddr + STAGING_HALF_WARP_BYTES;
+    const uint32_t staging_a = staging_saddr;                                          // linear (260B/row, 0 bank conflicts)
+    const uint32_t staging_b_lo = staging_saddr + STAGING_A_BYTES;                     // swizzled SWIZZLE_128B
+    const uint32_t staging_b_hi = staging_saddr + STAGING_A_BYTES + STAGING_B_REGION_BYTES;
+
+    // Remedy B: Wait for previous tile's Phase 2B TMA stores before overwriting staging_b.
+    // After ml_wait (~1,342 cycles), TMA stores are long done — this is a true no-op.
+    if (lane == 0) {
+        asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+    }
+    __syncwarp();
 
     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
     float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
 
-    // ═══ Phase 1A: cols NC_START..NC_MID-1 → staging_a ═══
+    // ═══ Phase 1A: cols NC_START..NC_MID-1 → staging_a (linear layout) ═══
     TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                   a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                   taddr_base + NC_START);
@@ -349,7 +360,7 @@ void epilogue_store(
 
         TMEM_WAIT();
 
-        uint32_t saddr = staging_a + lane * STAGING_HALF_ROW_BYTES + (nc - NC_START) * 2;
+        uint32_t saddr = staging_a + lane * STAGING_A_ROW_BYTES + (nc - NC_START) * 2;
         {
             uint32_t b0 = cvt_add_bf16x2(a0, a1, craw0.x);
             uint32_t b1 = cvt_add_bf16x2(a2, a3, craw0.y);
@@ -400,12 +411,12 @@ void epilogue_store(
 
     #pragma unroll 2
     for (int nc = NC_MID; nc < NC_END; nc += 32) {
-        // Phase 2A: 8 rows from staging_a (fills TMEM latency window)
+        // Phase 2A: 8 rows from staging_a (linear layout, fills TMEM latency window)
         {
             const int r_base = ((nc - NC_MID) / 32) * 8;
             #pragma unroll
             for (int r = r_base; r < r_base + 8; r++) {
-                uint32_t src = staging_a + r * STAGING_HALF_ROW_BYTES + lane * HALF_CPT * 2;
+                uint32_t src = staging_a + r * STAGING_A_ROW_BYTES + lane * HALF_CPT * 2;
                 __nv_bfloat16* dst = row_base_a + (long long)r * N_DIM + lane * HALF_CPT;
                 COALESCED_STORE_V2(src, dst);
             }
@@ -418,20 +429,25 @@ void epilogue_store(
 
         TMEM_WAIT();
 
-        uint32_t saddr = staging_b + lane * STAGING_HALF_ROW_BYTES + (nc - NC_MID) * 2;
+        // Swizzled SMEM write to staging_b
+        int col_in_half_b = nc - NC_MID;
+        uint32_t region_base_b = (col_in_half_b < 64) ? staging_b_lo : staging_b_hi;
+        int byte_base_b = (col_in_half_b & 63) * 2;
+        uint32_t xor_val_b = (lane & 7) << 4;
+        uint32_t saddr_row_b = region_base_b + lane * STAGING_B_REGION_ROW_BYTES;
         {
             uint32_t b0 = cvt_add_bf16x2(a0, a1, craw0.x);
             uint32_t b1 = cvt_add_bf16x2(a2, a3, craw0.y);
             uint32_t b2 = cvt_add_bf16x2(a4, a5, craw0.z);
             uint32_t b3 = cvt_add_bf16x2(a6, a7, craw0.w);
-            STS_V4(b0, b1, b2, b3, saddr);
+            STS_V4(b0, b1, b2, b3, saddr_row_b + (byte_base_b ^ xor_val_b));
         }
         {
             uint32_t b0 = cvt_add_bf16x2(a8, a9, craw1.x);
             uint32_t b1 = cvt_add_bf16x2(a10, a11, craw1.y);
             uint32_t b2 = cvt_add_bf16x2(a12, a13, craw1.z);
             uint32_t b3 = cvt_add_bf16x2(a14, a15, craw1.w);
-            STS_V4(b0, b1, b2, b3, saddr + 16);
+            STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 16) ^ xor_val_b));
         }
 
         craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
@@ -441,14 +457,14 @@ void epilogue_store(
             uint32_t b1 = cvt_add_bf16x2(a18, a19, craw0.y);
             uint32_t b2 = cvt_add_bf16x2(a20, a21, craw0.z);
             uint32_t b3 = cvt_add_bf16x2(a22, a23, craw0.w);
-            STS_V4(b0, b1, b2, b3, saddr + 32);
+            STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 32) ^ xor_val_b));
         }
         {
             uint32_t b0 = cvt_add_bf16x2(a24, a25, craw1.x);
             uint32_t b1 = cvt_add_bf16x2(a26, a27, craw1.y);
             uint32_t b2 = cvt_add_bf16x2(a28, a29, craw1.z);
             uint32_t b3 = cvt_add_bf16x2(a30, a31, craw1.w);
-            STS_V4(b0, b1, b2, b3, saddr + 48);
+            STS_V4(b0, b1, b2, b3, saddr_row_b + ((byte_base_b + 48) ^ xor_val_b));
         }
 
         if (nc + 32 < NC_END)
@@ -460,19 +476,23 @@ void epilogue_store(
 #ifdef TIMING
     t_phase1_end = clock64();
 #endif
-    __syncwarp();  // Phase 1B SMEM writes visible for Phase 2B reads
+    __syncwarp();  // Phase 1B SMEM writes visible for Phase 2B TMA reads
 
     // Signal: done reading TMEM — W1 can reuse buffer. Phase 2B only uses SMEM + global.
     if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
 
-    // ═══ Phase 2B: staging_b → global ═══
-    __nv_bfloat16* row_base_b = C + (long long)gm_base * N_DIM + n_start + NC_MID;
-
-    #pragma unroll 8
-    for (int r = 0; r < 32; r++) {
-        uint32_t src = staging_b + r * STAGING_HALF_ROW_BYTES + lane * HALF_CPT * 2;
-        __nv_bfloat16* dst = row_base_b + (long long)r * N_DIM + lane * HALF_CPT;
-        COALESCED_STORE_V2(src, dst);
+    // ═══ Phase 2B: TMA tensor store staging_b → global ═══
+    if (lane == 0) {
+        int col_lo = n_start + NC_MID;
+        int col_hi = n_start + NC_MID + 64;
+        int row = gm_base;
+        asm volatile(
+            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+            :: "l"(tma_c_desc), "r"(col_lo), "r"(row), "r"(staging_b_lo) : "memory");
+        asm volatile(
+            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+            :: "l"(tma_c_desc), "r"(col_hi), "r"(row), "r"(staging_b_hi) : "memory");
+        asm volatile("cp.async.bulk.commit_group;" ::: "memory");
     }
 }
 
@@ -508,6 +528,7 @@ __cluster_dims__(2, 1, 1)
 patch_embed_gemm(
     const __grid_constant__ CUtensorMap tma_a,
     const __grid_constant__ CUtensorMap tma_b,
+    const __grid_constant__ CUtensorMap tma_c,
     const __nv_bfloat16* __restrict__ combined,
     __nv_bfloat16* __restrict__ C
 #ifdef TIMING
@@ -752,19 +773,19 @@ patch_embed_gemm(
                 const uint32_t epi_mbar_masked = (epilogue_mbar_addr + prev_buf * 8) & 0xFEFFFFFF;
                 if (is_split) {
                     if (col_rank == 0)
-                        epilogue_store<0, TN/2>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr, epi_mbar_masked
+                        epilogue_store<0, TN/2>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #ifdef TIMING
                             , epi_t1
 #endif
                         );
                     else
-                        epilogue_store<TN/2, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr, epi_mbar_masked
+                        epilogue_store<TN/2, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #ifdef TIMING
                             , epi_t1
 #endif
                         );
                 } else {
-                    epilogue_store<0, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr, epi_mbar_masked
+                    epilogue_store<0, TN>(prev_buf * TN, row_group, lane, gm_base, prev_n, combined, pos_row, C, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #ifdef TIMING
                         , epi_t1
 #endif
@@ -862,24 +883,30 @@ patch_embed_gemm(
 #endif
         if (is_split) {
             if (col_rank == 0)
-                epilogue_store<0, TN/2>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr, 0
+                epilogue_store<0, TN/2>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr, 0, &tma_c
 #ifdef TIMING
                     , drain_t1
 #endif
                 );
             else
-                epilogue_store<TN/2, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr, 0
+                epilogue_store<TN/2, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr, 0, &tma_c
 #ifdef TIMING
                     , drain_t1
 #endif
                 );
         } else {
-            epilogue_store<0, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr, 0
+            epilogue_store<0, TN>(last_buf * TN, row_group, lane, gm_base, last_n, combined, pos_row, C, cta_rank, staging_saddr, 0, &tma_c
 #ifdef TIMING
                 , drain_t1
 #endif
             );
         }
+
+        // Wait for drain epilogue's Phase 2B TMA stores to complete
+        if (lane == 0) {
+            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+        }
+        __syncwarp();
     }
 
     // ── Cluster sync + TMEM dealloc (all warps, both CTAs) ──
@@ -970,6 +997,21 @@ int main() {
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }
 
+    CUtensorMap h_tma_c;
+    {
+        uint64_t dims[2]    = {(uint64_t)N_DIM, (uint64_t)M_TOTAL};
+        uint64_t strides[1] = {(uint64_t)N_DIM * sizeof(__nv_bfloat16)};  // 1536 bytes
+        uint32_t box[2]     = {64, 32};   // 64 BF16 cols x 32 rows
+        uint32_t estrides[2]= {1, 1};
+        CU_CHECK(cuTensorMapEncodeTiled(&h_tma_c,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_C,
+            dims, strides, box, estrides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    }
+
     CUDA_CHECK(cudaFuncSetAttribute(patch_embed_gemm,
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     printf("  TMA descriptors + func attr done\n");
@@ -986,7 +1028,7 @@ int main() {
     // ── Warmup: 2 iterations ──
     printf("Launching warmup (2 iters)...\n");
     for (int _i = 0; _i < 2; _i++) {
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_combined, d_C
 #ifdef TIMING
         , d_timing, d_spread
 #endif
@@ -1003,7 +1045,7 @@ int main() {
     cudaEventCreate(&_t1);
     cudaEventRecord(_t0);
     for (int _i = 0; _i < 10; _i++) {
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_combined, d_C
 #ifdef TIMING
         , d_timing, d_spread
 #endif
@@ -1020,7 +1062,7 @@ int main() {
     cudaEventDestroy(_t1);
 
     // ── Checksum run ──
-    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C
+    patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_combined, d_C
 #ifdef TIMING
         , d_timing, d_spread
 #endif

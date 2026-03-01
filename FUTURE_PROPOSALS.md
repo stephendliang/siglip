@@ -1,29 +1,32 @@
 # Future Proposals
 
-**Kernel state (2026-03-01):** F22 best fused path = 0.536 ms / 2041 TFLOPS. 229 regs, 0 spills. BF16 epilogue arithmetic with `#pragma unroll 2`.
+**Kernel state (2026-03-01):** F24 best fused path = 0.532 ms / 2059 TFLOPS. 235 regs, 0 spills. Asymmetric SMEM staging (linear staging_a, SWIZZLE_128B staging_b) + TMA tensor stores for Phase 2B.
 **Reference:** cuBLAS pure GEMM = 0.365 ms / 3001 TFLOPS | cuBLAS + unfused pos_embed = 0.835 ms
-**Bottleneck:** Epilogue-bound producer-consumer equilibrium. Phase 1 TMEM readback is the binding constraint — bandwidth-limited, not contention-limited (F23C: <10% contention at 4 warps, all warp-count variants ruled out). F22 reduced epilogue instructions by 1,480 SASS ops; partial unroll at 229 regs was the sweet spot (+1.3%). F21 confirmed B is L2-resident — TMA0_wait is pure A-matrix DRAM latency.
+**Bottleneck:** Epilogue-bound producer-consumer equilibrium. Phase 1 TMEM readback is the binding constraint — bandwidth-limited, not contention-limited (F23C: <10% contention at 4 warps). F24 eliminated Phase 2B L1/LSU contention via TMA tensor stores (-626 cycles) at the cost of +440 cycles Phase 1 swizzle overhead in staging_b. Net: +0.7% wall clock. Phase 1 is now 73.7% of epilogue time (was 67%). Per-warp spread increased to 330 cycles (>200 threshold), potentially reopening F27 dephasing.
 
 ### Execution order
 
 ```
 Dependencies:
   F25 ✅ (diagnostic) ──→ F23 (warp count sweep, low priority)
-                      └──→ F27 ✗ (skipped: symmetric)
+                      └──→ F27 ✗→? (was skipped: symmetric, but F24 reopened: 330 cyc spread)
   F21 ✗ (L2 promotion) ─→ F26 ✗ (killed: B already L2-resident)
-  F22 (BF16 math) ────→ F24 (swizzled staging)
+  F22 ✅ (BF16 math) ──→ F24 ✅ (swizzled staging + TMA tensor stores)
   F23C ✗ (2 warps) ───→ all warp-count variants ruled out (contention <10%)
   F28 ✅ (K-loop) ──────→ perf-neutral alone (K-loop -76 cyc, wall clock unchanged)
-  F22 ✅ (BF16 math) ──→ F24 (swizzled staging, only remaining active proposal)
 
-Recommended serial order:
-  F25 ✅ → F21 ✗ → F22 ✅ → F23C ✗ → F28 ✅ → (conditional: F24)
-  │         │        │        │         │
-  │         │        │        │         └──── DONE: perf-neutral, -76 cyc K-loop, cleaner baseline
-  │         │        │        └────────────── DONE: contention <10%, 1.85x per-warp Phase 1, 42% regression
-  │         │        └──────────────────────── DONE: +1.3%, 229 regs, #pragma unroll 2
-  │         └──────────────────────────────── DONE: B already L2-hot, F26 killed
-  └────────────────────────────────────────── DONE: symmetric + mild fat tail → F27 skipped
+Completed serial order:
+  F25 ✅ → F21 ✗ → F22 ✅ → F23C ✗ → F28 ✅ → F24 ✅
+  │         │        │        │         │        │
+  │         │        │        │         │        └── DONE: +0.7%, TMA tensor stores, asymmetric staging
+  │         │        │        │         └──────────── DONE: perf-neutral, -76 cyc K-loop, cleaner baseline
+  │         │        │        └────────────────────── DONE: contention <10%, 1.85x per-warp Phase 1, 42% regression
+  │         │        └──────────────────────────────── DONE: +1.3%, 229 regs, #pragma unroll 2
+  │         └──────────────────────────────────────── DONE: B already L2-hot, F26 killed
+  └────────────────────────────────────────────────── DONE: symmetric + mild fat tail → F27 skipped
+
+All proposals executed. No active proposals remaining.
+Potential reopener: F27 dephasing (F24 increased per-warp spread to 330 cycles, above 200 threshold).
 ```
 
 ---
@@ -132,59 +135,23 @@ Tested option C (2 epilogue warps, each processing 2 row_groups sequentially). P
 
 ---
 
-## F24: Swizzled SMEM staging layout (long-term)
+## F24: Swizzled SMEM staging + TMA tensor stores — ✅ DONE (+0.7%)
 
 **Effort:** High (staging buffer architecture redesign)
-**Expected impact:** Eliminates Phase 2B L1/LSU contention with K-loop (confirmed 170 cycles by F19a). Enables single-shot TMA tensor store for Phase 2B.
-**Risk:** Complexity. Swizzled addressing affects Phase 1B writes and Phase 2B reads.
+**Result:** 0.532 ms / 2059 TFLOPS / 235 regs — +0.7% wall clock improvement over F22+F28 baseline (0.536 ms).
 
-**Rationale:** F19a proved Phase 2B's `ld.shared.v2 + st.global.v2` stores contend with the K-loop on L1/LSU (+170 cycles to K-loop, perfect cancellation with early mbar savings). F19b proved TMA bulk stores eliminate this contention (K-loop improved 12.6%) but fail due to per-instruction overhead (32 × 256B stores at ~70 cycles each = 3× slower).
+**What shipped:** Asymmetric SMEM staging layout — linear 272-byte rows for staging_a (manual stores), SWIZZLE_128B regions for staging_b (TMA tensor stores). Phase 2B replaced with 2 × `cp.async.bulk.tensor.2d` (64 cols × 32 rows = 4 KB each). TMA C descriptor with `CU_TENSOR_MAP_SWIZZLE_128B`.
 
-The solution is a single `cp.async.bulk.tensor.2d` TMA tensor store covering the entire 128-col × 32-row staging half (8 KB), amortizing the per-instruction overhead across one large transfer. This requires SMEM layout compatible with the TMA descriptor's swizzle mode — currently impossible because of the 272-byte padded rows (256 useful + 16 pad).
+**Key tradeoffs:**
+- Phase 2B: **-626 cycles (-70%)** — TMA tensor stores dramatically more efficient than 32 manual ld.shared+st.global iterations
+- K-loop: **-47 cycles (-1.1%)** — modest LSU contention reduction (less than F19a's -170, TMA still has some L1 interaction)
+- TMA0: **-199 cycles (-23%)** — unexpected bonus from reduced memory subsystem pressure
+- Phase 1: **+440 cycles (+10.7%)** — swizzle XOR addressing overhead in staging_b writes (genuine cost, unavoidable for SWIZZLE_128B compatibility)
+- Per-warp spread: increased from 172 to 330 cycles (above 200-cycle threshold, potentially reopens F27)
 
-**Current staging layout:**
-```
-STAGING_HALF_ROW_BYTES = 272 (256 data + 16 pad)
-Purpose of pad: bank-conflict-free Phase 1B writes
-  lane 0 → offset 0 → bank 0
-  lane 1 → offset 272 → bank 4  (272/16 = 17, 17 % 32 = 17)
-  lane 2 → offset 544 → bank 2  (544/16 = 34, 34 % 32 = 2)
-  Without pad (256B stride): all lanes map to bank 0 → 32-way conflict
-```
+**Lessons:** Only swizzle what TMA touches. `memory` clobber placement on `cp.async.bulk.wait_group` matters — between Phase 1A and 1B it blocked register optimization; before Phase 1A (where it's a no-op after ml_wait) it's free. STS_V4 requires 16-byte aligned strides (stride 260 for zero conflicts causes misaligned trap; stride 272 with 4-way conflicts is the practical optimum).
 
-**Required layout for TMA tensor store:**
-```
-CU_TENSOR_MAP_SWIZZLE_NONE: contiguous 256-byte rows (no pad)
-  → 32-way bank conflict in Phase 1B writes
-
-CU_TENSOR_MAP_SWIZZLE_128B: hardware swizzles 128B chunks
-  → Phase 1B writes must use swizzle-aware addressing
-  → Phase 2B reads (currently ld.shared.v2) replaced by TMA store (reads from SMEM internally)
-```
-
-**Changes needed:**
-1. Remove STAGING_ROW_PAD. Staging rows become exactly 256 bytes (128 BF16 cols).
-2. Phase 1B `st.shared` addressing must use 128B swizzle pattern to avoid bank conflicts. The `CVT_STS` macro's store address computation changes from `lane * 272 + col_offset` to a swizzled address that XORs row and column bits per the 128B swizzle formula.
-3. Create TMA descriptor for staging buffer (2D, BF16, 128 cols × 32 rows, SWIZZLE_128B).
-4. Replace Phase 2B's 32-iteration `COALESCED_STORE_V2` loop with single `cp.async.bulk.tensor.2d` store from staging_b to global C.
-5. Add `cp.async.bulk.wait_group 0` before next Phase 1B (protect staging_b from overwrite).
-6. Phase 2A stores from staging_a need same treatment (or keep manual if Phase 2A is in TMEM overlap window — contention with K-loop is less relevant there since it's hiding behind TMEM stalls).
-
-**Swizzle addressing for Phase 1B writes:**
-Do not hardcode a guessed XOR formula. Derive the exact addressing from the Blackwell TMA swizzle semantics and validate against `cuTensorMapEncodeTiled` behavior + microbench conflict checks.
-
-**SMEM budget impact:**
-- Current: 4 warps × 17,408 = 69,632 bytes (272B per half-row × 32 rows × 2 halves)
-- New: 4 warps × 16,384 = 65,536 bytes (256B per half-row × 32 rows × 2 halves)
-- Saves 4,096 bytes of SMEM. Total drops from ~201 KB to ~197 KB.
-
-**Prerequisite:** F22 (BF16 arithmetic) should be done first. If F22 flips the equilibrium and epi_wait collapses, the 170-cycle Phase 2B contention becomes a larger fraction of the remaining gap and F24 becomes higher priority.
-
-**Go/no-go:**
-- Success: Phase 2B L1/LSU contention eliminated (K-loop improves ≥5% with TMA tensor store) AND total epilogue doesn't regress
-- Fail-fast: if swizzled Phase 1B writes introduce bank conflicts worse than the current baseline (re-measure with `analyze_source_counters.py` before attempting), abort
-- Max effort: 8–10 hours
-- Rollback: revert staging layout to padded 272-byte rows
+See EXPERIMENTS.md F24 for full 3-iteration development history and cycle breakdowns.
 
 ---
 
@@ -558,7 +525,7 @@ Skip B initially (fighting `ptxas` UR allocation) — inspect SASS after A+C to 
 | Proposal | Why dead |
 |----------|----------|
 | Next-tile TMA prefetch (F20) | ~0% — DRAM bandwidth, not scheduling. Prefetch shifts TMA issue by ~20 cycles vs 818-cycle shortfall. |
-| cp.async.bulk Phase 2B stores (F19b) | 3× slower than manual stores. 32 × 256B at ~70 cycles/instruction overhead. |
+| cp.async.bulk Phase 2B stores (F19b) | 3× slower than manual stores. 32 × 256B at ~70 cycles/instruction overhead. **Superseded by F24** (TMA tensor stores). |
 | 5-stage pipeline | Would need SMEM freed and register impact validated. Current 4-stage at 131 KB leaves 27 KB headroom. 5-stage = 163 KB → only 65 KB for staging (needs 70 KB). |
 | TMA multicast for B | B is N-split across CTAs (each loads different half). Zero redundancy. dest_multicast=0 is correct. |
 | L2 promotion for B (F21) | B already fully L2-resident. TMA0_wait unchanged (794 vs 787 cycles, noise). 576 KB B fits easily in 48 MB L2. |

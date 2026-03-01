@@ -4,7 +4,7 @@ Kernel: `patch_embed_gemm` — persistent megakernel for SigLIP2 patch embed GEM
 GEMM: `[928256, 768] x [768, 768]^T`, FP8 E4M3 inputs, BF16 output with fused bias + positional embedding.
 Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 
-**Current best: 0.536 ms / 2041 TFLOPS** (fused end-to-end). 229 regs, 0 spills.
+**Current best: 0.532 ms / 2059 TFLOPS** (fused end-to-end). 235 regs, 0 spills.
 
 ---
 
@@ -30,6 +30,9 @@ Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 | d1fc103 | F18: double-buffered SMEM epilogue overlap | 0.543 | 2018 | 223 | current best |
 | — | F19: early epilogue mbar + TMA Phase 2B stores | 0.542 | 2020 | 223 | early mbar neutral, TMA stores rejected |
 | — | F20: next-tile TMA prefetch | 0.544 | 2014 | 221 | rejected — ~0% improvement |
+| b5da9e8 | F22: BF16 epilogue arithmetic | 0.536 | 2041 | 229 | `#pragma unroll 2`, -1480 epilogue SASS |
+| 2bb3675 | F28: K-loop restructuring | 0.536 | 2041 | 229 | perf-neutral, -76 cyc K-loop, cleaner baseline |
+| — | F24: Swizzled staging + TMA tensor stores | 0.532 | 2059 | 235 | asymmetric layout, Phase 2B -626 cyc |
 
 Reference: cuBLAS per-tensor FP8 (best-of-8 algos, 256MB workspace) = 0.365 ms / 3001 TFLOPS (GEMM only, no fusion).
 cuBLAS + unfused pos_embed = 0.835 ms end-to-end.
@@ -832,3 +835,93 @@ These improvements prove that register pressure and thread count significantly i
 The kernel remains epilogue-bound. K-loop savings alone cannot shift the equilibrium — as predicted by the timing model. The change is retained as a cleaner K-loop baseline (eliminates descriptor recomputation, modulo, conditional) for potential future pairing with epilogue optimizations.
 
 **What the compiler did:** Despite adding 8 `uint64_t` precomputed descriptors (expected +16 regs), register count stayed at 229. The compiler likely kept the descriptors in the same registers previously used for `make_smem_desc` results — the precomputation hoisted the computation without inflating live ranges.
+
+---
+
+## F24: Swizzled SMEM staging + TMA tensor stores for Phase 2B — ACCEPTED (+0.7%)
+
+**Date:** 2026-03-01
+**Baseline:** 0.536 ms / 2041 TFLOPS / 229 regs (F22+F28)
+**Result:** 0.532 ms / 2059 TFLOPS / 235 regs — **+0.7% faster** (5 runs: 0.531–0.533 ms)
+**Verdict:** ACCEPTED (marginal)
+
+**Hypothesis:** F19a proved Phase 2B's manual `ld.shared.v2 + st.global.v2` stores contend with the concurrent K-loop on L1/LSU (~170 cycles). F19b proved TMA bulk stores eliminate the contention but 32 individual `cp.async.bulk` stores at ~70 cycles each = 2,240 cycles (3x slower). Using `cp.async.bulk.tensor.2d` TMA tensor stores, a single instruction moves an entire 64-col × 32-row region (4 KB), amortizing per-instruction overhead. Requires SWIZZLE_128B-compatible SMEM layout in staging_b.
+
+**Changes (3 iterations to reach final form):**
+
+*Iteration 1 — full swizzle (both staging_a and staging_b):*
+1. Replaced `STAGING_ROW_PAD` / `STAGING_HALF_ROW_BYTES` (272-byte rows) with two 64-col SWIZZLE_128B regions per 128-col staging half. Each region: 32 rows × 128 bytes = 4,096 bytes.
+2. Phase 1A/1B STS_V4 writes use swizzle XOR addressing: `byte_offset ^ ((lane & 7) << 4)`.
+3. Phase 2A reads use matching swizzle XOR for `ld.shared.v2`.
+4. Phase 2B replaced with 2 × `cp.async.bulk.tensor.2d.global.shared::cta.bulk_group` (64 cols × 32 rows each) + `commit_group`.
+5. Added `const __grid_constant__ CUtensorMap tma_c` kernel parameter with SWIZZLE_128B descriptor for output matrix C.
+6. TMA completion fence (`cp.async.bulk.wait_group 0`) between Phase 1A and Phase 1B to protect staging_b from overwrite while TMA reads it.
+
+**Result: 0.538 ms / 2036 TFLOPS, 242 regs.** Perf-neutral. Phase 2B dropped -627 cycles (-70%) but Phase 1 regressed +466 cycles (+11.3%), nearly cancelling the benefit.
+
+*Root cause analysis of Phase 1 regression:*
+
+The +466 cycle Phase 1 regression was initially attributed to bank conflicts from the swizzle XOR pattern. Analysis proved this wrong — the old 272-byte stride layout had **identical** 4-way write bank conflicts (`gcd(272/4, 32) = gcd(68, 32) = 4`). Phase 2A reads were actually *better* (conflict-free with swizzle vs 2-way before). The real culprits:
+
+| Source | Est. cycles | Mechanism |
+|--------|-------------|-----------|
+| Swizzle XOR computation (Phase 1A+1B) | ~100-150 | Region select, byte_base, XOR per loop iteration × 8 iterations |
+| Phase 2A swizzle reads | ~100-150 | XOR + ternary region branch per read × 32 reads |
+| TMA `wait_group` + extra `__syncwarp()` | ~30-50 | Inserted between Phase 1A and Phase 1B |
+| `memory` clobber on `wait_group` asm | ~100-200 | Compiler can't keep registers live across barrier |
+
+Key insight: **staging_a doesn't need swizzle.** Only staging_b feeds the TMA tensor stores. Phase 2A uses manual `COALESCED_STORE_V2`. The swizzle was imposed on staging_a for no benefit.
+
+*Iteration 2 — asymmetric layout (Remedy A) + relocated TMA wait (Remedy B):*
+
+**Remedy A:** Reverted staging_a to linear 272-byte rows (original layout, 4-way bank conflicts, simple addressing). Kept staging_b in SWIZZLE_128B layout for TMA stores. Asymmetric per-warp layout: 8,704 bytes (staging_a, linear) + 8,192 bytes (staging_b, swizzled) = 16,896 bytes.
+
+**Remedy B:** Moved TMA `wait_group 0` from between Phase 1A/Phase 1B to the start of `epilogue_store` (before Phase 1A). After `ml_wait` (~1,342 cycles), TMA stores from the previous tile are long completed — the wait is a true no-op. This eliminates the extra `__syncwarp()` and moves the `memory` clobber away from the critical Phase 1A→1B register optimization window.
+
+**Result: 0.532 ms / 2059 TFLOPS, 235 regs.** This is the accepted form.
+
+**Final cycle breakdown (timing build, 255 regs):**
+
+| Metric | F22+F28 baseline | F24 initial (all swizzled) | F24 final (A+B) | Delta (final vs baseline) |
+|--------|:-:|:-:|:-:|:-:|
+| **Wall clock** | **0.536 ms** | **0.538 ms** | **0.532 ms** | **-0.7%** |
+| K-loop | 4,154 | 4,118 | 4,107 | **-47 (-1.1%)** |
+| Phase 1 | 4,129 | 4,595 | 4,569 | **+440 (+10.7%)** |
+| Phase 2B | 899 | 272 | 273 | **-626 (-69.6%)** |
+| TMA0 | 857 | 762 | 658 | **-199 (-23.2%)** |
+| epi_wait | 1,056 | 1,244 | 1,352 | +296 |
+| ml_wait | 1,139 | 1,342 | 1,360 | +221 |
+
+**What worked:**
+- **Phase 2B: -626 cycles.** TMA tensor stores are dramatically more efficient than 32 manual `ld.shared.v2 + st.global.v2` iterations. Two 4KB TMA stores + commit = 273 cycles vs 899 cycles of LSU-issued stores.
+- **K-loop: -47 cycles.** Modest improvement from eliminating LSU contention between Phase 2B stores and K-loop memory traffic. Smaller than the expected -170 from F19a's measurement — TMA stores use a DMA path that has some residual L1 interaction.
+- **TMA0: -199 cycles.** Unexpected bonus. Possibly from reduced SMEM/L1 pressure (smaller staging footprint, fewer LSU stores) freeing memory subsystem bandwidth for TMA loads.
+
+**What didn't work — Phase 1: +440 cycles.** The staging_b swizzle XOR computation adds ~100-150 cycles of instruction overhead (region select, byte_base, XOR per STS_V4). This is the cost of SWIZZLE_128B-compatible writes. The asymmetric layout (Remedy A) eliminated the staging_a half of this overhead, but staging_b's swizzle cost remains. The 272-byte baseline was essentially free (simple `lane * stride + offset`).
+
+**Why wall clock improved despite wider deficit:**
+
+The cycle budget now shows a wider epilogue deficit (1,164 cycles vs baseline 257), yet wall clock improved. This seems paradoxical. The explanation: the timing build uses 255 regs (maxed out), which inflates Phase 1 disproportionately relative to the production build at 235 regs. The production build's equilibrium is tighter than the timing data suggests. The ground truth is wall clock at production register count: 0.532 ms vs 0.536 ms = real improvement.
+
+**Per-warp Phase 1 (timing build):**
+```
+W2 (ew=0, rg=0):  avg=4,533  p95=5,856
+W3 (ew=1, rg=1):  avg=4,569  p95=5,842
+W4 (ew=2, rg=2):  avg=4,863  p95=6,027
+W5 (ew=3, rg=3):  avg=4,779  p95=6,002
+Spread of averages: 330 cycles
+```
+
+Spread increased from F25's baseline 172 to 330 cycles. Now asymmetric (above 200-cycle threshold). This may reopen F27 (dephasing) as a viable optimization, though the asymmetry could be a timing-build artifact.
+
+**SMEM budget:**
+- Previous: 4 warps × 17,408 = 69,632 bytes staging. ~201 KB total.
+- F24: 4 warps × 16,896 = 67,584 bytes staging. ~199 KB total of 228 KB.
+
+**Production timing (5 runs):** 0.531, 0.532, 0.533, 0.533, 0.533 ms. Median 0.533 ms / 2055 TFLOPS.
+
+**Lessons learned:**
+- Asymmetric staging layouts (linear for manual stores, swizzled for TMA stores) are superior to uniform swizzle. Only swizzle what TMA touches.
+- Placement of `memory` clobber asm barriers matters. A `cp.async.bulk.wait_group 0` between Phase 1A and Phase 1B prevented register optimization across the critical boundary. Moving it before Phase 1A (where it's a no-op after ml_wait) eliminated this cost.
+- STS_V4 (`st.shared.v4.b32`) requires 16-byte alignment, which constrains staging_a row stride to multiples of 16. The optimal bank-conflict-minimizing stride with 16-byte alignment is 272 bytes (gcd(68, 32) = 4 → 4-way conflicts). Stride 260 (zero conflicts) is only 4-byte aligned — causes misaligned address trap.
+- The +440 cycle Phase 1 regression from staging_b swizzle is a genuine cost of TMA tensor stores. The trade is acceptable here (Phase 2B savings + TMA0 bonus > Phase 1 cost), but future work should explore ways to reduce swizzle addressing overhead.
