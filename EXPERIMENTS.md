@@ -4,7 +4,7 @@ Kernel: `patch_embed_gemm` — persistent megakernel for SigLIP2 patch embed GEM
 GEMM: `[928256, 768] x [768, 768]^T`, FP8 E4M3 inputs, BF16 output with fused bias + positional embedding.
 Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 
-**Current best: 0.530 ms / 2067 TFLOPS** (fused end-to-end). 236 regs, 0 spills.
+**Current best: 0.524 ms / 2090 TFLOPS** (fused end-to-end). 207 regs, 0 spills.
 
 ---
 
@@ -1307,3 +1307,82 @@ CUTLASS GEMM-only is faster (0.412 ms / 2658 TFLOPS) but its fusion penalty (+12
 4. **CUTLASS's LDTM.x64 advantage is elsewhere.** F36 identified CUTLASS using 4× LDTM.x64 vs our 40× LDTM.x16 as the key difference. This experiment rules out load width as the explanation. CUTLASS's faster GEMM-only time (0.412 ms) likely comes from other factors: fewer R2UR instructions (26 vs 428), TMA tensor stores throughout, and compiler-optimized epilogue scheduling.
 
 5. **Phase 1 TMEM readback is at a hardware floor.** Combined with F35 (software pipelining rejected), this confirms the TMEM read port throughput cannot be improved by instruction-level changes. The ~4,345-cycle Phase 1 cost is a fixed hardware constraint for 256 columns of TMEM readback.
+
+## F40: Interleaved TMA stores — grid search over store scheduling strategies
+
+**Date:** 2026-03-01
+**Baseline:** 0.554 ms / 1975 TFLOPS / 207 regs (F38 unified epilogue, all TMA stores batched at end)
+**Pre-F38 baseline:** 0.530 ms / 2067 TFLOPS (Phase 2A manual LDS+STG hiding in TMEM stalls)
+**Result:** **0.524 ms / 2090 TFLOPS** — half-batch interleaved TMA stores (V5/V6). New best.
+**Verdict:** Strong success. F38's clean unified architecture preserved, 1.1% faster than pre-F38 baseline.
+
+**Hypothesis:** F38 unified the epilogue (all 256 cols through swizzle+TMA stores, eliminating Phase 2A manual LDS+STG) but was 4.7% slower (0.555 ms vs 0.530 ms). NCU profiling revealed `long_scoreboard` +55K cycles/warp (+18%) — epilogue warps idle during TMEM stalls because Phase 2A's useful work no longer fills the stall windows. Fix: issue TMA stores for completed SMEM regions *during* TMEM stall windows, rather than batching all 4 at the end.
+
+**Approach:** Compile-time grid search over two axes:
+- `INTERLEAVE_STRATEGY`: 0=all-at-end (F38 baseline), 1=per-region (1 store after each 64-col region), 2=half-batch (2 stores after every 2nd region), 3=three-plus-one (3 stores after 3rd region, 1 at end)
+- `MBAR_EARLY`: 0=signal TMEM free after Phase 1, 1=signal right after last TMEM_WAIT (TMEM data in registers, safe to free early)
+
+Combined with `TMEM_LOAD_WIDTH` (x32 default, x64 alternate), this gives 10 variants.
+
+**Variants built:**
+
+| Variant | Width | Strategy | mbar | Regs | Spills |
+|---------|-------|----------|------|------|--------|
+| V1 | x32 | per-region | early | 208 | 0 |
+| V2 | x32 | per-region | late | 206 | 0 |
+| V3 | x64 | per-region | early | 233 | 0 |
+| V4 | x64 | per-region | late | 232 | 0 |
+| V5 | x32 | half-batch | early | 211 | 0 |
+| V6 | x32 | half-batch | late | 209 | 0 |
+| V7 | x64 | half-batch | late | 232 | 0 |
+| V8 | x32 | all-at-end | late | 207 | 0 |
+| V9 | x64 | all-at-end | late | 231 | 0 |
+| V10 | x32 | three+one | late | 209 | 0 |
+
+All variants pass correctness: checksum 1769472.0, C[0,0..3] = 1728.0.
+
+### Performance (5 runs per variant, median)
+
+| Rank | Variant | Config | Median (ms) | TFLOPS | vs V8 | vs pre-F38 |
+|------|---------|--------|-------------|--------|-------|------------|
+| 1 | **V5** | x32, half-batch, mbar_early | **0.524** | 2090 | -5.4% | -1.1% |
+| 2 | **V6** | x32, half-batch, mbar_late | **0.524** | 2090 | -5.4% | -1.1% |
+| 3 | V7 | x64, half-batch, mbar_late | 0.525 | 2087 | -5.2% | -0.9% |
+| 4 | V3 | x64, per-region, mbar_early | 0.527 | 2078 | -4.9% | -0.6% |
+| 5 | V2 | x32, per-region, mbar_late | 0.528 | 2074 | -4.7% | -0.4% |
+| 6 | V1 | x32, per-region, mbar_early | 0.529 | 2070 | -4.5% | -0.2% |
+| 7 | V4 | x64, per-region, mbar_late | 0.529 | 2070 | -4.5% | -0.2% |
+| 8 | V10 | x32, three+one, mbar_late | 0.541 | 2024 | -2.3% | +2.1% |
+| 9 | V8 | x32, all-at-end (F38 baseline) | 0.554 | 1975 | — | +4.5% |
+| 10 | V9 | x64, all-at-end (F38 baseline) | 0.555 | 1973 | — | +4.7% |
+
+Raw runs (ms):
+
+| Variant | R1 | R2 | R3 | R4 | R5 | Median |
+|---------|------|------|------|------|------|--------|
+| V1 | 0.529 | 0.528 | 0.527 | 0.529 | 0.529 | 0.529 |
+| V2 | 0.528 | 0.528 | 0.527 | 0.527 | 0.529 | 0.528 |
+| V3 | 0.528 | 0.527 | 0.527 | 0.526 | 0.528 | 0.527 |
+| V4 | 0.531 | 0.529 | 0.529 | 0.529 | 0.530 | 0.529 |
+| V5 | 0.522 | 0.523 | 0.524 | 0.524 | 0.524 | 0.524 |
+| V6 | 0.525 | 0.526 | 0.524 | 0.524 | 0.524 | 0.524 |
+| V7 | 0.526 | 0.525 | 0.525 | 0.524 | 0.526 | 0.525 |
+| V8 | 0.554 | 0.556 | 0.554 | 0.556 | 0.554 | 0.554 |
+| V9 | 0.555 | 0.556 | 0.554 | 0.555 | 0.554 | 0.555 |
+| V10 | 0.540 | 0.541 | 0.542 | 0.541 | 0.540 | 0.541 |
+
+### Analysis
+
+1. **Half-batch wins decisively.** Issuing 2 TMA stores after every 2nd region (strategy 2) is optimal. This fills the TMEM stall windows with useful TMA work — exactly the latency-hiding that Phase 2A's manual LDS+STG provided pre-F38, but using TMA stores instead. The 2-store batch amortizes the `__syncwarp` overhead while still issuing early enough to overlap with subsequent TMEM loads.
+
+2. **Per-region is too aggressive.** Strategy 1 (1 store per region) adds an `__syncwarp` barrier after every 64-col region, which serializes the Phase 1 loop more than necessary. The 3-5 µs penalty vs half-batch reflects this extra synchronization overhead.
+
+3. **Three-plus-one is too conservative.** Strategy 3 (3 stores after region 2, 1 at end) recovers only ~60% of the gap vs all-at-end. Batching 3 stores together creates a large burst that doesn't fit cleanly into TMEM stall windows, while the last store still waits in Phase 2.
+
+4. **MBAR_EARLY is negligible.** V5 (early) ≈ V6 (late) at 0.524 ms. Signaling TMEM free after TMEM_WAIT vs after Phase 1 makes no measurable difference — the interleaved TMA stores dominate the timing, and W1's epi_wait is not on the critical path for these variants.
+
+5. **x64 TMEM loads add no benefit.** Consistent with F37's finding: x64 variants (V3, V4, V7, V9) are within 1 µs of their x32 counterparts, while using 23-25 more registers. x32 remains the optimal default.
+
+6. **F38's unified epilogue is vindicated.** The 4.7% regression from F38 (all-at-end TMA stores) was not inherent to the unified architecture — it was a scheduling problem. Interleaved stores recover the stall-window utilization that Phase 2A provided, while keeping the cleaner single-pass epilogue structure.
+
+**Default set to:** `INTERLEAVE_STRATEGY=2` (half-batch), `MBAR_EARLY=0`, `TMEM_LOAD_WIDTH=32` — equivalent to V6.

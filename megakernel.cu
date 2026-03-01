@@ -2,7 +2,7 @@
 // Target: B200  Batch: 4736  GEMM: [928256,768]×[768,768]^T
 // Pipeline: 4-stage (parameterized)  K-iters: 6  MMA/iter: 4  idesc: 0x10400010
 // Warps: 2+NUM_EPI_WARPS  cta_group::2  __cluster_dims__(2,1,1)
-// Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2+,x32 TMEM ld,TMA stores)  BF16 output
+// Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2+,x32 TMEM ld,interleaved TMA stores)  BF16 output
 // tcgen05.mma.cta_group::2.kind::f8f6f4  (E4M3 × E4M3 → FP32)
 // Each CTA loads own A (128 rows) + half B (128 cols). MMA produces 256×256 output.
 
@@ -18,6 +18,12 @@
 #define STAGGER_CYCLES 80   // F31: per-warp Phase 1 stagger (sweep: 50, 80, 100, 200)
 #ifndef TMEM_LOAD_WIDTH
 #define TMEM_LOAD_WIDTH 32   // 32=1×x32 per 32-col chunk (default), 16=2×x16, 64=1×x64
+#endif
+#ifndef INTERLEAVE_STRATEGY
+#define INTERLEAVE_STRATEGY 2  // 0=all-at-end, 1=per-region, 2=half-batch, 3=three-plus-one
+#endif
+#ifndef MBAR_EARLY
+#define MBAR_EARLY 0           // 0=after Phase 1, 1=after last TMEM_WAIT
 #endif
 #define THREADS        (32 * (2 + NUM_EPI_WARPS))
 #define BATCH_SIZE     4736
@@ -373,6 +379,11 @@ void epilogue_store(
 
         TMEM_WAIT();
 
+        // F40: MBAR_EARLY — signal TMEM free immediately (data now in registers)
+        if (MBAR_EARLY && nc + 64 >= NC_END) {
+            if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
+        }
+
         // First 32 cols: a0..a31 → swizzle region (bytes 0-63)
         {
             {
@@ -444,6 +455,39 @@ void epilogue_store(
             }
         }
 
+        // F40: Interleaved TMA store(s) — completed region(s) → global
+        if (INTERLEAVE_STRATEGY == 1) {
+            __syncwarp();
+            if (lane == 0) {
+                int region_idx = (nc - NC_START) >> 6;
+                uint32_t src = staging_saddr + region_idx * STAGING_REGION_BYTES;
+                asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                    :: "l"(tma_c_desc), "r"(n_start + nc), "r"(gm_base), "r"(src) : "memory");
+            }
+        } else if (INTERLEAVE_STRATEGY == 2 && (((nc - NC_START) >> 6) & 1) == 1) {
+            // Half-batch: 2 stores after every 2nd region
+            __syncwarp();
+            if (lane == 0) {
+                int region_idx = (nc - NC_START) >> 6;
+                uint32_t src0 = staging_saddr + (region_idx - 1) * STAGING_REGION_BYTES;
+                uint32_t src1 = staging_saddr + region_idx * STAGING_REGION_BYTES;
+                asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                    :: "l"(tma_c_desc), "r"(n_start + nc - 64), "r"(gm_base), "r"(src0) : "memory");
+                asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                    :: "l"(tma_c_desc), "r"(n_start + nc), "r"(gm_base), "r"(src1) : "memory");
+            }
+        } else if (INTERLEAVE_STRATEGY == 3 && ((nc - NC_START) >> 6) == 2) {
+            // Three-plus-one: 3 stores after 3rd region
+            __syncwarp();
+            if (lane == 0) {
+                for (int r = 0; r < 3; r++) {
+                    uint32_t src = staging_saddr + r * STAGING_REGION_BYTES;
+                    asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                        :: "l"(tma_c_desc), "r"(n_start + NC_START + r * 64), "r"(gm_base), "r"(src) : "memory");
+                }
+            }
+        }
+
         if (nc + 64 < NC_END) {
             TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                           a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
@@ -468,6 +512,11 @@ void epilogue_store(
         uint4 craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
 
         TMEM_WAIT();
+
+        // F40: MBAR_EARLY — signal TMEM free immediately (data now in registers)
+        if (MBAR_EARLY && nc + 32 >= NC_END) {
+            if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
+        }
 
         const uint32_t srow = srow_base + ((nc - NC_START) >> 6) * STAGING_REGION_BYTES;
         const int byte_base = ((nc - NC_START) & 63) * 2;
@@ -503,6 +552,39 @@ void epilogue_store(
             STS_V4(b0, b1, b2, b3, srow + ((byte_base + 48) ^ xor_val));
         }
 
+        // F40: Interleaved TMA store(s) — region completes every 2 x32 iterations
+        if (INTERLEAVE_STRATEGY == 1 && ((nc - NC_START) & 63) == 32) {
+            int region_idx = (nc - NC_START) >> 6;
+            __syncwarp();
+            if (lane == 0) {
+                uint32_t src = staging_saddr + region_idx * STAGING_REGION_BYTES;
+                asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                    :: "l"(tma_c_desc), "r"(n_start + NC_START + region_idx * 64), "r"(gm_base), "r"(src) : "memory");
+            }
+        } else if (INTERLEAVE_STRATEGY == 2 && ((nc - NC_START) & 63) == 32 && (((nc - NC_START) >> 6) & 1) == 1) {
+            // Half-batch: 2 stores after every 2nd region
+            int region_idx = (nc - NC_START) >> 6;
+            __syncwarp();
+            if (lane == 0) {
+                uint32_t src0 = staging_saddr + (region_idx - 1) * STAGING_REGION_BYTES;
+                uint32_t src1 = staging_saddr + region_idx * STAGING_REGION_BYTES;
+                asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                    :: "l"(tma_c_desc), "r"(n_start + NC_START + (region_idx - 1) * 64), "r"(gm_base), "r"(src0) : "memory");
+                asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                    :: "l"(tma_c_desc), "r"(n_start + NC_START + region_idx * 64), "r"(gm_base), "r"(src1) : "memory");
+            }
+        } else if (INTERLEAVE_STRATEGY == 3 && ((nc - NC_START) & 63) == 32 && ((nc - NC_START) >> 6) == 2) {
+            // Three-plus-one: 3 stores after 3rd region
+            __syncwarp();
+            if (lane == 0) {
+                for (int r = 0; r < 3; r++) {
+                    uint32_t src = staging_saddr + r * STAGING_REGION_BYTES;
+                    asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                        :: "l"(tma_c_desc), "r"(n_start + NC_START + r * 64), "r"(gm_base), "r"(src) : "memory");
+                }
+            }
+        }
+
         if (nc + 32 < NC_END) {
             LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
@@ -514,9 +596,10 @@ void epilogue_store(
 #ifdef TIMING
     t_phase1_end = clock64();
 #endif
-    __syncwarp();  // Phase 1 SMEM writes visible for Phase 2 TMA reads
 
-    // Signal: done reading TMEM — W1 can reuse buffer. Phase 2 only uses SMEM + global.
+#if INTERLEAVE_STRATEGY == 0
+    // Strategy 0 (all-at-end): original behavior — all 4 TMA stores in Phase 2
+    __syncwarp();  // Phase 1 SMEM writes visible for Phase 2 TMA reads
     if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
 
     // ═══ Phase 2: 4 TMA tensor stores → global ═══
@@ -536,6 +619,23 @@ void epilogue_store(
             :: "l"(tma_c_desc), "r"(n_start + NC_START + 192), "r"(row), "r"(staging_r3) : "memory");
         asm volatile("cp.async.bulk.commit_group;" ::: "memory");
     }
+#elif INTERLEAVE_STRATEGY == 3
+    // Strategy 3 (three-plus-one): 3 stores issued inline, 4th store (region 3) here
+    __syncwarp();  // ensure region 3 STS visible for TMA read
+    if (!MBAR_EARLY && epi_mbar_addr) mbar_arrive(epi_mbar_addr);
+    if (lane == 0) {
+        asm volatile(
+            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+            :: "l"(tma_c_desc), "r"(n_start + NC_START + 192), "r"(gm_base), "r"(staging_r3) : "memory");
+        asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    }
+#else
+    // Strategies 1, 2: all 4 stores issued inline. Just signal + commit.
+    if (!MBAR_EARLY && epi_mbar_addr) mbar_arrive(epi_mbar_addr);
+    if (lane == 0) {
+        asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    }
+#endif
 }
 
 // ── Host precompute kernel: bias[c] + pos_embed[r,c] → BF16 combined[r,c] ──
