@@ -4,7 +4,7 @@ Kernel: `patch_embed_gemm` — persistent megakernel for SigLIP2 patch embed GEM
 GEMM: `[928256, 768] x [768, 768]^T`, FP8 E4M3 inputs, BF16 output with fused bias + positional embedding.
 Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 
-**Current best: 0.532 ms / 2059 TFLOPS** (fused end-to-end). 235 regs, 0 spills.
+**Current best: 0.530 ms / 2067 TFLOPS** (fused end-to-end). 236 regs, 0 spills.
 
 ---
 
@@ -34,6 +34,7 @@ Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 | 2bb3675 | F28: K-loop restructuring | 0.536 | 2041 | 229 | perf-neutral, -76 cyc K-loop, cleaner baseline |
 | — | F24: Swizzled staging + TMA tensor stores | 0.532 | 2059 | 235 | asymmetric layout, Phase 2B -626 cyc |
 | — | F30: Staging_b swizzle address precomputation | 0.532 | 2059 | 235 | no-op — compiler already hoisted; source cleanup only |
+| ef2aa9c | F31: Per-warp Phase 1 stagger | 0.530 | 2067 | 236 | clock64 spin, STAGGER=80, contention-based |
 
 Reference: cuBLAS per-tensor FP8 (best-of-8 algos, 256MB workspace) = 0.365 ms / 3001 TFLOPS (GEMM only, no fusion).
 cuBLAS + unfused pos_embed = 0.835 ms end-to-end.
@@ -970,3 +971,61 @@ Spread increased from F25's baseline 172 to 330 cycles. Now asymmetric (above 20
 **Why `16x64b` won't work for us:** The `16x64b` shape operates on a half-warp (16 threads), interleaving column pairs. Our per-thread TMEM layout from `32x32b` MMA uses all 32 threads. Switching to `16x64b` would require a complete epilogue restructure with only half the threads active.
 
 **Conclusion:** `pack::16b` is not viable for our `32x32b` TMEM layout. Phase 1 CVT elimination requires a different approach (inline PTX `cvt.rn.bf16x2.f32` + fused add, or TMEM layout change to `16x64b` with warp restructure).
+
+---
+
+## F31: Per-warp Phase 1 stagger — 0.530 ms / 2067 TFLOPS (+0.4%)
+
+**Hypothesis:** The 330-cycle step function between W2/W3 (fast, ~4,550 cycles) and W4/W5 (slow, ~4,820 cycles) in Phase 1 is caused by warp scheduling contention — lower warp IDs win TMEM read port arbitration. Staggering Phase 1 start times across warps should spread out the initial burst of `tcgen05.ld` instructions and reduce queueing.
+
+### Phase 1: Diagnostic (rg-swap)
+
+Swapped W2↔W4 row_group assignments (`row_group = (ew==0)?2:(ew==2)?0:ew`) to determine causality:
+
+| Warp | Baseline (rg=ew) | Swap (rg swapped) | Follows |
+|------|---|---|---|
+| W2 (ew=0) | 4,533 (fast, rg=0) | 4,451 (fast, rg=2) | warp ID |
+| W3 (ew=1) | 4,569 (fast, rg=1) | 4,553 (fast, rg=1) | unchanged |
+| W4 (ew=2) | 4,863 (slow, rg=2) | 4,842 (slow, rg=0) | warp ID |
+| W5 (ew=3) | 4,779 (slow, rg=3) | 4,799 (slow, rg=3) | unchanged |
+
+**Verdict: CONTENTION.** Timing follows warp ID, not row_group. W2 stays fast even when processing rg=2 (previously slow). W4 stays slow even when processing rg=0 (previously fast). The asymmetry is scheduling arbitration, not structural TMEM column or SMEM address effects.
+
+### Phase 2: Stagger sweep
+
+After `mbar_wait` + fence, each warp spins for `ew * STAGGER_CYCLES` via `clock64()` before Phase 1. Lane 0 only, followed by `__syncwarp()`.
+
+| STAGGER_CYCLES | Wall clock | TFLOPS | vs baseline |
+|---|---|---|---|
+| 0 (baseline) | 0.532 ms | 2059 | — |
+| 50 | 0.531 ms | 2063 | -0.2% |
+| **80** | **0.530 ms** | **2067** | **-0.4%** |
+| 100 | 0.530 ms | 2065 | -0.4% |
+| 200 | 0.532 ms | 2060 | 0% |
+
+Selected STAGGER_CYCLES=80 (theoretical optimum = 330 / 4 warps = 82.5).
+
+### clock64 timing (STAGGER=80 vs baseline)
+
+```
+Baseline:                                   F31 (STAGGER=80):
+  W2: avg=4,533  p95=5,856                   W2: avg=4,284  p95=5,581  (-249)
+  W3: avg=4,569  p95=5,842                   W3: avg=4,345  p95=5,567  (-224)
+  W4: avg=4,863  p95=6,027                   W4: avg=4,553  p95=5,740  (-310)
+  W5: avg=4,779  p95=6,002                   W5: avg=4,553  p95=5,617  (-226)
+  Spread: 330 cycles                         Spread: 269 cycles (-18%)
+
+  Phase 1 avg: 4,569 → 4,345  (-224, -4.9%)
+  ml_wait:     1,369 → 1,538  (+169) — stagger shifts epilogue start later
+  epi_wait:    1,352 → 1,344  (-8)
+```
+
+All warps improved, not just W4/W5 — confirms pervasive contention across all 4 warps, with lower warp IDs suffering less. The ml_wait increase partially offsets the Phase 1 gain (warps start Phase 1 later relative to W1's commit).
+
+### Changes
+
+1. `#define STAGGER_CYCLES 80` — tunable define at top of file
+2. Overlapped epilogue (line 763): `clock64()` spin after mbar_wait + fence, before Phase 1
+3. Drain epilogue (line 884): identical stagger
+
+236 regs (+1 for clock64 spin variable), 0 spills. Checksum = 1769472.0.

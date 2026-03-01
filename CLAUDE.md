@@ -5,41 +5,41 @@ FP8 (E4M3) precision, tcgen05 WGMMA, TMA, `cta_group::2` with 2-CTA clusters. Cr
 
 ## Current state
 
-**0.532 ms / 2059 TFLOPS** fused (GEMM + bias + pos_embed) — **36% faster** than cuBLAS end-to-end (0.835 ms = best GEMM + unfused pos_embed).
+**0.530 ms / 2067 TFLOPS** fused (GEMM + bias + pos_embed) — **36% faster** than cuBLAS end-to-end (0.835 ms = best GEMM + unfused pos_embed).
 
 The kernel's value is **fusion**: the overlapped epilogue eliminates the 0.470 ms unfused pos_embed overhead entirely.
 
 cuBLAS pure GEMM is faster: 0.365 ms / 3001 TFLOPS (per-tensor FP8, best-of-8 algos, 256MB workspace).
-Our effective TFLOPS (2059) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
+Our effective TFLOPS (2067) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
 
 GEMM: `[928256, 768] x [768, 768]^T` with fused bias + positional embedding add, BF16 output.
 Batch = 4736 images x 196 patches = 928256 rows. Square weight matrix (768x768).
 
 The kernel is correct (checksum validated) and stable.
 
-## Current bottlenecks (clock64 timing build, post-F24)
+## Current bottlenecks (clock64 timing build, post-F31)
 
 The kernel is **epilogue-bound** in a balanced producer-consumer equilibrium. Per-tile cycle budget:
 
 ```
-W1:       epi_wait(1,352) + TMA0(658) + K-loop(4,107) = 6,118
-Epilogue: ml_wait(1,360) + Phase1(4,569) + Phase2B(273) = 6,202
+W1:       epi_wait(1,344) + TMA0(662) + K-loop(4,059) = 6,066
+Epilogue: ml_wait(1,538) + Phase1(4,345) + Phase2B(273) = 6,156
 ```
 
-Equilibrium deficit: ~462 cycles (epilogue slower). Phase 2B collapsed from 899→273 via TMA tensor stores; Phase 1 grew +440 from swizzle addressing overhead.
+Equilibrium deficit: ~1,162 cycles (epilogue slower). Phase 2B collapsed from 899→273 via TMA tensor stores (F24); Phase 1 reduced by staggered warp start (F31).
 
 **Key facts:**
-- Phase 1 TMEM readback = 73.7% of epilogue cycle. Binding constraint.
+- Phase 1 TMEM readback = 70.6% of epilogue cycle. Binding constraint.
 - Phase 2B now near-free (273 cycles, 4.4%) — TMA tensor stores replaced 32 manual ld.shared+st.global iterations.
-- K-loop: 4,107 cycles. Precomputed descriptors + manual unroll from F28.
+- K-loop: 4,059 cycles. Precomputed descriptors + manual unroll from F28.
 - TMA multicast not applicable (B is N-split across CTAs).
-- 235 regs/thread, 0 spills. Limits occupancy to 1 CTA/SM.
-- Per-warp Phase 1 spread: 330 cycles (above 200 threshold — asymmetric).
-- Timing build uses 255 regs (distorts cycles vs production at 235 regs). Wall clock is ground truth.
+- 236 regs/thread, 0 spills. Limits occupancy to 1 CTA/SM.
+- Per-warp Phase 1 spread: 269 cycles (reduced from 330 by F31 stagger). Contention-based (confirmed by rg-swap diagnostic).
+- Timing build uses 255 regs (distorts cycles vs production at 236 regs). Wall clock is ground truth.
 
 Run `python3 analyze_timing.py clock64_timing.txt` for full equilibrium analysis and what-if projections.
 Run `python3 analyze_source_counters.py source_counters_raw.csv` for per-instruction stall breakdown.
-See `EXPERIMENTS.md` for experiments (F1-F24) with hypotheses, results, and analysis. See `FUTURE_PROPOSALS.md` for optimization roadmap (all proposals executed).
+See `EXPERIMENTS.md` for experiments (F1-F31) with hypotheses, results, and analysis. See `FUTURE_PROPOSALS.md` for optimization roadmap.
 
 ## Kernel structure
 
@@ -58,7 +58,7 @@ The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile 
 - TMEM: single alloc of 512 cols (TN*2), double-buffered via column offset (buf*TN)
 - SMEM: 4-stage pipeline (131 KB) + epilogue staging (4 warps x 16,896 = 66 KB, asymmetric: linear staging_a + swizzled staging_b) = ~199 KB total of 228 KB
 - Tiles: 3626 M-tiles x 3 N-tiles = 10,878 total, snake ordering
-- 235 registers/thread, 0 spills
+- 236 registers/thread, 0 spills
 - `NUM_EPI_WARPS` controls epilogue warp count (currently 4); `THREADS` derived as `32*(2+NUM_EPI_WARPS)`
 
 ## Development workflow

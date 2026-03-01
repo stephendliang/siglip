@@ -15,6 +15,7 @@
 
 #define SM_COUNT       148
 #define NUM_EPI_WARPS  4
+#define STAGGER_CYCLES 80   // F31: per-warp Phase 1 stagger (sweep: 50, 80, 100, 200)
 #define THREADS        (32 * (2 + NUM_EPI_WARPS))
 #define BATCH_SIZE     4736
 #define SEQ_LEN        196
@@ -756,6 +757,12 @@ patch_embed_gemm(
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             ml_phase[prev_buf] ^= 1;
+            // F31: stagger Phase 1 start to reduce TMEM scheduling contention
+            if (STAGGER_CYCLES > 0 && ew > 0 && lane == 0) {
+                long long __stagger_end = clock64() + ew * STAGGER_CYCLES;
+                while (clock64() < __stagger_end) {}
+            }
+            __syncwarp();
 #ifdef TIMING
             if (lane == 0 && cta_rank == 0)
                 epi_t0 = clock64();  // F25: all epilogue warps timestamp Phase 1 start
@@ -871,6 +878,12 @@ patch_embed_gemm(
         // All epilogue warps poll independently — no bar.sync broadcast needed.
         mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        // F31: stagger Phase 1 start (drain)
+        if (STAGGER_CYCLES > 0 && ew > 0 && lane == 0) {
+            long long __stagger_end = clock64() + ew * STAGGER_CYCLES;
+            while (clock64() < __stagger_end) {}
+        }
+        __syncwarp();
 
         // Epilogue store for the last tile
         const int last_idx = tile_end - 1;

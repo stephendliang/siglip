@@ -1,35 +1,35 @@
 # Future Proposals
 
-**Kernel state (2026-03-01):** F24 best fused path = 0.532 ms / 2059 TFLOPS. 235 regs, 0 spills. Asymmetric SMEM staging (linear staging_a, SWIZZLE_128B staging_b) + TMA tensor stores for Phase 2B.
+**Kernel state (2026-03-01):** F31 best fused path = 0.530 ms / 2067 TFLOPS. 236 regs, 0 spills. Per-warp Phase 1 stagger (STAGGER_CYCLES=80) reduces TMEM scheduling contention.
 **Reference:** cuBLAS pure GEMM = 0.365 ms / 3001 TFLOPS | cuBLAS + unfused pos_embed = 0.835 ms
 
 ## The problem: Phase 1 TMEM readback dominates the epilogue
 
-Phase 1 is 73.7% of epilogue time (4,569 cycles). The epilogue is the binding constraint. The kernel is stuck.
+Phase 1 is 70.6% of epilogue time (4,345 cycles). The epilogue is the binding constraint. The kernel is stuck.
 
 **Phase 1 is ~90% TMEM_WAIT stall, ~10% compute.** Each of the 8 TMEM_LOAD_X32 instructions has ~200+ cycle latency. The `tcgen05.wait::ld` global fence blocks until ALL outstanding loads complete — no selective waiting, no multi-load pipelining within a warp. The compute between loads (~50 cycles of CVT + HADD2 + STS) fills only ~10% of the stall window.
 
-**Equilibrium model:**
+**Equilibrium model (post-F31):**
 ```
-W1:       epi_wait(1,352) + TMA0(658) + K-loop(4,107) = 6,118 cycles/tile
-Epilogue: ml_wait(1,360) + Phase1(4,569) + Phase2B(273) = 6,202 cycles/tile
-Deficit:  462 cycles (epilogue slower) → amplified to ~1,352-cycle epi_wait
+W1:       epi_wait(1,344) + TMA0(662) + K-loop(4,059) = 6,066 cycles/tile
+Epilogue: ml_wait(1,538) + Phase1(4,345) + Phase2B(273) = 6,156 cycles/tile
+Deficit:  1,162 cycles (epilogue slower) → amplified to ~1,344-cycle epi_wait
 ```
 
 **Ceilings:**
-- Eliminate epi_wait (Phase 1 ≤ K-loop+TMA0 = 4,765): ~0.43 ms / ~2,550 TFLOPS (+24%)
-- Also eliminate TMA0 (impossible — A-matrix DRAM latency): ~0.36 ms / ~3,000 TFLOPS (cuBLAS territory)
+- Eliminate epi_wait (Phase 1 ≤ K-loop+TMA0 = 4,721): ~0.43 ms / ~2,646 TFLOPS (+28%)
+- Also eliminate TMA0 (impossible — A-matrix DRAM latency): ~0.36 ms / ~3,077 TFLOPS (cuBLAS territory)
 
-Phase 1 must drop ~460 cycles to reach equilibrium. Every 100-cycle Phase 1 reduction yields ~150-cycle wall clock improvement (due to deficit amplification).
+Phase 1 must drop ~376 cycles to reach equilibrium. Every 100-cycle Phase 1 reduction yields ~120-cycle wall clock improvement (due to deficit amplification).
 
-**Per-warp asymmetry (post-F24):**
+**Per-warp asymmetry (post-F31, STAGGER=80):**
 ```
-W2 (rg=0):  avg=4,533  p95=5,856
-W3 (rg=1):  avg=4,569  p95=5,842
-W4 (rg=2):  avg=4,863  p95=6,027  ← 330 cycles slower than W2
-W5 (rg=3):  avg=4,779  p95=6,002
+W2 (rg=0):  avg=4,284  p95=5,581
+W3 (rg=1):  avg=4,345  p95=5,567
+W4 (rg=2):  avg=4,553  p95=5,740  ← 269 cycles slower than W2 (was 330)
+W5 (rg=3):  avg=4,553  p95=5,617
 ```
-Step function between rg=1 and rg=2. The epilogue mbarrier fires when the LAST warp arrives — if W4/W5 can be brought to W2's speed, that's ~300 cycles on the critical path.
+Stagger reduced spread from 330 → 269 cycles. All warps improved. Residual asymmetry likely scheduling arbitration that stagger doesn't fully eliminate.
 
 **What is known:**
 - Phase 1 is TMEM bandwidth-limited, not instruction-bound or contention-limited (F23C: <10% contention)
@@ -44,16 +44,14 @@ Step function between rg=1 and rg=2. The epilogue mbarrier fires when the LAST w
 
 ```
 Tier 1 (attack Phase 1 directly):
-  F29 (PACK mode) ──→ if works: -128 CVT instructions, -16 regs, enables deeper optimizations
-  F31 (dephasing) ──→ targets 330-cycle per-warp spread
+  F29 (PACK mode) ──→ REJECTED — produces zeros with 32x32b layout
+  F31 (dephasing) ──→ DONE — +0.4%, spread 330→269 cycles
 
 Tier 2 (secondary targets):
   F32 (x16 TMEM granularity) ──→ re-test at new operating point
   F33 (tcgen05.cp diagnostic) ──→ speculative but potentially transformative
 
-Recommended serial order:
-  F29 → F31 → F32 → F33
-  (F29 first: highest ceiling if it works. F30 done — was a no-op.)
+Recommended next: F32 → F33
 ```
 
 ---
@@ -117,39 +115,23 @@ This eliminates 16 CVT instructions per iteration × 8 iterations = 128 CVT inst
 
 ---
 
-## F31: Dephasing revisited (per-warp stagger) — REOPENED
+## F31: Dephasing revisited (per-warp stagger) — DONE (+0.4%)
 
-**Effort:** Low (add staggered delay before Phase 1 start)
-**Expected impact:** Reduce mbar tail latency by ~150-300 cycles by equalizing per-warp Phase 1 completion
-**Risk:** Artificial delays waste cycles if the asymmetry is structural (not contention-based). Net could be worse.
+**Result: 0.530 ms / 2067 TFLOPS**, 236 regs, 0 spills. STAGGER_CYCLES=80.
 
-**Context change since original F27:** F25 showed 172-cycle spread (below 200-cycle threshold) → F27 was skipped. F24 increased per-warp spread to **330 cycles** (above threshold). The pattern is a step function: W2/W3 (rg=0/1) at ~4,550 cycles, W4/W5 (rg=2/3) at ~4,820 cycles. This is NOT consistent with random noise — it's structural.
+**Diagnostic (rg-swap):** Swapped W2↔W4 row_group assignments. Timing followed warp ID (W2 stayed fast, W4 stayed slow regardless of which row_group they processed). **Root cause = scheduling contention** (hypothesis 3), not structural TMEM column or SMEM address effects.
 
-**Root cause hypothesis:** The step function between rg=1 and rg=2 suggests either:
-1. **TMEM column address effect:** rg=0/1 read lower TMEM columns (0-63), rg=2/3 read higher columns (64-127). If the TMEM read port has asymmetric latency across column ranges (e.g., two 64-column banks with different access latencies), this explains the step.
-2. **Swizzle addressing asymmetry:** rg=2/3's staging_b base addresses land at higher SMEM offsets, potentially causing different SMEM bank conflict patterns with the swizzle XOR.
-3. **Burst TMEM contention:** W4/W5 consistently lose arbitration because W2/W3 are scheduled first (lower warp IDs). This is the original F27 hypothesis.
+**Stagger sweep:** `clock64()` spin of `ew * STAGGER_CYCLES` after mbar_wait, before Phase 1.
 
-**Only hypothesis 3 is addressable by dephasing.** If the cause is (1) or (2), dephasing adds idle cycles with no benefit.
+| STAGGER | Wall clock | TFLOPS |
+|---|---|---|
+| 0 | 0.532 ms | 2059 |
+| 50 | 0.531 ms | 2063 |
+| **80** | **0.530 ms** | **2067** |
+| 100 | 0.530 ms | 2065 |
+| 200 | 0.532 ms | 2060 |
 
-**Diagnostic first:** Before implementing the stagger, run a quick diagnostic:
-- Swap W2↔W4's row_group assignments (rg=2 for W2, rg=0 for W4). If the timing follows the row_group (W2 becomes slow, W4 becomes fast), the cause is structural (TMEM columns or SMEM addresses). If the timing follows the warp ID (W2 stays fast, W4 stays slow), the cause is scheduling/contention.
-
-**If contention-based (proceed with dephasing):**
-- After `mainloop_mbar` wait, each warp delays by `ew * STAGGER_CYCLES` before starting Phase 1
-- Sweep `STAGGER_CYCLES` = {50, 100, 200}
-- Use `clock64()` spin for precision
-- Expected: stagger of ~80 cycles (330 / 4 warps) should equalize completion times
-
-**If structural (pivot):**
-- Investigate SMEM bank conflict differences between rg=0/1 and rg=2/3
-- Consider swapping row_group processing order (process rg=2/3 first, rg=0/1 second) to allow slower groups more time
-
-**Go/no-go:**
-- Success: wall clock improves ≥0.3% at any stagger value
-- Fail-fast: if the rg-swap diagnostic shows structural cause (timing follows rg, not warp ID), skip dephasing and pivot to structural fix
-- Max effort: 3 hours (1 hour diagnostic + 2 hours stagger sweep)
-- Rollback: remove stagger delay
+Phase 1 avg: 4,569 → 4,345 (-224 cycles, -4.9%). Per-warp spread: 330 → 269 (-18%). All warps improved. ml_wait increased +169 cycles (stagger shifts epilogue start later), partially offsetting the Phase 1 gain.
 
 ---
 
@@ -229,6 +211,7 @@ The async copy would run concurrently with other work. The register pressure for
 | F28 ✅ | K-loop restructuring | perf-neutral, -76 cyc K-loop |
 | F24 ✅ | Swizzled staging + TMA tensor stores | +0.7%, Phase 2B -626 cycles, Phase 1 +440 cycles |
 | F30 — | Swizzle address precomputation | no-op — compiler already hoisted; source cleanup only |
+| F31 ✅ | Per-warp Phase 1 stagger | +0.4%, STAGGER=80, contention confirmed via rg-swap diagnostic |
 
 ---
 
