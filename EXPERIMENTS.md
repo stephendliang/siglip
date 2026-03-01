@@ -4,7 +4,7 @@ Kernel: `patch_embed_gemm` — persistent megakernel for SigLIP2 patch embed GEM
 GEMM: `[928256, 768] x [768, 768]^T`, FP8 E4M3 inputs, BF16 output with fused bias + positional embedding.
 Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 
-**Current best: 0.543 ms / 2018 TFLOPS** (fused end-to-end). 223 regs, 0 spills.
+**Current best: 0.536 ms / 2041 TFLOPS** (fused end-to-end). 229 regs, 0 spills.
 
 ---
 
@@ -762,3 +762,38 @@ Full unroll has lowest instruction count but worst register pressure — the reg
 - Exposing asm-local intermediates to the global register allocator (via C++ intrinsics or smaller asm blocks) can cause severe register inflation even when peak liveness is lower.
 - Full loop unrolling is not always optimal — register pressure from cross-iteration liveness can outweigh the ILP benefits. The compiler's default full-unroll heuristic is tuned for occupancy-limited kernels; for register-constrained kernels at 1 CTA/SM, partial unrolling is superior.
 - Register count is a better predictor of performance than instruction count for this epilogue-bound kernel.
+
+---
+
+## F23C: 2-warp epilogue contention test — ✗ REJECTED (contention <10%)
+
+**Hypothesis:** TMEM contention between 4 simultaneous epilogue warps accounts for a significant fraction of Phase 1 time. Reducing to 2 warps (each processing 2 row_groups sequentially) should reduce per-rg Phase 1 time enough to compensate for doubled work.
+
+**Changes:** `NUM_EPI_WARPS=2`, THREADS=128 (was 192). Each warp loops over 2 row_groups sequentially, reusing the same staging buffer. Mbar arrive only after second rg (both TMEM reads complete). Drain epilogue same pattern. Epilogue mbar expected arrivals: 2×2×32=128 (was 256).
+
+**Build:** 210 regs (was 229), 0 spills, 16-byte stack frame. SMEM staging 35 KB (was 70 KB).
+
+**Result: 42% REGRESSION.** 0.759 ms / 1443 TFLOPS (was 0.536 ms / 2041 TFLOPS). Checksum correct.
+
+**Cycle breakdown (timing build, 250 regs):**
+
+| Metric | 4 warps (F22 baseline) | 2 warps (F23C) | Delta |
+|--------|----------------------|----------------|-------|
+| Phase 1 | 4,524 | 8,357 | **1.85x** |
+| K-loop | 4,066 | 3,513 | -14% (better!) |
+| TMA0 | 585 | 81 | -86% (much better) |
+| epi_wait | 1,570 | 5,579 | +4,009 |
+| Wall clock | 0.536 ms | 0.759 ms | +42% |
+
+**Fail-fast triggered:** Per-warp Phase 1 = 1.85x (≥1.8x threshold). TMEM contention at 4 warps is **<10% of Phase 1 time**. The binding constraint is raw TMEM readback bandwidth per request, not queueing between concurrent warps.
+
+**Notable side effects of 2 warps:**
+- K-loop improved 14% (3,513 vs 4,066): lower register pressure (210 vs 229) and reduced scheduling contention with fewer threads
+- TMA0 dropped 86% (81 vs 585): with 128 threads vs 192, W0/W1 have more scheduling bandwidth
+- ml_wait dropped from 1,149 to 404: epilogue barely waits for W1 because it's so much slower
+
+These improvements prove that register pressure and thread count significantly impact W1 performance — but the doubled epilogue work overwhelms them.
+
+**Implication:** All warp-count variants (3, 2, or 1 epilogue warps) are ruled out. The TMEM contention hypothesis is dead. 4 warps is optimal for this tile geometry.
+
+**Key insight:** Phase 1 is bandwidth-limited, not contention-limited. The TMEM read port serves 4 concurrent requesters with <10% overhead. Optimization efforts must focus on reducing per-warp Phase 1 work (instruction count, scheduling) rather than reducing the number of concurrent TMEM readers.

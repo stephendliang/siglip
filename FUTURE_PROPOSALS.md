@@ -2,7 +2,7 @@
 
 **Kernel state (2026-03-01):** F22 best fused path = 0.536 ms / 2041 TFLOPS. 229 regs, 0 spills. BF16 epilogue arithmetic with `#pragma unroll 2`.
 **Reference:** cuBLAS pure GEMM = 0.365 ms / 3001 TFLOPS | cuBLAS + unfused pos_embed = 0.835 ms
-**Bottleneck:** Epilogue-bound producer-consumer equilibrium. F22 reduced epilogue instruction count by 1,480 SASS ops but register pressure from full unrolling (255 regs) negated gains — partial unroll (`#pragma unroll 2`) at 229 regs was the sweet spot (1.3% improvement). Phase 1 TMEM readback remains the binding constraint. F25 confirmed all 4 epilogue warps are equally bound (symmetric, 172-cycle spread). F21 confirmed B matrix is already L2-resident — TMA0_wait (~790 cycles) is pure A-matrix DRAM latency.
+**Bottleneck:** Epilogue-bound producer-consumer equilibrium. Phase 1 TMEM readback is the binding constraint — bandwidth-limited, not contention-limited (F23C: <10% contention at 4 warps, all warp-count variants ruled out). F22 reduced epilogue instructions by 1,480 SASS ops; partial unroll at 229 regs was the sweet spot (+1.3%). F21 confirmed B is L2-resident — TMA0_wait is pure A-matrix DRAM latency.
 
 ### Execution order
 
@@ -12,16 +12,17 @@ Dependencies:
                       └──→ F27 ✗ (skipped: symmetric)
   F21 ✗ (L2 promotion) ─→ F26 ✗ (killed: B already L2-resident)
   F22 (BF16 math) ────→ F24 (swizzled staging)
+  F23C ✗ (2 warps) ───→ all warp-count variants ruled out (contention <10%)
   F28 (K-loop) ────────→ best combined with F22 (attacks both sides of equilibrium)
 
 Recommended serial order:
-  F25 ✅ → F21 ✗ → F22 ✅ → F28 → F23C → (conditional: F24)
-  │         │        │        │      │
-  │         │        │        │      └─ low priority (F25: symmetric, bandwidth-limited)
-  │         │        │        └──────── pair with F22: K-loop + epilogue = both sides
-  │         │        └──────────────── DONE: +1.3%, 229 regs, #pragma unroll 2
-  │         └──────────────────────── DONE: B already L2-hot, F26 killed
-  └────────────────────────────────── DONE: symmetric + mild fat tail → F27 skipped
+  F25 ✅ → F21 ✗ → F22 ✅ → F23C ✗ → F28 → (conditional: F24)
+  │         │        │        │         │
+  │         │        │        │         └──── pair with F22: K-loop + epilogue = both sides
+  │         │        │        └────────────── DONE: contention <10%, 1.85x per-warp Phase 1, 42% regression
+  │         │        └──────────────────────── DONE: +1.3%, 229 regs, #pragma unroll 2
+  │         └──────────────────────────────── DONE: B already L2-hot, F26 killed
+  └────────────────────────────────────────── DONE: symmetric + mild fat tail → F27 skipped
 ```
 
 ---
@@ -118,49 +119,15 @@ All 4 warps are essentially equal (172-cycle spread < 200-cycle threshold). No s
 
 ---
 
-## F23: 3-warp epilogue contention sweep
+## F23: Epilogue warp count sweep — ✗ REJECTED (contention <10%)
 
-**Effort:** Medium (warp structure change + load balance solution)
-**Expected impact:** Uncertain. Directly targets Phase 1 TMEM contention (4 warps reading simultaneously).
-**Risk:** Load imbalance may negate contention reduction.
+**Result: 42% REGRESSION.** 0.759 ms / 1443 TFLOPS with 2 warps (was 0.536 ms / 2041 TFLOPS with 4 warps).
 
-**Rationale:** F16 showed 5→4 warps helped (TMEM contention reduction + eliminating unbalanced split warps). F3 showed 6 warps hurt (TMEM bandwidth saturation). The optimal warp count hasn't been swept — it could be 3 if TMEM contention is non-linear (queueing effects between 4 concurrent readers).
+Tested option C (2 epilogue warps, each processing 2 row_groups sequentially). Per-warp Phase 1 = 1.85x the 4-warp time — **fail-fast triggered** (≥1.8x threshold). TMEM contention at 4 warps is <10% of Phase 1 time.
 
-Phase 1 TMEM readback = 4,140 cycles with 4 warps. If TMEM port contention follows a queueing model (latency grows super-linearly with concurrent readers), 3 warps could see per-warp Phase 1 time increase by less than 33%, making the slowest warp faster than the current 4-warp slowest.
+**Build:** 210 regs (was 229), THREADS=128 (was 192). Lower register pressure improved K-loop 14% and TMA0 86%, but doubled epilogue work dominated.
 
-**Challenge:** 4 row_groups (128 rows / 32 rows each) don't divide into 3 warps evenly.
-
-Options:
-- **A) 2+1+1 split:** W2 gets 2 row_groups (64 rows), W3-W4 get 1 each. W2 takes ~2x longer → mbar bottleneck. Same structural problem as old 5-warp split. Likely worse.
-- **B) 3 row_groups of 42/43 rows:** Breaks 32-row TMEM alignment. TMEM_LOAD_X32 loads 32 elements per lane, tied to 32-row structure. Would need variable-length TMEM reads. Major restructuring.
-- **C) 2 epilogue warps, 2 row_groups each:** Equal split, minimal contention. Each warp does 2× work. If TMEM contention drops enough (2 readers vs 4), per-warp time could be < 2× current. Test this first as a simpler version.
-- **D) 3 warps with NC-split instead of row-split:** Each warp handles all 4 row_groups but only 85-86 columns. Keeps 32-row TMEM structure. But cols must be multiples of 32 (TMEM_LOAD_X32 granularity): 96+96+64 or 128+64+64. Unequal → mbar bottleneck again.
-
-**Recommended approach:** Test option C first (2 epilogue warps). `NUM_EPI_WARPS=2`, each warp processes row_groups 0+1 or 2+3 (sequential, not parallel). Measures pure contention effect without load-balance confounds. If wall clock improves, explore 3-warp variants.
-
-**Changes for option C:**
-```c
-#define NUM_EPI_WARPS 2
-// Each warp processes 2 row_groups sequentially
-const int rg_start = ew * 2;  // ew=0: row_groups 0,1. ew=1: row_groups 2,3
-for (int rg = rg_start; rg < rg_start + 2; rg++) {
-    epilogue_store<0, TN>(..., rg, ...);
-}
-```
-
-**Drain epilogue fix required:** The drain epilogue (after tile loop) uses `ew % 4` for row_group assignment. With `NUM_EPI_WARPS=2`, `ew = {0, 1}` gives row_groups {0, 1} only — row_groups 2 and 3 are never drained. The drain epilogue must use the same `rg_start + loop` pattern as the main loop above.
-
-Epilogue mbar expected arrivals: 2 × 2 × 32 = 128 (was 256).
-
-**Thread count:** With `NUM_EPI_WARPS=2`, `THREADS = 32*(2+2) = 128` (was 192). Drop THREADS to 128 — don't keep 192 and park 2 warps at a barrier, because parked warps still consume register file slots (223 regs × 32 threads × 2 warps = 14,336 registers wasted). Reducing THREADS to 128 frees those register file slots, potentially allowing higher occupancy or reducing register pressure. Verify `ptxas` output: register count may change with fewer warps competing for the register file.
-
-**Measurement:** Compare Phase 1 per-warp timing, epi_wait, and wall clock vs 4-warp baseline. Key metric: does reduced contention compensate for doubled per-warp work?
-
-**Go/no-go:**
-- Success: wall clock improves with 2 warps (option C)
-- Fail-fast: if 2-warp per-warp Phase 1 time is ≥1.8× the 4-warp per-warp time, contention at 4 warps is ≤10% of Phase 1 — abort all warp-count variants
-- Max effort: 2–3 hours (option C only)
-- Rollback: revert `NUM_EPI_WARPS` to 4
+**Implication:** All warp-count variants (3, 2, or 1 epilogue warps) are ruled out. Phase 1 is TMEM bandwidth-limited, not contention-limited. 4 warps is optimal for this tile geometry. See EXPERIMENTS.md F23C for full data.
 
 ---
 
@@ -596,6 +563,7 @@ Skip B initially (fighting `ptxas` UR allocation) — inspect SASS after A+C to 
 | TMA multicast for B | B is N-split across CTAs (each loads different half). Zero redundancy. dest_multicast=0 is correct. |
 | L2 promotion for B (F21) | B already fully L2-resident. TMA0_wait unchanged (794 vs 787 cycles, noise). 576 KB B fits easily in 48 MB L2. |
 | L2 persistence for B (F26) | Killed by F21. B already L2-hot — reserving L2 capacity adds nothing. |
+| Epilogue warp count (F23) | TMEM contention <10% of Phase 1. 2 warps: 1.85x per-warp Phase 1, 42% regression. All variants ruled out. |
 | TN=128 | 2× tiles, same per-tile overhead, 11.4% regression. Definitively ruled out at both 1190 and 1560 TFLOPS. |
 | Combined load L1 bypass | F13 relayout already solved combined loads. L1 at ~67% is equilibrium — remaining L1 is mostly K-loop traffic. |
 | Direct CVT_STG stores (F17) | Uncoalesced st.global.v8 contends with TMEM reads on L1. Phase 1 +19%, net regression. |
