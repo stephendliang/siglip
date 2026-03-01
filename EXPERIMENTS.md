@@ -1243,3 +1243,67 @@ Same session, reverted code, 10 runs:
 **Conclusion:** Software pipelining of TMEM reads is not viable on SM100a. The `tcgen05.wait::ld` global fence and batch-drain TMEM port behavior make per-load latency hiding impossible. Phase 1 optimization must reduce the total number of `tcgen05.ld` instructions (ruled out by F32's fixed-latency finding) or find a fundamentally different readback path (ruled out by F33's SMEM→TMEM-only finding for `tcgen05.cp`).
 
 **Implication for FUTURE_PROPOSALS:** Phase 1 TMEM readback appears to be at a hardware floor. The remaining optimization targets are: (a) reducing the number of tiles (larger TM/TN — blocked by TMEM/SMEM limits), (b) reducing epi_wait via K-loop improvements (absorbed by equilibrium), or (c) accepting the current 0.530 ms as the practical limit for this GEMM shape on SM100a.
+
+## F37: TMEM load width — x16 vs x32 vs x64 statistical test — NO DIFFERENCE
+
+**Date:** 2026-03-01
+**Baseline:** 0.530 ms / 2067 TFLOPS / 236 regs (x16, 40 LDTM.x16)
+**Result:** All three widths statistically identical. **No winner.**
+**Verdict:** TMEM read port is bandwidth-limited, not instruction-count-limited. Wider loads reduce instruction count (40→20→12) but wall-clock throughput is identical.
+
+**Hypothesis:** F36 SASS analysis showed CUTLASS uses 4× LDTM.x64 for TMEM readback vs our 40× LDTM.x16 — a 10× instruction count difference causing massive fence stalls. Wider loads should reduce Phase 1 TMEM readback time by issuing fewer instructions with less fence overhead.
+
+**Variants built:**
+
+| Variant | Regs | LDTM instructions | Binary |
+|---------|------|--------------------|--------|
+| x16 (baseline) | 236 | 40 × LDTM.x16 | `siglip_vision` |
+| x32 | 234 | 20 × LDTM.x32 | `siglip_x32` |
+| x64 | 255 | 12 × LDTM.x64 | `siglip_x64` |
+
+**Statistical test:** 30 runs per variant, Welch's t-test (pairwise) + one-way ANOVA. Script: `stat_test.py`.
+
+### Summary statistics (n=30)
+
+| Variant | Mean (ms) | Std (µs) | Min (ms) | Max (ms) | Median (ms) |
+|---------|-----------|----------|----------|----------|-------------|
+| x16 | 0.5306 | 0.7 | 0.5290 | 0.5320 | 0.5310 |
+| x32 | 0.5304 | 1.0 | 0.5290 | 0.5320 | 0.5310 |
+| x64 | 0.5306 | 0.9 | 0.5290 | 0.5320 | 0.5310 |
+
+### Pairwise Welch's t-tests
+
+| Comparison | t-stat | p-value | Cohen's d | Diff (µs) | Sig? |
+|------------|--------|---------|-----------|-----------|------|
+| x16 vs x32 | 0.928 | 0.358 | 0.240 | +0.2 | ns |
+| x16 vs x64 | 0.167 | 0.868 | 0.043 | +0.0 | ns |
+| x32 vs x64 | -0.705 | 0.483 | -0.182 | -0.2 | ns |
+
+### One-way ANOVA
+
+F = 0.485, p = 0.617 — **not significant**.
+
+### CUTLASS grid search comparison
+
+Best CUTLASS configs (per-tensor FP8 E4M3, 4736 images, B200):
+
+| Tile | Cluster | GEMM-only (ms) | Fused BF16 (ms) | TFLOPS |
+|------|---------|----------------|-----------------|--------|
+| 256x256x128 | 2x1 | 0.412 | 0.536 | 2045 |
+| 256x256x64 | 2x1 | 0.445 | 0.551 | 1987 |
+| 128x256x64 | 1x1 | 0.576 | 0.631 | 1734 |
+
+Custom kernel (fused): **0.530 ms / 2067 TFLOPS** — beats best CUTLASS fused (0.536 ms) by 6 µs.
+CUTLASS GEMM-only is faster (0.412 ms / 2658 TFLOPS) but its fusion penalty (+124 µs) exceeds ours.
+
+### Analysis
+
+1. **LDTM width does not affect throughput.** 40 × x16, 20 × x32, and 12 × x64 all produce identical wall-clock times within 0.2 µs. The TMEM read port processes loads at a fixed bandwidth regardless of instruction granularity.
+
+2. **Instruction count reduction is real but irrelevant.** The x64 path uses 12 LDTM instructions vs 40 for x16 (3.3× fewer), but the port bandwidth — not instruction issue rate — is the bottleneck.
+
+3. **Register pressure makes x64 impractical.** x64 hits 255 regs (the hard ceiling), leaving zero headroom for future changes. x32 at 234 regs is cleaner but offers no performance benefit over x16.
+
+4. **CUTLASS's LDTM.x64 advantage is elsewhere.** F36 identified CUTLASS using 4× LDTM.x64 vs our 40× LDTM.x16 as the key difference. This experiment rules out load width as the explanation. CUTLASS's faster GEMM-only time (0.412 ms) likely comes from other factors: fewer R2UR instructions (26 vs 428), TMA tensor stores throughout, and compiler-optimized epilogue scheduling.
+
+5. **Phase 1 TMEM readback is at a hardware floor.** Combined with F35 (software pipelining rejected), this confirms the TMEM read port throughput cannot be improved by instruction-level changes. The ~4,345-cycle Phase 1 cost is a fixed hardware constraint for 256 columns of TMEM readback.
