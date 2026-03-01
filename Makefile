@@ -11,7 +11,7 @@ CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUTLASS_FLAGS = -std=c++17 --expt-relaxed-constexpr
 CUTLASS_TILE ?=
 
-.PHONY: all gen clean dry-run timing cutlass-sass cutlass-sweep
+.PHONY: all gen clean dry-run timing tmem-x32 cutlass-sass cutlass-sweep
 
 all: $(TARGET)
 
@@ -20,6 +20,10 @@ $(TARGET): $(CU)
 
 timing: $(CU)
 	$(NVCC) $(CFLAGS) -DTIMING $< -o siglip_timing $(LDFLAGS)
+
+# F37: wider TMEM loads (SASS analysis — compile with -DTMEM_LOAD_WIDTH=32)
+tmem-x32: $(CU)
+	$(NVCC) $(CFLAGS) -DTMEM_LOAD_WIDTH=32 $< -o siglip_x32 $(LDFLAGS)
 
 # ── CUTLASS benchmark (per-tensor FP8) ──
 # Override tile: make cutlass-bench CUTLASS_TILE="-DTILE_N=256"
@@ -78,6 +82,6 @@ cublas-bench: cublas_bench.cu
 	$(NVCC) $(CFLAGS) -std=c++17 $< -o $@ -lcublasLt -lcublas
 
 clean:
-	rm -f $(TARGET) siglip_timing cutlass-bench cublas-bench \
+	rm -f $(TARGET) siglip_timing siglip_x32 cutlass-bench cublas-bench \
 	      cutlass-256x128x64 cutlass-256x256x64 cutlass-256x128x128 cutlass-128x128x64
 	rm -rf sass/

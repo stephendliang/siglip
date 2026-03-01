@@ -16,6 +16,9 @@
 #define SM_COUNT       148
 #define NUM_EPI_WARPS  4
 #define STAGGER_CYCLES 80   // F31: per-warp Phase 1 stagger (sweep: 50, 80, 100, 200)
+#ifndef TMEM_LOAD_WIDTH
+#define TMEM_LOAD_WIDTH 16   // 16=2×x16 per 32-col chunk (default), 32=1×x32, 64=1×x64
+#endif
 #define THREADS        (32 * (2 + NUM_EPI_WARPS))
 #define BATCH_SIZE     4736
 #define SEQ_LEN        196
@@ -214,6 +217,46 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
           "=f"(r28),"=f"(r29),"=f"(r30),"=f"(r31) \
         : "r"(TADDR))
 
+#define TMEM_LOAD_X64(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15, \
+                      r16,r17,r18,r19,r20,r21,r22,r23,r24,r25,r26,r27,r28,r29,r30,r31, \
+                      r32,r33,r34,r35,r36,r37,r38,r39,r40,r41,r42,r43,r44,r45,r46,r47, \
+                      r48,r49,r50,r51,r52,r53,r54,r55,r56,r57,r58,r59,r60,r61,r62,r63, TADDR) \
+    asm volatile( \
+        "tcgen05.ld.sync.aligned.32x32b.x64.b32 " \
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15," \
+        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31," \
+        "%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47," \
+        "%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63}, [%64];" \
+        : "=f"(r0),"=f"(r1),"=f"(r2),"=f"(r3), \
+          "=f"(r4),"=f"(r5),"=f"(r6),"=f"(r7), \
+          "=f"(r8),"=f"(r9),"=f"(r10),"=f"(r11), \
+          "=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15), \
+          "=f"(r16),"=f"(r17),"=f"(r18),"=f"(r19), \
+          "=f"(r20),"=f"(r21),"=f"(r22),"=f"(r23), \
+          "=f"(r24),"=f"(r25),"=f"(r26),"=f"(r27), \
+          "=f"(r28),"=f"(r29),"=f"(r30),"=f"(r31), \
+          "=f"(r32),"=f"(r33),"=f"(r34),"=f"(r35), \
+          "=f"(r36),"=f"(r37),"=f"(r38),"=f"(r39), \
+          "=f"(r40),"=f"(r41),"=f"(r42),"=f"(r43), \
+          "=f"(r44),"=f"(r45),"=f"(r46),"=f"(r47), \
+          "=f"(r48),"=f"(r49),"=f"(r50),"=f"(r51), \
+          "=f"(r52),"=f"(r53),"=f"(r54),"=f"(r55), \
+          "=f"(r56),"=f"(r57),"=f"(r58),"=f"(r59), \
+          "=f"(r60),"=f"(r61),"=f"(r62),"=f"(r63) \
+        : "r"(TADDR))
+
+#if TMEM_LOAD_WIDTH == 32
+#define LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, \
+                     a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31, TADDR) \
+    TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, \
+                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31, TADDR)
+#else
+#define LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, \
+                     a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31, TADDR) \
+    TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, TADDR); \
+    TMEM_LOAD(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31, (TADDR) + 16)
+#endif
+
 #define TMEM_WAIT() \
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory")
 
@@ -349,10 +392,9 @@ void epilogue_store(
     float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
 
     // ═══ Phase 1A: cols NC_START..NC_MID-1 → staging_a (linear layout) ═══
-    TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-              taddr_base + NC_START);
-    TMEM_LOAD(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-              taddr_base + NC_START + 16);
+    LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                 a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                 taddr_base + NC_START);
 
     #pragma unroll 2
     for (int nc = NC_START; nc < NC_MID; nc += 32) {
@@ -396,18 +438,16 @@ void epilogue_store(
         }
 
         if (nc + 32 < NC_MID) {
-            TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-                      taddr_base + nc + 32);
-            TMEM_LOAD(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                      taddr_base + nc + 32 + 16);
+            LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                         a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                         taddr_base + nc + 32);
         }
     }
 
     // Prefetch first chunk of second half (async, starts loading during syncwarp)
-    TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-              taddr_base + NC_MID);
-    TMEM_LOAD(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-              taddr_base + NC_MID + 16);
+    LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                 a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                 taddr_base + NC_MID);
 
     __syncwarp();  // Phase 1A SMEM writes visible for Phase 2A reads
 
@@ -476,10 +516,9 @@ void epilogue_store(
         }
 
         if (nc + 32 < NC_END) {
-            TMEM_LOAD(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-                      taddr_base + nc + 32);
-            TMEM_LOAD(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                      taddr_base + nc + 32 + 16);
+            LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                         a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                         taddr_base + nc + 32);
         }
     }
 
