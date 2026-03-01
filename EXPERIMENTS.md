@@ -797,3 +797,38 @@ These improvements prove that register pressure and thread count significantly i
 **Implication:** All warp-count variants (3, 2, or 1 epilogue warps) are ruled out. The TMEM contention hypothesis is dead. 4 warps is optimal for this tile geometry.
 
 **Key insight:** Phase 1 is bandwidth-limited, not contention-limited. The TMEM read port serves 4 concurrent requesters with <10% overhead. Optimization efforts must focus on reducing per-warp Phase 1 work (instruction count, scheduling) rather than reducing the number of concurrent TMEM readers.
+
+---
+
+## F28: K-loop restructuring — descriptor precomputation + manual unroll — PERF-NEUTRAL
+
+**Hypothesis:** Eliminating `make_smem_desc` recomputation (12 calls/tile × 5-8 instructions), `ki % N_STAGES` modulo, `ki == 0` conditional, and runtime accumulate predicate reduces K-loop overhead enough to be measurable.
+
+**Changes:**
+1. Precomputed `desc_a_base[N_STAGES]` and `desc_b_base[N_STAGES]` before tile loop — descriptors are constant across all tiles (SMEM base addresses never change).
+2. Replaced `for (int ki = 0; ki < K_ITERS; ki++)` with 6 explicit blocks using `K_ITER_ACCUM(S)` macro. Stage index S is a compile-time constant per block.
+3. ki=0: constant-false predicate (`setp.ne.b32 p, 0, 0`) clears accumulator. ki=1-5: constant-true predicate (`setp.ne.b32 p, 1, 0`) accumulates. Eliminates runtime `accumulate` variable.
+4. Sub-MMA inner loop kept as `for (int sub = 1; sub < MMA_PER_KI; sub++)` — compiler auto-unrolls (MMA_PER_KI=4 is constant).
+
+**Build:** 229 regs (unchanged from baseline), 0 spills. Timing build: 255 regs, 0 spills.
+
+**Result: PERF-NEUTRAL.** 0.536 ms / 2041 TFLOPS (identical to F22 baseline). Checksum correct: 1769472.0.
+
+**Cycle breakdown (timing build, 255 regs):**
+
+| Metric | F22 baseline | F28 | Delta |
+|--------|-------------|-----|-------|
+| K-loop | 4,154 | 4,078 | **-76 (-1.8%)** |
+| TMA0 | 857 | 600 | -257 (noise/run variance) |
+| epi_wait | 1,056 | 1,532 | +476 |
+| Phase 1 | 4,129 | 4,524 | +395 |
+| ml_wait | 1,139 | 1,141 | +2 (noise) |
+| Phase 2B | 899 | 641 | -258 |
+| W1 total | 6,067 | 6,211 | +144 |
+| Epilogue total | 6,167 | 6,306 | +139 |
+
+**Analysis:** K-loop saved 76 cycles (modest). However, the timing build uses 255 regs (maxed out) vs 229 for production — cycle data is distorted by register pressure and should not be taken at face value. The unchanged wall clock (0.536 ms) at 229 regs is the ground truth.
+
+The kernel remains epilogue-bound. K-loop savings alone cannot shift the equilibrium — as predicted by the timing model. The change is retained as a cleaner K-loop baseline (eliminates descriptor recomputation, modulo, conditional) for potential future pairing with epilogue optimizations.
+
+**What the compiler did:** Despite adding 8 `uint64_t` precomputed descriptors (expected +16 regs), register count stayed at 229. The compiler likely kept the descriptors in the same registers previously used for `make_smem_desc` results — the precomputation hoisted the computation without inflating live ranges.

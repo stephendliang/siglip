@@ -148,6 +148,42 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
         :: "r"(mbar_addr), "h"(cta_mask) : "memory");
 }
 
+// ── F28: Accumulating K-iteration macro (all sub-MMAs accumulate) ──
+// Used for ki=1..5 where accumulator is already initialized.
+// S must be a compile-time constant stage index (0..N_STAGES-1).
+#define K_ITER_ACCUM(S) do { \
+    mbar_wait(tma_mbar[S], tma_phase[S]); \
+    tma_phase[S] ^= 1; \
+    asm volatile("tcgen05.fence::after_thread_sync;"); \
+    { \
+        uint64_t da_ = desc_a_base[S], db_ = desc_b_base[S]; \
+        asm volatile( \
+            "{\n\t" \
+            ".reg .pred p;\n\t" \
+            "setp.ne.b32 p, 1, 0;\n\t" \
+            "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+            "[%0], %1, %2, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t" \
+            "}" \
+            : \
+            : "r"(buf * TN), "l"(da_), "l"(db_), "r"(IDESC), \
+              "r"(0),"r"(0),"r"(0),"r"(0), "r"(0),"r"(0),"r"(0),"r"(0)); \
+        for (int sub_ = 1; sub_ < MMA_PER_KI; sub_++) { \
+            da_ += 2; db_ += 2; \
+            asm volatile( \
+                "{\n\t" \
+                ".reg .pred p;\n\t" \
+                "setp.ne.b32 p, 1, 0;\n\t" \
+                "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+                "[%0], %1, %2, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t" \
+                "}" \
+                : \
+                : "r"(buf * TN), "l"(da_), "l"(db_), "r"(IDESC), \
+                  "r"(0),"r"(0),"r"(0),"r"(0), "r"(0),"r"(0),"r"(0),"r"(0)); \
+        } \
+    } \
+    tcgen05_commit_mcast(mma_mbar[S], 0x3); \
+} while(0)
+
 // ── Pipelined epilogue macros ────────────────────────────────
 
 #define TMEM_LOAD(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15, TADDR) \
@@ -532,6 +568,13 @@ patch_embed_gemm(
     int tma_phase[N_STAGES] = {0};
     int mma_phase[N_STAGES] = {0};
 
+    // F28: precompute SMEM descriptors — constant across all tiles
+    uint64_t desc_a_base[N_STAGES], desc_b_base[N_STAGES];
+    for (int s = 0; s < N_STAGES; s++) {
+        desc_a_base[s] = make_smem_desc(smem_a[s]);
+        desc_b_base[s] = make_smem_desc(smem_b[s]);
+    }
+
     // Double-buffered mbar phase tracking (SUPERIOR pattern).
     // mbar[X] protects tmem[X]. Phase init 1 = "fresh mbar, skip first wait".
     // W1: waits epilogue_mbar[buf] before writing tmem[buf]
@@ -600,55 +643,54 @@ patch_embed_gemm(
                 t_after_epi = clock64();
 #endif
 
-                for (int ki = 0; ki < K_ITERS; ki++) {
-                    const int s = ki % N_STAGES;
-
-                    mbar_wait(tma_mbar[s], tma_phase[s]);
-                    tma_phase[s] ^= 1;
+                // ── F28: Manually unrolled K-loop with precomputed descriptors ──
+                // ki=0 (s=0): clear accumulator on first sub-MMA
+                mbar_wait(tma_mbar[0], tma_phase[0]);
+                tma_phase[0] ^= 1;
 #ifdef TIMING
-                    if (ki == 0) t_after_tma0 = clock64();
+                t_after_tma0 = clock64();
 #endif
-                    asm volatile("tcgen05.fence::after_thread_sync;");
-
-                    uint64_t desc_a = make_smem_desc(smem_a[s]);
-                    uint64_t desc_b = make_smem_desc(smem_b[s]);
-
-                    {
-                        uint32_t accumulate = (ki == 0) ? 0 : 1;
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .pred p;\n\t"
-                            "setp.ne.b32 p, %4, 0;\n\t"
-                            "tcgen05.mma.cta_group::2.kind::f8f6f4 "
-                            "[%0], %1, %2, %3, {%5, %6, %7, %8, %9, %10, %11, %12}, p;\n\t"
-                            "}"
-                            :
-                            : "r"(buf * TN), "l"(desc_a), "l"(desc_b), "r"(IDESC),
-                              "r"(accumulate),
-                              "r"(0), "r"(0), "r"(0), "r"(0),
-                              "r"(0), "r"(0), "r"(0), "r"(0));
-                    }
-
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                {
+                    uint64_t desc_a = desc_a_base[0], desc_b = desc_b_base[0];
+                    // First sub-MMA: p=false → clear accumulator
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p;\n\t"
+                        "setp.ne.b32 p, 0, 0;\n\t"
+                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                        "[%0], %1, %2, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t"
+                        "}"
+                        :
+                        : "r"(buf * TN), "l"(desc_a), "l"(desc_b), "r"(IDESC),
+                          "r"(0),"r"(0),"r"(0),"r"(0),
+                          "r"(0),"r"(0),"r"(0),"r"(0));
                     for (int sub = 1; sub < MMA_PER_KI; sub++) {
-                        desc_a += 2;
-                        desc_b += 2;
+                        desc_a += 2; desc_b += 2;
                         asm volatile(
                             "{\n\t"
                             ".reg .pred p;\n\t"
-                            "setp.ne.b32 p, %4, 0;\n\t"
+                            "setp.ne.b32 p, 1, 0;\n\t"
                             "tcgen05.mma.cta_group::2.kind::f8f6f4 "
-                            "[%0], %1, %2, %3, {%5, %6, %7, %8, %9, %10, %11, %12}, p;\n\t"
+                            "[%0], %1, %2, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t"
                             "}"
                             :
                             : "r"(buf * TN), "l"(desc_a), "l"(desc_b), "r"(IDESC),
-                              "r"(1),
-                              "r"(0), "r"(0), "r"(0), "r"(0),
-                              "r"(0), "r"(0), "r"(0), "r"(0));
+                              "r"(0),"r"(0),"r"(0),"r"(0),
+                              "r"(0),"r"(0),"r"(0),"r"(0));
                     }
-
-                    // Multicast commit → MMA mbar in both CTAs
-                    tcgen05_commit_mcast(mma_mbar[s], 0x3);
                 }
+                tcgen05_commit_mcast(mma_mbar[0], 0x3);
+                // ki=1 (s=1)
+                K_ITER_ACCUM(1);
+                // ki=2 (s=2)
+                K_ITER_ACCUM(2);
+                // ki=3 (s=3)
+                K_ITER_ACCUM(3);
+                // ki=4 (s=0)
+                K_ITER_ACCUM(0);
+                // ki=5 (s=1)
+                K_ITER_ACCUM(1);
 
                 // Signal K-loop done: multicast commit → mainloop_mbar[buf] in both CTAs
                 tcgen05_commit_mcast(mainloop_mbar_addr + buf * 8, 0x3);

@@ -13,12 +13,13 @@ Dependencies:
   F21 ✗ (L2 promotion) ─→ F26 ✗ (killed: B already L2-resident)
   F22 (BF16 math) ────→ F24 (swizzled staging)
   F23C ✗ (2 warps) ───→ all warp-count variants ruled out (contention <10%)
-  F28 (K-loop) ────────→ best combined with F22 (attacks both sides of equilibrium)
+  F28 ✅ (K-loop) ──────→ perf-neutral alone (K-loop -76 cyc, wall clock unchanged)
+  F22 ✅ (BF16 math) ──→ F24 (swizzled staging, only remaining active proposal)
 
 Recommended serial order:
-  F25 ✅ → F21 ✗ → F22 ✅ → F23C ✗ → F28 → (conditional: F24)
+  F25 ✅ → F21 ✗ → F22 ✅ → F23C ✗ → F28 ✅ → (conditional: F24)
   │         │        │        │         │
-  │         │        │        │         └──── pair with F22: K-loop + epilogue = both sides
+  │         │        │        │         └──── DONE: perf-neutral, -76 cyc K-loop, cleaner baseline
   │         │        │        └────────────── DONE: contention <10%, 1.85x per-warp Phase 1, 42% regression
   │         │        └──────────────────────── DONE: +1.3%, 229 regs, #pragma unroll 2
   │         └──────────────────────────────── DONE: B already L2-hot, F26 killed
@@ -222,12 +223,11 @@ Do not hardcode a guessed XOR formula. Derive the exact addressing from the Blac
 
 ---
 
-## F28: K-loop restructuring — tighter MMA dispatch
+## F28: K-loop restructuring — tighter MMA dispatch — ✅ DONE (perf-neutral)
 
 **Effort:** Medium (rewrite W1 K-loop body, touch `make_smem_desc` and MMA inline asm)
-**Expected impact:** ~200–350 cycle K-loop reduction (~5–8%), worth ~0.5–1.5% wall clock **only if paired with F22** (epilogue absorbs gains otherwise)
-**Risk:** Register pressure shift, compiler scheduling differences. Inline PTX changes can surprise `ptxas`.
-**Prerequisite:** Must be done together with or after F22. Alone, the epilogue equilibrium swallows most of the savings (see analysis below).
+**Result:** 0.536 ms / 2041 TFLOPS / 229 regs — perf-neutral. K-loop -76 cycles in timing build, wall clock unchanged. Retained as cleaner baseline (eliminates descriptor recomputation, modulo, conditional).
+**Risk materialized:** As predicted, K-loop savings alone cannot shift the epilogue-bound equilibrium.
 
 ### The problem: 20 overhead instructions per MMA
 
