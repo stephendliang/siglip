@@ -33,10 +33,10 @@ Stagger reduced spread from 330 → 269 cycles. All warps improved. Residual asy
 
 **What is known:**
 - Phase 1 is TMEM bandwidth-limited, not instruction-bound or contention-limited (F23C: <10% contention)
-- The `tcgen05.wait::ld` global fence prevents multi-load pipelining within a warp
+- The `tcgen05.wait::ld` global fence prevents per-load latency hiding — WAIT drains the entire TMEM read pipeline as a batch (F35 confirmed)
 - SMEM staging is mandatory (no TMEM→GMEM direct path exists in hardware)
 - Each warp independently reads its own TMEM partition (32 lanes × own columns) — no cross-warp TMEM conflicts
-- Register pressure (235/255) constrains all approaches — only 20 regs headroom
+- Register pressure (236/255) constrains all approaches — only 19 regs headroom (F32 showed x16 drops to 174 but the latency penalty outweighs register savings)
 - Phase 2B is solved (273 cycles via TMA tensor stores)
 - K-loop improvements alone cannot improve wall clock (equilibrium absorption)
 
@@ -48,10 +48,10 @@ Tier 1 (attack Phase 1 directly):
   F31 (dephasing) ──→ DONE — +0.4%, spread 330→269 cycles
 
 Tier 2 (secondary targets):
-  F32 (x16 TMEM granularity) ──→ re-test at new operating point
+  F32 (x16 TMEM granularity) ──→ REJECTED — 10.6% regression, fixed latency per load
   F33 (tcgen05.cp diagnostic) ──→ RULED OUT (SMEM→TMEM only)
-
-Recommended next: F32
+  F34 (parallel TMEM load)   ──→ DIAGNOSTIC — loads pipeline, but...
+  F35 (software-pipelined readback) ──→ REJECTED — WAIT is global fence, batch-drain port
 ```
 
 ---
@@ -135,33 +135,15 @@ Phase 1 avg: 4,569 → 4,345 (-224 cycles, -4.9%). Per-warp spread: 330 → 269 
 
 ---
 
-## F32: TMEM x16 granularity re-evaluation
+## F32: TMEM x16 granularity re-evaluation — REJECTED (10.6% regression)
 
-**Effort:** Low (change TMEM_LOAD_X32 to TMEM_LOAD_X16, double loop iterations)
-**Expected impact:** Uncertain. May improve Phase 1 scheduling by creating finer-grained TMEM_WAIT windows for interleaving work.
-**Risk:** Could regress from doubled instruction overhead (16 TMEM loads instead of 8).
+**Result: 0.586 ms / 1868 TFLOPS** — 10.6% regression vs 0.530 ms baseline. 174 regs (-62), 0 spills. Checksum correct.
 
-**Rationale:** The x16-vs-x32 comparison (commit `abf04a5`) was done at 1433 TFLOPS with no double-buffered staging, no Phase 2A interleaving, no BF16 math. The kernel has changed fundamentally since then. At the current operating point:
+**Answer to the key question:** TMEM load latency is **fixed per instruction** (~200 cycles), not proportional to data volume. `tcgen05.ld.x16` takes roughly the same time per load as x32 but moves half the data. Doubling the load count (8→16) adds ~56 µs wall clock.
 
-- Phase 1B interleaves Phase 2A stores inside TMEM_WAIT stalls
-- `#pragma unroll 2` controls register pressure
-- The equilibrium has shifted from K-loop-bound to epilogue-bound
+**Confirmed at two operating points:** F8 (1433 TFLOPS, no staging) and F32 (2067 TFLOPS, full staging + interleaving). x32 is definitively the optimal TMEM load granularity.
 
-With x16 TMEM loads:
-- 16 loads × ~100 cycle latency each (half the data per load → potentially half the latency)
-- Twice as many TMEM_WAIT windows, each half as long
-- Each iteration processes 16 cols instead of 32 → half the compute per iteration
-- Phase 2A stores could be spread across 8 Phase 1B iterations instead of 4
-
-**The key question:** Is TMEM load latency proportional to data volume? If `tcgen05.ld.x16` has ~100-cycle latency (vs ~200 for x32), the total TMEM stall is unchanged (16 × 100 = 8 × 200 = 1,600 cycles). But the finer granularity allows better interleaving: 16 × ~25 cycles compute per window vs 8 × ~50 cycles. If TMEM latency is fixed (not proportional to volume), x16 would be 2× worse (16 × 200 = 3,200 cycles).
-
-**Register impact:** x16 loads use 16 FP32 registers instead of 32. This frees 16 registers, which could enable `#pragma unroll 4` or other register-intensive optimizations. Combined with F29 (PACK mode), this could reduce TMEM readback registers to 8, opening significant headroom.
-
-**Go/no-go:**
-- Success: Phase 1 drops ≥100 cycles OR wall clock improves ≥0.5%
-- Fail-fast: if Phase 1 regresses ≥200 cycles, abort (TMEM latency is fixed, not proportional)
-- Max effort: 2 hours
-- Rollback: revert to x32 loads
+**Key insight:** The 62-register savings (236→174) are real but irrelevant — no register-gated optimization can overcome the 2× fixed-latency penalty. Phase 1 optimization must reduce the number of `tcgen05.ld` instructions, not their granularity.
 
 ---
 
@@ -190,7 +172,10 @@ With x16 TMEM loads:
 | F24 ✅ | Swizzled staging + TMA tensor stores | +0.7%, Phase 2B -626 cycles, Phase 1 +440 cycles |
 | F30 — | Swizzle address precomputation | no-op — compiler already hoisted; source cleanup only |
 | F31 ✅ | Per-warp Phase 1 stagger | +0.4%, STAGGER=80, contention confirmed via rg-swap diagnostic |
+| F32 ✗ | x16 TMEM loads — fixed latency per load | 0.586 ms, 10.6% regression, 174 regs |
 | F33 ✗ | tcgen05.cp is SMEM→TMEM only | No code — ruled out by ISA research |
+| F34 — | Parallel TMEM load diagnostic | 0.531 ms, loads pipeline (2×x16 ≈ 1×x32) |
+| F35 ✗ | Software-pipelined TMEM readback | 0.540–0.542 ms, WAIT is batch-drain, not per-load |
 
 ---
 
@@ -209,6 +194,8 @@ With x16 TMEM loads:
 | Direct CVT_STG stores (F17) | Uncoalesced st.global.v8 contends with TMEM reads on L1. Phase 1 +19%. |
 | 6 epilogue warps (F3) | TMEM bandwidth saturation. |
 | Split TMEM loads x32→2×x16 (F1) | tcgen05.wait::ld is a global fence — waits for ALL loads. Split adds overhead without reducing wait. |
+| x16 TMEM load granularity (F32) | Fixed ~200-cycle latency per `tcgen05.ld` regardless of data volume. x16 = 2× loads = 10.6% regression. Confirmed at two operating points (F8 + F32). |
+| Software-pipelined TMEM readback (F35) | `tcgen05.wait::ld` is a global fence with batch-drain behavior. Separating loads in time does not create independent completion. Two variants tested (doubled WAITs: 220 regs, 0.540 ms; same WAITs split LOADs: 244 regs, 0.542 ms). Both regressed vs 0.536 ms baseline. TMEM port processes outstanding loads as a batch — no per-load latency hiding possible. |
 | Register-staged transpose (warp shuffle) | Would need 32+ extra registers (exceeds 255 limit). 160 shuffles per 32-col chunk ≈ SMEM staging cost. |
 | SMEM staging elimination | F17 proved L1 contention. SMEM transpose is mandatory for coalesced global stores. |
 | tcgen05.cp epilogue readback (F33) | tcgen05.cp is SMEM→TMEM only. No hardware path for TMEM→SMEM. Only tcgen05.ld (TMEM→registers) can read accumulators out. |

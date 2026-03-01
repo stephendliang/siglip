@@ -36,6 +36,7 @@ Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 | — | F30: Staging_b swizzle address precomputation | 0.532 | 2059 | 235 | no-op — compiler already hoisted; source cleanup only |
 | ef2aa9c | F31: Per-warp Phase 1 stagger | 0.530 | 2067 | 236 | clock64 spin, STAGGER=80, contention-based |
 | — | F34: Parallel TMEM load diagnostic | 0.531 | 2064 | 248 | 2×x16 before single WAIT — loads pipeline |
+| — | F35: x16 ping-pong software-pipelined TMEM readback | 0.540 | 2029 | 220–244 | rejected — WAIT overhead > overlap benefit |
 
 Reference: cuBLAS per-tensor FP8 (best-of-8 algos, 256MB workspace) = 0.365 ms / 3001 TFLOPS (GEMM only, no fusion).
 cuBLAS + unfused pos_embed = 0.835 ms end-to-end.
@@ -1141,3 +1142,104 @@ If loads had serialized, wall clock would have been ~0.586 ms (matching F32's re
 - Opens the door to software-pipelined TMEM readback: issue next iteration's TMEM loads early (before current WAIT), overlapping them with CVT+add+STS compute from the current iteration.
 - The +12 register cost (248 vs 236) is the price of parallelism — both loads' destinations must be live simultaneously. A software-pipelined design would need careful register budgeting.
 - Combined with F32's finding (fixed ~200-cycle latency per load), this means x32 remains optimal for sequential access, but parallel x16 loads are viable when register budget allows overlapping compute with TMEM reads.
+
+---
+
+## F35: x16 ping-pong software-pipelined TMEM readback — REJECTED
+
+**Date:** 2026-03-01
+**Baseline:** 0.530 ms / 2067 TFLOPS / 236 regs (F31, with F34 showing loads pipeline)
+**Result:** Both variants regressed. **Rejected, rolled back.**
+**Verdict:** `tcgen05.wait::ld` is a global fence — stall time is dominated by the most recently issued load regardless of how early prior loads were issued. Software pipelining cannot reduce the per-WAIT stall below the single-load latency of the youngest outstanding load.
+
+**Hypothesis:** F34 proved that 2 `tcgen05.ld.x16` loads pipeline before a single `TMEM_WAIT`. The current epilogue issues both x16 loads, then does ~40 cycles of combined loads, then WAITs (~160 cycle stall). Software pipelining restructures this so that one bank (a0..a15) is issued earlier (in the previous iteration's Step B or a prologue), giving it ~170 cycles of head start. If TMEM loads complete independently, the WAIT stall would be dominated only by the more recently issued load (a16..a31), reducing per-WAIT stall from ~160 to ~40–80 cycles.
+
+**Two variants tested:**
+
+### Variant 1: Doubled WAITs (full ping-pong)
+
+Alternate between "process bank A / load bank B" and "process bank B / load bank A", with a WAIT between each step.
+
+```
+Prologue: LOAD(a0..a15), WAIT (immediate, zero head start)
+
+Step A:
+  LOAD(a16..a31)        ← async
+  CVT+STS(a0..a15)      ← ~130 cycles overlap
+  WAIT                   ← a16..a31 had 130-cycle head start
+
+Step B:
+  LOAD(a0..a15, next)   ← async
+  CVT+STS(a16..a31)     ← ~130 cycles overlap
+  WAIT                   ← a0..a15 had 130-cycle head start
+```
+
+**Build:** 220 regs (-16 from baseline), 0 spills.
+**Result:** 0.534–0.548 ms, median ~0.540 ms. **Regression.**
+
+| Run | Time (ms) |
+|-----|-----------|
+| 1 | 0.540 |
+| 2 | 0.540 |
+| 3 | 0.548 |
+| 4 | 0.534 |
+
+**Failure mode:** Doubled WAIT count (8 per phase, was 4). Each `tcgen05.wait::ld.sync.aligned` has fixed instruction overhead even when not stalling. The prologue WAIT with zero head start serializes the very first load completely (~200 cycle stall). Net overhead > overlap savings.
+
+### Variant 2: Same WAIT count, split LOADs (no prologue WAIT)
+
+Keep one WAIT per 32-col iteration (same count as baseline). Issue LOAD(a16..a31) at the start of Step A; issue LOAD(a0..a15) in Step B for the next iteration. Step A's WAIT clears both banks; Step B processes a16..a31 without a WAIT since it was already completed.
+
+```
+Prologue: LOAD(a0..a15)          ← async, NO WAIT
+
+Step A:
+  LOAD(a16..a31)                 ← async
+  combined_loads (~40 cyc)       ← head start
+  WAIT                           ← clears both (a0 had ~170 cyc, a16 had ~40 cyc)
+  CVT+STS(a0..a15)
+
+Step B:
+  LOAD(a0..a15, next)            ← async prefetch
+  CVT+STS(a16..a31)              ← NO WAIT (already ready from Step A)
+```
+
+**Build:** 244 regs (+8 from baseline), 0 spills. Register increase from having combined-load values (`craw0/craw1`) and TMEM registers (`a0..a31`) simultaneously live across restructured code paths.
+**Result:** 0.539–0.550 ms, median ~0.542 ms. **Regression.**
+
+| Run | Time (ms) |
+|-----|-----------|
+| 1 | 0.546 |
+| 2 | 0.539 |
+| 3 | 0.550 |
+| 4 | 0.541 |
+| 5 | 0.544 |
+| 6 | 0.541 |
+
+**Failure mode:** Register pressure (244 vs 236) degraded scheduling. More fundamentally, `tcgen05.wait::ld` stall time is not `max(remaining_latency_per_load)` — it appears to be `remaining_pipeline_latency` for the entire TMEM read port. Issuing loads at different times does not give them independent completion — the port processes them as a batch, and WAIT stalls until the batch is drained.
+
+### Baseline (control)
+
+Same session, reverted code, 10 runs:
+
+| Statistic | Time (ms) |
+|-----------|-----------|
+| Min | 0.533 |
+| Median | 0.536 |
+| Max | 0.541 |
+
+### Analysis
+
+**Why software pipelining fails for TMEM reads:**
+
+1. **`tcgen05.wait::ld` is a global fence.** It waits for ALL outstanding loads, not a specific load. There is no `wait_group` equivalent for TMEM (unlike `cp.async.bulk.wait_group` for TMA). Separating loads in time does not create independent completion events.
+
+2. **The TMEM read port batches outstanding loads.** F34 showed two back-to-back x16 loads complete in ~200 cycles total (pipelined). But this does not mean each load has independent ~100-cycle latency. Rather, the port accepts both loads into a single ~200-cycle pipeline flush. Issuing them 130 cycles apart does not make the first one "finish early" — the port processes them in whatever order it receives them, and WAIT drains the entire pipeline.
+
+3. **Register pressure is a hidden cost.** Restructuring the loop to interleave loads and compute across iterations forces more values to be live simultaneously. Variant 1 dropped to 220 regs (simpler loop body) but paid in WAIT count. Variant 2 kept WAIT count but inflated to 244 regs. Neither found a register-neutral transformation.
+
+4. **The baseline is already near-optimal for this microarchitecture.** The current pattern (LOAD both banks → combined loads → WAIT → process both banks → prefetch both banks) aligns naturally with the TMEM port's batch-drain behavior. The ~40-cycle combined-load window is approximately the right amount of head start — enough for the pipeline to begin filling without paying extra overhead.
+
+**Conclusion:** Software pipelining of TMEM reads is not viable on SM100a. The `tcgen05.wait::ld` global fence and batch-drain TMEM port behavior make per-load latency hiding impossible. Phase 1 optimization must reduce the total number of `tcgen05.ld` instructions (ruled out by F32's fixed-latency finding) or find a fundamentally different readback path (ruled out by F33's SMEM→TMEM-only finding for `tcgen05.cp`).
+
+**Implication for FUTURE_PROPOSALS:** Phase 1 TMEM readback appears to be at a hardware floor. The remaining optimization targets are: (a) reducing the number of tiles (larger TM/TN — blocked by TMEM/SMEM limits), (b) reducing epi_wait via K-loop improvements (absorbed by equilibrium), or (c) accepting the current 0.530 ms as the practical limit for this GEMM shape on SM100a.
