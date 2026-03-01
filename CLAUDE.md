@@ -5,12 +5,12 @@ FP8 (E4M3) precision, tcgen05 WGMMA, TMA, `cta_group::2` with 2-CTA clusters. Cr
 
 ## Current state
 
-**0.543 ms / 2018 TFLOPS** fused (GEMM + bias + pos_embed) — **35% faster** than cuBLAS end-to-end (0.835 ms = best GEMM + unfused pos_embed).
+**0.536 ms / 2041 TFLOPS** fused (GEMM + bias + pos_embed) — **36% faster** than cuBLAS end-to-end (0.835 ms = best GEMM + unfused pos_embed).
 
 The kernel's value is **fusion**: the overlapped epilogue eliminates the 0.470 ms unfused pos_embed overhead entirely.
 
 cuBLAS pure GEMM is faster: 0.365 ms / 3001 TFLOPS (per-tensor FP8, best-of-8 algos, 256MB workspace).
-Our effective TFLOPS (2018) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
+Our effective TFLOPS (2041) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
 
 GEMM: `[928256, 768] x [768, 768]^T` with fused bias + positional embedding add, BF16 output.
 Batch = 4736 images x 196 patches = 928256 rows. Square weight matrix (768x768).
@@ -33,13 +33,13 @@ Equilibrium deficit: ~257 cycles (epilogue slightly slower). Double-buffer lag a
 - Phase 1 TMEM readback = 67% of epilogue cycle. Primary target.
 - K-loop: 411 instructions/tile, only 24 MMA (5.8%). R2UR (42%), PLOP3 (23%), ELECT (8%) dominate overhead.
 - TMA multicast not applicable (B is N-split across CTAs).
-- 223 regs/thread, 0 spills. Limits occupancy to 1 CTA/SM.
+- 229 regs/thread, 0 spills. Limits occupancy to 1 CTA/SM.
 
 **Ceiling:** Eliminate epi_wait → 2,486 TFLOPS. Also TMA0 → 2,998 TFLOPS (≈ cuBLAS 3,001).
 
 Run `python3 analyze_timing.py clock64_timing.txt` for full equilibrium analysis and what-if projections.
 Run `python3 analyze_source_counters.py source_counters_raw.csv` for per-instruction stall breakdown.
-See `EXPERIMENTS.md` for 20 experiments (F1-F20) with hypotheses, results, and analysis. See `FUTURE_PROPOSALS.md` for active optimization roadmap.
+See `EXPERIMENTS.md` for experiments (F1-F22) with hypotheses, results, and analysis. See `FUTURE_PROPOSALS.md` for active optimization roadmap.
 
 ## Kernel structure
 
@@ -58,7 +58,7 @@ The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile 
 - TMEM: single alloc of 512 cols (TN*2), double-buffered via column offset (buf*TN)
 - SMEM: 4-stage pipeline (131 KB) + epilogue staging (4 warps x 17,408 = 70 KB, double-buffered halves) = ~201 KB total of 228 KB
 - Tiles: 3626 M-tiles x 3 N-tiles = 10,878 total, snake ordering
-- 223 registers/thread, 0 spills
+- 229 registers/thread, 0 spills
 - `NUM_EPI_WARPS` controls epilogue warp count (currently 4); `THREADS` derived as `32*(2+NUM_EPI_WARPS)`
 
 ## Development workflow

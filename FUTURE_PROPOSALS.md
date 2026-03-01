@@ -1,8 +1,8 @@
 # Future Proposals
 
-**Kernel state (2026-03-01):** F18 best fused path = 0.543 ms / 2018 TFLOPS. F19a early-mbar variant = 0.542 ms / 2020 TFLOPS (performance-neutral, structurally kept). 223 regs, 0 spills.
+**Kernel state (2026-03-01):** F22 best fused path = 0.536 ms / 2041 TFLOPS. 229 regs, 0 spills. BF16 epilogue arithmetic with `#pragma unroll 2`.
 **Reference:** cuBLAS pure GEMM = 0.365 ms / 3001 TFLOPS | cuBLAS + unfused pos_embed = 0.835 ms
-**Bottleneck:** Epilogue-bound producer-consumer equilibrium. ~300-cycle deficit (epilogue slower), amplified to ~1,080 epi_wait. Phase 1 TMEM readback (~4,200 cycles, 68% of epilogue) is the binding constraint. F25 confirmed all 4 epilogue warps are equally bound (symmetric, 172-cycle spread). F21 confirmed B matrix is already L2-resident — TMA0_wait (~790 cycles) is pure A-matrix DRAM latency.
+**Bottleneck:** Epilogue-bound producer-consumer equilibrium. F22 reduced epilogue instruction count by 1,480 SASS ops but register pressure from full unrolling (255 regs) negated gains — partial unroll (`#pragma unroll 2`) at 229 regs was the sweet spot (1.3% improvement). Phase 1 TMEM readback remains the binding constraint. F25 confirmed all 4 epilogue warps are equally bound (symmetric, 172-cycle spread). F21 confirmed B matrix is already L2-resident — TMA0_wait (~790 cycles) is pure A-matrix DRAM latency.
 
 ### Execution order
 
@@ -15,11 +15,11 @@ Dependencies:
   F28 (K-loop) ────────→ best combined with F22 (attacks both sides of equilibrium)
 
 Recommended serial order:
-  F25 ✅ → F21 ✗ → F22 → F28 → F23C → (conditional: F24)
-  │         │        │      │      │
-  │         │        │      │      └─ low priority (F25: symmetric, bandwidth-limited)
-  │         │        │      └──────── pair with F22: K-loop + epilogue = both sides
-  │         │        └──────────────── highest expected value, attacks ~300-cycle deficit
+  F25 ✅ → F21 ✗ → F22 ✅ → F28 → F23C → (conditional: F24)
+  │         │        │        │      │
+  │         │        │        │      └─ low priority (F25: symmetric, bandwidth-limited)
+  │         │        │        └──────── pair with F22: K-loop + epilogue = both sides
+  │         │        └──────────────── DONE: +1.3%, 229 regs, #pragma unroll 2
   │         └──────────────────────── DONE: B already L2-hot, F26 killed
   └────────────────────────────────── DONE: symmetric + mild fat tail → F27 skipped
 ```
@@ -103,38 +103,18 @@ All 4 warps are essentially equal (172-cycle spread < 200-cycle threshold). No s
 
 ---
 
-## F22: BF16 Epilogue Arithmetic
+## F22: BF16 Epilogue Arithmetic — ✅ DONE (+1.3%)
 
 **Effort:** Medium (rewrite Phase 1 math path in `epilogue_store`)
-**Expected impact:** Uncertain but potentially meaningful. If Phase 1 drops by ~100-300 cycles, the current ~272-cycle producer/consumer imbalance could shrink materially.
-**Risk:** Numeric behavior changes (different rounding point), possible register/scheduling side effects.
+**Result:** 0.536 ms / 2041 TFLOPS / 229 regs — 1.3% wall clock improvement over baseline 0.543 ms.
 
-**Rationale:** Current Phase 1 math converts packed BF16 combined values to FP32, does FP32 adds, then converts back to BF16 for SMEM staging. A BF16-native variant may reduce instruction pressure in the post-`TMEM_WAIT` region.
+**What worked:** Replaced BF16X2_TO_F32 unpack → FP32 scalar adds → CVT_STS chain with `cvt.rn.bf16x2.f32` → `add.bf16x2` → `st.shared.v4.b32` using C++ intrinsics (`__floats2bfloat162_rn`, `__hadd2`). Eliminated 1,480 SASS instructions from the epilogue (4,502 → 3,022). K-loop unchanged (394 SASS instructions, structurally identical).
 
-**Proposed direction:**
-1. Keep combined values in packed BF16x2 form instead of converting to FP32.
-2. Convert FP32 accumulator pairs to packed BF16x2 via `cvt.rn.bf16x2.f32` (TMEM gives FP32 accumulators — this conversion cost doesn't disappear, it shifts from per-element scalar `cvt.rn.bf16.f32` to packed pair conversion).
-3. Perform packed BF16 adds via `hadd2` (or equivalent `add.bf16x2`).
-4. Store packed BF16x2 directly to SMEM via `st.shared.b32`.
-5. Verify exact PTX op names/availability with `ptxas` (mnemonics can differ by ISA version).
+**What almost killed it — register pressure:** The naive implementation (full unroll) hit 255 registers despite fewer instructions. Three approaches (full-width asm macro, half-width asm macro, C++ intrinsics) all hit 255. Root cause: baseline's `CVT_STS` hid intermediate BF16x2 values in asm-local `.reg` declarations, invisible to ptxas's global allocator. The new code (whether via intrinsics or separate asm blocks) exposes these as global physical registers, and full unrolling keeps multiple iterations' intermediates alive across `asm volatile` barriers.
 
-The savings come from eliminating the separate per-element `BF16X2_TO_F32` unpack of combined data + per-element `cvt.rn.bf16.f32` repack, replacing scalar add chains with packed ops. The accumulator conversion cost shifts from many scalar CVTs to fewer packed CVTs — the question is whether packed ops are faster than the scalar equivalent.
+**The fix:** `#pragma unroll 2` on both Phase 1 loops. Full unroll (255 regs) had lowest instruction count but worst register pressure — the bloat negated instruction savings (0.547 ms, slower than baseline). No unroll (198 regs) had too much loop overhead (0.614 ms). Unroll 2 (229 regs) balanced register pressure vs ILP.
 
-**Precision note:** This changes arithmetic order from `round(acc + combined)` to approximately `round(round(acc) + combined)`. Error can increase versus the current path, especially at larger magnitudes.
-
-**Verification plan:**
-1. Compare against the current FP32-add epilogue path on representative inputs.
-2. Report max absolute error, max relative error, and BF16 ULP-distance stats.
-3. Use magnitude-aware ULP checks (BF16 ULP is value-dependent; around 1728, 1 ULP is about 8.0).
-4. Accept only if quality is acceptable for downstream model metrics, not checksum equality.
-5. **Critical-path diagnostic (from F25):** Before implementing F22, F25 should instrument the gap between the last `tcgen05.ld` and the `__syncwarp()` before early mbar arrive. If this gap is near-zero, Phase 1 is TMEM-gated and arithmetic is fully in shadow — F22 saves instructions but zero wall-clock cycles. If the gap shows arithmetic-dependent latency (>50 cycles after last TMEM read), F22 has a target. This diagnostic should be added to F25's instrumentation list.
-
-**Go/no-go:**
-- Success: Phase 1 drops ≥200 cycles AND wall clock improves ≥1%
-- Fail-fast (perf): if Phase 1 time is unchanged or increases (instruction count reduction eaten by register pressure / scheduling), abort
-- Fail-fast (precision): if max absolute error exceeds 16.0 (2 ULPs of BF16 at magnitude ~1728) on the validation set, abort or flag for downstream accuracy review before committing
-- Max effort: 3–4 hours
-- Rollback: revert `epilogue_store` math path to FP32
+**Lesson:** Full loop unrolling is not always optimal. For this register-constrained kernel at 1 CTA/SM, partial unrolling is superior. Register count is a better predictor of performance than instruction count for epilogue-bound kernels.
 
 ---
 

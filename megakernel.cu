@@ -229,6 +229,21 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
            "r"(SADDR) \
         : "memory")
 
+__device__ __forceinline__ uint32_t cvt_add_bf16x2(float lo, float hi, uint32_t combined) {
+    __nv_bfloat162 acc = __floats2bfloat162_rn(lo, hi);
+    __nv_bfloat162 comb;
+    memcpy(&comb, &combined, sizeof(uint32_t));
+    acc = __hadd2(acc, comb);
+    uint32_t result;
+    memcpy(&result, &acc, sizeof(uint32_t));
+    return result;
+}
+
+#define STS_V4(b0,b1,b2,b3, SADDR) \
+    asm volatile( \
+        "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" \
+        :: "r"(SADDR), "r"(b0), "r"(b1), "r"(b2), "r"(b3) : "memory")
+
 #define COALESCED_STORE_V4(SADDR, GPTR) \
     asm volatile( \
         "{\n\t" \
@@ -290,48 +305,46 @@ void epilogue_store(
                   a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                   taddr_base + NC_START);
 
+    #pragma unroll 2
     for (int nc = NC_START; nc < NC_MID; nc += 32) {
         const __nv_bfloat16* comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
         uint4 craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
         uint4 craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
-        float s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15;
-        BF16X2_TO_F32(craw0.x, s0, s1);
-        BF16X2_TO_F32(craw0.y, s2, s3);
-        BF16X2_TO_F32(craw0.z, s4, s5);
-        BF16X2_TO_F32(craw0.w, s6, s7);
-        BF16X2_TO_F32(craw1.x, s8, s9);
-        BF16X2_TO_F32(craw1.y, s10, s11);
-        BF16X2_TO_F32(craw1.z, s12, s13);
-        BF16X2_TO_F32(craw1.w, s14, s15);
-
-        craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
-        craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
 
         TMEM_WAIT();
 
-        a0+=s0; a1+=s1; a2+=s2; a3+=s3;
-        a4+=s4; a5+=s5; a6+=s6; a7+=s7;
-        a8+=s8; a9+=s9; a10+=s10; a11+=s11;
-        a12+=s12; a13+=s13; a14+=s14; a15+=s15;
-
         uint32_t saddr = staging_a + lane * STAGING_HALF_ROW_BYTES + (nc - NC_START) * 2;
-        CVT_STS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, saddr);
+        {
+            uint32_t b0 = cvt_add_bf16x2(a0, a1, craw0.x);
+            uint32_t b1 = cvt_add_bf16x2(a2, a3, craw0.y);
+            uint32_t b2 = cvt_add_bf16x2(a4, a5, craw0.z);
+            uint32_t b3 = cvt_add_bf16x2(a6, a7, craw0.w);
+            STS_V4(b0, b1, b2, b3, saddr);
+        }
+        {
+            uint32_t b0 = cvt_add_bf16x2(a8, a9, craw1.x);
+            uint32_t b1 = cvt_add_bf16x2(a10, a11, craw1.y);
+            uint32_t b2 = cvt_add_bf16x2(a12, a13, craw1.z);
+            uint32_t b3 = cvt_add_bf16x2(a14, a15, craw1.w);
+            STS_V4(b0, b1, b2, b3, saddr + 16);
+        }
 
-        BF16X2_TO_F32(craw0.x, s0, s1);
-        BF16X2_TO_F32(craw0.y, s2, s3);
-        BF16X2_TO_F32(craw0.z, s4, s5);
-        BF16X2_TO_F32(craw0.w, s6, s7);
-        BF16X2_TO_F32(craw1.x, s8, s9);
-        BF16X2_TO_F32(craw1.y, s10, s11);
-        BF16X2_TO_F32(craw1.z, s12, s13);
-        BF16X2_TO_F32(craw1.w, s14, s15);
-
-        a16+=s0; a17+=s1; a18+=s2; a19+=s3;
-        a20+=s4; a21+=s5; a22+=s6; a23+=s7;
-        a24+=s8; a25+=s9; a26+=s10; a27+=s11;
-        a28+=s12; a29+=s13; a30+=s14; a31+=s15;
-
-        CVT_STS(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31, saddr + 32);
+        craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
+        craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
+        {
+            uint32_t b0 = cvt_add_bf16x2(a16, a17, craw0.x);
+            uint32_t b1 = cvt_add_bf16x2(a18, a19, craw0.y);
+            uint32_t b2 = cvt_add_bf16x2(a20, a21, craw0.z);
+            uint32_t b3 = cvt_add_bf16x2(a22, a23, craw0.w);
+            STS_V4(b0, b1, b2, b3, saddr + 32);
+        }
+        {
+            uint32_t b0 = cvt_add_bf16x2(a24, a25, craw1.x);
+            uint32_t b1 = cvt_add_bf16x2(a26, a27, craw1.y);
+            uint32_t b2 = cvt_add_bf16x2(a28, a29, craw1.z);
+            uint32_t b3 = cvt_add_bf16x2(a30, a31, craw1.w);
+            STS_V4(b0, b1, b2, b3, saddr + 48);
+        }
 
         if (nc + 32 < NC_MID)
             TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
@@ -349,6 +362,7 @@ void epilogue_store(
     // ═══ Phase 1B (cols NC_MID..NC_END-1 → staging_b) + Phase 2A (staging_a → global) ═══
     __nv_bfloat16* row_base_a = C + (long long)gm_base * N_DIM + n_start + NC_START;
 
+    #pragma unroll 2
     for (int nc = NC_MID; nc < NC_END; nc += 32) {
         // Phase 2A: 8 rows from staging_a (fills TMEM latency window)
         {
@@ -365,44 +379,41 @@ void epilogue_store(
         const __nv_bfloat16* comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
         uint4 craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
         uint4 craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
-        float s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15;
-        BF16X2_TO_F32(craw0.x, s0, s1);
-        BF16X2_TO_F32(craw0.y, s2, s3);
-        BF16X2_TO_F32(craw0.z, s4, s5);
-        BF16X2_TO_F32(craw0.w, s6, s7);
-        BF16X2_TO_F32(craw1.x, s8, s9);
-        BF16X2_TO_F32(craw1.y, s10, s11);
-        BF16X2_TO_F32(craw1.z, s12, s13);
-        BF16X2_TO_F32(craw1.w, s14, s15);
-
-        craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
-        craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
 
         TMEM_WAIT();
 
-        a0+=s0; a1+=s1; a2+=s2; a3+=s3;
-        a4+=s4; a5+=s5; a6+=s6; a7+=s7;
-        a8+=s8; a9+=s9; a10+=s10; a11+=s11;
-        a12+=s12; a13+=s13; a14+=s14; a15+=s15;
-
         uint32_t saddr = staging_b + lane * STAGING_HALF_ROW_BYTES + (nc - NC_MID) * 2;
-        CVT_STS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, saddr);
+        {
+            uint32_t b0 = cvt_add_bf16x2(a0, a1, craw0.x);
+            uint32_t b1 = cvt_add_bf16x2(a2, a3, craw0.y);
+            uint32_t b2 = cvt_add_bf16x2(a4, a5, craw0.z);
+            uint32_t b3 = cvt_add_bf16x2(a6, a7, craw0.w);
+            STS_V4(b0, b1, b2, b3, saddr);
+        }
+        {
+            uint32_t b0 = cvt_add_bf16x2(a8, a9, craw1.x);
+            uint32_t b1 = cvt_add_bf16x2(a10, a11, craw1.y);
+            uint32_t b2 = cvt_add_bf16x2(a12, a13, craw1.z);
+            uint32_t b3 = cvt_add_bf16x2(a14, a15, craw1.w);
+            STS_V4(b0, b1, b2, b3, saddr + 16);
+        }
 
-        BF16X2_TO_F32(craw0.x, s0, s1);
-        BF16X2_TO_F32(craw0.y, s2, s3);
-        BF16X2_TO_F32(craw0.z, s4, s5);
-        BF16X2_TO_F32(craw0.w, s6, s7);
-        BF16X2_TO_F32(craw1.x, s8, s9);
-        BF16X2_TO_F32(craw1.y, s10, s11);
-        BF16X2_TO_F32(craw1.z, s12, s13);
-        BF16X2_TO_F32(craw1.w, s14, s15);
-
-        a16+=s0; a17+=s1; a18+=s2; a19+=s3;
-        a20+=s4; a21+=s5; a22+=s6; a23+=s7;
-        a24+=s8; a25+=s9; a26+=s10; a27+=s11;
-        a28+=s12; a29+=s13; a30+=s14; a31+=s15;
-
-        CVT_STS(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31, saddr + 32);
+        craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
+        craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
+        {
+            uint32_t b0 = cvt_add_bf16x2(a16, a17, craw0.x);
+            uint32_t b1 = cvt_add_bf16x2(a18, a19, craw0.y);
+            uint32_t b2 = cvt_add_bf16x2(a20, a21, craw0.z);
+            uint32_t b3 = cvt_add_bf16x2(a22, a23, craw0.w);
+            STS_V4(b0, b1, b2, b3, saddr + 32);
+        }
+        {
+            uint32_t b0 = cvt_add_bf16x2(a24, a25, craw1.x);
+            uint32_t b1 = cvt_add_bf16x2(a26, a27, craw1.y);
+            uint32_t b2 = cvt_add_bf16x2(a28, a29, craw1.z);
+            uint32_t b3 = cvt_add_bf16x2(a30, a31, craw1.w);
+            STS_V4(b0, b1, b2, b3, saddr + 48);
+        }
 
         if (nc + 32 < NC_END)
             TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,

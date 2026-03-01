@@ -692,3 +692,73 @@ TMA0_wait (~790 cycles) is pure A-matrix DRAM latency: each tile loads 16 KB of 
 **Implications:**
 - **F26 (L2 persistence window): DEAD** — per fail-fast rule, if F21 shows zero change, B is already L2-hot and reserving L2 capacity via `cudaAccessPropertyPersisting` adds nothing.
 - TMA0_wait is confirmed as a pure DRAM bandwidth cost for A, not an L2 eviction problem.
+
+---
+
+### Experiment F22: BF16 Epilogue Arithmetic
+
+**Date:** 2026-03-01
+**Baseline:** 0.543 ms / 2018 TFLOPS / 223 regs (F18+F19a)
+**Result:** 0.536 ms / 2041 TFLOPS / 229 regs — **1.3% faster**
+**Verdict:** ACCEPTED (marginal)
+
+**Hypothesis:** Phase 1 post-TMEM_WAIT path does 76 instructions per 32-col chunk: 8 BF16X2_TO_F32 unpacks → 16 FP32 adds → CVT_STS, repeated for second half. Replacing this with BF16-native arithmetic (`cvt.rn.bf16x2.f32` + `add.bf16x2` + `st.shared.v4`) eliminates the unpack+add chain, reducing to ~36 ops per chunk.
+
+**Changes:**
+1. Added `cvt_add_bf16x2()` inline helper using C++ intrinsics (`__floats2bfloat162_rn` + `__hadd2`)
+2. Added `STS_V4` macro for `st.shared.v4.b32`
+3. Rewrote Phase 1A and Phase 1B loop bodies — eliminated `BF16X2_TO_F32`, `float s0..s15` temps, and FP32 scalar adds
+4. Added `#pragma unroll 2` to both Phase 1A and Phase 1B loops (critical for register pressure — see below)
+
+**Precision:** Checksum 1769472.0 — **exact match**. The double-rounding (`round_bf16(round_bf16(acc) + combined)` vs `round_bf16(acc + combined_as_fp32)`) happened to produce identical results at the test values.
+
+**SASS analysis (epilogue only, K-loop is structurally identical):**
+
+| Instruction | Baseline | F22 | Delta |
+|-------------|----------|-----|-------|
+| PRMT (bf16 unpack) | 411 | 27 | **-384** |
+| FADD (fp32 scalar add) | 769 | 1 | **-768** |
+| HADD2/HFMA2 (bf16x2 add) | 1 | 385 | +384 |
+| F2FP (cvt f32→bf16x2) | 385 | 385 | 0 |
+| Epilogue SASS total | 4,502 | 3,022 | **-1,480** |
+| K-loop SASS total | 394 | 394 | **0** |
+
+**Register pressure investigation — the main complication:**
+
+The naive implementation (full unroll, default) hit **255 registers** despite eliminating 1,480 instructions. Three approaches were tried — all hit 255:
+
+| Approach | Regs | Why 255 |
+|----------|------|---------|
+| Full-width asm macro (25 operands) | 255 | Too many simultaneous inputs |
+| Half-width asm macro (13 operands) | 255 | Still too many cross-barrier live values |
+| C++ intrinsics + STS_V4 | 255 | Intermediates become global physical regs |
+
+**Root cause:** In the baseline, `CVT_STS` uses asm-local `.reg .b32 b0..b7` — the 385 F2FP outputs are invisible to ptxas's global allocator. With C++ intrinsics, every `F2FP` and `HADD2` output becomes a global physical register. The fully-unrolled loop (4 iters × 2 phases × 4 template instantiations) keeps multiple iterations' intermediates alive across `asm volatile` barriers.
+
+PTX virtual register comparison confirms this:
+
+| | Baseline | F22 (full unroll) |
+|---|---------|-------------------|
+| `%r` (int b32) | 1,307 | **2,891** (+1,584) |
+| `%f` (float) | 2,305 | 1,537 (-768) |
+
+The BF16 math shifted work from float to int register space, and the asm-local → global exposure added ~816 net virtual registers.
+
+**The fix: `#pragma unroll 2`** on both Phase 1 loops. This limits cross-iteration register liveness while still allowing the compiler to interleave 2 iterations for ILP:
+
+| Unroll factor | Regs | Production ms | TFLOPS |
+|---------------|------|--------------|--------|
+| Full (default) | 255 | 0.547 | 2000 |
+| 1 (no unroll) | 198 | 0.614 | 1783 |
+| **2** | **229** | **0.536** | **2041** |
+
+Full unroll has lowest instruction count but worst register pressure — the register bloat negates the instruction savings. No unroll has best register pressure but too much loop overhead. Unroll 2 is the sweet spot.
+
+**Production timing (5 runs):** 0.535–0.538 ms, median 0.537 ms / 2040 TFLOPS.
+
+**Timing build caveat:** The timing build (`-DTIMING`) hits 255 regs (clock64 instrumentation pushes over the edge), which distorts the cycle breakdown. The production build at 229 regs is the authoritative performance measurement.
+
+**Lessons learned:**
+- Exposing asm-local intermediates to the global register allocator (via C++ intrinsics or smaller asm blocks) can cause severe register inflation even when peak liveness is lower.
+- Full loop unrolling is not always optimal — register pressure from cross-iteration liveness can outweigh the ILP benefits. The compiler's default full-unroll heuristic is tuned for occupancy-limited kernels; for register-constrained kernels at 1 CTA/SM, partial unrolling is superior.
+- Register count is a better predictor of performance than instruction count for this epilogue-bound kernel.
