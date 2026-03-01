@@ -2,26 +2,26 @@
 
 **Kernel state (2026-02-28):** F18 best fused path = 0.543 ms / 2018 TFLOPS. F19a early-mbar variant = 0.542 ms / 2020 TFLOPS (performance-neutral, structurally kept). 223 regs, 0 spills.
 **Reference:** cuBLAS pure GEMM = 0.365 ms / 3001 TFLOPS | cuBLAS + unfused pos_embed = 0.835 ms
-**Bottleneck:** Balanced producer-consumer equilibrium. W1 and epilogue warps wait ~1,100 cycles/tile for each other. Phase 1 TMEM readback (4,140 cycles, 67% of epilogue) is the binding constraint.
+**Bottleneck:** Epilogue-bound producer-consumer equilibrium. 403-cycle deficit (epilogue slower), amplified to ~1,162 epi_wait. Phase 1 TMEM readback (4,288 cycles, 68% of epilogue) is the binding constraint. F25 confirmed all 4 epilogue warps are equally bound (symmetric, 172-cycle spread).
 
 ### Execution order
 
 ```
 Dependencies:
-  F25 (diagnostic) ──→ F23 (warp count sweep)
-                   └──→ F27 (dephasing)
+  F25 ✅ (diagnostic) ──→ F23 (warp count sweep, low priority)
+                      └──→ F27 ✗ (skipped: symmetric)
   F21 (L2 promotion) ─→ F26 (L2 persistence)
   F22 (BF16 math) ────→ F24 (swizzled staging)
   F28 (K-loop) ────────→ best combined with F22 (attacks both sides of equilibrium)
 
 Recommended serial order:
-  F25 → F21 → F22 → F28 → F23C → (conditional: F26, F27, F24)
-  │      │      │      │      │
-  │      │      │      │      └─ only if F25 shows contention target
-  │      │      │      └──────── pair with F22: K-loop + epilogue = both sides
-  │      │      └──────────────── highest expected value, attacks 272-cycle deficit
-  │      └─────────────────────── 30 min, confirms/eliminates L2 hypothesis
-  └────────────────────────────── diagnostic, informs everything else
+  F25 ✅ → F21 → F22 → F28 → F23C → (conditional: F26, F24)
+  │         │      │      │      │
+  │         │      │      │      └─ low priority (F25: symmetric, bandwidth-limited)
+  │         │      │      └──────── pair with F22: K-loop + epilogue = both sides
+  │         │      └──────────────── highest expected value, attacks 403-cycle deficit
+  │         └─────────────────────── 30 min, confirms/eliminates L2 hypothesis
+  └────────────────────────────────── DONE: symmetric + mild fat tail → F27 skipped
 ```
 
 ---
@@ -40,11 +40,30 @@ Every proposal below uses this format:
 
 ---
 
-## F25: Full epilogue-warp timing (W2–W5) — DIAGNOSTIC
+## F25: Full epilogue-warp timing (W2–W5) — DIAGNOSTIC ✅ DONE
 
 **Effort:** Low (extend existing clock64 infrastructure)
 **Expected impact:** No performance change. Informs F23 and F27.
 **Risk:** Register pressure in timing build (currently 254 regs).
+
+**Result: SYMMETRIC (Result A) + mild fat tail (Result C)**
+
+```
+W2 (ew=0, rg=0):  avg=4,252  p95=5,589
+W3 (ew=1, rg=1):  avg=4,288  p95=5,599
+W4 (ew=2, rg=2):  avg=4,424  p95=5,618
+W5 (ew=3, rg=3):  avg=4,392  p95=5,673
+Spread of averages: 172 cycles (<200 threshold)
+Per-tile spread:    avg=615  p95=1,606 (2.6x fat tail)
+```
+
+All 4 warps are essentially equal (172-cycle spread < 200-cycle threshold). No systematic TMEM port bias or bank conflict asymmetry. rg=2/3 are ~140-170 cycles slower on average but p95 values are nearly identical (84-cycle spread), confirming this is noise not hardware bias. Per-tile spread shows mild fat tail (p95/avg = 2.6x) — burst contention creates outlier tiles but no consistent victim.
+
+**Implications:**
+- **F27 (dephasing): Skip** — no queueing to exploit; stagger adds idle time without benefit
+- **F23C (2 warps): Low priority** — contention is bandwidth-limited; reduced warps may not compensate for doubled per-warp work
+- **F22 (BF16 arithmetic): Confirmed highest EV** — Phase 1 is the binding constraint across all warps equally; reducing it attacks the deficit directly
+- Timing build: 252 regs, 0 spills (3 regs headroom vs 255 ceiling)
 
 **Rationale:** Current clock64 timing measures W3 only (ew=1). But `epilogue_mbar` fires when the **last** warp arrives — W3 could be average while W2 or W5 is consistently 200–300 cycles slower due to TMEM port ordering or SMEM bank conflict asymmetry. Without per-warp data, F23's contention hypothesis and F27's dephasing idea are flying blind.
 
@@ -266,12 +285,13 @@ cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
 
 ---
 
-## F27: TMEM contention dephasing test
+## F27: TMEM contention dephasing test — SKIPPED (F25 ruled out)
 
 **Effort:** Low–medium (add staggered delays to epilogue warp Phase 1 start)
 **Expected impact:** Uncertain. Tests whether burst TMEM read contention is worse than sustained.
 **Risk:** Artificial delays waste cycles; net could be worse.
 **Prerequisite:** F25 must show clear per-warp asymmetry (≥200-cycle spread in avg Phase 1). If all 4 warps have symmetric Phase 1 times, contention is bandwidth-limited (not port-queued) and dephasing won't help.
+**Status:** F25 showed 172-cycle spread (< 200 threshold). Contention is bandwidth-limited. Skipped.
 
 **Rationale:** After `mainloop_mbar` fires, all 4 epilogue warps wake near-simultaneously and issue `TMEM_LOAD_X32` within a few cycles of each other. If the TMEM read port has a shallow issue queue, 4 simultaneous requests create burst contention — queueing delays that grow super-linearly with concurrent requesters. Staggering Phase 1 start times would spread TMEM read pressure over time.
 

@@ -11,6 +11,7 @@
 #include <curand.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 #define SM_COUNT       148
 #define NUM_EPI_WARPS  4
@@ -46,6 +47,11 @@
 #define TMA_BYTES      32768
 #define MMA_K          32
 #define MMA_PER_KI     4
+
+#ifdef TIMING
+#define TIMING_CLUSTER_STRIDE 32
+#define MAX_SPREAD_TILES 148
+#endif
 
 #define COMB_PADDED_ROWS   224          // ceil(196/32)*32 = 7*32
 #define COMB_BLOCK_ROWS    32
@@ -458,7 +464,8 @@ patch_embed_gemm(
     const __nv_bfloat16* __restrict__ combined,
     __nv_bfloat16* __restrict__ C
 #ifdef TIMING
-    , long long* __restrict__ timing_buf  // [74 clusters × 16 values]
+    , long long* __restrict__ timing_buf   // [74 clusters × TIMING_CLUSTER_STRIDE values]
+    , long long* __restrict__ spread_buf   // [74 × MAX_SPREAD_TILES × NUM_EPI_WARPS] per-tile per-warp Phase 1
 #endif
 ) {
 
@@ -529,13 +536,16 @@ patch_embed_gemm(
     long long min_kloop = 0x7FFFFFFFFFFFFFFFLL, max_kloop = 0;
     long long min_total = 0x7FFFFFFFFFFFFFFFLL, max_total = 0;
     int tile_count = 0;
-    // Epilogue warp (W3/ew=1) phase timing
-    long long epi_t_before_ml = 0, epi_t0 = 0, epi_t1 = 0, epi_t2 = 0;
-    long long epi_sum_p1 = 0, epi_sum_p2 = 0, epi_sum_ml = 0;
+    // Epilogue Phase 1 timing — ALL epilogue warps (F25)
+    long long epi_t0 = 0, epi_t1 = 0;
+    long long epi_sum_p1 = 0;
     long long epi_min_p1 = 0x7FFFFFFFFFFFFFFFLL, epi_max_p1 = 0;
+    int epi_count = 0;
+    // Epilogue ml_wait + Phase 2 timing — W3/ew=1 only (backward compat)
+    long long epi_t_before_ml = 0, epi_t2 = 0;
+    long long epi_sum_p2 = 0, epi_sum_ml = 0;
     long long epi_min_p2 = 0x7FFFFFFFFFFFFFFFLL, epi_max_p2 = 0;
     long long epi_min_ml = 0x7FFFFFFFFFFFFFFFLL, epi_max_ml = 0;
-    int epi_count = 0;
 #endif
 
     for (int tile_idx = tile_start; tile_idx < tile_end; tile_idx++) {
@@ -670,8 +680,8 @@ patch_embed_gemm(
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             ml_phase[prev_buf] ^= 1;
 #ifdef TIMING
-            if (ew == 1 && lane == 0 && cta_rank == 0)
-                epi_t0 = clock64();
+            if (lane == 0 && cta_rank == 0)
+                epi_t0 = clock64();  // F25: all epilogue warps timestamp Phase 1 start
 #endif
 
             if (tile_idx > tile_start) {
@@ -708,21 +718,28 @@ patch_embed_gemm(
                     );
                 }
 #ifdef TIMING
-                if (ew == 1 && lane == 0 && cta_rank == 0) {
-                    epi_t2 = clock64();
-                    long long ml = epi_t0 - epi_t_before_ml;
+                // F25: all epilogue warps track Phase 1 + write per-tile spread data
+                if (lane == 0 && cta_rank == 0) {
                     long long p1 = epi_t1 - epi_t0;
-                    long long p2 = epi_t2 - epi_t1;
-                    epi_sum_ml += ml;
                     epi_sum_p1 += p1;
-                    epi_sum_p2 += p2;
-                    if (ml < epi_min_ml) epi_min_ml = ml;
-                    if (ml > epi_max_ml) epi_max_ml = ml;
                     if (p1 < epi_min_p1) epi_min_p1 = p1;
                     if (p1 > epi_max_p1) epi_max_p1 = p1;
-                    if (p2 < epi_min_p2) epi_min_p2 = p2;
-                    if (p2 > epi_max_p2) epi_max_p2 = p2;
                     epi_count++;
+                    // Per-tile per-warp Phase 1 for spread analysis
+                    int tile_offset = tile_idx - tile_start - 1;
+                    spread_buf[cluster_id * (MAX_SPREAD_TILES * NUM_EPI_WARPS) + tile_offset * NUM_EPI_WARPS + ew] = p1;
+                    // ew=1 only: ml_wait + Phase 2 (backward compat)
+                    if (ew == 1) {
+                        epi_t2 = clock64();
+                        long long ml = epi_t0 - epi_t_before_ml;
+                        long long p2 = epi_t2 - epi_t1;
+                        epi_sum_ml += ml;
+                        epi_sum_p2 += p2;
+                        if (ml < epi_min_ml) epi_min_ml = ml;
+                        if (ml > epi_max_ml) epi_max_ml = ml;
+                        if (p2 < epi_min_p2) epi_min_p2 = p2;
+                        if (p2 > epi_max_p2) epi_max_p2 = p2;
+                    }
                 }
 #endif
             }
@@ -732,7 +749,7 @@ patch_embed_gemm(
 #ifdef TIMING
     // Write timing data — W1 (CTA0, lane 0) writes per-cluster stats
     if (warp == 1 && lane == 0 && cta_rank == 0) {
-        long long* out = timing_buf + cluster_id * 24;
+        long long* out = timing_buf + cluster_id * TIMING_CLUSTER_STRIDE;
         out[0] = sum_epi_wait;
         out[1] = sum_tma0_wait;
         out[2] = sum_kloop;
@@ -742,19 +759,24 @@ patch_embed_gemm(
         out[6] = min_total;
         out[7] = max_total;
     }
-    // Write epilogue phase timing — W3 (ew=1, CTA0, lane 0)
-    if (warp == 3 && lane == 0 && cta_rank == 0) {
-        long long* out = timing_buf + cluster_id * 24 + 8;
+    // F25: Write per-warp epilogue Phase 1 timing — all epilogue warps
+    if (warp >= 2 && lane == 0 && cta_rank == 0) {
+        int ew_out = warp - 2;
+        long long* out = timing_buf + cluster_id * TIMING_CLUSTER_STRIDE + 8 + ew_out * 4;
         out[0] = epi_sum_p1;
-        out[1] = epi_sum_p2;
-        out[2] = epi_min_p1;
-        out[3] = epi_max_p1;
-        out[4] = epi_min_p2;
-        out[5] = epi_max_p2;
-        out[6] = epi_count;
-        out[7] = epi_sum_ml;
-        out[8] = epi_min_ml;
-        out[9] = epi_max_ml;
+        out[1] = epi_min_p1;
+        out[2] = epi_max_p1;
+        out[3] = epi_count;
+    }
+    // Write ew=1 ml_wait + Phase 2 timing (backward compat)
+    if (warp == 3 && lane == 0 && cta_rank == 0) {
+        long long* out = timing_buf + cluster_id * TIMING_CLUSTER_STRIDE + 24;
+        out[0] = epi_sum_p2;
+        out[1] = epi_min_p2;
+        out[2] = epi_max_p2;
+        out[3] = epi_sum_ml;
+        out[4] = epi_min_ml;
+        out[5] = epi_max_ml;
     }
 #endif
 
@@ -820,6 +842,14 @@ patch_embed_gemm(
 // ═════════════════════════════════════════════════════════════
 // Host
 // ═════════════════════════════════════════════════════════════
+
+#ifdef TIMING
+static int cmp_ll(const void* a, const void* b) {
+    long long va = *(const long long*)a;
+    long long vb = *(const long long*)b;
+    return (va > vb) - (va < vb);
+}
+#endif
 
 int main() {
     setbuf(stdout, NULL);  // unbuffered stdout for debugging
@@ -892,9 +922,12 @@ int main() {
     printf("  TMA descriptors + func attr done\n");
 
 #ifdef TIMING
-    long long *d_timing;
-    CUDA_CHECK(cudaMalloc(&d_timing, 74 * 24 * sizeof(long long)));
-    CUDA_CHECK(cudaMemset(d_timing, 0, 74 * 24 * sizeof(long long)));
+    long long *d_timing, *d_spread;
+    CUDA_CHECK(cudaMalloc(&d_timing, 74 * TIMING_CLUSTER_STRIDE * sizeof(long long)));
+    CUDA_CHECK(cudaMemset(d_timing, 0, 74 * TIMING_CLUSTER_STRIDE * sizeof(long long)));
+    size_t spread_bytes = (size_t)74 * MAX_SPREAD_TILES * NUM_EPI_WARPS * sizeof(long long);
+    CUDA_CHECK(cudaMalloc(&d_spread, spread_bytes));
+    CUDA_CHECK(cudaMemset(d_spread, 0, spread_bytes));
 #endif
 
     // ── Warmup: 2 iterations ──
@@ -902,7 +935,7 @@ int main() {
     for (int _i = 0; _i < 2; _i++) {
     patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C
 #ifdef TIMING
-        , d_timing
+        , d_timing, d_spread
 #endif
     );
     }
@@ -919,7 +952,7 @@ int main() {
     for (int _i = 0; _i < 10; _i++) {
     patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C
 #ifdef TIMING
-        , d_timing
+        , d_timing, d_spread
 #endif
     );
     }
@@ -936,7 +969,7 @@ int main() {
     // ── Checksum run ──
     patch_embed_gemm<<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, d_combined, d_C
 #ifdef TIMING
-        , d_timing
+        , d_timing, d_spread
 #endif
     );
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -952,46 +985,27 @@ int main() {
            __bfloat162float(h_C[2]), __bfloat162float(h_C[3]));
 
 #ifdef TIMING
-    // Read and print timing data
-    long long h_timing[74 * 24];
-    CUDA_CHECK(cudaMemcpy(h_timing, d_timing, 74 * 24 * sizeof(long long), cudaMemcpyDeviceToHost));
+    // Read timing data
+    long long h_timing[74 * TIMING_CLUSTER_STRIDE];
+    CUDA_CHECK(cudaMemcpy(h_timing, d_timing, sizeof(h_timing), cudaMemcpyDeviceToHost));
+    long long* h_spread = (long long*)malloc(spread_bytes);
+    CUDA_CHECK(cudaMemcpy(h_spread, d_spread, spread_bytes, cudaMemcpyDeviceToHost));
 
-    // Aggregate W1 data across clusters
+    // ── Aggregate W1 data across clusters ──
     long long g_epi = 0, g_tma0 = 0, g_kloop = 0, g_total = 0;
     long long g_min_kloop = 0x7FFFFFFFFFFFFFFFLL, g_max_kloop = 0;
     long long g_min_total = 0x7FFFFFFFFFFFFFFFLL, g_max_total = 0;
     int total_tiles = 0;
-    // Aggregate epilogue phase data across clusters
-    long long g_ep1 = 0, g_ep2 = 0, g_eml = 0;
-    long long g_min_p1 = 0x7FFFFFFFFFFFFFFFLL, g_max_p1 = 0;
-    long long g_min_p2 = 0x7FFFFFFFFFFFFFFFLL, g_max_p2 = 0;
-    long long g_min_ml = 0x7FFFFFFFFFFFFFFFLL, g_max_ml = 0;
-    int total_epi_tiles = 0;
 
     for (int c = 0; c < 74; c++) {
-        long long* d = h_timing + c * 24;
+        long long* d = h_timing + c * TIMING_CLUSTER_STRIDE;
         int tiles_this = (int)((long long)(c + 1) * TOTAL_TILES / 74) - (int)((long long)c * TOTAL_TILES / 74);
-        g_epi += d[0];
-        g_tma0 += d[1];
-        g_kloop += d[2];
-        g_total += d[3];
+        g_epi += d[0];  g_tma0 += d[1];  g_kloop += d[2];  g_total += d[3];
         if (d[4] < g_min_kloop) g_min_kloop = d[4];
         if (d[5] > g_max_kloop) g_max_kloop = d[5];
         if (d[6] < g_min_total) g_min_total = d[6];
         if (d[7] > g_max_total) g_max_total = d[7];
         total_tiles += tiles_this;
-        // Epilogue phase data
-        long long* e = d + 8;
-        g_ep1 += e[0];
-        g_ep2 += e[1];
-        if (e[2] < g_min_p1) g_min_p1 = e[2];
-        if (e[3] > g_max_p1) g_max_p1 = e[3];
-        if (e[4] < g_min_p2) g_min_p2 = e[4];
-        if (e[5] > g_max_p2) g_max_p2 = e[5];
-        total_epi_tiles += (int)e[6];
-        g_eml += e[7];
-        if (e[8] < g_min_ml) g_min_ml = e[8];
-        if (e[9] > g_max_ml) g_max_ml = e[9];
     }
 
     double clock_ghz = 2.1; // B200 SM clock approx
@@ -1010,10 +1024,118 @@ int main() {
            g_min_total > 0 ? (double)g_max_total / g_min_total : 0.0);
     printf("  Expected total cycles (wall clock): %.0f\n", _ms * 1e-3 * clock_ghz * 1e9);
 
+    // ── F25: Aggregate per-warp Phase 1 data ──
+    long long gw_sum_p1[NUM_EPI_WARPS] = {0};
+    long long gw_min_p1[NUM_EPI_WARPS], gw_max_p1[NUM_EPI_WARPS];
+    int gw_count[NUM_EPI_WARPS] = {0};
+    for (int w = 0; w < NUM_EPI_WARPS; w++) {
+        gw_min_p1[w] = 0x7FFFFFFFFFFFFFFFLL;
+        gw_max_p1[w] = 0;
+    }
+    for (int c = 0; c < 74; c++) {
+        long long* d = h_timing + c * TIMING_CLUSTER_STRIDE;
+        for (int w = 0; w < NUM_EPI_WARPS; w++) {
+            long long* pw = d + 8 + w * 4;
+            gw_sum_p1[w] += pw[0];
+            if (pw[1] < gw_min_p1[w]) gw_min_p1[w] = pw[1];
+            if (pw[2] > gw_max_p1[w]) gw_max_p1[w] = pw[2];
+            gw_count[w] += (int)pw[3];
+        }
+    }
+    // Backward-compat ew=1 ml_wait + Phase 2
+    long long g_ep2 = 0, g_eml = 0;
+    long long g_min_p2 = 0x7FFFFFFFFFFFFFFFLL, g_max_p2 = 0;
+    long long g_min_ml = 0x7FFFFFFFFFFFFFFFLL, g_max_ml = 0;
+    for (int c = 0; c < 74; c++) {
+        long long* d = h_timing + c * TIMING_CLUSTER_STRIDE + 24;
+        g_ep2 += d[0];
+        if (d[1] < g_min_p2) g_min_p2 = d[1];
+        if (d[2] > g_max_p2) g_max_p2 = d[2];
+        g_eml += d[3];
+        if (d[4] < g_min_ml) g_min_ml = d[4];
+        if (d[5] > g_max_ml) g_max_ml = d[5];
+    }
+    int total_epi_tiles = gw_count[1]; // ew=1 count for backward compat
+
+    // ── F25: Compute per-warp p95 and per-tile inter-warp spread from spread_buf ──
+    // Collect per-warp Phase 1 times and per-tile spreads
+    int n_spread_tiles = 0;
+    for (int c = 0; c < 74; c++) {
+        int ts = (int)((long long)c * TOTAL_TILES / 74);
+        int te = (int)((long long)(c + 1) * TOTAL_TILES / 74);
+        n_spread_tiles += (te - ts - 1); // in-loop epilogue tiles
+    }
+
+    long long* warp_p1_all[NUM_EPI_WARPS];
+    for (int w = 0; w < NUM_EPI_WARPS; w++)
+        warp_p1_all[w] = (long long*)malloc(n_spread_tiles * sizeof(long long));
+    long long* tile_spreads = (long long*)malloc(n_spread_tiles * sizeof(long long));
+
+    int idx = 0;
+    long long sum_spread = 0;
+    long long min_spread_val = 0x7FFFFFFFFFFFFFFFLL, max_spread_val = 0;
+    for (int c = 0; c < 74; c++) {
+        int ts = (int)((long long)c * TOTAL_TILES / 74);
+        int te = (int)((long long)(c + 1) * TOTAL_TILES / 74);
+        int epi_tiles_c = te - ts - 1;
+        for (int t = 0; t < epi_tiles_c; t++) {
+            long long mn = 0x7FFFFFFFFFFFFFFFLL, mx = 0;
+            for (int w = 0; w < NUM_EPI_WARPS; w++) {
+                long long v = h_spread[c * (MAX_SPREAD_TILES * NUM_EPI_WARPS) + t * NUM_EPI_WARPS + w];
+                warp_p1_all[w][idx] = v;
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+            long long sp = mx - mn;
+            tile_spreads[idx] = sp;
+            sum_spread += sp;
+            if (sp < min_spread_val) min_spread_val = sp;
+            if (sp > max_spread_val) max_spread_val = sp;
+            idx++;
+        }
+    }
+
+    // Per-warp p95
+    long long gw_p95[NUM_EPI_WARPS];
+    for (int w = 0; w < NUM_EPI_WARPS; w++) {
+        qsort(warp_p1_all[w], n_spread_tiles, sizeof(long long), cmp_ll);
+        gw_p95[w] = warp_p1_all[w][(int)(n_spread_tiles * 0.95)];
+    }
+    // Spread p95
+    qsort(tile_spreads, n_spread_tiles, sizeof(long long), cmp_ll);
+    long long p95_spread = tile_spreads[(int)(n_spread_tiles * 0.95)];
+
+    // ── Print F25: Per-warp Phase 1 timing ──
+    printf("\n=== EPILOGUE PER-WARP PHASE 1 TIMING (W2-W5, %d tiles across 74 clusters) ===\n", n_spread_tiles);
+    printf("  Per-warp Phase 1 (cycles):\n");
+    for (int w = 0; w < NUM_EPI_WARPS; w++) {
+        long long avg = gw_count[w] > 0 ? gw_sum_p1[w] / gw_count[w] : 0;
+        printf("    W%d (ew=%d, rg=%d):  avg=%lld  min=%lld  max=%lld  p95=%lld\n",
+               w + 2, w, w, avg, gw_min_p1[w], gw_max_p1[w], gw_p95[w]);
+    }
+    // Per-warp average spread
+    long long warp_avgs[NUM_EPI_WARPS];
+    long long avg_min = 0x7FFFFFFFFFFFFFFFLL, avg_max = 0;
+    for (int w = 0; w < NUM_EPI_WARPS; w++) {
+        warp_avgs[w] = gw_count[w] > 0 ? gw_sum_p1[w] / gw_count[w] : 0;
+        if (warp_avgs[w] < avg_min) avg_min = warp_avgs[w];
+        if (warp_avgs[w] > avg_max) avg_max = warp_avgs[w];
+    }
+    printf("  Spread of per-warp averages: %lld cycles (max_avg - min_avg)\n", avg_max - avg_min);
+    printf("  Inter-warp spread per tile (max-min Phase 1 across warps):\n");
+    printf("    Average: %lld cycles\n", n_spread_tiles > 0 ? sum_spread / n_spread_tiles : 0LL);
+    printf("    Min: %lld  Max: %lld  P95: %lld cycles\n", min_spread_val, max_spread_val, p95_spread);
+    long long warp_avg_spread = avg_max - avg_min;
+    if (warp_avg_spread < 200)
+        printf("  => SYMMETRIC (avg spread %lld < 200 cyc): bandwidth-limited, F27 dephasing won't help\n", warp_avg_spread);
+    else
+        printf("  => ASYMMETRIC (avg spread %lld >= 200 cyc): port-queued or bank-conflict bias, F27 has a target\n", warp_avg_spread);
+
+    // ── Backward-compat: W3/ew=1 full phase timing ──
     printf("\n=== EPILOGUE PHASE TIMING (W3/ew=1, %d tiles across 74 clusters) ===\n", total_epi_tiles);
     if (total_epi_tiles > 0) {
         long long avg_ml = g_eml / total_epi_tiles;
-        long long avg_p1 = g_ep1 / total_epi_tiles;
+        long long avg_p1 = gw_sum_p1[1] / total_epi_tiles;
         long long avg_p2 = g_ep2 / total_epi_tiles;
         long long avg_total = avg_ml + avg_p1 + avg_p2;
         printf("  Per-tile averages (cycles / ns at %.1f GHz):\n", clock_ghz);
@@ -1029,13 +1151,17 @@ int main() {
                avg_p1 + avg_p2, (double)(avg_p1 + avg_p2) / clock_ghz);
         printf("  Mainloop wait range: min=%lld max=%lld (%.1fx spread)\n", g_min_ml, g_max_ml,
                g_min_ml > 0 ? (double)g_max_ml / g_min_ml : 0.0);
-        printf("  Phase 1 range: min=%lld max=%lld (%.1fx spread)\n", g_min_p1, g_max_p1,
-               g_min_p1 > 0 ? (double)g_max_p1 / g_min_p1 : 0.0);
+        printf("  Phase 1 range: min=%lld max=%lld (%.1fx spread)\n", gw_min_p1[1], gw_max_p1[1],
+               gw_min_p1[1] > 0 ? (double)gw_max_p1[1] / gw_min_p1[1] : 0.0);
         printf("  Phase 2 range: min=%lld max=%lld (%.1fx spread)\n", g_min_p2, g_max_p2,
                g_min_p2 > 0 ? (double)g_max_p2 / g_min_p2 : 0.0);
     }
 
+    for (int w = 0; w < NUM_EPI_WARPS; w++) free(warp_p1_all[w]);
+    free(tile_spreads);
+    free(h_spread);
     cudaFree(d_timing);
+    cudaFree(d_spread);
 #endif
 
     free(h_C);

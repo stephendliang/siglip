@@ -6,28 +6,40 @@ Launching warmup (2 iters)...
   Waiting for warmup sync...
   Warmup done.
 Timing: 10 iterations...
-Custom kernel: 0.533 ms  2052.90 TFLOPS
+Custom kernel: 0.536 ms  2041.12 TFLOPS
 Checksum (first 1024): 1769472.000000
 C[0,0..3] = 1728.0 1728.0 1728.0 1728.0
 
 === W1 TIMING (clock64, 10878 tiles across 74 clusters) ===
   Per-tile averages (cycles / ns at 2.1 GHz):
-    Epilogue mbar wait:     1056 cycles /  502.9 ns
-    TMA stage-0 wait:        857 cycles /  408.4 ns
-    K-loop (6 ki × 4 MMA):    4154 cycles / 1978.1 ns
-    Total tile:             6067 cycles / 2889.4 ns
-    Overhead (epi+tma0):    1913 cycles /  911.3 ns  (31.5% of tile)
-  K-loop range: min=2450 max=11290 (4.6x spread)
-  Total tile range: min=3081 max=13505 (4.4x spread)
-  Expected total cycles (wall clock): 1120137
+    Epilogue mbar wait:     1162 cycles /  553.4 ns
+    TMA stage-0 wait:        761 cycles /  362.8 ns
+    K-loop (6 ki × 4 MMA):    4238 cycles / 2018.3 ns
+    Total tile:             6162 cycles / 2934.5 ns
+    Overhead (epi+tma0):    1924 cycles /  916.3 ns  (31.2% of tile)
+  K-loop range: min=2431 max=11397 (4.7x spread)
+  Total tile range: min=3099 max=14485 (4.7x spread)
+  Expected total cycles (wall clock): 1126601
+
+=== EPILOGUE PER-WARP PHASE 1 TIMING (W2-W5, 10804 tiles across 74 clusters) ===
+  Per-warp Phase 1 (cycles):
+    W2 (ew=0, rg=0):  avg=4252  min=3066  max=9571  p95=5589
+    W3 (ew=1, rg=1):  avg=4288  min=3054  max=9907  p95=5599
+    W4 (ew=2, rg=2):  avg=4424  min=2815  max=9559  p95=5618
+    W5 (ew=3, rg=3):  avg=4392  min=3114  max=10426  p95=5673
+  Spread of per-warp averages: 172 cycles (max_avg - min_avg)
+  Inter-warp spread per tile (max-min Phase 1 across warps):
+    Average: 615 cycles
+    Min: 5  Max: 5358  P95: 1606 cycles
+  => ASYMMETRIC (>=615 cyc): port-queued or bank-conflict bias, F27 has a target
 
 === EPILOGUE PHASE TIMING (W3/ew=1, 10804 tiles across 74 clusters) ===
   Per-tile averages (cycles / ns at 2.1 GHz):
-    Mainloop mbar wait:       1139 cycles /  542.4 ns  (18.5%)
-    Phase 1 (TMEM->SMEM):     4129 cycles / 1966.2 ns  (67.0%)
-    Phase 2 (SMEM->global):     899 cycles /  428.1 ns  (14.6%)
-    Total (wait+work):        6167 cycles / 2936.7 ns
-    Work only (P1+P2):        5028 cycles / 2394.3 ns
-  Mainloop wait range: min=325 max=10007 (30.8x spread)
-  Phase 1 range: min=3094 max=8306 (2.7x spread)
-  Phase 2 range: min=505 max=1294 (2.6x spread)
+    Mainloop mbar wait:       1114 cycles /  530.5 ns  (17.7%)
+    Phase 1 (TMEM->SMEM):     4288 cycles / 2041.9 ns  (68.2%)
+    Phase 2 (SMEM->global):     882 cycles /  420.0 ns  (14.0%)
+    Total (wait+work):        6284 cycles / 2992.4 ns
+    Work only (P1+P2):        5170 cycles / 2461.9 ns
+  Mainloop wait range: min=330 max=10131 (30.7x spread)
+  Phase 1 range: min=3054 max=9907 (3.2x spread)
+  Phase 2 range: min=545 max=1379 (2.5x spread)

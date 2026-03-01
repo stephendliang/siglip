@@ -116,6 +116,47 @@ def parse_timing(lines):
             d['K'] = int(m.group(2))
             d['N'] = int(m.group(4))
 
+        # F25: Per-warp Phase 1 timing
+        m = re.search(r'W(\d+)\s+\(ew=(\d+),\s*rg=(\d+)\):\s+avg=(\d+)\s+min=(\d+)\s+max=(\d+)\s+p95=(\d+)', line)
+        if m:
+            ew = int(m.group(2))
+            if 'f25_warps' not in d:
+                d['f25_warps'] = {}
+            d['f25_warps'][ew] = {
+                'warp': int(m.group(1)),
+                'rg': int(m.group(3)),
+                'avg': int(m.group(4)),
+                'min': int(m.group(5)),
+                'max': int(m.group(6)),
+                'p95': int(m.group(7)),
+            }
+
+        # F25: Spread of per-warp averages
+        m = re.search(r'Spread of per-warp averages:\s+(\d+)\s+cycles', line)
+        if m:
+            d['f25_avg_spread'] = int(m.group(1))
+
+        # F25: Inter-warp spread per tile (average is on its own line)
+        m = re.search(r'^Average:\s+(\d+)\s+cycles', line)
+        if m and 'f25_warps' in d and 'f25_tile_spread_avg' not in d:
+            d['f25_tile_spread_avg'] = int(m.group(1))
+
+        m = re.search(r'Min:\s+(\d+)\s+Max:\s+(\d+)\s+P95:\s+(\d+)\s+cycles', line)
+        if m and 'f25_tile_spread_min' not in d:
+            d['f25_tile_spread_min'] = int(m.group(1))
+            d['f25_tile_spread_max'] = int(m.group(2))
+            d['f25_tile_spread_p95'] = int(m.group(3))
+
+        # F25: Interpretation
+        m = re.search(r'=> (SYMMETRIC|ASYMMETRIC)', line)
+        if m:
+            d['f25_verdict'] = m.group(1)
+
+        # F25: Per-warp tile count
+        m = re.search(r'PER-WARP PHASE 1 TIMING.*?(\d+)\s+tiles', line)
+        if m:
+            d['f25_tiles'] = int(m.group(1))
+
     return d
 
 
@@ -289,6 +330,50 @@ def analyze(d, cublas_tflops=3001):
             print(f"  F22(-{p1_save})+F28(-{k_save}): epi_wait→{new_epi_wait:,}, tile→{new_tile:,}, {speedup:.2f}x → {proj:.0f} TFLOPS")
 
         print(f"  (Amplification model: epi_wait ≈ deficit × {w1_epi/deficit:.1f}. Approximate for small perturbations.)")
+        print()
+
+    # --- F25: Per-warp Phase 1 analysis ---
+    if 'f25_warps' in d:
+        print("--- F25: PER-WARP PHASE 1 CONTENTION ANALYSIS ---")
+        warps = d['f25_warps']
+        avgs = [warps[ew]['avg'] for ew in sorted(warps.keys())]
+        p95s = [warps[ew]['p95'] for ew in sorted(warps.keys())]
+        maxes = [warps[ew]['max'] for ew in sorted(warps.keys())]
+        mins = [warps[ew]['min'] for ew in sorted(warps.keys())]
+
+        for ew in sorted(warps.keys()):
+            w = warps[ew]
+            print(f"  W{w['warp']} (ew={ew}, rg={w['rg']}):  avg={w['avg']:,}  p95={w['p95']:,}  "
+                  f"min={w['min']:,}  max={w['max']:,}")
+
+        avg_spread = d.get('f25_avg_spread', max(avgs) - min(avgs))
+        tile_spread_avg = d.get('f25_tile_spread_avg', 0)
+        tile_spread_p95 = d.get('f25_tile_spread_p95', 0)
+
+        print(f"  Spread of averages: {avg_spread:,} cycles")
+        print(f"  Per-tile spread:    avg={tile_spread_avg:,}  p95={tile_spread_p95:,}")
+
+        # Interpret for F23/F27
+        slowest_ew = max(warps.keys(), key=lambda ew: warps[ew]['avg'])
+        fastest_ew = min(warps.keys(), key=lambda ew: warps[ew]['avg'])
+        slowest = warps[slowest_ew]
+        fastest = warps[fastest_ew]
+
+        if avg_spread < 200:
+            print(f"  Verdict: SYMMETRIC — contention is bandwidth-limited, not port-queued")
+            print(f"    F27 (dephasing): unlikely to help — no queueing advantage to exploit")
+            print(f"    F23 (warp count): test F23C (2 warps) for pure bandwidth reduction")
+        else:
+            print(f"  Verdict: ASYMMETRIC — W{slowest['warp']} (rg={slowest['rg']}) is {avg_spread:,} cycles slower than W{fastest['warp']}")
+            if slowest_ew in (0, 3):
+                print(f"    Edge row_group ({slowest_ew}) disadvantaged — possible TMEM port bias")
+            print(f"    F27 (dephasing): HAS A TARGET — stagger could reduce queueing")
+            print(f"    F23 (warp count): higher expected value with asymmetry present")
+
+        if tile_spread_p95 > 2 * tile_spread_avg and tile_spread_avg > 0:
+            print(f"  FAT TAIL detected: p95 spread ({tile_spread_p95:,}) is {tile_spread_p95/tile_spread_avg:.1f}x avg ({tile_spread_avg:,})")
+            print(f"    Burst contention causes outlier tiles that gate the mbar")
+            print(f"    F27 (dephasing) would shave the tail even if averages look symmetric")
         print()
 
     # --- Jitter ---
