@@ -948,3 +948,25 @@ Spread increased from F25's baseline 172 to 330 cycles. Now asymmetric (above 20
 **Conclusion:** nvcc at `-O3` was already hoisting all three loop-invariant computations. The source change makes the invariance explicit (fewer lines, clearer intent) but produces identical machine code. The +440 cycle Phase 1 regression from F24 is NOT from redundant swizzle address computation — the overhead comes from the swizzle XOR operations themselves within the STS_V4 address operands and/or register pressure from staging_b pointers displacing other scheduling-critical values.
 
 **Kept as source cleanup** — shorter, clearer Phase 1B loop body (3 lines vs 5 lines per iteration).
+
+---
+
+## F29: PACK::16b TMEM Load Mode (rejected — produces zeros)
+
+**Hypothesis:** Replace `tcgen05.ld.sync.aligned.32x32b.x32.b32` (32 FP32 regs) with `tcgen05.ld.sync.aligned.32x32b.x16.pack::16b.b32` (16 BF16x2 regs). PACK converts FP32→BF16 during TMEM readback and packs pairs, eliminating 128 CVT instructions and freeing 16 registers.
+
+**Changes:**
+1. New `TMEM_LOAD_PACK` macro: `.x16.pack::16b.b32` with `"=r"` constraints (16 regs)
+2. New `pack_add_bf16x2` helper: `__hadd2` on packed BF16x2 (no FP32→BF16 CVT)
+3. Variable declarations: `uint32_t p0..p15` (16 regs) instead of `float a0..a31` (32 regs)
+4. All 4 `TMEM_LOAD_X32` → `TMEM_LOAD_PACK`, all `cvt_add_bf16x2` → `pack_add_bf16x2`
+
+**Build result:** 222 regs (down from 235), 0 spills. PTX and SASS assembled successfully. SASS showed correct `LDTM.x16.PACK16BIT` instructions and 126 `HADD2.BF16_V2` instructions (vs 128 CVT instructions in baseline). Only 1 `F2FP` instruction remaining.
+
+**Result: Checksum = 0.0 (FAIL).** Output is all zeros. Raw PACK output (bypassing combined add) also all zeros. The PACK instruction reads zeros from TMEM with FP32 accumulators.
+
+**Root cause:** CUTLASS's copy traits reveal that `pack::16b` is ONLY defined for `16dp` tile shapes (`16x64b`, `16x128b`, `16x256b`) — there are NO `SM100_TMEM_LOAD_32dp*_16b` variants. The `32x32b.pack::16b` combination assembles in PTX/SASS but does not correctly read FP32 accumulator data. The hardware semantics appear undefined or incompatible for `32x32b` + `pack::16b`.
+
+**Why `16x64b` won't work for us:** The `16x64b` shape operates on a half-warp (16 threads), interleaving column pairs. Our per-thread TMEM layout from `32x32b` MMA uses all 32 threads. Switching to `16x64b` would require a complete epilogue restructure with only half the threads active.
+
+**Conclusion:** `pack::16b` is not viable for our `32x32b` TMEM layout. Phase 1 CVT elimination requires a different approach (inline PTX `cvt.rn.bf16x2.f32` + fused add, or TMEM layout change to `16x64b` with warp restructure).
