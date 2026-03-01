@@ -33,6 +33,7 @@ Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 | b5da9e8 | F22: BF16 epilogue arithmetic | 0.536 | 2041 | 229 | `#pragma unroll 2`, -1480 epilogue SASS |
 | 2bb3675 | F28: K-loop restructuring | 0.536 | 2041 | 229 | perf-neutral, -76 cyc K-loop, cleaner baseline |
 | — | F24: Swizzled staging + TMA tensor stores | 0.532 | 2059 | 235 | asymmetric layout, Phase 2B -626 cyc |
+| — | F30: Staging_b swizzle address precomputation | 0.532 | 2059 | 235 | no-op — compiler already hoisted; source cleanup only |
 
 Reference: cuBLAS per-tensor FP8 (best-of-8 algos, 256MB workspace) = 0.365 ms / 3001 TFLOPS (GEMM only, no fusion).
 cuBLAS + unfused pos_embed = 0.835 ms end-to-end.
@@ -925,3 +926,25 @@ Spread increased from F25's baseline 172 to 330 cycles. Now asymmetric (above 20
 - Placement of `memory` clobber asm barriers matters. A `cp.async.bulk.wait_group 0` between Phase 1A and Phase 1B prevented register optimization across the critical boundary. Moving it before Phase 1A (where it's a no-op after ml_wait) eliminated this cost.
 - STS_V4 (`st.shared.v4.b32`) requires 16-byte alignment, which constrains staging_a row stride to multiples of 16. The optimal bank-conflict-minimizing stride with 16-byte alignment is 272 bytes (gcd(68, 32) = 4 → 4-way conflicts). Stride 260 (zero conflicts) is only 4-byte aligned — causes misaligned address trap.
 - The +440 cycle Phase 1 regression from staging_b swizzle is a genuine cost of TMA tensor stores. The trade is acceptable here (Phase 2B savings + TMA0 bonus > Phase 1 cost), but future work should explore ways to reduce swizzle addressing overhead.
+
+---
+
+## F30: Staging_b swizzle address precomputation (no-op — compiler already hoisted)
+
+**Hypothesis:** The +440 cycle Phase 1 regression from F24 includes ~40 instructions of redundant per-iteration swizzle address computation. Hoisting loop-invariant values (`xor_val_b`, row base addresses) before the Phase 1B loop should save ~50-100 cycles.
+
+**Changes:**
+1. Precomputed `xor_val_b = (lane & 7) << 4`, `saddr_row_b_lo`, `saddr_row_b_hi` before the `#pragma unroll 2` loop
+2. Replaced 5-line per-iteration address block (region_base_b ternary + lane multiply + xor recompute) with 3-line version (ternary selects between precomputed row bases)
+
+**Result: 0.532 ms / 2059 TFLOPS, 235 regs.** Performance-neutral. Identical SASS (modulo register renumbering).
+
+**SASS verification:** `cuobjdump --dump-sass` diff between old and new binaries shows:
+- Same total instruction count (2864)
+- Same opcode histogram (LOP3: 256, SHF: 69, STS: 67, ISETP: 44)
+- Same total SASS lines (5760)
+- Only register number differences (e.g., R168→R164, R174→R172)
+
+**Conclusion:** nvcc at `-O3` was already hoisting all three loop-invariant computations. The source change makes the invariance explicit (fewer lines, clearer intent) but produces identical machine code. The +440 cycle Phase 1 regression from F24 is NOT from redundant swizzle address computation — the overhead comes from the swizzle XOR operations themselves within the STS_V4 address operands and/or register pressure from staging_b pointers displacing other scheduling-critical values.
+
+**Kept as source cleanup** — shorter, clearer Phase 1B loop body (3 lines vs 5 lines per iteration).

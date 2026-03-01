@@ -409,6 +409,11 @@ void epilogue_store(
     // ═══ Phase 1B (cols NC_MID..NC_END-1 → staging_b) + Phase 2A (staging_a → global) ═══
     __nv_bfloat16* row_base_a = C + (long long)gm_base * N_DIM + n_start + NC_START;
 
+    // Precompute swizzle constants for Phase 1B (loop-invariant)
+    const uint32_t xor_val_b = (lane & 7) << 4;
+    const uint32_t saddr_row_b_lo = staging_b_lo + lane * STAGING_B_REGION_ROW_BYTES;
+    const uint32_t saddr_row_b_hi = staging_b_hi + lane * STAGING_B_REGION_ROW_BYTES;
+
     #pragma unroll 2
     for (int nc = NC_MID; nc < NC_END; nc += 32) {
         // Phase 2A: 8 rows from staging_a (linear layout, fills TMEM latency window)
@@ -431,10 +436,8 @@ void epilogue_store(
 
         // Swizzled SMEM write to staging_b
         int col_in_half_b = nc - NC_MID;
-        uint32_t region_base_b = (col_in_half_b < 64) ? staging_b_lo : staging_b_hi;
+        uint32_t saddr_row_b = (col_in_half_b < 64) ? saddr_row_b_lo : saddr_row_b_hi;
         int byte_base_b = (col_in_half_b & 63) * 2;
-        uint32_t xor_val_b = (lane & 7) << 4;
-        uint32_t saddr_row_b = region_base_b + lane * STAGING_B_REGION_ROW_BYTES;
         {
             uint32_t b0 = cvt_add_bf16x2(a0, a1, craw0.x);
             uint32_t b1 = cvt_add_bf16x2(a2, a3, craw0.y);
