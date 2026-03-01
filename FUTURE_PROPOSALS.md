@@ -160,6 +160,117 @@ Phase 1 avg: 4,569 → 4,345 (-224 cycles, -4.9%). Per-warp spread: 330 → 269 
 
 ---
 
+## F36: SASS Static Analysis — CUTLASS vs Custom Kernel
+
+**Effort:** Low (compile + cuobjdump, no GPU needed)
+**Type:** Diagnostic / competitive benchmark
+
+Rebuilt `cutlass_bench.cu` from scratch: per-tensor FP8 E4M3 (`OpClassTensorOp` + `float_e4m3_t`) instead of the old broken MXFP8 bench (`OpClassBlockScaledTensorOp`). Added configurable tile/cluster shapes, fused epilogue via `LinearCombination` (beta=1 loads C = tiled combined tensor), and multiple tile configs for sweep. Compiled all configs and dumped SASS via `cuobjdump --dump-sass` for static analysis.
+
+### ptxas register comparison
+
+| Config | Regs | Spills | Barriers | TMEM load shape |
+|--------|------|--------|----------|-----------------|
+| CUTLASS 256×128×64 | **120** | 0 | 7 | LDTM.x32 (32dp32b) |
+| CUTLASS 256×256×64 | **192** | 0 | 7 | LDTM.x64 (32dp64b) |
+| Custom kernel | **243** | 0 | 0 | LDTM.x16 (32dp32b) |
+
+CUTLASS at 120 regs (256×128) can run 2 CTAs/SM — much higher occupancy. At 256×256, CUTLASS uses 192 regs (still 51 below ours).
+
+### SASS instruction comparison (256×256 configs, closest tile match)
+
+```
+Category                     CUTLASS    Custom    Delta
+─────────────────────────    ───────    ──────    ─────
+MMA (UTCQMMA)                     2        24      -22   (CUTLASS loops, we unroll)
+TMEM load (LDTM)                  4        40      -36   ← THE BIG ONE
+  LDTM.x64                        4         0       +4
+  LDTM.x16                        0        40      -40
+MMA commit (UTCBAR)               2         7       -5
+TMEM fence                       16         1      +15
+R2UR                             26       428     -402   (F28 unroll descriptor cost)
+ELECT                            12        45      -33
+PLOP3                            21       171     -150
+F2FP (BF16 pack)                128       256     -128   (CUTLASS: pack once after FP32 math)
+FMUL (FP32)                     258         0     +258   (CUTLASS epilogue in FP32)
+FFMA (FP32)                     256         0     +256
+HFMA2 (BF16)                     15       130     -115   (our epilogue in BF16)
+HADD2 (BF16)                      0       126     -126
+STS                               36        67      -31
+LDS                               81        70      +11
+STG                                0        64      -64   (CUTLASS: TMA stores only, 0 STG)
+LDG                                5        64      -59
+SYNCS (barrier)                  258        92     +166
+NANOSLEEP                         45        18      +27
+IMAD                             235       316      -81
+Total static instructions       3224      2832     +392
+```
+
+### Key findings
+
+**1. TMEM load width — the actionable lead.**
+CUTLASS uses `LDTM.x64` for 256-col output: **4 loads** covering all 256 columns, each reading 64 cols into 64 registers. Our kernel uses `LDTM.x16` (tcgen05.ld 32dp32b): **40 loads** at 16 cols each. That's 10× more TMEM load instructions, each with a ~200-cycle `tcgen05.wait::ld` fence.
+
+The wider load shape (x32 or x64) reduces the number of fence stalls proportionally. CUTLASS 256×128 uses x32 (4 loads for 128 cols), CUTLASS 256×256 uses x64 (4 loads for 256 cols). The register cost is real (64 regs per LDTM.x64 vs 16 per x16), but CUTLASS at 192 regs manages it easily. Our kernel at 243 regs would need to free ~48 registers to afford x64 — but x32 (32 regs per load, 8 loads for 256 cols) is plausible and would still halve our TMEM load count.
+
+This is directly related to F32's finding that TMEM latency is fixed per instruction (~200 cycles). x32 → 8 loads × 200 cycles ≈ 1600 cycles vs current 20 loads × 200 cycles ≈ 4000 cycles (×2 for double-buffer). The math says x32 could cut Phase 1 by ~50%. The constraint is register pressure.
+
+**2. R2UR explosion from F28 manual unroll.**
+428 R2UR in our kernel vs 26 in CUTLASS. F28 fully unrolls 24 MMA instructions with per-iteration descriptor setup → ~18 R2UR per MMA. CUTLASS keeps 2 MMA in a loop body → only 13 R2UR total per K-iteration. The 402 extra R2UR are part of why our register count is so high. Reverting to a looped K-loop (sacrificing the F28 descriptor precomputation) would free significant registers.
+
+**3. CUTLASS does epilogue math in FP32, we do BF16.**
+CUTLASS: LDTM.x64 → FP32 FMUL+FFMA → F2FP pack to BF16 → TMA store.
+Us: LDTM.x16 → F2FP pack to BF16 → HFMA2+HADD2 in BF16 → STS → LDS+STG.
+
+CUTLASS has 258 FMUL + 256 FFMA = 514 FP32 ops but only 128 F2FP packs (pack once at the end). We have 256 F2FP + 130 HFMA2 + 126 HADD2 = 512 ops but pack per-load (4× more F2FP). The FP32 approach requires more register space but produces higher precision intermediate results and packs only once.
+
+**4. Zero STG in CUTLASS — all TMA stores.**
+CUTLASS uses `SM90_TMA_STORE` for all output writes (0 STG instructions). We use 64 STG.E.64 (Phase 2A manual stores from staging_a) + 2 TMA tensor stores (Phase 2B from staging_b). The 64 STG contribute to our Phase 2A/L1 contention.
+
+**5. Static vs dynamic instruction count.**
+CUTLASS has +392 more static instructions (3224 vs 2832), but CUTLASS uses a **loop** (2 MMA per iteration × 12 iterations for K=768/TK=64). Our kernel is **fully unrolled** (24 MMA in-line, 6 iterations × 4 per iter). The overhead-per-MMA metric (1611 vs 117) is misleading — CUTLASS re-executes its loop body 12 times, giving a much higher *dynamic* instruction count per tile.
+
+### Tools
+
+```bash
+# Build all tile configs:
+make cutlass-sweep
+
+# Dump SASS for comparison:
+make cutlass-sass-all
+
+# Compare any two SASS dumps:
+python3 compare_sass.py sass/cutlass_256x256x64.txt sass/custom_kernel.txt
+```
+
+---
+
+## CUTLASS competitive benchmark — the fight ahead
+
+The SASS analysis shows CUTLASS and our kernel make fundamentally different tradeoffs. Neither is strictly better — they're playing different games:
+
+| Dimension | CUTLASS | Custom kernel | Who wins |
+|-----------|---------|---------------|----------|
+| TMEM loads | 4 × x64 | 40 × x16 | CUTLASS (10× fewer fence stalls) |
+| Registers | 192 | 243 | CUTLASS (higher occupancy possible) |
+| Epilogue fusion | LinearCombination (beta=1) | Hand-fused bias+pos_embed | Custom (tighter integration) |
+| K-loop | Looped (2 MMA/iter) | Unrolled (24 MMA total) | Custom (less loop overhead dynamically) |
+| Output stores | TMA-only (0 STG) | 64 STG + 2 TMA | CUTLASS (cleaner store path) |
+| Epilogue precision | FP32 | BF16 | CUTLASS (higher precision, single pack) |
+| Scheduling | Auto (CUTLASS heuristics) | Hand-tuned warp specialization | Unknown (need runtime) |
+
+**What we need:** A proper head-to-head runtime comparison on B200. The old `cutlass_bench.cu` was broken (MXFP8 instead of per-tensor FP8 — different MMA instruction entirely). The new bench uses the correct `OpClassTensorOp` + `float_e4m3_t` path that matches cuBLAS's per-tensor mode and our kernel's `tcgen05.mma.kind::f8f6f4`.
+
+**The real question:** Can CUTLASS's epilogue (4 × LDTM.x64, FP32 math, TMA stores) beat our hand-tuned epilogue (40 × LDTM.x16, BF16 math, SMEM staging + mixed stores) when both are fused? If CUTLASS fused is faster, the x64 TMEM load width is the most likely explanation — and we should steal it.
+
+**Next steps when B200 is available:**
+1. Run `./cutlass-bench` — get CUTLASS per-tensor FP8 numbers (GEMM-only, fused, unfused)
+2. Compare CUTLASS fused vs our 0.530 ms
+3. If CUTLASS fused is competitive, investigate x32/x64 LDTM adoption in our kernel
+4. Profile CUTLASS with ncu to get per-warp epilogue cycle breakdown (are the 4 LDTM.x64 really 4 × 200 = 800 cycles vs our ~4,345?)
+
+---
+
 ## Completed experiments (F21-F28, see EXPERIMENTS.md for full details)
 
 | Experiment | Result | Key number |
