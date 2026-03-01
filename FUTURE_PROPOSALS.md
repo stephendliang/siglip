@@ -1,317 +1,299 @@
 # Future Proposals
 
-**Kernel state (2026-03-01):** F31 best fused path = 0.530 ms / 2067 TFLOPS. 236 regs, 0 spills. Per-warp Phase 1 stagger (STAGGER_CYCLES=80) reduces TMEM scheduling contention.
+**Kernel state (2026-03-01):** 0.530 ms / 2067 TFLOPS. 236 regs, 0 spills.
 **Reference:** cuBLAS pure GEMM = 0.365 ms / 3001 TFLOPS | cuBLAS + unfused pos_embed = 0.835 ms
+**CUTLASS best fused BF16 (256x256x128 2x1):** 0.536 ms / 2044 TFLOPS
 
-## The problem: Phase 1 TMEM readback dominates the epilogue
+## The problem: our epilogue architecture is needlessly complex
 
-Phase 1 is 70.6% of epilogue time (4,345 cycles). The epilogue is the binding constraint. The kernel is stuck.
+The kernel's value is fusion — the overlapped epilogue hides epilogue time behind the K-loop. This is the right idea. But the *implementation* of the epilogue is a mess of historical accidents that creates unnecessary L1 contention.
 
-**Phase 1 is ~90% TMEM_WAIT stall, ~10% compute.** Each of the 8 TMEM_LOAD_X32 instructions has ~200+ cycle latency. The `tcgen05.wait::ld` global fence blocks until ALL outstanding loads complete — no selective waiting, no multi-load pipelining within a warp. The compute between loads (~50 cycles of CVT + HADD2 + STS) fills only ~10% of the stall window.
+### What we actually compute
 
-**Equilibrium model (post-F31):**
+The epilogue computation is trivial: `D[r,c] = bf16(acc[r,c]) + combined[r,c]`
+
+That's it. One F2FP conversion, one BF16 add, per element. CUTLASS does the same thing. The computation is not the problem.
+
+### What we actually do (the problem)
+
+Each epilogue warp processes 32 rows x 256 cols. The 256 cols are split into two halves, each with a *different* staging layout and a *different* store mechanism:
+
+```
+Phase 1A:  TMEM → regs → F2FP+HADD2 → STS to staging_a (LINEAR, 272B rows, 16B pad)
+Phase 1B:  TMEM → regs → F2FP+HADD2 → STS to staging_b (SWIZZLE_128B, 128B rows)
+           ↑ interleaved with Phase 2A ↓
+Phase 2A:  LDS from staging_a → STG to global (64 st.global.v2 through L1)
+Phase 2B:  TMA tensor store from staging_b → global (2 cp.async.bulk, async, off L1)
+```
+
+Count the redundancy:
+- **Two staging buffer layouts** (linear + swizzle) for the same data type doing the same job
+- **Two store mechanisms** (64 manual STG + 2 TMA stores) writing to the same output matrix
+- **64 LDS instructions** to read back data we just wrote to SMEM, solely because staging_a can't use TMA
+- **64 LDG instructions** loading combined from global through L1, competing with everything else
+- **16B padding per row** in staging_a (272B vs 256B) to work around bank conflicts from the linear layout — a problem swizzle solves for free
+
+The Phase 2A STG instructions go through L1 and contend with TMEM reads during Phase 1B. F19a measured **~170 cycles of L1/LSU contention** from this. We're paying a performance penalty because half our output path uses the wrong SMEM layout.
+
+### Why it's this way (historical debt)
+
+Before F24, *both* halves used manual LDS+STG (Phase 2B was 899 cycles). F24 converted staging_b to swizzle + TMA stores, dropping Phase 2B to 273 cycles. But staging_a was left as-is because converting it to swizzle caused a +440 cycle Phase 1 regression (swizzle address overhead and/or register pressure). The net was still positive (+0.7%), but only because Phase 2B improved so dramatically.
+
+Result: a half-migrated architecture where one half is clean (swizzle + TMA) and the other half is legacy (linear + manual STG).
+
+### What CUTLASS does instead
+
+CUTLASS 256x256x128 BF16 epilogue (from SASS comparison):
+```
+TMA load C → SMEM (async, off L1)         0 LDG
+LDTM.x64 → 64 FP32 regs                  4 loads (vs our 40 LDTM.x16)
+LDS C from SMEM                           81 LDS
+F2FP + HFMA2                              128 F2FP + 143 HFMA2
+STS → swizzle SMEM                        36 STS
+TMA store → global                        0 STG
+```
+
+One staging layout (swizzle). One store mechanism (TMA). Zero STG. Zero LDG in the hot loop.
+The computation is the same. The memory path is cleaner.
+
+CUTLASS runs this epilogue *sequentially* after the K-loop. We overlap ours with the next K-loop. Our architecture is better in principle — we just execute it worse.
+
+### The SASS evidence
+
+```
+                              CUTLASS    Custom    Delta
+TMEM loads (LDTM)                   4        40      -36
+R2UR (descriptor setup)            26       428     -402
+F2FP (BF16 pack)                  128       256     -128
+STG (global stores)                 0        64      -64
+LDG (global loads)                  5        64      -59
+Total instructions              3032      2832     +200
+```
+
+We have fewer total instructions (2832 vs 3032) but more of the *wrong kind*. The 64 STG + 64 LDG create L1 traffic that contends with TMEM reads. CUTLASS's 0 STG + 5 LDG keeps the L1 clean.
+
+---
+
+## Equilibrium model
+
 ```
 W1:       epi_wait(1,344) + TMA0(662) + K-loop(4,059) = 6,066 cycles/tile
 Epilogue: ml_wait(1,538) + Phase1(4,345) + Phase2B(273) = 6,156 cycles/tile
-Deficit:  1,162 cycles (epilogue slower) → amplified to ~1,344-cycle epi_wait
+Deficit:  90 cycles (epilogue slower) → amplified to 1,344-cycle epi_wait
 ```
+
+W1 productive = TMA0 + K-loop = 4,721 cycles.
+Epilogue productive = Phase1 + Phase2B = 4,618 cycles.
+
+Epilogue productive is **already 103 cycles faster** than W1 productive. Yet epi_wait is 1,344 cycles because of double-buffer amplification — startup deficit compounds over tiles.
+
+**Phase transition:** if we can eliminate enough Phase 1 overhead to reliably outrun W1, epi_wait drops to ~0 and per-tile throughput drops from ~6,100 to ~4,721 cycles. That's a 22.6% reduction.
 
 **Ceilings:**
-- Eliminate epi_wait (Phase 1 ≤ K-loop+TMA0 = 4,721): ~0.43 ms / ~2,646 TFLOPS (+28%)
-- Also eliminate TMA0 (impossible — A-matrix DRAM latency): ~0.36 ms / ~3,077 TFLOPS (cuBLAS territory)
-
-Phase 1 must drop ~376 cycles to reach equilibrium. Every 100-cycle Phase 1 reduction yields ~120-cycle wall clock improvement (due to deficit amplification).
-
-**Per-warp asymmetry (post-F31, STAGGER=80):**
-```
-W2 (rg=0):  avg=4,284  p95=5,581
-W3 (rg=1):  avg=4,345  p95=5,567
-W4 (rg=2):  avg=4,553  p95=5,740  ← 269 cycles slower than W2 (was 330)
-W5 (rg=3):  avg=4,553  p95=5,617
-```
-Stagger reduced spread from 330 → 269 cycles. All warps improved. Residual asymmetry likely scheduling arbitration that stagger doesn't fully eliminate.
-
-**What is known:**
-- Phase 1 is TMEM bandwidth-limited, not instruction-bound or contention-limited (F23C: <10% contention)
-- The `tcgen05.wait::ld` global fence prevents per-load latency hiding — WAIT drains the entire TMEM read pipeline as a batch (F35 confirmed)
-- SMEM staging is mandatory (no TMEM→GMEM direct path exists in hardware)
-- Each warp independently reads its own TMEM partition (32 lanes × own columns) — no cross-warp TMEM conflicts
-- Register pressure (236/255) constrains all approaches — only 19 regs headroom (F32 showed x16 drops to 174 but the latency penalty outweighs register savings)
-- Phase 2B is solved (273 cycles via TMA tensor stores)
-- K-loop improvements alone cannot improve wall clock (equilibrium absorption)
-
-### Execution order
-
-```
-Tier 1 (attack Phase 1 directly):
-  F29 (PACK mode) ──→ REJECTED — produces zeros with 32x32b layout
-  F31 (dephasing) ──→ DONE — +0.4%, spread 330→269 cycles
-
-Tier 2 (secondary targets):
-  F32 (x16 TMEM granularity) ──→ REJECTED — 10.6% regression, fixed latency per load
-  F33 (tcgen05.cp diagnostic) ──→ RULED OUT (SMEM→TMEM only)
-  F34 (parallel TMEM load)   ──→ DIAGNOSTIC — loads pipeline, but...
-  F35 (software-pipelined readback) ──→ REJECTED — WAIT is global fence, batch-drain port
-```
+- Eliminate epi_wait: ~0.43 ms / ~2,646 TFLOPS (+28%)
+- Also eliminate TMA0 (impossible — A-matrix DRAM latency): ~0.36 ms / ~3,077 TFLOPS
 
 ---
 
-## Go/no-go template
+## F38: Unified epilogue — eliminate Phase 2A entirely
 
-Every proposal below uses this format:
+**Effort:** 8-12 hours
+**Expected impact:** Phase 1 saves ~170 cycles (L1 contention elimination). Possible equilibrium phase transition → 2,300-2,600 TFLOPS. If transition doesn't occur: ~2,100-2,200 TFLOPS.
 
+### Thesis
+
+Don't fix staging_a. Delete it. Process all 256 cols through swizzle staging, store everything via TMA. No Phase 2A, no dual-staging, no LDS+STG.
+
+### Current vs proposed
+
+**Current (asymmetric, two store paths):**
 ```
-**Go/no-go:**
-- Success: [metric] improves by ≥[threshold]
-- Fail-fast: if [quick check] shows [condition], abort
-- Max effort: [hours]
-- Rollback: revert to [commit/state]
-```
-
----
-
-## F29: PACK_16b_IN_32b TMEM load mode — DIAGNOSTIC
-
-**Effort:** Low (change TMEM_LOAD_X32 macro, adjust downstream consumer code)
-**Expected impact:** Eliminates 128 CVT instructions per Phase 1, halves TMEM readback register pressure (32 → 16 regs). Could unlock unroll 4 or other register-gated optimizations.
-**Risk:** The PACK mode may not perform FP32→BF16 conversion on read — it may only work with natively 16-bit TMEM data (which we don't have, since FP8 MMA always accumulates to FP32).
-
-**Rationale:** The `tcgen05.ld` instruction supports a `PACK_16b_IN_32b` option that packs two 16-bit values into each 32-bit register during the load. If this performs FP32→BF16 conversion during the TMEM read, each `TMEM_LOAD_X32` would produce 16 BF16x2 registers instead of 32 FP32 registers. The downstream code becomes:
-
-```
-Current:  TMEM_LOAD_X32 → 32 FP32 regs → cvt.rn.bf16x2.f32 (×16) → hadd2 (×16) → STS_V4 (×4)
-With PACK: TMEM_LOAD_X32.PACK → 16 BF16x2 regs → hadd2 (×16) → STS_V4 (×4)
+Phase 1A: TMEM → CVT+ADD → STS staging_a (linear)     [128 cols]
+Phase 1B: TMEM → CVT+ADD → STS staging_b (swizzle)    [128 cols]
+          ↕ interleaved with Phase 2A: LDS staging_a → STG global (64 STG, L1 traffic)
+Phase 2B: TMA store staging_b → global                 [128 cols, during next K-loop]
 ```
 
-This eliminates 16 CVT instructions per iteration × 8 iterations = 128 CVT instructions per Phase 1. More importantly, it halves the TMEM readback register footprint (32 → 16 registers live after each load). This could allow `#pragma unroll 4` (full unroll) at ~229 regs instead of the current 235, or enable other register-constrained optimizations.
-
-**The uncertainty:** The PTX ISA documents `PACK_16b_IN_32b` on `tcgen05.ld` shapes, but it's unclear whether this works with FP32 accumulators. If PACK only works with natively 16-bit TMEM data (e.g., from an FP16 MMA accumulator), it's inapplicable. The diagnostic must determine:
-1. Does `tcgen05.ld.sync.aligned.32x32b.x32.pack` compile for our FP32 accumulator TMEM?
-2. If so, does it produce correct BF16x2 values (not garbage from raw bit reinterpretation)?
-3. What is the register count impact?
-4. What is the cycle impact on Phase 1?
-
-**Implementation:**
-1. Modify `TMEM_LOAD_X32` macro to add `.pack` suffix (or use the PTX `PACK_16b_IN_32b` qualifier)
-2. Change output registers from `a0..a31` (32 × FP32) to `p0..p15` (16 × BF16x2)
-3. Remove the 16 × `cvt_add_bf16x2` calls, replace with 16 × `__hadd2(p_i, comb_i)`
-4. Adjust STS_V4 to write the BF16x2 values directly
-
-**If PACK doesn't exist for FP32 accumulators:** Try the `tcgen05.ld.sync.aligned.32x32b.x16` variant (half the columns per load, 16 iterations instead of 8). This doesn't eliminate CVT but creates finer-grained TMEM_WAIT windows, which is the thesis of F32.
-
-**Go/no-go:**
-- Success: PACK mode compiles, produces correct BF16x2 output, register count drops ≥10
-- Fail-fast: if PACK doesn't compile or produces incorrect values, abort immediately
-- Max effort: 2 hours
-- Rollback: revert TMEM_LOAD_X32 macro
-
----
-
-## F30: Staging_b swizzle address precomputation — NO-OP (compiler already hoisted)
-
-**Result:** Identical SASS. nvcc `-O3` already hoists all loop-invariant swizzle computations. Source change kept as cleanup (5→3 lines per iteration). See EXPERIMENTS.md for SASS diff details.
-
-**Key insight:** The +440 cycle Phase 1 regression from F24 is NOT from redundant address computation. The cost is intrinsic to the swizzle XOR operations and/or register pressure effects.
-
----
-
-## F31: Dephasing revisited (per-warp stagger) — DONE (+0.4%)
-
-**Result: 0.530 ms / 2067 TFLOPS**, 236 regs, 0 spills. STAGGER_CYCLES=80.
-
-**Diagnostic (rg-swap):** Swapped W2↔W4 row_group assignments. Timing followed warp ID (W2 stayed fast, W4 stayed slow regardless of which row_group they processed). **Root cause = scheduling contention** (hypothesis 3), not structural TMEM column or SMEM address effects.
-
-**Stagger sweep:** `clock64()` spin of `ew * STAGGER_CYCLES` after mbar_wait, before Phase 1.
-
-| STAGGER | Wall clock | TFLOPS |
-|---|---|---|
-| 0 | 0.532 ms | 2059 |
-| 50 | 0.531 ms | 2063 |
-| **80** | **0.530 ms** | **2067** |
-| 100 | 0.530 ms | 2065 |
-| 200 | 0.532 ms | 2060 |
-
-Phase 1 avg: 4,569 → 4,345 (-224 cycles, -4.9%). Per-warp spread: 330 → 269 (-18%). All warps improved. ml_wait increased +169 cycles (stagger shifts epilogue start later), partially offsetting the Phase 1 gain.
-
----
-
-## F32: TMEM x16 granularity re-evaluation — REJECTED (10.6% regression)
-
-**Result: 0.586 ms / 1868 TFLOPS** — 10.6% regression vs 0.530 ms baseline. 174 regs (-62), 0 spills. Checksum correct.
-
-**Answer to the key question:** TMEM load latency is **fixed per instruction** (~200 cycles), not proportional to data volume. `tcgen05.ld.x16` takes roughly the same time per load as x32 but moves half the data. Doubling the load count (8→16) adds ~56 µs wall clock.
-
-**Confirmed at two operating points:** F8 (1433 TFLOPS, no staging) and F32 (2067 TFLOPS, full staging + interleaving). x32 is definitively the optimal TMEM load granularity.
-
-**Key insight:** The 62-register savings (236→174) are real but irrelevant — no register-gated optimization can overcome the 2× fixed-latency penalty. Phase 1 optimization must reduce the number of `tcgen05.ld` instructions, not their granularity.
-
----
-
-## F33: tcgen05.cp TMEM→SMEM async copy — RULED OUT (SMEM→TMEM only)
-
-**Result:** Killed by ISA research. `tcgen05.cp` is architecturally SMEM→TMEM only — no hardware path exists for TMEM→SMEM. No code changes.
-
-**Evidence (3 independent sources):**
-1. **CUTLASS**: Has `make_s2t_copy()` (SMEM-to-TMEM) but NO `make_t2s_copy()`. No `SM100_TMEM_LOAD` copy traits use `tcgen05.cp`. All epilogue code uses `tcgen05.ld`.
-2. **Colfax tutorial**: "data gets _into_ TMEM via UMMA operations, and is explicitly moved _out_ to registers using `tcgen05.ld`." Explicitly skips `tcgen05.cp` as irrelevant to epilogue.
-3. **JAX/Pallas docs**: "only way to move data out from tensor memory is through `tcgen05.ld`"
-
-**Conclusion:** The only way to read accumulators out of TMEM is `tcgen05.ld` (TMEM→registers). Phase 1 optimization must work within this constraint.
-
----
-
-## F36: SASS Static Analysis — CUTLASS vs Custom Kernel
-
-**Effort:** Low (compile + cuobjdump, no GPU needed)
-**Type:** Diagnostic / competitive benchmark
-
-Rebuilt `cutlass_bench.cu` from scratch: per-tensor FP8 E4M3 (`OpClassTensorOp` + `float_e4m3_t`) instead of the old broken MXFP8 bench (`OpClassBlockScaledTensorOp`). Added configurable tile/cluster shapes, fused epilogue via `LinearCombination` (beta=1 loads C = tiled combined tensor), and multiple tile configs for sweep. Compiled all configs and dumped SASS via `cuobjdump --dump-sass` for static analysis.
-
-### ptxas register comparison
-
-| Config | Regs | Spills | Barriers | TMEM load shape |
-|--------|------|--------|----------|-----------------|
-| CUTLASS 256×128×64 | **120** | 0 | 7 | LDTM.x32 (32dp32b) |
-| CUTLASS 256×256×64 | **192** | 0 | 7 | LDTM.x64 (32dp64b) |
-| Custom kernel | **243** | 0 | 0 | LDTM.x16 (32dp32b) |
-
-CUTLASS at 120 regs (256×128) can run 2 CTAs/SM — much higher occupancy. At 256×256, CUTLASS uses 192 regs (still 51 below ours).
-
-### SASS instruction comparison (256×256 configs, closest tile match)
-
+**Proposed (symmetric, one store path):**
 ```
-Category                     CUTLASS    Custom    Delta
-─────────────────────────    ───────    ──────    ─────
-MMA (UTCQMMA)                     2        24      -22   (CUTLASS loops, we unroll)
-TMEM load (LDTM)                  4        40      -36   ← THE BIG ONE
-  LDTM.x64                        4         0       +4
-  LDTM.x16                        0        40      -40
-MMA commit (UTCBAR)               2         7       -5
-TMEM fence                       16         1      +15
-R2UR                             26       428     -402   (F28 unroll descriptor cost)
-ELECT                            12        45      -33
-PLOP3                            21       171     -150
-F2FP (BF16 pack)                128       256     -128   (CUTLASS: pack once after FP32 math)
-FMUL (FP32)                     258         0     +258   (CUTLASS epilogue in FP32)
-FFMA (FP32)                     256         0     +256
-HFMA2 (BF16)                     15       130     -115   (our epilogue in BF16)
-HADD2 (BF16)                      0       126     -126
-STS                               36        67      -31
-LDS                               81        70      +11
-STG                                0        64      -64   (CUTLASS: TMA stores only, 0 STG)
-LDG                                5        64      -59
-SYNCS (barrier)                  258        92     +166
-NANOSLEEP                         45        18      +27
-IMAD                             235       316      -81
-Total static instructions       3224      2832     +392
+Phase 1:  TMEM → CVT+ADD → STS staging (swizzle, 4 regions of 32x64 BF16)  [256 cols]
+Phase 2:  TMA store staging → global (4 cp.async.bulk, during next K-loop)  [256 cols]
 ```
 
-### Key findings
+### What this eliminates
 
-**1. TMEM load width — the actionable lead.**
-CUTLASS uses `LDTM.x64` for 256-col output: **4 loads** covering all 256 columns, each reading 64 cols into 64 registers. Our kernel uses `LDTM.x16` (tcgen05.ld 32dp32b): **40 loads** at 16 cols each. That's 10× more TMEM load instructions, each with a ~200-cycle `tcgen05.wait::ld` fence.
+| Removed | Count | Why it existed |
+|---------|-------|----------------|
+| STG (st.global) | 64 | Phase 2A manual stores (staging_a not TMA-compatible) |
+| LDS (ld.shared) | ~32 | Phase 2A reads from staging_a |
+| staging_a buffer | 8,704 B/warp | Linear layout, bank-conflict pad, can't use TMA |
+| L1 contention | ~170 cycles | STG during Phase 1B competes with TMEM reads |
+| Phase 2A interleaving | all | No longer needed — nothing to interleave |
 
-The wider load shape (x32 or x64) reduces the number of fence stalls proportionally. CUTLASS 256×128 uses x32 (4 loads for 128 cols), CUTLASS 256×256 uses x64 (4 loads for 256 cols). The register cost is real (64 regs per LDTM.x64 vs 16 per x16), but CUTLASS at 192 regs manages it easily. Our kernel at 243 regs would need to free ~48 registers to afford x64 — but x32 (32 regs per load, 8 loads for 256 cols) is plausible and would still halve our TMEM load count.
+### What this adds
 
-This is directly related to F32's finding that TMEM latency is fixed per instruction (~200 cycles). x32 → 8 loads × 200 cycles ≈ 1600 cycles vs current 20 loads × 200 cycles ≈ 4000 cycles (×2 for double-buffer). The math says x32 could cut Phase 1 by ~50%. The constraint is register pressure.
+| Added | Count | Cost |
+|-------|-------|------|
+| TMA stores | +2 (2→4) | ~130 extra cycles in Phase 2, fully overlapped with K-loop |
+| Swizzle XOR per STS | same | Already done for staging_b; extending to all 256 cols |
 
-**2. R2UR explosion from F28 manual unroll.**
-428 R2UR in our kernel vs 26 in CUTLASS. F28 fully unrolls 24 MMA instructions with per-iteration descriptor setup → ~18 R2UR per MMA. CUTLASS keeps 2 MMA in a loop body → only 13 R2UR total per K-iteration. The 402 extra R2UR are part of why our register count is so high. Reverting to a looped K-loop (sacrificing the F28 descriptor precomputation) would free significant registers.
+### SMEM layout
 
-**3. CUTLASS does epilogue math in FP32, we do BF16.**
-CUTLASS: LDTM.x64 → FP32 FMUL+FFMA → F2FP pack to BF16 → TMA store.
-Us: LDTM.x16 → F2FP pack to BF16 → HFMA2+HADD2 in BF16 → STS → LDS+STG.
+4 swizzle regions per warp, each 32 rows x 64 cols x 2 bytes = 4,096 bytes:
+- Per warp: 4 x 4,096 = 16,384 bytes
+- 4 warps: 65,536 bytes
 
-CUTLASS has 258 FMUL + 256 FFMA = 514 FP32 ops but only 128 F2FP packs (pack once at the end). We have 256 F2FP + 130 HFMA2 + 126 HADD2 = 512 ops but pack per-load (4× more F2FP). The FP32 approach requires more register space but produces higher precision intermediate results and packs only once.
+Current staging: 4 x 16,896 = 67,584 bytes. **New staging is 2,048 bytes smaller** — the 16B/row linear padding in staging_a is gone.
 
-**4. Zero STG in CUTLASS — all TMA stores.**
-CUTLASS uses `SM90_TMA_STORE` for all output writes (0 STG instructions). We use 64 STG.E.64 (Phase 2A manual stores from staging_a) + 2 TMA tensor stores (Phase 2B from staging_b). The 64 STG contribute to our Phase 2A/L1 contention.
+### Why F24's +440 cycle regression doesn't apply
 
-**5. Static vs dynamic instruction count.**
-CUTLASS has +392 more static instructions (3224 vs 2832), but CUTLASS uses a **loop** (2 MMA per iteration × 12 iterations for K=768/TK=64). Our kernel is **fully unrolled** (24 MMA in-line, 6 iterations × 4 per iter). The overhead-per-MMA metric (1611 vs 117) is misleading — CUTLASS re-executes its loop body 12 times, giving a much higher *dynamic* instruction count per tile.
+F24 converted staging_a to swizzle but *kept Phase 2A* (LDS + STG from the now-swizzled staging_a). The regression was from the combination of swizzle STS + swizzle LDS in the same Phase 1B loop, plus possible register pressure from holding swizzle constants for both buffers simultaneously.
 
-### Tools
+The proposed redesign has no Phase 2A at all. During the TMEM stall windows in Phase 1, the only work is combined LDG (~50 cycles, L2-cached). The stall windows are "wasted" but **uncontended** — no L1 traffic from STG means TMEM reads face no contention.
 
-```bash
-# Build all tile configs:
-make cutlass-sweep
+The trade-off: we lose ~100 cycles of useful Phase 2A work that filled TMEM stall windows, but we save ~170 cycles of L1 contention that Phase 2A caused. Net: ~70 cycles Phase 1 reduction, plus whatever the swizzle STS overhead is for the staging_a half (should be small — one XOR per store, F30 confirmed compiler hoists loop-invariant swizzle math).
 
-# Dump SASS for comparison:
-make cutlass-sass-all
+### The phase transition math
 
-# Compare any two SASS dumps:
-python3 compare_sass.py sass/cutlass_256x256x64.txt sass/custom_kernel.txt
+Current deficit: epilogue 90 cycles slower than W1 per tile.
+Phase 1 reduction needed to flip: >90 cycles.
+Expected Phase 1 reduction: 70-170 cycles (conservative to optimistic).
+
+If it flips:
+- epi_wait drops from 1,344 to ~0
+- Per-tile time drops from ~6,100 to ~4,721 cycles
+- Wall clock: ~0.43 ms / ~2,646 TFLOPS
+
+If it doesn't quite flip (70-cycle reduction, deficit shrinks but doesn't invert):
+- Per the amplification model: 70 cycles Phase 1 → ~84 cycles wall clock/tile
+- Wall clock: ~0.52 ms / ~2,106 TFLOPS
+
+**Range: 2,100-2,600 TFLOPS. Binary outcome depending on equilibrium flip.**
+
+### Phase 2 budget
+
+Current Phase 2B: 2 TMA stores in 273 cycles (during 4,059-cycle K-loop — 93% margin).
+Proposed Phase 2: 4 TMA stores in ~400 cycles (during 4,059-cycle K-loop — 90% margin).
+
+TMA stores are fully async and overlap with the K-loop via early mbar_arrive. The extra 2 stores are free.
+
+### Implementation
+
+1. Replace `staging_a` + `staging_b` with 4 identical swizzle regions per warp (32x64 BF16, SWIZZLE_128B)
+2. Phase 1: loop over 8 x32 TMEM chunks (256 cols / 32), each chunk → CVT+ADD → STS to the appropriate swizzle region
+3. Remove Phase 2A interleaving from the Phase 1B loop
+4. syncwarp after Phase 1 complete
+5. Early mbar_arrive (same as current — signals TMEM buffer free)
+6. Phase 2: 4 TMA tensor stores from 4 staging regions (lane==0)
+7. Create TMA tensor map for output C with SWIZZLE_128B matching staging layout
+
+### Interaction with x32 TMEM loads (F39)
+
+This proposal assumes x32 TMEM loads (available via LOAD_32_COLS when TMEM_LOAD_WIDTH=32; not the current default). Combining with F39 (switch default to x32, remove x16 codepath) simplifies the implementation — one TMEM load width, one staging layout, one store path.
+
+### Go/no-go
+
+- Success: wall clock ≤ 0.510 ms (≥ 2,148 TFLOPS, +4% over baseline)
+- Stretch goal: wall clock ≤ 0.476 ms (≥ 2,300 TFLOPS, equilibrium flip)
+- Fail-fast: if Phase 1 cycle count increases (swizzle overhead > contention savings), abort
+- Fail-fast: if register count exceeds 250 (too close to ceiling), abort
+- Max effort: 12 hours
+- Rollback: revert to current dual-staging architecture
+
+---
+
+## F39: Default to x32 TMEM loads — code cleanup
+
+**Effort:** 1 hour
+**Expected impact:** Zero wall clock change. Cleaner code, fewer SASS instructions.
+
+### Rationale
+
+F37 proved x16/x32/x64 TMEM loads are statistically identical in wall clock (p=0.617). The LOAD_32_COLS macro already uses x32 when TMEM_LOAD_WIDTH=32, but the default is x16 (two TMEM_LOAD x16 instructions per 32-col chunk).
+
+x32 halves the static instruction count in the epilogue:
+- LDTM: 40 → 20 (half the load instructions)
+- R2UR: ~428 → ~214 (half the descriptor setup)
+- ELECT: ~45 → ~23
+- PLOP3: ~171 → ~86
+
+Register count may drop modestly (fewer R2UR temporaries). No wall clock change expected — R2UR and LDTM overhead is hidden in TMEM stall windows.
+
+### Implementation
+
+1. Change `#define TMEM_LOAD_WIDTH 16` → `#define TMEM_LOAD_WIDTH 32` (line 20)
+2. Optionally: remove the x16 codepath from LOAD_32_COLS (dead code elimination)
+3. Keep TMEM_LOAD_X64 and the x64 codepath for reference/future use
+
+### Interaction with F38
+
+Do F39 first. It simplifies the codebase before the larger F38 restructuring and establishes x32 as the baseline.
+
+### Go/no-go
+
+- Success: wall clock unchanged (within measurement noise ±0.003 ms), checksum correct
+- Bonus: register count drops (any amount)
+- Fail-fast: wall clock regresses by >0.005 ms → revert
+- Max effort: 1 hour
+- Rollback: change one `#define` back
+
+---
+
+## Execution order
+
+```
+F39 (x32 default)  ──→  F38 (unified epilogue)
+     1 hour                  8-12 hours
+     code cleanup            the real bet
 ```
 
----
-
-## CUTLASS competitive benchmark — the fight ahead
-
-The SASS analysis shows CUTLASS and our kernel make fundamentally different tradeoffs. Neither is strictly better — they're playing different games:
-
-| Dimension | CUTLASS | Custom kernel | Who wins |
-|-----------|---------|---------------|----------|
-| TMEM loads | 4 × x64 | 40 × x16 | CUTLASS (10× fewer fence stalls) |
-| Registers | 192 | 243 | CUTLASS (higher occupancy possible) |
-| Epilogue fusion | LinearCombination (beta=1) | Hand-fused bias+pos_embed | Custom (tighter integration) |
-| K-loop | Looped (2 MMA/iter) | Unrolled (24 MMA total) | Custom (less loop overhead dynamically) |
-| Output stores | TMA-only (0 STG) | 64 STG + 2 TMA | CUTLASS (cleaner store path) |
-| Epilogue precision | FP32 | BF16 | CUTLASS (higher precision, single pack) |
-| Scheduling | Auto (CUTLASS heuristics) | Hand-tuned warp specialization | Unknown (need runtime) |
-
-**What we need:** A proper head-to-head runtime comparison on B200. The old `cutlass_bench.cu` was broken (MXFP8 instead of per-tensor FP8 — different MMA instruction entirely). The new bench uses the correct `OpClassTensorOp` + `float_e4m3_t` path that matches cuBLAS's per-tensor mode and our kernel's `tcgen05.mma.kind::f8f6f4`.
-
-**The real question:** Can CUTLASS's epilogue (4 × LDTM.x64, FP32 math, TMA stores) beat our hand-tuned epilogue (40 × LDTM.x16, BF16 math, SMEM staging + mixed stores) when both are fused? If CUTLASS fused is faster, the x64 TMEM load width is the most likely explanation — and we should steal it.
-
-**Next steps when B200 is available:**
-1. Run `./cutlass-bench` — get CUTLASS per-tensor FP8 numbers (GEMM-only, fused, unfused)
-2. Compare CUTLASS fused vs our 0.530 ms
-3. If CUTLASS fused is competitive, investigate x32/x64 LDTM adoption in our kernel
-4. Profile CUTLASS with ncu to get per-warp epilogue cycle breakdown (are the 4 LDTM.x64 really 4 × 200 = 800 cycles vs our ~4,345?)
+F39 is a no-risk cleanup. F38 is the only remaining proposal with a realistic path to 2,300+ TFLOPS.
 
 ---
 
-## Completed experiments (F21-F28, see EXPERIMENTS.md for full details)
+## Completed experiments
 
-| Experiment | Result | Key number |
-|-----------|--------|-----------|
-| F25 ✅ | Diagnostic: symmetric + mild fat tail | 172-cycle spread (pre-F24) |
+| Exp | Result | Key number |
+|-----|--------|-----------|
+| F25 ✅ | Per-warp timing diagnostic | 172-cycle spread |
 | F21 ✗ | B already L2-resident | 7-cycle difference (noise) |
-| F22 ✅ | BF16 epilogue arithmetic | +1.3%, 229 regs, -1480 SASS instructions |
-| F23C ✗ | 2-warp epilogue contention test | TMEM contention <10%, 42% regression |
+| F22 ✅ | BF16 epilogue arithmetic | +1.3%, 229 regs |
+| F23C ✗ | 2-warp epilogue contention | TMEM contention <10%, 42% regression |
 | F28 ✅ | K-loop restructuring | perf-neutral, -76 cyc K-loop |
-| F24 ✅ | Swizzled staging + TMA tensor stores | +0.7%, Phase 2B -626 cycles, Phase 1 +440 cycles |
-| F30 — | Swizzle address precomputation | no-op — compiler already hoisted; source cleanup only |
-| F31 ✅ | Per-warp Phase 1 stagger | +0.4%, STAGGER=80, contention confirmed via rg-swap diagnostic |
-| F32 ✗ | x16 TMEM loads — fixed latency per load | 0.586 ms, 10.6% regression, 174 regs |
-| F33 ✗ | tcgen05.cp is SMEM→TMEM only | No code — ruled out by ISA research |
-| F34 — | Parallel TMEM load diagnostic | 0.531 ms, loads pipeline (2×x16 ≈ 1×x32) |
-| F35 ✗ | Software-pipelined TMEM readback | 0.540–0.542 ms, WAIT is batch-drain, not per-load |
+| F24 ✅ | Swizzled staging_b + TMA stores | +0.7%, Phase 2B 899→273 cycles, Phase 1 +440 |
+| F29 ✗ | PACK_16b_IN_32b TMEM load | Produces zeros with 32x32b layout |
+| F30 — | Swizzle address precompute | No-op, compiler hoists already |
+| F31 ✅ | Per-warp stagger | +0.4%, STAGGER=80, spread 330→269 |
+| F32 ✗ | x16 TMEM granularity | 10.6% regression, 174 regs |
+| F33 ✗ | tcgen05.cp readback | SMEM→TMEM only, ruled out |
+| F34 — | Parallel TMEM load diagnostic | Loads pipeline (2×x16 ≈ 1×x32) |
+| F35 ✗ | Software-pipelined readback | WAIT is global fence, batch-drain |
+| F36 — | SASS static analysis (CUTLASS vs custom) | See above |
+| F37 — | TMEM load width x16/x32/x64 | Identical wall clock (p=0.617) |
 
 ---
 
-## Ruled out (see EXPERIMENTS.md for full details)
+## Ruled out
 
 | Proposal | Why dead |
 |----------|----------|
-| Next-tile TMA prefetch (F20) | ~0% — DRAM bandwidth, not scheduling. Prefetch shifts TMA issue by ~20 cycles vs 818-cycle shortfall. |
-| cp.async.bulk Phase 2B stores (F19b) | 3× slower than manual stores. **Superseded by F24** (TMA tensor stores). |
-| 5-stage pipeline | SMEM-limited: 5-stage = 163 KB pipeline → only 65 KB for staging (needs 68 KB). |
-| TMA multicast for B | B is N-split across CTAs (each loads different half). Zero redundancy. |
-| L2 promotion/persistence for B (F21, F26) | B already fully L2-resident. TMA0_wait is pure A-matrix DRAM latency. |
-| Epilogue warp count (F23) | TMEM contention <10% of Phase 1. 2 warps: 1.85x per-warp Phase 1. All variants ruled out. |
-| TN=128 | 2× tiles, same per-tile overhead, 11.4% regression. Definitively ruled out. |
-| Combined load L1 bypass | Blocked layout already gives near-perfect L1 locality. All bypass variants regressed. |
-| Direct CVT_STG stores (F17) | Uncoalesced st.global.v8 contends with TMEM reads on L1. Phase 1 +19%. |
-| 6 epilogue warps (F3) | TMEM bandwidth saturation. |
-| Split TMEM loads x32→2×x16 (F1) | tcgen05.wait::ld is a global fence — waits for ALL loads. Split adds overhead without reducing wait. |
-| x16 TMEM load granularity (F32) | Fixed ~200-cycle latency per `tcgen05.ld` regardless of data volume. x16 = 2× loads = 10.6% regression. Confirmed at two operating points (F8 + F32). |
-| Software-pipelined TMEM readback (F35) | `tcgen05.wait::ld` is a global fence with batch-drain behavior. Separating loads in time does not create independent completion. Two variants tested (doubled WAITs: 220 regs, 0.540 ms; same WAITs split LOADs: 244 regs, 0.542 ms). Both regressed vs 0.536 ms baseline. TMEM port processes outstanding loads as a batch — no per-load latency hiding possible. |
-| Register-staged transpose (warp shuffle) | Would need 32+ extra registers (exceeds 255 limit). 160 shuffles per 32-col chunk ≈ SMEM staging cost. |
-| SMEM staging elimination | F17 proved L1 contention. SMEM transpose is mandatory for coalesced global stores. |
-| tcgen05.cp epilogue readback (F33) | tcgen05.cp is SMEM→TMEM only. No hardware path for TMEM→SMEM. Only tcgen05.ld (TMEM→registers) can read accumulators out. |
-| Tile shape changes (TM, TN, TK) | All directions hardware-limited: TMEM (512 col) caps TN, SMEM (228 KB) caps TM and TK. |
-| Split-K | TMEM double-buffering precludes second accumulator. GPU already fully occupied (10,878 tiles on 74 clusters). |
-| Warp role restructuring (W1 helps epilogue) | TMEM is per-SM (CTA0 can't read CTA1's TMEM). Register pressure. Late arrival timing. |
-| BF16 accumulation in TMEM | Hardware mandates FP32 for FP8 MMA inputs. Even if possible, precision loss unacceptable for K=768. |
-| Triple-buffered TMEM | Only 512 TMEM columns available. TN=256 × 2 buffers = 512 (maxed). |
+| Next-tile TMA prefetch (F20) | DRAM bandwidth, not scheduling |
+| cp.async.bulk Phase 2B stores (F19b) | 3x slower. Superseded by F24 TMA tensor stores |
+| 5-stage pipeline | SMEM-limited (163 KB pipeline → only 65 KB for staging) |
+| TMA multicast for B | B is N-split across CTAs. Zero redundancy |
+| L2 promotion for B (F21, F26) | B already L2-resident. TMA0_wait is A-matrix DRAM |
+| Epilogue warp count (F23) | TMEM contention <10%. 2 warps: 42% regression |
+| TN=128 | 2x tiles, same overhead, 11.4% regression |
+| Combined load L1 bypass | Blocked layout gives near-perfect L1 locality |
+| Direct CVT_STG (F17) | st.global.v8 contends with TMEM on L1. +19% Phase 1 |
+| 6 epilogue warps (F3) | TMEM bandwidth saturation |
+| x16 TMEM loads (F32) | Fixed ~200-cycle latency per load. 2x loads = 10.6% regression |
+| Software-pipelined readback (F35) | WAIT is global fence, batch-drain. No per-load hiding |
+| Register-staged transpose | 32+ extra regs (exceeds 255). 160 shuffles ≈ SMEM cost |
+| SMEM staging elimination (F17) | L1 contention. SMEM staging mandatory |
+| tcgen05.cp readback (F33) | SMEM→TMEM only. No TMEM→SMEM path in hardware |
+| Tile shape changes | TMEM caps TN, SMEM caps TM and TK |
+| Split-K | TMEM double-buffering precludes second accumulator |
+| W1 helps epilogue | TMEM per-SM, register pressure, late arrival |
+| BF16 accumulation | Hardware mandates FP32 for FP8 inputs |
+| Triple-buffered TMEM | 512 cols = TN*2 buffers (maxed) |

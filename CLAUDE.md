@@ -47,7 +47,7 @@ Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1
 
 - **W0**: TMA async bulk loads (A + B tiles, both CTAs load independently)
 - **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
-- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs double-buffered SMEM-staged store: Phase 1A (first 128 cols: `tcgen05.ld` → BF16 add → CVT → `st.shared` to staging_a, linear 272B rows), `__syncwarp()`, Phase 1B+2A interleaved (second 128 cols → staging_b in SWIZZLE_128B layout, with Phase 2A coalesced `ld.shared`+`st.global.v2` from staging_a hiding in TMEM stalls), `__syncwarp()` + **early mbar_arrive** (signals TMEM free — W1 can start next K-loop while Phase 2B runs), Phase 2B (2 × `cp.async.bulk.tensor.2d` TMA tensor stores from staging_b → global C, overlapped with K-loop)
+- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs double-buffered SMEM-staged store: Phase 1A (first 128 cols: x32 `tcgen05.ld` → BF16 add → CVT → `st.shared` to staging_a, linear 272B rows), `__syncwarp()`, Phase 1B+2A interleaved (second 128 cols → staging_b in SWIZZLE_128B layout, with Phase 2A coalesced `ld.shared`+`st.global.v2` from staging_a hiding in TMEM stalls), `__syncwarp()` + **early mbar_arrive** (signals TMEM free — W1 can start next K-loop while Phase 2B runs), Phase 2B (2 × `cp.async.bulk.tensor.2d` TMA tensor stores from staging_b → global C, overlapped with K-loop)
 
 TM=128 rows / 32 rows per warp = 4 row groups. W2-W5 each own a row group (all 256 cols). No column splitting (is_split always 0). `epilogue_store` is templated on `<NC_START, NC_END>` so the compiler sees constant loop bounds and fully unrolls.
 
@@ -103,14 +103,19 @@ make timing && ./siglip_timing | tee clock64_timing.txt | python3 analyze_timing
 ncu --set source --csv ./siglip_vision > source_counters_raw.csv && python3 analyze_source_counters.py source_counters_raw.csv
 
 # CUTLASS grid search (single binary, sweeps all tile/cluster configs)
-make cutlass-bench      # ~1-2 min compile (24 CUTLASS template instantiations)
+make cutlass-bench      # ~1-2 min compile (26 CUTLASS template instantiations)
 ./cutlass-bench         # full sweep (4736 imgs, ~5 min runtime)
 ./cutlass-bench 1       # quick test (148 imgs, ~30s)
+
+# CUTLASS extended search (stronger baseline pass)
+make cutlass-bench-max  # broader tile/cluster sweep, slower compile/runtime
+./cutlass-bench-max     # use when locking baseline
+./cutlass-bench-max 1   # quick sanity pass
 ```
 
 ### CUTLASS bench details
 
-`cutlass_bench.cu` is a self-contained grid search over 12 tile/cluster configs. For each config, it measures:
+`cutlass_bench.cu` is a self-contained grid search over 13 tile/cluster configs (standard build), or 20 configs in extended mode (`-DCUTLASS_EXTENDED_SWEEP=1`). For each config, it measures:
 1. **GEMM-only** (beta=0, FP32 epilogue) — pure compute baseline
 2. **Fused FP32** (beta=1, FP32 epilogue) — `D = float(acc) + float(C)`
 3. **Fused BF16** (beta=1, BF16 epilogue) — `D = bf16(acc) + C` (matches custom kernel's cvt_add_bf16x2)

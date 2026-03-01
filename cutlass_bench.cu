@@ -10,6 +10,7 @@
 //
 // Build:  make cutlass-bench
 // Usage:  ./cutlass-bench [imgs_per_sm]
+//         make cutlass-bench-max   (extended tile sweep)
 
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +32,10 @@
 #include <cuda_bf16.h>
 
 using namespace cute;
+
+#ifndef CUTLASS_EXTENDED_SWEEP
+#define CUTLASS_EXTENDED_SWEEP 0
+#endif
 
 #define CUDA_CHECK(x) do { \
     cudaError_t e = (x); \
@@ -371,7 +376,13 @@ int main(int argc, char** argv) {
     // ── Grid search ──
     std::vector<ConfigResult> results;
 
-    printf("Sweeping 12 tile configs (GEMM-only / Fused FP32 / Fused BF16)...\n");
+#if CUTLASS_EXTENDED_SWEEP
+    constexpr int kConfigCount = 20;
+    printf("Sweeping %d tile configs (extended search, GEMM-only / Fused FP32 / Fused BF16)...\n", kConfigCount);
+#else
+    constexpr int kConfigCount = 13;
+    printf("Sweeping %d tile configs (standard search, GEMM-only / Fused FP32 / Fused BF16)...\n", kConfigCount);
+#endif
 
     // 2SM configs (cluster_m=2)
     TRY(256, 128,  64, 2, 1);
@@ -384,10 +395,24 @@ int main(int argc, char** argv) {
     TRY(128, 256, 128, 2, 1);
     TRY(256, 128,  64, 2, 2);
     TRY(256, 256,  64, 2, 2);
+    TRY(256, 256, 128, 2, 2);
 
     // 1SM configs
     TRY(128, 128,  64, 1, 1);
     TRY(128, 256,  64, 1, 1);
+
+#if CUTLASS_EXTENDED_SWEEP
+    // Extended 2SM configs (cluster_m=2, cluster_n=2)
+    TRY(256, 128, 128, 2, 2);
+    TRY(128, 128,  64, 2, 2);
+    TRY(128, 256,  64, 2, 2);
+    TRY(128, 128, 128, 2, 2);
+    TRY(128, 256, 128, 2, 2);
+
+    // Extended 1SM configs
+    TRY(128, 128, 128, 1, 1);
+    TRY(128, 256, 128, 1, 1);
+#endif
 
     // ── Sort by fused BF16 time (invalid configs last) ──
     std::sort(results.begin(), results.end(), [](const ConfigResult& a, const ConfigResult& b) {

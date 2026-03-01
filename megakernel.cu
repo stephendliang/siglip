@@ -17,7 +17,7 @@
 #define NUM_EPI_WARPS  4
 #define STAGGER_CYCLES 80   // F31: per-warp Phase 1 stagger (sweep: 50, 80, 100, 200)
 #ifndef TMEM_LOAD_WIDTH
-#define TMEM_LOAD_WIDTH 16   // 16=2×x16 per 32-col chunk (default), 32=1×x32, 64=1×x64
+#define TMEM_LOAD_WIDTH 32   // 32=1×x32 per 32-col chunk (default), 16=2×x16, 64=1×x64
 #endif
 #define THREADS        (32 * (2 + NUM_EPI_WARPS))
 #define BATCH_SIZE     4736
