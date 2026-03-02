@@ -393,16 +393,8 @@ void epilogue_store(
         + (long long)comb_block_row * COMB_COL_BLOCKS * COMB_BLOCK_ELEMS
         + comb_row_in_blk * COMB_BLOCK_COLS;
 
-    // 4 swizzle regions per warp, each 32 rows x 64 cols BF16 (SWIZZLE_128B)
-    // Only declare staging_rN when used (strategies 0 and 3) to avoid unused-variable warnings.
-#if INTERLEAVE_STRATEGY == 0
-    const uint32_t staging_r0 = staging_saddr;
-    const uint32_t staging_r1 = staging_saddr + STAGING_REGION_BYTES;
-    const uint32_t staging_r2 = staging_saddr + 2 * STAGING_REGION_BYTES;
-    const uint32_t staging_r3 = staging_saddr + 3 * STAGING_REGION_BYTES;
-#elif INTERLEAVE_STRATEGY == 3
-    const uint32_t staging_r3 = staging_saddr + 3 * STAGING_REGION_BYTES;
-#endif
+    // 4 swizzle regions per warp (unsplit) or 2 (split), each 32 rows x 64 cols BF16 (SWIZZLE_128B)
+    constexpr int N_REGIONS = (NC_END - NC_START) / 64;
 
     // Wait for previous tile's Phase 2 TMA stores before overwriting staging.
     // After ml_wait (~1,342 cycles), TMA stores are long done — this is a true no-op.
@@ -488,11 +480,12 @@ void epilogue_store(
                 asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
                     :: "l"(tma_c_desc), "r"(n_start + nc), "r"(gm_base), "r"(src1) : "memory");
             }
-        } else if (INTERLEAVE_STRATEGY == 3 && ((nc - NC_START) >> 6) == 2) {
-            // Three-plus-one: 3 stores after 3rd region
+        } else if (INTERLEAVE_STRATEGY == 3 && ((nc - NC_START) >> 6) == (N_REGIONS < 3 ? N_REGIONS - 1 : 2)) {
+            // Three-plus-one: store min(N_REGIONS, 3) regions after last inline-storable region
+            constexpr int INLINE_REGIONS = N_REGIONS < 3 ? N_REGIONS : 3;
             __syncwarp();
             if (lane == 0) {
-                for (int r = 0; r < 3; r++) {
+                for (int r = 0; r < INLINE_REGIONS; r++) {
                     uint32_t src = staging_saddr + r * STAGING_REGION_BYTES;
                     asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
                         :: "l"(tma_c_desc), "r"(n_start + NC_START + r * 64), "r"(gm_base), "r"(src) : "memory");
@@ -561,11 +554,12 @@ void epilogue_store(
                 asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
                     :: "l"(tma_c_desc), "r"(n_start + NC_START + region_idx * 64), "r"(gm_base), "r"(src1) : "memory");
             }
-        } else if (INTERLEAVE_STRATEGY == 3 && ((nc - NC_START) & 63) == 32 && ((nc - NC_START) >> 6) == 2) {
-            // Three-plus-one: 3 stores after 3rd region
+        } else if (INTERLEAVE_STRATEGY == 3 && ((nc - NC_START) & 63) == 32 && ((nc - NC_START) >> 6) == (N_REGIONS < 3 ? N_REGIONS - 1 : 2)) {
+            // Three-plus-one: store min(N_REGIONS, 3) regions after last inline-storable region
+            constexpr int INLINE_REGIONS = N_REGIONS < 3 ? N_REGIONS : 3;
             __syncwarp();
             if (lane == 0) {
-                for (int r = 0; r < 3; r++) {
+                for (int r = 0; r < INLINE_REGIONS; r++) {
                     uint32_t src = staging_saddr + r * STAGING_REGION_BYTES;
                     asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
                         :: "l"(tma_c_desc), "r"(n_start + NC_START + r * 64), "r"(gm_base), "r"(src) : "memory");
@@ -586,36 +580,35 @@ void epilogue_store(
 #endif
 
 #if INTERLEAVE_STRATEGY == 0
-    // Strategy 0 (all-at-end): original behavior — all 4 TMA stores in Phase 2
+    // Strategy 0 (all-at-end): all TMA stores in Phase 2
     __syncwarp();  // Phase 1 SMEM writes visible for Phase 2 TMA reads
 
     if (!MBAR_EARLY && epi_mbar_addr) mbar_arrive(epi_mbar_addr);
 
-    // ═══ Phase 2: 4 TMA tensor stores → global ═══
+    // ═══ Phase 2: TMA tensor stores → global (only regions that were written) ═══
     if (lane == 0) {
         int row = gm_base;
-        asm volatile(
-            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
-            :: "l"(tma_c_desc), "r"(n_start + NC_START), "r"(row), "r"(staging_r0) : "memory");
-        asm volatile(
-            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
-            :: "l"(tma_c_desc), "r"(n_start + NC_START + 64), "r"(row), "r"(staging_r1) : "memory");
-        asm volatile(
-            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
-            :: "l"(tma_c_desc), "r"(n_start + NC_START + 128), "r"(row), "r"(staging_r2) : "memory");
-        asm volatile(
-            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
-            :: "l"(tma_c_desc), "r"(n_start + NC_START + 192), "r"(row), "r"(staging_r3) : "memory");
+        #pragma unroll
+        for (int r = 0; r < N_REGIONS; r++) {
+            uint32_t src = staging_saddr + r * STAGING_REGION_BYTES;
+            asm volatile(
+                "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                :: "l"(tma_c_desc), "r"(n_start + NC_START + r * 64), "r"(row), "r"(src) : "memory");
+        }
         asm volatile("cp.async.bulk.commit_group;" ::: "memory");
     }
 #elif INTERLEAVE_STRATEGY == 3
-    // Strategy 3 (three-plus-one): 3 stores issued inline, 4th store (region 3) here
-    __syncwarp();  // ensure region 3 STS visible for TMA read
+    // Strategy 3 (three-plus-one): inline stores cover first 3 regions, Phase 2 handles last
+    __syncwarp();  // ensure last region STS visible for TMA read
     if (!MBAR_EARLY && epi_mbar_addr) mbar_arrive(epi_mbar_addr);
     if (lane == 0) {
-        asm volatile(
-            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
-            :: "l"(tma_c_desc), "r"(n_start + NC_START + 192), "r"(gm_base), "r"(staging_r3) : "memory");
+        // Inline stores fired for regions 0..min(N_REGIONS,3)-1. Store remaining if any.
+        if constexpr (N_REGIONS > 3) {
+            uint32_t src = staging_saddr + 3 * STAGING_REGION_BYTES;
+            asm volatile(
+                "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                :: "l"(tma_c_desc), "r"(n_start + NC_START + 192), "r"(gm_base), "r"(src) : "memory");
+        }
         asm volatile("cp.async.bulk.commit_group;" ::: "memory");
     }
 #else
