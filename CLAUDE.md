@@ -48,7 +48,7 @@ Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1
 - **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
 - **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols: x32 `tcgen05.ld` → BF16 add → CVT → `st.shared` to 4 SWIZZLE_128B staging regions, with **interleaved TMA stores** every 2 regions hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1
 
-TM=128 rows / 32 rows per warp = 4 row groups. W2-W5 each own a row group (all 256 cols). No column splitting (is_split always 0). `epilogue_store` is templated on `<NC_START, NC_END>` so the compiler sees constant loop bounds; unroll depth controlled by `PHASE1_UNROLL` (default 2).
+TM=128 rows / 32 rows per warp = 4 row groups. With 4 epi warps (default), each warp owns a full row group (256 cols, `is_split=0`). With 5 epi warps, warp 4 shares row_group 0 via `ew % 4`, creating split warps (`is_split=1`) that each handle 128 cols (2 regions). `epilogue_store` is templated on `<NC_START, NC_END>` so the compiler sees constant loop bounds and `N_REGIONS = (NC_END - NC_START) / 64` is constexpr; unroll depth controlled by `PHASE1_UNROLL` (default 2).
 
 The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile N (double-buffered TMEM, mbarrier-protected). After the tile loop, W2-5 run a drain epilogue for the last tile.
 
@@ -88,7 +88,11 @@ edit megakernel.cu -> make -> ./siglip_vision
 | `calibration.cu` | 10 microbenchmark kernels (K1-K9) measuring instruction throughput/latency on B200. Used to verify SASS control word bit layout and populate `sass_analysis.py` latency table |
 | **Grid search data** | |
 | `sweep_results.csv` | Run 1 grid search (145 configs, Tier 1→4 epi warps). Best: 0.519 ms |
-| `sweep_results_run2.csv` | Run 2 grid search (145 configs, Tier 1→5 epi warps). Best: 0.522 ms |
+| `sweep_results_run2.csv` | Run 2 grid search (145 configs, Tier 1→5 epi warps, pre is_split fix). Best: 0.522 ms |
+| `sweep_results_run3.csv` | Run 3 grid search (145 configs, Tier 1→5 epi warps, post is_split fix). 141/145 valid. Best: 0.522 ms |
+| `sweep_results_run4.csv` | Run 4 grid search (145 configs, Tier 1→4 epi warps, post fence.proxy.async fix). **145/145 valid**. Best: 0.522 ms |
+| `top5_profile.csv` | ncu profiling of top 5 configs from run 4 (21 metrics + 2 derived per config) |
+| `top5_analysis.md` | Writeup: why the top 5 win — TC utilization, instruction counts, stall breakdown |
 | **Raw profiling data** | |
 | `clock64_timing.txt` | Kernel printf from timing build (34 lines). Analyze with `analyze_timing.py` |
 | `source_counters_raw.csv` | Raw ncu `--set source --csv` data (4K lines). Analyze with `analyze_source_counters.py` |
@@ -112,15 +116,10 @@ make cutlass-bench      # ~1-2 min compile (26 CUTLASS template instantiations)
 ./cutlass-bench         # full sweep (4736 imgs, ~5 min runtime)
 ./cutlass-bench 1       # quick test (148 imgs, ~30s)
 
-# CUTLASS extended search (stronger baseline pass)
-make cutlass-bench-max  # broader tile/cluster sweep, slower compile/runtime
-./cutlass-bench-max     # use when locking baseline
-./cutlass-bench-max 1   # quick sanity pass
+# CUTLASS extended search (stronger baseline)
+make cutlass-bench-max && ./cutlass-bench-max
 
-# Megakernel parameter grid search (replaces manual -D flag Makefile targets)
-python3 grid_search.py --tier 1          # structure: N_STAGES × NUM_EPI_WARPS
-python3 grid_search.py --tier 2          # epilogue: INTERLEAVE × MBAR × STAGGER × TMEM
-python3 grid_search.py --tier 3          # tuning: PHASE1_UNROLL × SNAKE_ORDER × CVT_ADD_FUSED
+# Megakernel parameter grid search
 python3 grid_search.py --tier all        # sequential 1→2→3, pinning winners
 python3 grid_search.py --full-cross      # all parameters crossed (~3000 configs)
 
@@ -141,12 +140,7 @@ python3 sass_analysis.py cal_sass.txt --calibrate-compare --runtime cal_output.t
 
 ### CUTLASS bench details
 
-`cutlass_bench.cu` is a self-contained grid search over 13 tile/cluster configs (standard build), or 20 configs in extended mode (`-DCUTLASS_EXTENDED_SWEEP=1`). For each config, it measures:
-1. **GEMM-only** (beta=0, FP32 epilogue) — pure compute baseline
-2. **Fused FP32** (beta=1, FP32 epilogue) — `D = float(acc) + float(C)`
-3. **Fused BF16** (beta=1, BF16 epilogue) — `D = bf16(acc) + C` (matches custom kernel's cvt_add_bf16x2)
-
-Core template: `GemmInstance<TM, TN, TK, CM, CN, EpiCompute>` — full CUTLASS type chain parameterized on tile shape, cluster shape, and epilogue compute type (`float` or `cutlass::bfloat16_t`). Invalid configs return -1.0f via `can_implement` check. Results sorted by fused BF16 ms.
+`cutlass_bench.cu` sweeps 13 tile/cluster configs (20 in `-DCUTLASS_EXTENDED_SWEEP=1` mode), measuring GEMM-only (beta=0), fused FP32, and fused BF16 epilogues. Template: `GemmInstance<TM, TN, TK, CM, CN, EpiCompute>`.
 
 ## Key constraints
 
@@ -158,11 +152,12 @@ Core template: `GemmInstance<TM, TN, TK, CM, CN, EpiCompute>` — full CUTLASS t
 - `megakernel.cu` is hand-edited directly
 - Validation: non-uniform B (alternating FP8 rows: 1.5/1.0 → distinct even/odd col accumulators), non-uniform bias/pos_embed, 1024 strided checksum + 32 CPU reference spot checks (valid=1 in @@RESULT)
 - **OFF_STAGING must be 1024-byte aligned** for SWIZZLE_128B correctness — TMA swizzle operates on absolute SMEM address bits `addr[6:4] ^= addr[9:7]`; misalignment causes systematic 8-col (16-byte) group swaps in output. Swizzle period = 8 rows x 128 bytes = 1024 bytes.
+- **`fence.proxy.async.shared::cta` required** before every TMA store that reads from SMEM written by `st.shared` — bridges sync→async memory proxies. Without it, TMA may read stale data (sporadic corruption).
 - ml_phase init must account for odd tile_start (start_buf-dependent)
 
-## Grid search findings (2 runs × 145 configs)
+## Grid search findings (4 runs × 145 configs)
 
-Full parameter sweep results in `sweep_results.csv` (run 1) and `sweep_results_run2.csv` (run 2). Run 1 pinned 4 epi warps at Tier 1; Run 2 pinned 5 epi warps. Key findings:
+Full parameter sweep results in `sweep_results.csv` (run 1), `sweep_results_run2.csv` (run 2), `sweep_results_run3.csv` (run 3), `sweep_results_run4.csv` (run 4). Run 4 is the definitive run after all correctness fixes (fence.proxy.async + is_split + OFF_STAGING alignment) — **145/145 valid, zero failures**. Key findings:
 
 ### Performance (valid configs only, sorted by impact)
 
@@ -170,13 +165,13 @@ Full parameter sweep results in `sweep_results.csv` (run 1) and `sweep_results_r
 |-----------|------|---------|--------|
 | SNAKE_ORDER | 1 | 1 | **Critical**: 0=1 costs ~50-200 TFLOPS (10-40%). Snake ordering essential. |
 | PHASE1_UNROLL | 2 | 2 | **Critical**: 1 is catastrophic (-30%, ~1500 TFLOPS). 4 slightly slower + 255 regs. |
-| INTERLEAVE_STRATEGY | 2 | 2 | **Best for correctness + perf.** 0 = ~30 TFLOPS slower. 3 = ~50 TFLOPS slower. 1 = fast but has sporadic race conditions. |
+| INTERLEAVE_STRATEGY | 2 | 2 | **Best perf.** 0 = ~30 TFLOPS slower. 3 = ~50 TFLOPS slower. All strategies pass 145/145 after fence.proxy.async fix. |
 | MBAR_EARLY | 1 | 0 | +5-18 TFLOPS consistently. 0.519 vs 0.524 ms at optimal stagger. |
 | STAGGER_CYCLES | 120-160 | 80 | Sweet spot 80-160; 0 costs ~5 TFLOPS; 200 slightly worse. |
 | N_STAGES | 4 | 4 | 3 too few (0.557 ms). 5 works but +20 regs for marginal gain. |
 | TMEM_LOAD_WIDTH | 32 | 32 | 64 burns 255 regs, ~10-20 TFLOPS slower than 32 (209 regs). |
 | CVT_ADD_FUSED | 0 or 1 | 1 | Equivalent within noise. |
-| NUM_EPI_WARPS | 4 or 5 | 4 | 5 matches 4 in perf (~0.523 ms) but has more validation failures with some interleave strategies. |
+| NUM_EPI_WARPS | 4 or 5 | 4 | 5 matches 4 in perf (~0.523 ms). All strategies work with both 4 and 5 warps. |
 
 ### Top configs (cross-run)
 
@@ -187,15 +182,18 @@ Run 2 best: INTER=1 MBAR=1 EPI=5 PH1U=4 STAG=160 TLW=64 → 0.522 ms / 2096 TFLO
 Defaults:                                                  → 0.524 ms / 2090 TFLOPS (209 regs)
 ```
 
-### Validation failure patterns (remaining race conditions)
+### Validation history and is_split fix
 
-The OFF_STAGING 1024-alignment fix resolved the systematic column-swap bug. Remaining failures are interleave-strategy-dependent races:
+**Bug 1 — OFF_STAGING alignment** (fixed): SWIZZLE_128B requires 1024-byte aligned SMEM base. Was 128-aligned → systematic 8-col group swaps. Fix: `(... + 1023) & ~1023` rounding.
 
-| Config | 4 epi warps | 5 epi warps |
-|--------|-------------|-------------|
-| INTERLEAVE_STRATEGY=0 | All pass (32/32) | **ALL FAIL (32/32)** |
-| INTERLEAVE_STRATEGY=1 | Sporadic (~17/32 pass) | Sporadic (~22/32 pass) |
-| INTERLEAVE_STRATEGY=2 | All pass (32/32) | Almost all pass (31/32) |
-| INTERLEAVE_STRATEGY=3 | All pass (32/32) | **ALL FAIL (32/32)** |
+**Bug 2 — Strategy 0,3 hardcoded region counts** (fixed): With 5 epi warps, `row_group = ew % 4` wraps, creating split warps (`is_split=1`) that handle 128 cols (2 regions) instead of 256 cols (4 regions). Strategy 0 hardcoded 4 TMA stores (wrote garbage from uninitialized regions 2-3). Strategy 3's inline trigger `((nc - NC_START) >> 6) == 2` never fired for 2-region split, and Phase 2 was guarded by `N_REGIONS > 3`. Fix: derive `constexpr N_REGIONS = (NC_END - NC_START) / 64` at function scope; loop over N_REGIONS in strategy 0; adjust trigger/loop bounds in strategy 3.
 
-INTERLEAVE_STRATEGY=2 (default) is the only fully robust strategy across both warp counts. Strategies 0 and 3 have latent race conditions exposed by 5 epi warps. Strategy 1 has sporadic races at both counts.
+**Bug 3 — Missing `fence.proxy.async.shared::cta`** (fixed): TMA stores read staging SMEM via the async proxy, but `st.shared` writes use the sync proxy. `__syncwarp()` does NOT bridge proxies — `fence.proxy.async.shared::cta` is required (per PTX ISA). Without it, TMA reads stale data. Strategy 1 was most affected (inline stores fire immediately after writes); strategies 0,3 had enough latency to mask the bug. Fix: added fence after every `__syncwarp()` preceding TMA stores (8 sites).
+
+| Config | Run 1 (4w) | Run 2 (5w, pre-fix) | Run 3 (5w, +is_split) | Run 4 (+fence) |
+|--------|------------|---------------------|-----------------------|----------------|
+| INTERLEAVE_STRATEGY=0 | 32/32 | 0/32 | **32/32** | 32/32 |
+| INTERLEAVE_STRATEGY=1 | ~17/32 | ~22/32 | ~29/32 | **32/32** |
+| INTERLEAVE_STRATEGY=2 | 32/32 | 31/32 | 31/32 | **32/32** |
+| INTERLEAVE_STRATEGY=3 | 32/32 | 0/32 | **32/32** | 32/32 |
+| **Total** | **130/145** | **74/145** | **141/145** | **145/145** |

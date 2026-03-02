@@ -460,8 +460,10 @@ void epilogue_store(
         }
 
         // F40: Interleaved TMA store(s) — completed region(s) → global
+        // fence.proxy.async bridges sync proxy (st.shared) → async proxy (TMA engine)
         if (INTERLEAVE_STRATEGY == 1) {
             __syncwarp();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             if (lane == 0) {
                 int region_idx = (nc - NC_START) >> 6;
                 uint32_t src = staging_saddr + region_idx * STAGING_REGION_BYTES;
@@ -471,6 +473,7 @@ void epilogue_store(
         } else if (INTERLEAVE_STRATEGY == 2 && (((nc - NC_START) >> 6) & 1) == 1) {
             // Half-batch: 2 stores after every 2nd region
             __syncwarp();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             if (lane == 0) {
                 int region_idx = (nc - NC_START) >> 6;
                 uint32_t src0 = staging_saddr + (region_idx - 1) * STAGING_REGION_BYTES;
@@ -484,6 +487,7 @@ void epilogue_store(
             // Three-plus-one: store min(N_REGIONS, 3) regions after last inline-storable region
             constexpr int INLINE_REGIONS = N_REGIONS < 3 ? N_REGIONS : 3;
             __syncwarp();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             if (lane == 0) {
                 for (int r = 0; r < INLINE_REGIONS; r++) {
                     uint32_t src = staging_saddr + r * STAGING_REGION_BYTES;
@@ -534,9 +538,11 @@ void epilogue_store(
         CVT_ADD_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, craw1.x,craw1.y,craw1.z,craw1.w, srow + ((byte_base + 48) ^ xor_val));
 
         // F40: Interleaved TMA store(s) — region completes every 2 x32 iterations
+        // fence.proxy.async bridges sync proxy (st.shared) → async proxy (TMA engine)
         if (INTERLEAVE_STRATEGY == 1 && ((nc - NC_START) & 63) == 32) {
             int region_idx = (nc - NC_START) >> 6;
             __syncwarp();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             if (lane == 0) {
                 uint32_t src = staging_saddr + region_idx * STAGING_REGION_BYTES;
                 asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
@@ -546,6 +552,7 @@ void epilogue_store(
             // Half-batch: 2 stores after every 2nd region
             int region_idx = (nc - NC_START) >> 6;
             __syncwarp();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             if (lane == 0) {
                 uint32_t src0 = staging_saddr + (region_idx - 1) * STAGING_REGION_BYTES;
                 uint32_t src1 = staging_saddr + region_idx * STAGING_REGION_BYTES;
@@ -558,6 +565,7 @@ void epilogue_store(
             // Three-plus-one: store min(N_REGIONS, 3) regions after last inline-storable region
             constexpr int INLINE_REGIONS = N_REGIONS < 3 ? N_REGIONS : 3;
             __syncwarp();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             if (lane == 0) {
                 for (int r = 0; r < INLINE_REGIONS; r++) {
                     uint32_t src = staging_saddr + r * STAGING_REGION_BYTES;
@@ -581,7 +589,8 @@ void epilogue_store(
 
 #if INTERLEAVE_STRATEGY == 0
     // Strategy 0 (all-at-end): all TMA stores in Phase 2
-    __syncwarp();  // Phase 1 SMEM writes visible for Phase 2 TMA reads
+    __syncwarp();
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // sync→async proxy bridge
 
     if (!MBAR_EARLY && epi_mbar_addr) mbar_arrive(epi_mbar_addr);
 
@@ -599,7 +608,8 @@ void epilogue_store(
     }
 #elif INTERLEAVE_STRATEGY == 3
     // Strategy 3 (three-plus-one): inline stores cover first 3 regions, Phase 2 handles last
-    __syncwarp();  // ensure last region STS visible for TMA read
+    __syncwarp();
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // sync→async proxy bridge
     if (!MBAR_EARLY && epi_mbar_addr) mbar_arrive(epi_mbar_addr);
     if (lane == 0) {
         // Inline stores fired for regions 0..min(N_REGIONS,3)-1. Store remaining if any.
