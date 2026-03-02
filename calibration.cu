@@ -547,6 +547,138 @@ extern "C" __global__ void k9_f2fp_wide(long long* out) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Kernel 10: HADD2 throughput (independent streams)
+// 16 independent add.rn.bf16x2 — no RAW deps.
+// 64 HADD2 instances in production kernel epilogue (bias + pos_embed add).
+// ─────────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void k10_hadd2_throughput(long long* out) {
+    unsigned a = 0x3c003c00; // bf16x2 (1.0, 1.0)
+    unsigned b = 0x40004000; // bf16x2 (2.0, 2.0)
+    unsigned r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15;
+
+    for (int i = 0; i < WARMUP; i++) {
+        asm volatile("add.rn.bf16x2 %0, %1, %2;" : "=r"(r0) : "r"(a), "r"(b));
+    }
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "add.rn.bf16x2 %0,  %16, %17;\n\t"
+            "add.rn.bf16x2 %1,  %17, %16;\n\t"
+            "add.rn.bf16x2 %2,  %16, %17;\n\t"
+            "add.rn.bf16x2 %3,  %17, %16;\n\t"
+            "add.rn.bf16x2 %4,  %16, %17;\n\t"
+            "add.rn.bf16x2 %5,  %17, %16;\n\t"
+            "add.rn.bf16x2 %6,  %16, %17;\n\t"
+            "add.rn.bf16x2 %7,  %17, %16;\n\t"
+            "add.rn.bf16x2 %8,  %16, %17;\n\t"
+            "add.rn.bf16x2 %9,  %17, %16;\n\t"
+            "add.rn.bf16x2 %10, %16, %17;\n\t"
+            "add.rn.bf16x2 %11, %17, %16;\n\t"
+            "add.rn.bf16x2 %12, %16, %17;\n\t"
+            "add.rn.bf16x2 %13, %17, %16;\n\t"
+            "add.rn.bf16x2 %14, %16, %17;\n\t"
+            "add.rn.bf16x2 %15, %17, %16;\n\t"
+            : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3),
+              "=r"(r4), "=r"(r5), "=r"(r6), "=r"(r7),
+              "=r"(r8), "=r"(r9), "=r"(r10), "=r"(r11),
+              "=r"(r12), "=r"(r13), "=r"(r14), "=r"(r15)
+            : "r"(a), "r"(b)
+        );
+    }
+    long long t1 = clock64();
+
+    if (threadIdx.x == 0) {
+        out[0] = t1 - t0;
+        out[1] = r0+r1+r2+r3+r4+r5+r6+r7+r8+r9+r10+r11+r12+r13+r14+r15;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel 11: HADD2 latency (dependent chain)
+// add.rn.bf16x2 with RAW dependency — each result feeds next.
+// ─────────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void k11_hadd2_latency(long long* out) {
+    volatile int* gin = (volatile int*)out;
+    unsigned a = (unsigned)gin[threadIdx.x] | 0x3c003c00; // opaque to compiler
+    unsigned inc = 0x00010001; // tiny bf16 increment
+
+    for (int i = 0; i < WARMUP; i++) {
+        asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(a) : "r"(inc));
+    }
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            "add.rn.bf16x2 %0, %0, %1;\n\t"
+            : "+r"(a)
+            : "r"(inc)
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    out[1] = a;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel 12: LDG latency (dependent pointer chase, L1 hit)
+// 16-deep chain: each load's result determines next address.
+// Buffer pre-zeroed → idx stays 0 → always hits L1.
+// 34 LDG instances in production kernel (bias, pos_embed loads).
+// ─────────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void k12_ldg_latency(long long* out) {
+    // Use out+64 as chase buffer (pre-zeroed by cudaMemset)
+    const int* data = (const int*)(out + 64);
+    int idx = 0;
+
+    for (int i = 0; i < WARMUP; i++) {
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+    }
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+        asm volatile("ld.global.b32 %0, [%1];" : "=r"(idx) : "l"(data + idx));
+    }
+    long long t1 = clock64();
+
+    if (threadIdx.x == 0) {
+        out[0] = t1 - t0;
+        out[1] = idx;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Host: run all kernels, print results
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -574,6 +706,9 @@ int main() {
         {"K7b: IADD dependent (decoder)",          16, k7b_iadd_dependent},
         {"K8: PRMT throughput (16 indep)",         16, k8_prmt_throughput},
         {"K9: F2FP throughput (32 indep)",         32, k9_f2fp_wide},
+        {"K10: HADD2 throughput (16 indep)",       16, k10_hadd2_throughput},
+        {"K11: HADD2 latency (dep chain)",         16, k11_hadd2_latency},
+        {"K12: LDG latency (pointer chase)",       16, k12_ldg_latency},
     };
     int n_benches = sizeof(benches) / sizeof(benches[0]);
 
@@ -611,6 +746,9 @@ int main() {
     printf("  K5 vs K1+K4: if K5 ≈ max(K1,K4) → different pipes; if K5 ≈ K1+K4 → same pipe\n");
     printf("  K7a vs K7b: stall count = K7b_cyc/instr - K7a_cyc/instr (verify bits [3:0])\n");
     printf("  K9 vs K1: check if throughput degrades at 32-wide (register file pressure)\n");
+    printf("  K10 cyc/instr = HADD2 throughput (cycles between independent issues)\n");
+    printf("  K11 cyc/instr = HADD2 dep chain latency (pure, no MOV in chain)\n");
+    printf("  K12 cyc/instr = LDG L1-hit latency (includes addr calc overhead)\n");
 
     cudaFree(d_out);
     return 0;

@@ -61,40 +61,45 @@ def decode_control(ctrl_word: int, layout: dict = CTRL_LAYOUT) -> dict:
     return result
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Instruction latency table (initial estimates — refine with microbenchmarks)
+# Instruction latency table (calibrated on B200 via calibration.cu K1-K9)
 # These are ISSUE latencies (cycles until result available for dependent op).
 # Long-latency ops (LDTM, MMA, TMA) use barrier sync, not stall counts.
 # ══════════════════════════════════════════════════════════════════════════════
 
 LATENCY = {
-    # Integer ALU
+    # Integer ALU — calibrated via K7a/K7b (B200)
     'IMAD':     4,
-    'IADD3':    4,
+    'IADD3':    2,    # K7b dep chain=2.08 cyc/instr (was 4)
     'LEA':      4,
     'LOP3':     4,
     'SHF':      4,
-    'PRMT':     4,
+    'PRMT':     0,    # K8: ~0 cyc/instr, UPRMT pipe on Blackwell (was 4)
     'MOV':      2,
     'SEL':      4,
     'IMNMX':    4,
     'ISETP':    4,
     'ISET':     4,
 
-    # Float ALU
+    # Float ALU — calibrated via K4, K10/K11 (B200)
     'FADD':     4,
     'FMUL':     4,
     'FFMA':     4,
+    'HFMA2':    4,    # K4: 0.25 cyc/instr throughput, ~4 cyc latency (dep chain)
+    'HADD2':    5,    # K11: 5.52 measured (true=5, +0.5 asm fence overhead); throughput ~0 (K10)
     'MUFU':     8,    # special function unit — higher latency
 
-    # Conversion
-    'F2FP':     4,    # FP32→BF16 / precision changes
+    # Conversion — calibrated via K1/K2/K9 (B200)
+    'F2FP':     4,    # K2 dep chain=4.10 cyc/instr; throughput ~0 (K1/K9)
     'I2FP':     4,
     'F2IP':     4,
     'I2IP':     4,
 
-    # Shared memory
-    'STS':      4,    # fire-and-forget store (write port occupancy)
+    # Shared memory — calibrated via K6 (B200)
+    'STS':      32,   # K6: 32 cyc/instr throughput, NOT fire-and-forget (was 4)
     'LDS':      20,   # shared load — ~20 cycle latency
+
+    # Global memory — calibrated via K12 (B200)
+    'LDG':      39,   # K12: 39.09 measured (includes ~7 cyc addr calc; pure L1 hit ~32)
 
     # TMEM (barrier-synchronized, stall count typically 0)
     'LDTM':     0,    # result via DEPBAR/wait, not stall
@@ -997,6 +1002,9 @@ CALIBRATION_KERNELS = [
     {'fn': 'k7b_iadd_dependent',     'label': 'K7b: IADD dep',        'ops': ['IADD3', 'IADD', 'UIADD3'],       'mode': 'latency'},
     {'fn': 'k8_prmt_throughput',     'label': 'K8: PRMT throughput',   'ops': ['PRMT', 'UPRMT'],                 'mode': 'throughput'},
     {'fn': 'k9_f2fp_wide',           'label': 'K9: F2FP 32-wide',     'ops': ['F2FP'],                           'mode': 'throughput'},
+    {'fn': 'k10_hadd2_throughput',   'label': 'K10: HADD2 throughput', 'ops': ['HADD2'],                          'mode': 'throughput'},
+    {'fn': 'k11_hadd2_latency',      'label': 'K11: HADD2 latency',   'ops': ['HADD2'],                          'mode': 'latency'},
+    {'fn': 'k12_ldg_latency',        'label': 'K12: LDG latency',     'ops': ['LDG'],                            'mode': 'latency'},
 ]
 
 
