@@ -64,7 +64,7 @@
 #define OFF_MMA_MBAR       (OFF_TMA_MBAR + N_STAGES * 8)
 #define OFF_MAINLOOP_MBAR  (OFF_MMA_MBAR + N_STAGES * 8)
 #define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
-#define OFF_STAGING        ((OFF_EPILOGUE_MBAR + 16 + 127) & ~127)
+#define OFF_STAGING        ((OFF_EPILOGUE_MBAR + 16 + 1023) & ~1023)  // 1024-align for SWIZZLE_128B (addr[6:4] ^= addr[9:7])
 #define STAGING_REGION_ROW_BYTES  128                                               // 64 BF16 cols = 128 bytes (SWIZZLE_128B)
 #define STAGING_REGION_BYTES      (32 * STAGING_REGION_ROW_BYTES)                   // 4096 bytes per region (32 rows x 128B)
 #define STAGING_WARP_BYTES        (4 * STAGING_REGION_BYTES)                         // 16384 bytes per warp (4 regions x 4096)
@@ -588,6 +588,7 @@ void epilogue_store(
 #if INTERLEAVE_STRATEGY == 0
     // Strategy 0 (all-at-end): original behavior — all 4 TMA stores in Phase 2
     __syncwarp();  // Phase 1 SMEM writes visible for Phase 2 TMA reads
+
     if (!MBAR_EARLY && epi_mbar_addr) mbar_arrive(epi_mbar_addr);
 
     // ═══ Phase 2: 4 TMA tensor stores → global ═══
@@ -1296,6 +1297,28 @@ int main() {
     printf("C[0,0..3] = %.1f %.1f %.1f %.1f\n",
            __bfloat162float(h_C[0]), __bfloat162float(h_C[1]),
            __bfloat162float(h_C[2]), __bfloat162float(h_C[3]));
+
+    // Diagnostic: dump row 0 cols 0-31 actual vs expected combined effect
+    printf("DIAG row0 actual:   ");
+    for (int c = 0; c < 32; c++) printf("%.0f ", __bfloat162float(h_C[c]));
+    printf("\n");
+    printf("DIAG row0 expected: ");
+    for (int c = 0; c < 32; c++) {
+        float b_val = (c & 1) ? 1.0f : 1.5f;
+        float g = __bfloat162float(__float2bfloat16((float)K_DIM * 1.5f * b_val));
+        int br0 = 0, rir0 = 0, bc0 = c / COMB_BLOCK_COLS, cic0 = c % COMB_BLOCK_COLS;
+        int ci = (br0 * COMB_COL_BLOCKS + bc0) * COMB_BLOCK_ELEMS + rir0 * COMB_BLOCK_COLS + cic0;
+        float cf = __bfloat162float(h_combined[ci]);
+        printf("%.0f ", __bfloat162float(__float2bfloat16(g + cf)));
+    }
+    printf("\n");
+    printf("DIAG combined[0,0..31]: ");
+    for (int c = 0; c < 32; c++) {
+        int br0 = 0, rir0 = 0, bc0 = c / COMB_BLOCK_COLS, cic0 = c % COMB_BLOCK_COLS;
+        int ci = (br0 * COMB_COL_BLOCKS + bc0) * COMB_BLOCK_ELEMS + rir0 * COMB_BLOCK_COLS + cic0;
+        printf("%.0f ", __bfloat162float(h_combined[ci]));
+    }
+    printf("\n");
     printf("@@RESULT ms=%.3f tflops=%.2f checksum=%f valid=%d c0=%.1f\n",
            _ms, 2.0 * M_TOTAL * N_DIM * K_DIM / _ms / 1e9, cksum, valid,
            __bfloat162float(h_C[0]));

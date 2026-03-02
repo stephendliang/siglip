@@ -5,17 +5,17 @@ FP8 (E4M3) precision, tcgen05 WGMMA, TMA, `cta_group::2` with 2-CTA clusters. Cr
 
 ## Current state
 
-**0.524 ms / 2090 TFLOPS** fused (GEMM + bias + pos_embed) — **37% faster** than cuBLAS end-to-end (0.835 ms = best GEMM + unfused pos_embed).
+**0.519 ms / 2108 TFLOPS** fused (GEMM + bias + pos_embed) with `MBAR_EARLY=1 STAGGER_CYCLES=160` — **38% faster** than cuBLAS end-to-end (0.835 ms = best GEMM + unfused pos_embed). Defaults produce 0.524 ms / 2090 TFLOPS.
 
 The kernel's value is **fusion**: the overlapped epilogue eliminates the 0.470 ms unfused pos_embed overhead entirely.
 
 cuBLAS pure GEMM is faster: 0.365 ms / 3001 TFLOPS (per-tensor FP8, best-of-8 algos, 256MB workspace).
-Our effective TFLOPS (2090) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
+Our effective TFLOPS (2090-2108) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
 
 GEMM: `[928256, 768] x [768, 768]^T` with fused bias + positional embedding add, BF16 output.
 Batch = 4736 images x 196 patches = 928256 rows. Square weight matrix (768x768).
 
-The kernel is correct (checksum validated) and stable.
+The kernel is correct (non-uniform validation, checksum validated) and stable.
 
 ## Current bottlenecks (clock64 timing build, post-F31)
 
@@ -57,7 +57,7 @@ The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile 
 - TMEM: single alloc of 512 cols (TN*2), double-buffered via column offset (buf*TN)
 - SMEM: 4-stage pipeline (131 KB) + epilogue staging (4 warps x 16,384 = 64 KB, SWIZZLE_128B) = ~197 KB total of 228 KB
 - Tiles: 3626 M-tiles x 3 N-tiles = 10,878 total, snake ordering
-- ~205 registers/thread, 0 spills (varies with `CVT_ADD_FUSED`, `PHASE1_UNROLL`)
+- ~205-211 registers/thread, 0 spills (varies with `CVT_ADD_FUSED`, `PHASE1_UNROLL`, `MBAR_EARLY`)
 - `NUM_EPI_WARPS` controls epilogue warp count (currently 4); `THREADS` derived as `32*(2+NUM_EPI_WARPS)`
 
 ## Development workflow
@@ -86,6 +86,9 @@ edit megakernel.cu -> make -> ./siglip_vision
 | `compare.py` | ncu CSV diff tool — usage: `python compare.py a.csv b.csv` |
 | `sass_analysis.py` | SASS scheduling analyzer — decodes control words, builds dependency graphs, identifies slack. Has `--calibrate-compare` mode for closed-loop decoder verification against `calibration.cu` runtime |
 | `calibration.cu` | 10 microbenchmark kernels (K1-K9) measuring instruction throughput/latency on B200. Used to verify SASS control word bit layout and populate `sass_analysis.py` latency table |
+| **Grid search data** | |
+| `sweep_results.csv` | Run 1 grid search (145 configs, Tier 1→4 epi warps). Best: 0.519 ms |
+| `sweep_results_run2.csv` | Run 2 grid search (145 configs, Tier 1→5 epi warps). Best: 0.522 ms |
 | **Raw profiling data** | |
 | `clock64_timing.txt` | Kernel printf from timing build (34 lines). Analyze with `analyze_timing.py` |
 | `source_counters_raw.csv` | Raw ncu `--set source --csv` data (4K lines). Analyze with `analyze_source_counters.py` |
@@ -150,8 +153,49 @@ Core template: `GemmInstance<TM, TN, TK, CM, CN, EpiCompute>` — full CUTLASS t
 - Target: `sm_100a` (B200, 148 SMs)
 - `cta_group::2` with `__cluster_dims__(2,1,1)` — 74 clusters of 2 CTAs
 - TMEM: 512 cols/SM total, single alloc of TN*2 for double buffering (learned from matmul_v7: two separate allocs deadlock, single alloc works)
-- SMEM: 228 KB/SM — current usage ~197 KB (4-stage pipeline + unified SWIZZLE_128B epilogue staging, ~31 KB free)
+- SMEM: 228 KB/SM — current usage ~192 KB (4-stage pipeline + unified SWIZZLE_128B epilogue staging, ~36 KB free)
 - All inline PTX — no CUTLASS dependency for the kernel itself
 - `megakernel.cu` is hand-edited directly
 - Validation: non-uniform B (alternating FP8 rows: 1.5/1.0 → distinct even/odd col accumulators), non-uniform bias/pos_embed, 1024 strided checksum + 32 CPU reference spot checks (valid=1 in @@RESULT)
+- **OFF_STAGING must be 1024-byte aligned** for SWIZZLE_128B correctness — TMA swizzle operates on absolute SMEM address bits `addr[6:4] ^= addr[9:7]`; misalignment causes systematic 8-col (16-byte) group swaps in output. Swizzle period = 8 rows x 128 bytes = 1024 bytes.
 - ml_phase init must account for odd tile_start (start_buf-dependent)
+
+## Grid search findings (2 runs × 145 configs)
+
+Full parameter sweep results in `sweep_results.csv` (run 1) and `sweep_results_run2.csv` (run 2). Run 1 pinned 4 epi warps at Tier 1; Run 2 pinned 5 epi warps. Key findings:
+
+### Performance (valid configs only, sorted by impact)
+
+| Parameter | Best | Default | Effect |
+|-----------|------|---------|--------|
+| SNAKE_ORDER | 1 | 1 | **Critical**: 0=1 costs ~50-200 TFLOPS (10-40%). Snake ordering essential. |
+| PHASE1_UNROLL | 2 | 2 | **Critical**: 1 is catastrophic (-30%, ~1500 TFLOPS). 4 slightly slower + 255 regs. |
+| INTERLEAVE_STRATEGY | 2 | 2 | **Best for correctness + perf.** 0 = ~30 TFLOPS slower. 3 = ~50 TFLOPS slower. 1 = fast but has sporadic race conditions. |
+| MBAR_EARLY | 1 | 0 | +5-18 TFLOPS consistently. 0.519 vs 0.524 ms at optimal stagger. |
+| STAGGER_CYCLES | 120-160 | 80 | Sweet spot 80-160; 0 costs ~5 TFLOPS; 200 slightly worse. |
+| N_STAGES | 4 | 4 | 3 too few (0.557 ms). 5 works but +20 regs for marginal gain. |
+| TMEM_LOAD_WIDTH | 32 | 32 | 64 burns 255 regs, ~10-20 TFLOPS slower than 32 (209 regs). |
+| CVT_ADD_FUSED | 0 or 1 | 1 | Equivalent within noise. |
+| NUM_EPI_WARPS | 4 or 5 | 4 | 5 matches 4 in perf (~0.523 ms) but has more validation failures with some interleave strategies. |
+
+### Top configs (cross-run)
+
+```
+Run 1 best: MBAR_EARLY=1 STAGGER_CYCLES=160              → 0.519 ms / 2108 TFLOPS (211 regs, 4 epi warps)
+Run 1 #2:   MBAR_EARLY=1 STAGGER_CYCLES=120              → 0.520 ms / 2104 TFLOPS (211 regs)
+Run 2 best: INTER=1 MBAR=1 EPI=5 PH1U=4 STAG=160 TLW=64 → 0.522 ms / 2096 TFLOPS (235 regs)
+Defaults:                                                  → 0.524 ms / 2090 TFLOPS (209 regs)
+```
+
+### Validation failure patterns (remaining race conditions)
+
+The OFF_STAGING 1024-alignment fix resolved the systematic column-swap bug. Remaining failures are interleave-strategy-dependent races:
+
+| Config | 4 epi warps | 5 epi warps |
+|--------|-------------|-------------|
+| INTERLEAVE_STRATEGY=0 | All pass (32/32) | **ALL FAIL (32/32)** |
+| INTERLEAVE_STRATEGY=1 | Sporadic (~17/32 pass) | Sporadic (~22/32 pass) |
+| INTERLEAVE_STRATEGY=2 | All pass (32/32) | Almost all pass (31/32) |
+| INTERLEAVE_STRATEGY=3 | All pass (32/32) | **ALL FAIL (32/32)** |
+
+INTERLEAVE_STRATEGY=2 (default) is the only fully robust strategy across both warp counts. Strategies 0 and 3 have latent race conditions exposed by 5 epi warps. Strategy 1 has sporadic races at both counts.

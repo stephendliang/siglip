@@ -144,7 +144,7 @@ def make_dflags(cfg):
     """Build -D flags string, only for values that differ from defaults."""
     parts = []
     for k, v in sorted(cfg.items()):
-        if v != DEFAULTS[k]:
+        if k in DEFAULTS and v != DEFAULTS[k]:
             parts.append(f'-D{k}={v}')
     return ' '.join(parts)
 
