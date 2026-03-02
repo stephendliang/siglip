@@ -14,8 +14,12 @@
 #include <cstdlib>
 
 #define SM_COUNT       148
+#ifndef NUM_EPI_WARPS
 #define NUM_EPI_WARPS  4
+#endif
+#ifndef STAGGER_CYCLES
 #define STAGGER_CYCLES 80   // F31: per-warp Phase 1 stagger (sweep: 50, 80, 100, 200)
+#endif
 #ifndef TMEM_LOAD_WIDTH
 #define TMEM_LOAD_WIDTH 32   // 32=1×x32 per 32-col chunk (default), 16=2×x16, 64=1×x64
 #endif
@@ -25,6 +29,19 @@
 #ifndef MBAR_EARLY
 #define MBAR_EARLY 0           // 0=after Phase 1, 1=after last TMEM_WAIT
 #endif
+#ifndef PHASE1_UNROLL
+#define PHASE1_UNROLL  2
+#endif
+#ifndef SNAKE_ORDER
+#define SNAKE_ORDER 1
+#endif
+#ifndef CVT_ADD_FUSED
+#define CVT_ADD_FUSED 1    // 1=fused asm (asm-local regs), 0=C++ intrinsics (global regs)
+#endif
+// nvcc doesn't expand macros in #pragma unroll — use _Pragma instead
+#define _UNROLL_STR2(x) #x
+#define _UNROLL_STR(x) _UNROLL_STR2(unroll x)
+#define PRAGMA_UNROLL(n) _Pragma(_UNROLL_STR(n))
 #define THREADS        (32 * (2 + NUM_EPI_WARPS))
 #define BATCH_SIZE     4736
 #define SEQ_LEN        196
@@ -38,7 +55,9 @@
 #define TILES_N        3
 #define K_ITERS        6
 #define TOTAL_TILES    10878
-#define N_STAGES       4                                          // change to 4 or 5 to test
+#ifndef N_STAGES
+#define N_STAGES       4
+#endif
 #define STAGE_BYTES    32768                                      // 16KB A + 16KB B per stage
 #define OFF_TMEM           (N_STAGES * STAGE_BYTES)
 #define OFF_TMA_MBAR       (OFF_TMEM + 8)
@@ -158,8 +177,8 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
 }
 
 // ── F28: Accumulating K-iteration macro (all sub-MMAs accumulate) ──
-// Used for ki=1..5 where accumulator is already initialized.
-// S must be a compile-time constant stage index (0..N_STAGES-1).
+// Used for ki=1..K_ITERS-1 where accumulator is already initialized.
+// S is the stage index (0..N_STAGES-1); works with runtime values but best with constants.
 #define K_ITER_ACCUM(S) do { \
     mbar_wait(tma_mbar[S], tma_phase[S]); \
     tma_phase[S] ^= 1; \
@@ -308,6 +327,42 @@ __device__ __forceinline__ uint32_t cvt_add_bf16x2(float lo, float hi, uint32_t 
         "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" \
         :: "r"(SADDR), "r"(b0), "r"(b1), "r"(b2), "r"(b3) : "memory")
 
+// ── Fused CVT+ADD+STS macro — asm-local .reg intermediates avoid global register inflation ──
+// Converts 4 pairs of FP32 accumulators to BF16x2, adds combined BF16x2, stores 16B to SMEM.
+// With CVT_ADD_FUSED=1, b0-b3 are .reg locals invisible to ptxas's register allocator.
+// With CVT_ADD_FUSED=0, falls back to cvt_add_bf16x2() + STS_V4 (global regs).
+
+#if CVT_ADD_FUSED
+#define CVT_ADD_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, c0,c1,c2,c3, SADDR) \
+    asm volatile( \
+        "{\n\t" \
+        ".reg .b32 b0, b1, b2, b3;\n\t" \
+        "cvt.rn.bf16x2.f32 b0, %1, %0;\n\t" \
+        "add.rn.bf16x2 b0, b0, %8;\n\t" \
+        "cvt.rn.bf16x2.f32 b1, %3, %2;\n\t" \
+        "add.rn.bf16x2 b1, b1, %9;\n\t" \
+        "cvt.rn.bf16x2.f32 b2, %5, %4;\n\t" \
+        "add.rn.bf16x2 b2, b2, %10;\n\t" \
+        "cvt.rn.bf16x2.f32 b3, %7, %6;\n\t" \
+        "add.rn.bf16x2 b3, b3, %11;\n\t" \
+        "st.shared.v4.b32 [%12], {b0,b1,b2,b3};\n\t" \
+        "}" \
+        :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
+           "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
+           "r"(c0),"r"(c1),"r"(c2),"r"(c3), \
+           "r"(SADDR) \
+        : "memory")
+#else
+#define CVT_ADD_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, c0,c1,c2,c3, SADDR) \
+    do { \
+        uint32_t _b0 = cvt_add_bf16x2(f0, f1, c0); \
+        uint32_t _b1 = cvt_add_bf16x2(f2, f3, c1); \
+        uint32_t _b2 = cvt_add_bf16x2(f4, f5, c2); \
+        uint32_t _b3 = cvt_add_bf16x2(f6, f7, c3); \
+        STS_V4(_b0, _b1, _b2, _b3, SADDR); \
+    } while(0)
+#endif
+
 // ── Epilogue: TMEM → inline BF16 add → CVT → 4 swizzle SMEM regions → TMA tensor stores ──
 // Phase 1: TMEM readback (all 256 cols) + combined add + CVT → 4 swizzle regions (SWIZZLE_128B)
 // Phase 2: 4 TMA tensor stores from swizzle regions → global C
@@ -339,10 +394,15 @@ void epilogue_store(
         + comb_row_in_blk * COMB_BLOCK_COLS;
 
     // 4 swizzle regions per warp, each 32 rows x 64 cols BF16 (SWIZZLE_128B)
+    // Only declare staging_rN when used (strategies 0 and 3) to avoid unused-variable warnings.
+#if INTERLEAVE_STRATEGY == 0
     const uint32_t staging_r0 = staging_saddr;
     const uint32_t staging_r1 = staging_saddr + STAGING_REGION_BYTES;
     const uint32_t staging_r2 = staging_saddr + 2 * STAGING_REGION_BYTES;
     const uint32_t staging_r3 = staging_saddr + 3 * STAGING_REGION_BYTES;
+#elif INTERLEAVE_STRATEGY == 3
+    const uint32_t staging_r3 = staging_saddr + 3 * STAGING_REGION_BYTES;
+#endif
 
     // Wait for previous tile's Phase 2 TMA stores before overwriting staging.
     // After ml_wait (~1,342 cycles), TMA stores are long done — this is a true no-op.
@@ -368,7 +428,7 @@ void epilogue_store(
                   a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
                   taddr_base + NC_START);
 
-    #pragma unroll 1
+    PRAGMA_UNROLL(PHASE1_UNROLL)
     for (int nc = NC_START; nc < NC_END; nc += 64) {
         const uint32_t srow = srow_base + ((nc - NC_START) >> 6) * STAGING_REGION_BYTES;
 
@@ -386,36 +446,12 @@ void epilogue_store(
 
         // First 32 cols: a0..a31 → swizzle region (bytes 0-63)
         {
-            {
-                uint32_t b0 = cvt_add_bf16x2(a0, a1, craw0.x);
-                uint32_t b1 = cvt_add_bf16x2(a2, a3, craw0.y);
-                uint32_t b2 = cvt_add_bf16x2(a4, a5, craw0.z);
-                uint32_t b3 = cvt_add_bf16x2(a6, a7, craw0.w);
-                STS_V4(b0, b1, b2, b3, srow + (0 ^ xor_val));
-            }
-            {
-                uint32_t b0 = cvt_add_bf16x2(a8, a9, craw1.x);
-                uint32_t b1 = cvt_add_bf16x2(a10, a11, craw1.y);
-                uint32_t b2 = cvt_add_bf16x2(a12, a13, craw1.z);
-                uint32_t b3 = cvt_add_bf16x2(a14, a15, craw1.w);
-                STS_V4(b0, b1, b2, b3, srow + (16 ^ xor_val));
-            }
+            CVT_ADD_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, craw0.x,craw0.y,craw0.z,craw0.w, srow + (0 ^ xor_val));
+            CVT_ADD_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, craw1.x,craw1.y,craw1.z,craw1.w, srow + (16 ^ xor_val));
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
             craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
-            {
-                uint32_t b0 = cvt_add_bf16x2(a16, a17, craw0.x);
-                uint32_t b1 = cvt_add_bf16x2(a18, a19, craw0.y);
-                uint32_t b2 = cvt_add_bf16x2(a20, a21, craw0.z);
-                uint32_t b3 = cvt_add_bf16x2(a22, a23, craw0.w);
-                STS_V4(b0, b1, b2, b3, srow + (32 ^ xor_val));
-            }
-            {
-                uint32_t b0 = cvt_add_bf16x2(a24, a25, craw1.x);
-                uint32_t b1 = cvt_add_bf16x2(a26, a27, craw1.y);
-                uint32_t b2 = cvt_add_bf16x2(a28, a29, craw1.z);
-                uint32_t b3 = cvt_add_bf16x2(a30, a31, craw1.w);
-                STS_V4(b0, b1, b2, b3, srow + (48 ^ xor_val));
-            }
+            CVT_ADD_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, craw0.x,craw0.y,craw0.z,craw0.w, srow + (32 ^ xor_val));
+            CVT_ADD_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, craw1.x,craw1.y,craw1.z,craw1.w, srow + (48 ^ xor_val));
         }
 
         // Second 32 cols: a32..a63 → swizzle region (bytes 64-127)
@@ -423,36 +459,12 @@ void epilogue_store(
             const __nv_bfloat16* comb_ptr2 = comb_base + (long long)((n_start + nc + 32) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr2);
             craw1 = *reinterpret_cast<const uint4*>(comb_ptr2 + 8);
-            {
-                uint32_t b0 = cvt_add_bf16x2(a32, a33, craw0.x);
-                uint32_t b1 = cvt_add_bf16x2(a34, a35, craw0.y);
-                uint32_t b2 = cvt_add_bf16x2(a36, a37, craw0.z);
-                uint32_t b3 = cvt_add_bf16x2(a38, a39, craw0.w);
-                STS_V4(b0, b1, b2, b3, srow + (64 ^ xor_val));
-            }
-            {
-                uint32_t b0 = cvt_add_bf16x2(a40, a41, craw1.x);
-                uint32_t b1 = cvt_add_bf16x2(a42, a43, craw1.y);
-                uint32_t b2 = cvt_add_bf16x2(a44, a45, craw1.z);
-                uint32_t b3 = cvt_add_bf16x2(a46, a47, craw1.w);
-                STS_V4(b0, b1, b2, b3, srow + (80 ^ xor_val));
-            }
+            CVT_ADD_STS_V4(a32,a33,a34,a35,a36,a37,a38,a39, craw0.x,craw0.y,craw0.z,craw0.w, srow + (64 ^ xor_val));
+            CVT_ADD_STS_V4(a40,a41,a42,a43,a44,a45,a46,a47, craw1.x,craw1.y,craw1.z,craw1.w, srow + (80 ^ xor_val));
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr2 + 16);
             craw1 = *reinterpret_cast<const uint4*>(comb_ptr2 + 24);
-            {
-                uint32_t b0 = cvt_add_bf16x2(a48, a49, craw0.x);
-                uint32_t b1 = cvt_add_bf16x2(a50, a51, craw0.y);
-                uint32_t b2 = cvt_add_bf16x2(a52, a53, craw0.z);
-                uint32_t b3 = cvt_add_bf16x2(a54, a55, craw0.w);
-                STS_V4(b0, b1, b2, b3, srow + (96 ^ xor_val));
-            }
-            {
-                uint32_t b0 = cvt_add_bf16x2(a56, a57, craw1.x);
-                uint32_t b1 = cvt_add_bf16x2(a58, a59, craw1.y);
-                uint32_t b2 = cvt_add_bf16x2(a60, a61, craw1.z);
-                uint32_t b3 = cvt_add_bf16x2(a62, a63, craw1.w);
-                STS_V4(b0, b1, b2, b3, srow + (112 ^ xor_val));
-            }
+            CVT_ADD_STS_V4(a48,a49,a50,a51,a52,a53,a54,a55, craw0.x,craw0.y,craw0.z,craw0.w, srow + (96 ^ xor_val));
+            CVT_ADD_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63, craw1.x,craw1.y,craw1.z,craw1.w, srow + (112 ^ xor_val));
         }
 
         // F40: Interleaved TMA store(s) — completed region(s) → global
@@ -505,7 +517,7 @@ void epilogue_store(
                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                  taddr_base + NC_START);
 
-    #pragma unroll 2
+    PRAGMA_UNROLL(PHASE1_UNROLL)
     for (int nc = NC_START; nc < NC_END; nc += 32) {
         const __nv_bfloat16* comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
         uint4 craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
@@ -520,37 +532,13 @@ void epilogue_store(
 
         const uint32_t srow = srow_base + ((nc - NC_START) >> 6) * STAGING_REGION_BYTES;
         const int byte_base = ((nc - NC_START) & 63) * 2;
-        {
-            uint32_t b0 = cvt_add_bf16x2(a0, a1, craw0.x);
-            uint32_t b1 = cvt_add_bf16x2(a2, a3, craw0.y);
-            uint32_t b2 = cvt_add_bf16x2(a4, a5, craw0.z);
-            uint32_t b3 = cvt_add_bf16x2(a6, a7, craw0.w);
-            STS_V4(b0, b1, b2, b3, srow + (byte_base ^ xor_val));
-        }
-        {
-            uint32_t b0 = cvt_add_bf16x2(a8, a9, craw1.x);
-            uint32_t b1 = cvt_add_bf16x2(a10, a11, craw1.y);
-            uint32_t b2 = cvt_add_bf16x2(a12, a13, craw1.z);
-            uint32_t b3 = cvt_add_bf16x2(a14, a15, craw1.w);
-            STS_V4(b0, b1, b2, b3, srow + ((byte_base + 16) ^ xor_val));
-        }
+        CVT_ADD_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, craw0.x,craw0.y,craw0.z,craw0.w, srow + (byte_base ^ xor_val));
+        CVT_ADD_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, craw1.x,craw1.y,craw1.z,craw1.w, srow + ((byte_base + 16) ^ xor_val));
 
         craw0 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
         craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
-        {
-            uint32_t b0 = cvt_add_bf16x2(a16, a17, craw0.x);
-            uint32_t b1 = cvt_add_bf16x2(a18, a19, craw0.y);
-            uint32_t b2 = cvt_add_bf16x2(a20, a21, craw0.z);
-            uint32_t b3 = cvt_add_bf16x2(a22, a23, craw0.w);
-            STS_V4(b0, b1, b2, b3, srow + ((byte_base + 32) ^ xor_val));
-        }
-        {
-            uint32_t b0 = cvt_add_bf16x2(a24, a25, craw1.x);
-            uint32_t b1 = cvt_add_bf16x2(a26, a27, craw1.y);
-            uint32_t b2 = cvt_add_bf16x2(a28, a29, craw1.z);
-            uint32_t b3 = cvt_add_bf16x2(a30, a31, craw1.w);
-            STS_V4(b0, b1, b2, b3, srow + ((byte_base + 48) ^ xor_val));
-        }
+        CVT_ADD_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, craw0.x,craw0.y,craw0.z,craw0.w, srow + ((byte_base + 32) ^ xor_val));
+        CVT_ADD_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, craw1.x,craw1.y,craw1.z,craw1.w, srow + ((byte_base + 48) ^ xor_val));
 
         // F40: Interleaved TMA store(s) — region completes every 2 x32 iterations
         if (INTERLEAVE_STRATEGY == 1 && ((nc - NC_START) & 63) == 32) {
@@ -600,7 +588,7 @@ void epilogue_store(
 #if INTERLEAVE_STRATEGY == 0
     // Strategy 0 (all-at-end): original behavior — all 4 TMA stores in Phase 2
     __syncwarp();  // Phase 1 SMEM writes visible for Phase 2 TMA reads
-    if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
+    if (!MBAR_EARLY && epi_mbar_addr) mbar_arrive(epi_mbar_addr);
 
     // ═══ Phase 2: 4 TMA tensor stores → global ═══
     if (lane == 0) {
@@ -769,7 +757,7 @@ patch_embed_gemm(
         const int buf = tile_idx & 1;
         const int tm = tile_idx / TILES_N;
         int tn = tile_idx % TILES_N;
-        if (tm & 1) tn = TILES_N - 1 - tn;  // snake: reverse odd M-rows
+        if (SNAKE_ORDER && (tm & 1)) tn = TILES_N - 1 - tn;  // snake: reverse odd M-rows
         const int m_start = tm * TM * 2 + cta_rank * TM;  // macro tile (256 rows) + CTA offset
         const int n_start = tn * TN;
 
@@ -844,16 +832,10 @@ patch_embed_gemm(
                     }
                 }
                 tcgen05_commit_mcast(mma_mbar[0], 0x3);
-                // ki=1 (s=1)
-                K_ITER_ACCUM(1);
-                // ki=2 (s=2)
-                K_ITER_ACCUM(2);
-                // ki=3 (s=3)
-                K_ITER_ACCUM(3);
-                // ki=4 (s=0)
-                K_ITER_ACCUM(0);
-                // ki=5 (s=1)
-                K_ITER_ACCUM(1);
+                #pragma unroll
+                for (int ki = 1; ki < K_ITERS; ki++) {
+                    K_ITER_ACCUM(ki % N_STAGES);
+                }
 
                 // Signal K-loop done: multicast commit → mainloop_mbar[buf] in both CTAs
                 tcgen05_commit_mcast(mainloop_mbar_addr + buf * 8, 0x3);
@@ -911,7 +893,7 @@ patch_embed_gemm(
                 const int prev_idx = tile_idx - 1;
                 const int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
-                if (ptm & 1) ptn = TILES_N - 1 - ptn;
+                if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
                 const int prev_m = ptm * TM * 2 + cta_rank * TM;
                 const int prev_n = ptn * TN;
 
@@ -1027,7 +1009,7 @@ patch_embed_gemm(
         const int last_idx = tile_end - 1;
         const int ltm = last_idx / TILES_N;
         int ltn = last_idx % TILES_N;
-        if (ltm & 1) ltn = TILES_N - 1 - ltn;
+        if (SNAKE_ORDER && (ltm & 1)) ltn = TILES_N - 1 - ltn;
         const int last_m = ltm * TM * 2 + cta_rank * TM;
         const int last_n = ltn * TN;
         const int gm_base = last_m + row_group * 32;
@@ -1102,11 +1084,37 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_combined, (size_t)COMB_PADDED_ROWS * N_DIM * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&d_C,    (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16)));
 
-    // Fill A, B with 0x3C (=1.5 in FP8 E4M3, a valid finite value)
+    // A: uniform 0x3C (=1.5 in FP8 E4M3)
+    // B: alternating rows — even rows 0x3C (1.5), odd rows 0x38 (1.0)
+    // This makes adjacent output columns have different accumulator values:
+    //   even cols: K_DIM * 1.5 * 1.5 = 1728.0
+    //   odd cols:  K_DIM * 1.5 * 1.0 = 1152.0
+    // Detects CVT bf16x2 lane swap bugs that uniform data cannot catch.
     CUDA_CHECK(cudaMemset(d_A, 0x3C, (size_t)M_TOTAL * K_DIM));
-    CUDA_CHECK(cudaMemset(d_B, 0x3C, (size_t)N_DIM * K_DIM));
-    CUDA_CHECK(cudaMemset(d_bias, 0, (size_t)N_DIM * sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_pos,  0, (size_t)SEQ_LEN * N_DIM * sizeof(float)));
+    {
+        uint8_t* h_B = (uint8_t*)malloc((size_t)N_DIM * K_DIM);
+        for (int n = 0; n < N_DIM; n++)
+            memset(h_B + (size_t)n * K_DIM, (n & 1) ? 0x38 : 0x3C, K_DIM);
+        CUDA_CHECK(cudaMemcpy(d_B, h_B, (size_t)N_DIM * K_DIM, cudaMemcpyHostToDevice));
+        free(h_B);
+    }
+
+    // Non-uniform bias/pos_embed: makes every output element position-dependent,
+    // so layout/permutation bugs (tile ordering, CTA rank, snake direction) are detectable.
+    // bias[c] = c + 1 (column-dependent), pos_embed[r][c] = 3*(r+1) (row-dependent)
+    {
+        float* h_bias = (float*)malloc((size_t)N_DIM * sizeof(float));
+        float* h_pos  = (float*)malloc((size_t)SEQ_LEN * N_DIM * sizeof(float));
+        for (int c = 0; c < N_DIM; c++)
+            h_bias[c] = (float)(c + 1);
+        for (int r = 0; r < SEQ_LEN; r++)
+            for (int c = 0; c < N_DIM; c++)
+                h_pos[r * N_DIM + c] = (float)((r + 1) * 3);
+        CUDA_CHECK(cudaMemcpy(d_bias, h_bias, (size_t)N_DIM * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_pos, h_pos, (size_t)SEQ_LEN * N_DIM * sizeof(float), cudaMemcpyHostToDevice));
+        free(h_bias);
+        free(h_pos);
+    }
 
     // Precompute combined[r][c] = __float2bfloat16(bias[c] + pos_embed[r*N_DIM+c])
     {
@@ -1226,12 +1234,71 @@ int main() {
     __nv_bfloat16* h_C = (__nv_bfloat16*)malloc((size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16));
     CUDA_CHECK(cudaMemcpy(h_C, d_C, (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
 
+    // Copy combined (blocked layout) back to host for CPU reference validation
+    __nv_bfloat16* h_combined = (__nv_bfloat16*)malloc((size_t)COMB_PADDED_ROWS * N_DIM * sizeof(__nv_bfloat16));
+    CUDA_CHECK(cudaMemcpy(h_combined, d_combined, (size_t)COMB_PADDED_ROWS * N_DIM * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+
+    // Strided checksum: 1024 samples spread across the full output matrix.
+    // Catches tile ordering, snake direction, CTA rank, and late-tile bugs
+    // that a first-1024-element window would miss entirely.
     double cksum = 0;
-    for (int i = 0; i < 1024 && i < M_TOTAL * N_DIM; i++) cksum += __bfloat162float(h_C[i]);
-    printf("Checksum (first 1024): %f\n", cksum);
+    {
+        long long total_elems = (long long)M_TOTAL * N_DIM;
+        long long stride = total_elems / 1024;
+        for (int i = 0; i < 1024; i++)
+            cksum += (double)__bfloat162float(h_C[(long long)i * stride]);
+    }
+
+    // CPU reference spot checks: 32 positions spread across the matrix.
+    // Validates layout correctness (combined blocked-index lookup must match kernel).
+    // GEMM result is column-dependent (non-uniform B):
+    //   even cols: K_DIM * 1.5 * 1.5 = 1728.0
+    //   odd cols:  K_DIM * 1.5 * 1.0 = 1152.0
+    int errors = 0;
+    {
+        for (int spot = 0; spot < 32; spot++) {
+            long long row = (long long)spot * M_TOTAL / 32;
+            int col = (spot * 47) % N_DIM;  // prime stride for column diversity
+            int pos_row = (int)(row % SEQ_LEN);
+
+            // Column-dependent GEMM result: B[even_n]=1.5, B[odd_n]=1.0
+            float b_val = (col & 1) ? 1.0f : 1.5f;
+            float gemm_f32 = (float)K_DIM * 1.5f * b_val;
+            float gemm_bf16_f = __bfloat162float(__float2bfloat16(gemm_f32));
+
+            // Blocked combined layout lookup (must match precompute_combined kernel)
+            int br = pos_row / COMB_BLOCK_ROWS;
+            int rir = pos_row % COMB_BLOCK_ROWS;
+            int bc = col / COMB_BLOCK_COLS;
+            int cic = col % COMB_BLOCK_COLS;
+            int cidx = (br * COMB_COL_BLOCKS + bc) * COMB_BLOCK_ELEMS + rir * COMB_BLOCK_COLS + cic;
+
+            float comb_f = __bfloat162float(h_combined[cidx]);
+            // Reference: bf16(bf16(gemm) + bf16(combined)) — matches kernel's cvt+add
+            __nv_bfloat16 expected = __float2bfloat16(gemm_bf16_f + comb_f);
+            __nv_bfloat16 actual = h_C[row * N_DIM + col];
+
+            float ef = __bfloat162float(expected);
+            float af = __bfloat162float(actual);
+            if (ef != af) {
+                if (errors < 5)
+                    printf("  MISMATCH at (%lld,%d): expected %.1f got %.1f (combined=%.4f gemm=%.1f)\n",
+                           row, col, ef, af, comb_f, gemm_bf16_f);
+                errors++;
+            }
+        }
+    }
+    free(h_combined);
+
+    int valid = (errors == 0) ? 1 : 0;
+    printf("Validation: %d/32 spot checks passed%s\n", 32 - errors, valid ? "" : " — FAILED");
+    printf("Checksum (1024 strided): %f\n", cksum);
     printf("C[0,0..3] = %.1f %.1f %.1f %.1f\n",
            __bfloat162float(h_C[0]), __bfloat162float(h_C[1]),
            __bfloat162float(h_C[2]), __bfloat162float(h_C[3]));
+    printf("@@RESULT ms=%.3f tflops=%.2f checksum=%f valid=%d c0=%.1f\n",
+           _ms, 2.0 * M_TOTAL * N_DIM * K_DIM / _ms / 1e9, cksum, valid,
+           __bfloat162float(h_C[0]));
 
 #ifdef TIMING
     // Read timing data

@@ -32,9 +32,9 @@ F40 interleaved TMA stores hide Phase 2 latency inside Phase 1 TMEM stall window
 - Phase 1 TMEM readback = binding constraint. F40 overlaps TMA stores with TMEM stalls.
 - K-loop: 4,059 cycles. Precomputed descriptors + manual unroll from F28.
 - TMA multicast not applicable (B is N-split across CTAs).
-- 207 regs/thread, 0 spills. Limits occupancy to 1 CTA/SM.
+- ~205 regs/thread (varies with `CVT_ADD_FUSED` and `PHASE1_UNROLL`), 0 spills. Limits occupancy to 1 CTA/SM.
 - Per-warp Phase 1 spread: 269 cycles (reduced from 330 by F31 stagger). Contention-based (confirmed by rg-swap diagnostic).
-- Timing build uses 255 regs (distorts cycles vs production at 207 regs). Wall clock is ground truth.
+- Timing build uses ~245 regs (distorts cycles vs production at ~205 regs). Wall clock is ground truth.
 
 Run `python3 analyze_timing.py clock64_timing.txt` for full equilibrium analysis and what-if projections.
 Run `python3 analyze_source_counters.py source_counters_raw.csv` for per-instruction stall breakdown.
@@ -48,7 +48,7 @@ Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1
 - **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
 - **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols: x32 `tcgen05.ld` → BF16 add → CVT → `st.shared` to 4 SWIZZLE_128B staging regions, with **interleaved TMA stores** every 2 regions hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1
 
-TM=128 rows / 32 rows per warp = 4 row groups. W2-W5 each own a row group (all 256 cols). No column splitting (is_split always 0). `epilogue_store` is templated on `<NC_START, NC_END>` so the compiler sees constant loop bounds and fully unrolls.
+TM=128 rows / 32 rows per warp = 4 row groups. W2-W5 each own a row group (all 256 cols). No column splitting (is_split always 0). `epilogue_store` is templated on `<NC_START, NC_END>` so the compiler sees constant loop bounds; unroll depth controlled by `PHASE1_UNROLL` (default 2).
 
 The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile N (double-buffered TMEM, mbarrier-protected). After the tile loop, W2-5 run a drain epilogue for the last tile.
 
@@ -57,7 +57,7 @@ The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile 
 - TMEM: single alloc of 512 cols (TN*2), double-buffered via column offset (buf*TN)
 - SMEM: 4-stage pipeline (131 KB) + epilogue staging (4 warps x 16,384 = 64 KB, SWIZZLE_128B) = ~197 KB total of 228 KB
 - Tiles: 3626 M-tiles x 3 N-tiles = 10,878 total, snake ordering
-- 207 registers/thread, 0 spills
+- ~205 registers/thread, 0 spills (varies with `CVT_ADD_FUSED`, `PHASE1_UNROLL`)
 - `NUM_EPI_WARPS` controls epilogue warp count (currently 4); `THREADS` derived as `32*(2+NUM_EPI_WARPS)`
 
 ## Development workflow
@@ -75,14 +75,17 @@ edit megakernel.cu -> make -> ./siglip_vision
 | File | What |
 |------|------|
 | `megakernel.cu` | **Source of truth** — hand-tuned CUDA kernel |
-| `cutlass_bench.cu` | CUTLASS grid search — sweeps 12 tile/cluster configs × FP32/BF16 epilogue. Single binary, no `-D` flags |
+| `cutlass_bench.cu` | CUTLASS grid search — sweeps 13 tile/cluster configs × FP32/BF16 epilogue. Single binary, no `-D` flags |
 | `EXPERIMENTS.md` | Experiment log (F1-F40), profiling data, optimization history |
 | `FUTURE_PROPOSALS.md` | Optimization roadmap (F21-F28, all executed) with results |
+| `grid_search.py` | Compile-time parameter sweep — tiered search, cross-product, CSV output. Replaces manual Makefile targets |
 | `Makefile` | Build rules (sm_100a, nvcc flags). `make timing` for clock64 build |
 | **Analysis scripts** | |
 | `analyze_timing.py` | Parses `clock64_timing.txt` → equilibrium analysis, ceiling projections, what-if scenarios |
 | `analyze_source_counters.py` | Parses ncu SourceCounters CSV → stall breakdown, MMA stats, W1 budget, instruction mix |
 | `compare.py` | ncu CSV diff tool — usage: `python compare.py a.csv b.csv` |
+| `sass_analysis.py` | SASS scheduling analyzer — decodes control words, builds dependency graphs, identifies slack. Has `--calibrate-compare` mode for closed-loop decoder verification against `calibration.cu` runtime |
+| `calibration.cu` | 10 microbenchmark kernels (K1-K9) measuring instruction throughput/latency on B200. Used to verify SASS control word bit layout and populate `sass_analysis.py` latency table |
 | **Raw profiling data** | |
 | `clock64_timing.txt` | Kernel printf from timing build (34 lines). Analyze with `analyze_timing.py` |
 | `source_counters_raw.csv` | Raw ncu `--set source --csv` data (4K lines). Analyze with `analyze_source_counters.py` |
@@ -110,6 +113,27 @@ make cutlass-bench      # ~1-2 min compile (26 CUTLASS template instantiations)
 make cutlass-bench-max  # broader tile/cluster sweep, slower compile/runtime
 ./cutlass-bench-max     # use when locking baseline
 ./cutlass-bench-max 1   # quick sanity pass
+
+# Megakernel parameter grid search (replaces manual -D flag Makefile targets)
+python3 grid_search.py --tier 1          # structure: N_STAGES × NUM_EPI_WARPS
+python3 grid_search.py --tier 2          # epilogue: INTERLEAVE × MBAR × STAGGER × TMEM
+python3 grid_search.py --tier 3          # tuning: PHASE1_UNROLL × SNAKE_ORDER × CVT_ADD_FUSED
+python3 grid_search.py --tier all        # sequential 1→2→3, pinning winners
+python3 grid_search.py --full-cross      # all parameters crossed (~3000 configs)
+
+# SASS scheduling analysis
+cuobjdump --dump-sass siglip_vision > sass_dump.txt
+python3 sass_analysis.py sass_dump.txt                          # annotated listing
+python3 sass_analysis.py sass_dump.txt --section 0x1300 0x1a70  # address range (e.g., epilogue)
+python3 sass_analysis.py sass_dump.txt --deps                   # dependency + slack analysis
+python3 sass_analysis.py --cubin siglip_vision                  # runs cuobjdump internally
+
+# Calibration: verify SASS control word decoder on B200
+make calibration          # compile calibration.cu
+./calibration > cal_output.txt
+cuobjdump --dump-sass calibration > cal_sass.txt
+python3 sass_analysis.py cal_sass.txt --calibrate-compare                          # SASS-only
+python3 sass_analysis.py cal_sass.txt --calibrate-compare --runtime cal_output.txt # compare vs runtime
 ```
 
 ### CUTLASS bench details
@@ -126,8 +150,8 @@ Core template: `GemmInstance<TM, TN, TK, CM, CN, EpiCompute>` — full CUTLASS t
 - Target: `sm_100a` (B200, 148 SMs)
 - `cta_group::2` with `__cluster_dims__(2,1,1)` — 74 clusters of 2 CTAs
 - TMEM: 512 cols/SM total, single alloc of TN*2 for double buffering (learned from matmul_v7: two separate allocs deadlock, single alloc works)
-- SMEM: 228 KB/SM — current usage ~199 KB (4-stage pipeline + asymmetric epilogue staging, ~29 KB free)
+- SMEM: 228 KB/SM — current usage ~197 KB (4-stage pipeline + unified SWIZZLE_128B epilogue staging, ~31 KB free)
 - All inline PTX — no CUTLASS dependency for the kernel itself
 - `megakernel.cu` is hand-edited directly
-- Expected checksum: 1769472.0, C[0,0..3] = 1728.0
+- Validation: non-uniform B (alternating FP8 rows: 1.5/1.0 → distinct even/odd col accumulators), non-uniform bias/pos_embed, 1024 strided checksum + 32 CPU reference spot checks (valid=1 in @@RESULT)
 - ml_phase init must account for odd tile_start (start_buf-dependent)
