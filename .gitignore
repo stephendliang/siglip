@@ -1,0 +1,23 @@
+# Build artifacts
+siglip_vision
+siglip_timing
+siglip_best
+siglip_x32
+siglip_x64
+cutlass-bench
+cutlass-bench-max
+cutlass-256x256x64
+cublas-bench
+calibration
+
+# SASS dumps (large, regenerable)
+sass/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor
+*.swp
+*.swo
+*~

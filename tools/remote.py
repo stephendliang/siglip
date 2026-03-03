@@ -472,7 +472,7 @@ def main():
             remote_cmd = f'cd {REPO_DIR} && {args.cmd}'
         elif args.sweep:
             tier_arg = '--full-cross' if args.tier == 'full-cross' else f'--tier {args.tier}'
-            remote_cmd = f'cd {REPO_DIR} && python3 grid_search.py {tier_arg} {args.sweep_args}'
+            remote_cmd = f'cd {REPO_DIR} && python3 tools/grid_search.py {tier_arg} {args.sweep_args}'
         else:
             remote_cmd = f'cd {REPO_DIR} && make && ./siglip_vision'
 
@@ -485,8 +485,8 @@ def main():
         # Fetch results
         if args.fetch_csv and args.sweep:
             local_csv = 'sweep_results_remote.csv'
-            print(f'Fetching sweep_results.csv → {local_csv}')
-            fetch_file(ip, f'{REPO_DIR}/sweep_results.csv', local_csv)
+            print(f'Fetching data/sweep_results.csv → {local_csv}')
+            fetch_file(ip, f'{REPO_DIR}/data/sweep_results.csv', local_csv)
 
     except subprocess.TimeoutExpired:
         print(f'\nTIMEOUT: remote command exceeded {RUN_TIMEOUT}s', file=sys.stderr)

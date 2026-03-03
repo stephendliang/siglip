@@ -1,0 +1,144 @@
+Tier 1 — High frequency, scheduling-critical (stall count directly affects cycle budget):
+
+┌─────────────────────────────────────┬───────┬─────────────┬─────────┬───────────────────────────────────────────┐
+│               Opcode                │ Count │   Current   │ Source  │                  Problem                  │
+├─────────────────────────────────────┼───────┼─────────────┼─────────┼───────────────────────────────────────────┤
+│ IMAD (.MOV, .WIDE, .IADD, .X, .SHL) │ 339   │ 4           │ assumed │ Never measured. 5 sub-variants may differ │
+├─────────────────────────────────────┼───────┼─────────────┼─────────┼───────────────────────────────────────────┤
+│ R2UR (.BROADCAST)                   │ 408   │ 8           │ guessed │ Never measured. Highest frequency opcode  │
+├─────────────────────────────────────┼───────┼─────────────┼─────────┼───────────────────────────────────────────┤
+│ VIADD                               │ 75    │ 4 (default) │ missing │ Not even in the table                     │
+├─────────────────────────────────────┼───────┼─────────────┼─────────┼───────────────────────────────────────────┤
+│ LOP3                                │ 77    │ 4           │ assumed │ Never measured                            │
+├─────────────────────────────────────┼───────┼─────────────┼─────────┼───────────────────────────────────────────┤
+│ SHF (.R.S32, .L.U32)                │ 64    │ 4           │ assumed │ Never measured                            │
+├─────────────────────────────────────┼───────┼─────────────┼─────────┼───────────────────────────────────────────┤
+│ MOV                                 │ 35    │ 2           │ assumed │ Never measured                            │
+├─────────────────────────────────────┼───────┼─────────────┼─────────┼───────────────────────────────────────────┤
+│ LEA                                 │ 25    │ 4           │ assumed │ Never measured                            │
+├─────────────────────────────────────┼───────┼─────────────┼─────────┼───────────────────────────────────────────┤
+│ LDS (.64)                           │ 70    │ 20          │ guessed │ Never measured. Guessed from Ampere       │
+├─────────────────────────────────────┼───────┼─────────────┼─────────┼───────────────────────────────────────────┤
+│ STG (.E.64)                         │ 65    │ 4 (default) │ missing │ Not in table at all                       │
+├─────────────────────────────────────┼───────┼─────────────┼─────────┼───────────────────────────────────────────┤
+│ ISETP                               │ 47    │ 4           │ assumed │ Never measured                            │
+├─────────────────────────────────────┼───────┼─────────────┼─────────┼───────────────────────────────────────────┤
+│ SEL                                 │ 4     │ 4           │ assumed │ Never measured                            │
+├─────────────────────────────────────┼───────┼─────────────┼─────────┼───────────────────────────────────────────┤
+│ IABS                                │ 4     │ 4 (default) │ missing │ Not in table                              │
+└─────────────────────────────────────┴───────┴─────────────┴─────────┴───────────────────────────────────────────┘
+
+Tier 2 — Uniform pipeline (U-prefix ops, may have different latency from scalar):
+
+┌─────────────┬───────┬─────────────┬─────────┬──────────────────────────────────────┐
+│   Opcode    │ Count │   Current   │ Source  │               Problem                │
+├─────────────┼───────┼─────────────┼─────────┼──────────────────────────────────────┤
+│ UMOV        │ 51    │ 4 (default) │ missing │ Uniform MOV — different pipe?        │
+├─────────────┼───────┼─────────────┼─────────┼──────────────────────────────────────┤
+│ UIADD3 (.X) │ 39    │ 4 (default) │ missing │ Uniform IADD3 — is it 2 like scalar? │
+├─────────────┼───────┼─────────────┼─────────┼──────────────────────────────────────┤
+│ USHF        │ 7     │ 4 (default) │ missing │ Uniform shift                        │
+├─────────────┼───────┼─────────────┼─────────┼──────────────────────────────────────┤
+│ ULEA        │ 2     │ 4 (default) │ missing │ Uniform LEA                          │
+└─────────────┴───────┴─────────────┴─────────┴──────────────────────────────────────┘
+
+Tier 3 — Special registers, cross-domain:
+
+┌────────┬───────┬─────────┬─────────┬────────────────┐
+│ Opcode │ Count │ Current │ Source  │    Problem     │
+├────────┼───────┼─────────┼─────────┼────────────────┤
+│ S2R    │ 10    │ 20      │ guessed │ Never measured │
+├────────┼───────┼─────────┼─────────┼────────────────┤
+│ S2UR   │ 4     │ 20      │ guessed │ Never measured │
+├────────┼───────┼─────────┼─────────┼────────────────┤
+│ CS2R   │ 6     │ 20      │ guessed │ Never measured │
+└────────┴───────┴─────────┴─────────┴────────────────┘
+
+Tier 4 — Already calibrated (keep): F2FP=4, STS=32, LDG=39, IADD3=2, PRMT≈0, HFMA2=4, HADD2=5
+
+Tier 5 — Barrier-synchronized (latency=0 is correct): LDTM, UTCQMMA, UTCBAR, SYNCS, DEPBAR, NANOSLEEP, WARPSYNC, BAR, BSYNC — these use
+scoreboard barriers not stall counts. 0 is correct.
+
+Tier 6 — Control flow (latency=0 is correct): BRA, EXIT, RET, CALL, BSSY, BSYNC, PLOP3, ELECT, NOP
+
+Tier 7 — TMA/async (latency=0 is correct): UTMALDG, UTMASTG, UTMACMDFLUSH, UTCATOMSWS
+
+Here's the expanded calibration kernel design. Keeping the existing K1-K12 methodology (1 block, 1 warp, clock64, REPS=1024):
+
+New kernels needed
+
+K13a/K13b — IMAD throughput/latency (339 occurrences)
+- K13a: 16 independent mad.lo.s32 %dst, %a, %b, %c (throughput)
+- K13b: dependent chain mad.lo.s32 %0, %0, %1, %2 (latency)
+- PTX mad.lo.s32 maps to SASS IMAD
+
+K14a/K14b — IMAD.WIDE throughput/latency (67 occurrences of IMAD.WIDE)
+- K14a: 16 independent mad.wide.s32 %dst, %a, %b, %c → produces 64-bit result
+- K14b: dependent chain (feed low 32 bits back)
+- Important: IMAD.WIDE may use different functional unit than IMAD
+
+K15a/K15b — LOP3 throughput/latency (77 occurrences)
+- K15a: 16 independent lop3.b32 %dst, %a, %b, %c, 0xE8 (throughput)
+- K15b: dependent chain (latency)
+
+K16a/K16b — SHF throughput/latency (64 occurrences)
+- K16a: 16 independent shf.r.clamp.b32 %dst, %a, %b, %c (throughput)
+- K16b: dependent chain (latency)
+- PTX shf maps to SASS SHF
+
+K17a/K17b — MOV throughput/latency (35 occurrences)
+- K17a: 16 independent mov.b32 %dst, %src with different src/dst (throughput)
+- K17b: dependent chain mov.b32 %0, %0 — but this may be eliminated by compiler. Instead: mov.b32 → add.s32 %0, %0, 0 → mov.b32 chain to
+prevent elimination
+- Actually simpler: mov.b32 %0, %1; mov.b32 %1, %0 alternating
+
+K18a/K18b — LEA throughput/latency (25 occurrences)
+- K18a: independent mad.lo.s32 %dst, %a, 1, %b (which compiles to LEA)
+- Actually LEA is %dst = %a * scale + %b + offset. In PTX there's no direct LEA; it comes from address computation. Use inline asm.
+
+K19a/K19b — VIADD throughput/latency (75 occurrences)
+- VIADD is a video instruction. PTX: vadd.s32.s32.s32. In inline asm: "vadd.s32.s32.s32 %0, %1, %2, %3;"
+
+K20a/K20b — R2UR throughput/latency (408 occurrences — most frequent!)
+- "r2ur.result UR4, R5;" — cross-domain register transfer
+- PTX doesn't have a direct equivalent. Needs SASS-level inline or a trick.
+- Actually in the megakernel it appears as R2UR and R2UR.BROADCAST. The PTX for this is just referencing uniform registers from scalar
+context, or using mov from R to UR space.
+- Can use: asm volatile("mov.u32 %%ur0, %0;" :: "r"(val)); — maps to R2UR
+
+K21a/K21b — ISETP throughput/latency (47 occurrences)
+- K21a: independent setp.ne.s32 %p, %a, %b (throughput)
+- K21b: dependent — predicate feeds next selp which feeds next setp
+
+K22 — LDS latency (70 occurrences)
+- Pointer chase in shared memory: ld.shared.b32 %idx, [smem + %idx*4]
+- Pre-fill smem with self-referencing indices (like K12 for global)
+
+K23 — STG throughput (65 occurrences)
+- Independent st.global.b64 to different addresses
+- Throughput matters, not latency (fire-and-forget like STS?)
+
+K24a/K24b — S2R throughput/latency (10 occurrences)
+- K24a: independent mov.u32 %dst, %tid.x repeated
+- K24b: dependent chain is hard (S2R reads special regs, doesn't write them). Just throughput.
+
+K25a/K25b — UMOV throughput/latency (51 occurrences, uniform pipe)
+- asm volatile("mov.u32 %%ur4, %0;" :: "r"(val)) followed by uniform ops
+
+K26a/K26b — UIADD3 throughput/latency (39 occurrences, uniform pipe)
+- Need to verify if uniform IADD3 has same latency as scalar IADD3 (K7b measured 2 cycles)
+
+That's 14 new kernel pairs (K13-K26) plus K22, K23, K24 standalone = roughly 17 new kernels. Combined with existing K1-K12, total of ~29
+kernels.
+
+The hard ones to write are:
+- R2UR (K20) — cross-domain, needs careful asm
+- VIADD (K19) — video instruction, unusual encoding
+- LEA (K18) — compiler artifact, may need inline asm tricks
+- UIADD3/UMOV/USHF (K25-K27) — uniform pipeline, UR registers
+
+The ones where latency=0/barrier-sync is correct and doesn't need calibration: LDTM, UTCQMMA, SYNCS, UTCBAR, DEPBAR, NANOSLEEP, WARPSYNC,
+BRA, EXIT, NOP, PLOP3, ELECT, BSSY, BSYNC, UTMALDG, UTMASTG, FENCE, CCTL, ENDCOLLECTIVE, UCGABAR, BPT.
+
+Want me to write the full calibration.cu expansion, or should I write it as a separate file (e.g. bench/calibration_v2.cu) to not break the
+existing one?

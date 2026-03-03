@@ -62,7 +62,9 @@ NVCC = 'nvcc'
 ARCH = 'sm_100a'
 CFLAGS = f'-gencode arch=compute_100a,code={ARCH} -O3 --ptxas-options=-v'
 LDFLAGS = '-lcurand -lcuda'
-SRC = 'megakernel.cu'
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)
+SRC = os.path.join(ROOT_DIR, 'megakernel.cu')
 COMPILE_TIMEOUT = 120
 RUN_TIMEOUT = 30
 SMEM_LIMIT = 233472  # 228 KB
@@ -371,8 +373,8 @@ def main():
                         help='Sweep only these parameters, pin rest at defaults')
     parser.add_argument('--repeat', type=int, default=1,
                         help='Run each config N times, report best (default: 1)')
-    parser.add_argument('--csv', default='sweep_results.csv',
-                        help='Output CSV path (default: sweep_results.csv)')
+    parser.add_argument('--csv', default=os.path.join(ROOT_DIR, 'data', 'sweep_results.csv'),
+                        help='Output CSV path (default: data/sweep_results.csv)')
     args = parser.parse_args()
 
     # Parse --fix

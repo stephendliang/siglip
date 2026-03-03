@@ -1,0 +1,142 @@
+CALIBRATION STATUS — opcodes in megakernel SASS
+  ================================================
+
+  !! SASS AUDIT (nvcc 13.1 / sm_100a) — v3: feedback chains replace XOR accum !!
+  ptxas aggressively optimizes calibration loops: loop elimination, CSE,
+  copy propagation. XOR accumulation (`x ^= constant`) is period-2 — ptxas
+  detects identity after even REPS and eliminates entire loops.
+
+  Fix strategy: feedback chains — make accumulator a direct INPUT to the target
+  instruction, so the target itself is the loop-carried dependency. No separate
+  XOR step needed. Zero LOP3 overhead for F2FP, PRMT, SEL kernels.
+
+  Remaining XOR accum: K22a (LDS) uses `ld.volatile.shared.b32` to prevent LICM,
+  then XOR is valid since ptxas can't prove loaded value is loop-invariant.
+  K4 (HFMA2), K7a (IADD), K13a (IMAD), K19a (VIADD), K26a (IABS) use self-
+  accumulation (`+r` as both input and output) — loop-carried by design.
+
+  All "f" constraints eliminated (nvcc 13.1 never emits .reg .f32).
+  All .reg .u32 → .reg .b32 for cvt bf16x2 correctness.
+
+  MEASURED (7 opcodes, B200 calibration.cu K1-K12):
+    !! K1, K4, K5, K8, K9, K10 had broken SASS — now fixed with feedback chains.
+    !! Previous measurements for these 6 kernels are INVALID.
+    !! Re-run on B200 required for corrected values.
+    [!] IADD3    =  2   (K7b, 2.08 c/i)     339 occ — VALID (latency chain, not affected)
+    [!] PRMT     =  0   (K8, ~0 c/i)         —      — INVALID: was 8 prmt+8 LOP3, now 16 prmt feedback
+    [!] HFMA2    =  4   (K4, 4.00 c/i)       —      — INVALID: loop was eliminated, now fixed
+    [!] HADD2    =  5   (K11, 5.52 c/i)      64 occ — VALID (latency chain, not affected)
+    [!] F2FP     =  4   (K2, 4.10 c/i)      128 occ — INVALID: loop was eliminated, now fixed
+    [!] STS      = 32   (K6, 31.99 c/i)      —      — VALID (memory op, not affected)
+    [!] LDG      = 39   (K12, 39.09 c/i)     34 occ — VALID (memory op, not affected)
+
+  WRITTEN, AWAITING B200 RUN (6 opcodes, K13-K21):
+    [~] IMAD       339 occ   K13a throughput / K13b latency — mad.lo.s32
+    [~] LOP3        77 occ   K15a throughput / K15b latency — lop3.b32 (0x96 XOR3)
+    [~] SHF         64 occ   K16a throughput / K16b latency — shf.r.clamp.b32
+    [~] VIADD       75 occ   K19a throughput / K19b latency — vadd.s32.s32.s32
+    [~] ISETP       47 occ   K21a throughput / K21b latency — setp+selp+add feedback (count ISETP only)
+
+  WRITTEN, AWAITING B200 RUN (memory ops, K22-K23):
+    [~] LDS         70 occ   K22a throughput / K22b latency — ld.volatile.shared.b32 (prevents LICM)
+    [~] STG         65 occ   K23 throughput — st.global.b32 (16 indep stores)
+
+  WRITTEN, AWAITING B200 RUN (R→UR proxy, K20):
+    [~] REDUX       —        K20a throughput / K20b latency — redux.sync.add.s32 (REDUX.SUM URx, Ry)
+    NOTE: R2UR (408 occ) has NO PTX equivalent — ptxas-internal R→UR domain crossing.
+    REDUX is the closest benchmarkable proxy (warp reduction + R→UR output).
+    Pure R2UR calibration requires SASS control word stall count analysis.
+
+  WRITTEN, AWAITING B200 RUN (misc ALU, K24-K26):
+    [~] S2R         10 occ   K24 throughput — mov.u32 %r, %tid.x (5 S2R in SASS, rest→S2UR)
+    [~] SEL          4 occ   K25a throughput / K25b latency — selp+add feedback (pred set once)
+    [~] IABS         4 occ   K26a throughput / K26b latency — abs.s32 (K26b = IABS+VIADD chain)
+
+  UNFIXABLE (ptxas defeats calibration):
+    [X] MOV         35 occ   K17a throughput: copy propagation eliminates ALL MOVs (0 in SASS)
+                             K17b latency: MOV+ADD chain collapses to 1 IADD3 (bench entry=1)
+                             MOV is architecturally zero-cost on Blackwell — ptxas proves it.
+                             Calibrate from SASS stall counts if needed.
+
+  UNCALIBRATED — Tier 1 (high frequency, returns -1):
+    [ ] R2UR       408 occ   — NO PTX equivalent (ptxas-internal), calibrate from SASS stalls
+    [ ] LEA         25 occ   — address calc (compiler artifact)
+
+  UNCALIBRATED — Tier 2 (uniform pipeline):
+    [ ] UMOV        51 occ   — uniform MOV
+    [ ] UIADD3      39 occ   — uniform IADD3
+    [ ] USHF         7 occ   — low count, skip unless needed
+    [ ] ULEA         2 occ   — low count, skip unless needed
+
+  UNCALIBRATED — Tier 3 (special registers):
+    [ ] S2UR         4 occ   — low count, skip unless needed
+    [ ] CS2R         6 occ   — low count, skip unless needed
+
+  CORRECT BY DESIGN (latency=0, no calibration needed):
+    [=] LDTM, STTM, UTCBAR, BAR, DEPBAR, BSYNC, WARPSYNC, NANOSLEEP
+    [=] MEMBAR, ERRBAR, CGAERRBAR, BRA, EXIT, RET, BREAK, CALL
+    [=] TCGEN05, UTMALDG, UTMASTG, SYNCS, PLOP3, ELECT, NOP, FENCE, CCTL
+
+  TOTAL: 7 measured (4 INVALID, need re-run) + 12 written + 1 UNFIXABLE + 8 uncal = 28 opcodes
+         After B200 re-run: 18/28 calibrated (MOV via SASS stalls), ~1,253+ of ~2,430 instances.
+         R2UR (408 occ) requires SASS stall analysis, not runtime benchmark.
+
+  SASS AUDIT — verified instruction counts per kernel loop body (SASS-verified):
+    K1:   16 F2FP (feedback chain, zero LOP3) — VERIFIED: 16448 F2FP in SASS (16*1024+64 setup)
+    K2:    8 F2FP (latency chain)            — was eliminated, fixed with "+r" chain + mov.b32
+    K3:    4 F2FP + 4 STS                    — was eliminated, fixed with "r" + mov.b32 bitcast
+    K4:    8 HFMA2 + 8 LOP3                 — was eliminated, fixed with XOR accum
+    K5:    8 HFMA2 + 8 F2FP (feedback)      — VERIFIED: 8256 HFMA2 + 8256 F2FP, zero LOP3
+    K6:   16 STS (OK, memory op survived)
+    K7a:  16 IADD3 (OK, "+r" accum)
+    K7b:   8 IADD3 (OK, latency chain)
+    K8:   16 PRMT (feedback chain, zero LOP3) — VERIFIED: 16448 PRMT (8 control words × 2 sources)
+    K9:   32 F2FP (feedback chain, zero LOP3) — VERIFIED: 32832 F2FP
+    K10:   8 HADD2                           — was 1 (CSE), fixed to 8 (ptxas defeats 16), bench=8
+    K11:   8 HADD2 (OK, latency chain)
+    K12:  16 LDG (OK, memory op)
+    K13a: 16 IMAD (needs verify)
+    K13b:  8 IMAD (needs verify)
+    K15a: 16 LOP3 (needs verify)
+    K15b:  8 LOP3 (needs verify)
+    K16a: 16 SHF + 16 LOP3 (needs verify)
+    K16b:  8 SHF (needs verify)
+    K17a:  0 MOV (UNFIXABLE — copy propagation)
+    K17b:  0 MOV, 1 IADD3 (UNFIXABLE — chain collapse)
+    K19a: 16 VIADD (needs verify)
+    K19b:  8 VIADD (needs verify)
+    K20a: 16 REDUX (needs verify)
+    K20b: 16 REDUX + 16 readback (IMAD+MOV) — VERIFIED: 16384 REDUX + 8194 IMAD + 8191 MOV
+    K21a: 16 ISETP + 16 SEL + 16 IMAD (feedback) — VERIFIED: 16384 ISETP + 16384 SEL + 16371 IMAD
+    K21b:  8 ISETP + 8 SEL (needs verify)
+    K22a: 16 LDS + 8 LOP3 (volatile + XOR) — VERIFIED: 16384 LDS + 8192 LOP3
+    K22b:  8 LDS (needs verify)
+    K23:  16 STG (needs verify)
+    K24:   5 S2R                             — only 5 of 8 special regs produce S2R (rest→S2UR), bench=5
+    K25a: 16 SEL + 16 IMAD (feedback)       — VERIFIED: 16448 SEL + 16435 IMAD, zero LOP3
+    K25b:  8 SEL (needs verify)
+    K26a: 16 IABS (16384 in SASS due to unroll)  — OK
+    K26b:  8 IABS + 8 VIADD (needs verify)
+
+  Measurement overhead notes:
+    - Feedback chains: accumulator feeds directly into target instruction as input operand.
+      Target output replaces accumulator. Loop-carried dependency = target instruction latency.
+      With 16 independent chains, throughput = 16/latency instructions/cycle, which saturates
+      the pipeline if 16/L >= issue_rate. For F2FP (L~4), 16 chains give 4/cycle.
+      ZERO LOP3 overhead — no separate XOR step.
+    - K21a, K25a: `add.s32` compiles to IMAD on Blackwell. Overhead is 1 IMAD per ISETP/SEL.
+      IMAD is on a different pipe from ISETP/SEL, so throughput measurement is valid (ILP).
+    - K22a: XOR accum (LOP3) retained because `ld.volatile.shared.b32` prevents LICM.
+      8 LOP3 per 16 LDS (half-interleaved). LOP3 on integer pipe, LDS on memory pipe.
+    - mov.b32 bitcast in F2FP kernels (K1, K2, K3, K9) compiles to zero MOV in SASS
+      (confirmed: register rename, no real instruction emitted).
+    - K8 PRMT: now 16 feedback chains with 8 different control words × 2 second sources.
+      All 16 unique — ptxas cannot CSE. Previous version had only 8 (CSE'd to 8).
+    - K10 HADD2: only 8 after all fix attempts (ptxas constant-offset + accumulator
+      merging). Throughput result valid at 8-wide ILP.
+
+  Next priorities after B200 run:
+  1. Re-run K1, K4, K5, K8, K9, K10 (previously broken, now fixed with feedback chains)
+  2. Run K13-K26 (new kernels, first measurement)
+  3. R2UR (408 occ) — no PTX path, calibrate from SASS control word stall counts
+  4. UMOV (51 occ) + UIADD3 (39 occ) — uniform pipeline, different execution model

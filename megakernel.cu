@@ -129,7 +129,6 @@ static __device__ __forceinline__
 void mbar_init(uint32_t addr, uint32_t count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
         :: "r"(addr), "r"(count));
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
 
 static __device__ __forceinline__
@@ -696,6 +695,7 @@ patch_embed_gemm(
             mbar_init(smem_to_uint(smem + OFF_MAINLOOP_MBAR + i * 8), 1);          // CTA0 multicast commits
             mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR + i * 8), NUM_EPI_WARPS * 2 * 32); // NUM_EPI_WARPS warps × 2 CTAs × 32 threads
         }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
@@ -1292,8 +1292,6 @@ int main() {
             }
         }
     }
-    free(h_combined);
-
     int valid = (errors == 0) ? 1 : 0;
     printf("Validation: %d/32 spot checks passed%s\n", 32 - errors, valid ? "" : " — FAILED");
     printf("Checksum (1024 strided): %f\n", cksum);
@@ -1322,6 +1320,7 @@ int main() {
         printf("%.0f ", __bfloat162float(h_combined[ci]));
     }
     printf("\n");
+    free(h_combined);
     printf("@@RESULT ms=%.3f tflops=%.2f checksum=%f valid=%d c0=%.1f\n",
            _ms, 2.0 * M_TOTAL * N_DIM * K_DIM / _ms / 1e9, cksum, valid,
            __bfloat162float(h_C[0]));

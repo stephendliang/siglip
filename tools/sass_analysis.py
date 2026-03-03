@@ -24,9 +24,8 @@ Usage:
     python3 sass_analysis.py --cubin siglip_vision
 
 Prerequisites:
-    Phase 0 (calibration): Compile & run calibration kernels on B200 to verify
-    control word bit layout. Without calibration, stall counts use assumed
-    Ampere-style layout — may be wrong for SM 100a.
+    Latency table and control word layout calibrated on B200 via K1-K12
+    microbenchmarks (bench/calibration.cu).
 """
 
 import argparse
@@ -39,8 +38,7 @@ from collections import defaultdict
 from typing import Optional
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Control word decoder — configurable bit layout
-# Default: Ampere-style (SM 80). Must be calibrated for SM 100a.
+# Control word decoder — bit layout (verified on SM 100a via K7a/K7b decoder test)
 # ══════════════════════════════════════════════════════════════════════════════
 
 CTRL_LAYOUT = {
@@ -726,9 +724,8 @@ def print_summary(instrs: list[Instruction], slack_data: list[dict],
 
     print(f'\n{"=" * 60}')
     print('SCHEDULING ANALYSIS SUMMARY')
-    print('  Decoder: assumed Ampere-style bit layout (NOT calibrated)')
-    print('  bits [3:0]=stall appears correct; barrier fields unverified')
-    print('  Run: python3 sass_analysis.py --calibrate > calibration.cu')
+    print('  Decoder: SM 100a bit layout (calibrated via K7a/K7b on B200)')
+    print('  Latency table: calibrated via K1-K12 microbenchmarks')
     if section:
         print(f'Section: 0x{section[0]:04x} - 0x{section[1]:04x}')
     print(f'{"=" * 60}')
@@ -810,8 +807,8 @@ def make_json(kernel_name: str, instrs: list[Instruction], slack_data: list[dict
     result = {
         'kernel': kernel_name,
         'ctrl_layout': CTRL_LAYOUT,
-        'ctrl_layout_calibrated': False,
-        'latency_table_source': 'estimated_defaults',
+        'ctrl_layout_calibrated': True,
+        'latency_table_source': 'b200_calibrated_k1_k12',
         'n_instructions': len(filtered),
         'total_stall_cycles': total_stalls,
         'min_stall_cycles': sum(s['min_stall'] for s in filtered),

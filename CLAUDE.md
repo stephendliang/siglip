@@ -36,9 +36,9 @@ F40 interleaved TMA stores hide Phase 2 latency inside Phase 1 TMEM stall window
 - Per-warp Phase 1 spread: 269 cycles (reduced from 330 by F31 stagger). Contention-based (confirmed by rg-swap diagnostic).
 - Timing build uses ~245 regs (distorts cycles vs production at ~205 regs). Wall clock is ground truth.
 
-Run `python3 analyze_timing.py clock64_timing.txt` for full equilibrium analysis and what-if projections.
-Run `python3 analyze_source_counters.py source_counters_raw.csv` for per-instruction stall breakdown.
-See `EXPERIMENTS.md` for experiments (F1-F40) with hypotheses, results, and analysis. See `FUTURE_PROPOSALS.md` for optimization roadmap.
+Run `python3 tools/analyze_timing.py data/clock64_timing.txt` for full equilibrium analysis and what-if projections.
+Run `python3 tools/analyze_source_counters.py data/source_counters_raw.csv` for per-instruction stall breakdown.
+See `docs/EXPERIMENTS.md` for experiments (F1-F40) with hypotheses, results, and analysis. See `docs/FUTURE_PROPOSALS.md` for optimization roadmap.
 
 ## Kernel structure
 
@@ -68,48 +68,67 @@ The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile 
 edit megakernel.cu -> make -> ./siglip_vision
 ```
 
-`gen.py` is outdated — do not use.
+## Repository structure
 
-## File map
+```
+megakernel.cu           # THE kernel — source of truth
+Makefile                # Build rules (sm_100a, nvcc flags)
+CLAUDE.md               # This file
 
-| File | What |
-|------|------|
-| `megakernel.cu` | **Source of truth** — hand-tuned CUDA kernel |
-| `cutlass_bench.cu` | CUTLASS grid search — sweeps 13 tile/cluster configs × FP32/BF16 epilogue. Single binary, no `-D` flags |
-| `EXPERIMENTS.md` | Experiment log (F1-F40), profiling data, optimization history |
-| `FUTURE_PROPOSALS.md` | Optimization roadmap (F21-F28, all executed) with results |
-| `grid_search.py` | Compile-time parameter sweep — tiered search, cross-product, CSV output. Replaces manual Makefile targets |
-| `Makefile` | Build rules (sm_100a, nvcc flags). `make timing` for clock64 build |
-| **Analysis scripts** | |
-| `analyze_timing.py` | Parses `clock64_timing.txt` → equilibrium analysis, ceiling projections, what-if scenarios |
-| `analyze_source_counters.py` | Parses ncu SourceCounters CSV → stall breakdown, MMA stats, W1 budget, instruction mix |
-| `compare.py` | ncu CSV diff tool — usage: `python compare.py a.csv b.csv` |
-| `sass_analysis.py` | SASS scheduling analyzer — decodes control words, builds dependency graphs, identifies slack. Has `--calibrate-compare` mode for closed-loop decoder verification against `calibration.cu` runtime |
-| `calibration.cu` | 10 microbenchmark kernels (K1-K9) measuring instruction throughput/latency on B200. Used to verify SASS control word bit layout and populate `sass_analysis.py` latency table |
-| **Grid search data** | |
-| `sweep_results.csv` | Run 1 grid search (145 configs, Tier 1→4 epi warps). Best: 0.519 ms |
-| `sweep_results_run2.csv` | Run 2 grid search (145 configs, Tier 1→5 epi warps, pre is_split fix). Best: 0.522 ms |
-| `sweep_results_run3.csv` | Run 3 grid search (145 configs, Tier 1→5 epi warps, post is_split fix). 141/145 valid. Best: 0.522 ms |
-| `sweep_results_run4.csv` | Run 4 grid search (145 configs, Tier 1→4 epi warps, post fence.proxy.async fix). **145/145 valid**. Best: 0.522 ms |
-| `top5_profile.csv` | ncu profiling of top 5 configs from run 4 (21 metrics + 2 derived per config) |
-| `top5_analysis.md` | Writeup: why the top 5 win — TC utilization, instruction counts, stall breakdown |
-| **Raw profiling data** | |
-| `clock64_timing.txt` | Kernel printf from timing build (34 lines). Analyze with `analyze_timing.py` |
-| `source_counters_raw.csv` | Raw ncu `--set source --csv` data (4K lines). Analyze with `analyze_source_counters.py` |
-| `clock64_timing_analysis.md` | Historical prose analysis — **superseded by `analyze_timing.py`** |
-| `source_counters_analysis.md` | Historical prose analysis — **superseded by `analyze_source_counters.py`** |
-| **Reference docs** | |
-| `docs/make_better.md` | Deep ncu profiling — TC utilization, per-pipe breakdown, bank conflicts |
-| `docs/reference/model.txt` | PyTorch model architecture dump |
-| `docs/reference/sass_dump.txt` | SASS disassembly (load on demand only) |
+tools/                  # Analysis & sweep scripts
+  sass_analysis.py      # SASS scheduling analyzer (decodes control words, dep graphs, slack)
+  grid_search.py        # Compile-time parameter sweep (tiered search, CSV output)
+  analyze_timing.py     # clock64 timing → equilibrium analysis
+  analyze_source_counters.py  # ncu SourceCounters CSV → stall breakdown
+  remote.py             # Remote B200 provisioning + sweep runner
+  compare.py            # ncu CSV diff tool
+  compare_sass.py       # SASS dump diff tool
+  stat_test.py          # Statistical significance testing
+  bench_sweep.sh        # Shell-based sweep (legacy)
+
+bench/                  # Benchmark & calibration kernels
+  cutlass_bench.cu      # CUTLASS tile/policy sweep with fused EVT path
+  siglip_periodic_add.hpp # Custom EVT visitor (Sm100PeriodicAddNode)
+  cublas_bench.cu       # cuBLAS baseline benchmark (fused + unfused)
+  calibration.cu        # SASS latency microbenchmarks (K1-K26)
+  common.h              # Shared PTX helpers (mbarrier, TMA, tcgen05)
+  profiler.h            # globaltimer-based kernel profiler
+  CALIBRATION_LACKING   # Calibration status audit (measured/pending/unfixable)
+  test_tmem.cu          # TMEM test kernel
+  SUPERIOR.cu           # Reference kernel
+  leetgpu_b200.cu       # LeetGPU benchmark
+
+data/                   # Profiling data & sweep results
+  sweep_results.csv     # Run 1 grid search (145 configs). Best: 0.519 ms
+  sweep_results_run2.csv  # Run 2 (pre is_split fix). Best: 0.522 ms
+  sweep_results_run3.csv  # Run 3 (post is_split fix). 141/145 valid
+  sweep_results_run4.csv  # Run 4 (post fence.proxy.async). 145/145 valid
+  top5_profile.csv      # ncu profiling of top 5 configs
+  source_counters_raw.csv  # Raw ncu --set source --csv data
+  clock64_timing*.txt   # Kernel printf from timing builds
+  after.csv, baseline.csv  # ncu comparison data
+
+ISSUES_CALIBRATION      # Calibration expansion design (K13-K26 kernel specs)
+
+docs/                   # Documentation & analysis
+  EXPERIMENTS.md        # Experiment log (F1-F40)
+  FUTURE_PROPOSALS.md   # Optimization roadmap
+  GRID_SEARCH.md        # Grid search design & findings
+  top5_analysis.md      # Top 5 config ncu analysis
+  sass_optimizer.md     # SASS post-compile optimizer design
+  architecture.md       # Kernel architecture notes
+  make_better.md        # Deep ncu profiling analysis
+  sass.md               # SASS reference notes
+  reference/            # Model dump, SASS disassembly
+```
 
 ## Build and run
 
 ```bash
 make                    # compile megakernel.cu -> siglip_vision
 ./siglip_vision         # run on B200, prints timing + TFLOPS + checksum
-make timing && ./siglip_timing | tee clock64_timing.txt | python3 analyze_timing.py
-ncu --set source --csv ./siglip_vision > source_counters_raw.csv && python3 analyze_source_counters.py source_counters_raw.csv
+make timing && ./siglip_timing | tee data/clock64_timing.txt | python3 tools/analyze_timing.py
+ncu --set source --csv ./siglip_vision > data/source_counters_raw.csv && python3 tools/analyze_source_counters.py data/source_counters_raw.csv
 
 # CUTLASS grid search (single binary, sweeps all tile/cluster configs)
 make cutlass-bench      # ~1-2 min compile (26 CUTLASS template instantiations)
@@ -120,27 +139,35 @@ make cutlass-bench      # ~1-2 min compile (26 CUTLASS template instantiations)
 make cutlass-bench-max && ./cutlass-bench-max
 
 # Megakernel parameter grid search
-python3 grid_search.py --tier all        # sequential 1→2→3, pinning winners
-python3 grid_search.py --full-cross      # all parameters crossed (~3000 configs)
+python3 tools/grid_search.py --tier all        # sequential 1→2→3, pinning winners
+python3 tools/grid_search.py --full-cross      # all parameters crossed (~3000 configs)
 
 # SASS scheduling analysis
 cuobjdump --dump-sass siglip_vision > sass_dump.txt
-python3 sass_analysis.py sass_dump.txt                          # annotated listing
-python3 sass_analysis.py sass_dump.txt --section 0x1300 0x1a70  # address range (e.g., epilogue)
-python3 sass_analysis.py sass_dump.txt --deps                   # dependency + slack analysis
-python3 sass_analysis.py --cubin siglip_vision                  # runs cuobjdump internally
+python3 tools/sass_analysis.py sass_dump.txt                          # annotated listing
+python3 tools/sass_analysis.py sass_dump.txt --section 0x1300 0x1a70  # address range (e.g., epilogue)
+python3 tools/sass_analysis.py sass_dump.txt --deps                   # dependency + slack analysis
+python3 tools/sass_analysis.py --cubin siglip_vision                  # runs cuobjdump internally
 
 # Calibration: verify SASS control word decoder on B200
-make calibration          # compile calibration.cu
+make calibration          # compile bench/calibration.cu
 ./calibration > cal_output.txt
 cuobjdump --dump-sass calibration > cal_sass.txt
-python3 sass_analysis.py cal_sass.txt --calibrate-compare                          # SASS-only
-python3 sass_analysis.py cal_sass.txt --calibrate-compare --runtime cal_output.txt # compare vs runtime
+python3 tools/sass_analysis.py cal_sass.txt --calibrate-compare                          # SASS-only
+python3 tools/sass_analysis.py cal_sass.txt --calibrate-compare --runtime cal_output.txt # compare vs runtime
 ```
 
 ### CUTLASS bench details
 
-`cutlass_bench.cu` sweeps 13 tile/cluster configs (20 in `-DCUTLASS_EXTENDED_SWEEP=1` mode), measuring GEMM-only (beta=0), fused FP32, and fused BF16 epilogues. Template: `GemmInstance<TM, TN, TK, CM, CN, EpiCompute>`.
+`bench/cutlass_bench.cu` sweeps 26+ tile/cluster/policy configs (more with `-DCUTLASS_EXTENDED_SWEEP=1`). Six measurements per config:
+1. GEMM-only (beta=0, FP32 epilogue)
+2. Fused FP32 (beta=1)
+3. Fused BF16 (beta=1)
+4. **Fused EVT**: custom `SigLipPeriodicAdd` visitor (`bench/siglip_periodic_add.hpp`) fuses periodic table add in epilogue — truest apples-to-apples comparison
+5. PostAdd-only (unfused `apply_combined` kernel)
+6. GEMM+PostAdd (unfused two-kernel baseline)
+
+Data init matches megakernel: A=0x3C (1.5), B alternating columns (even=1.5, odd=1.0), non-uniform bias/pos_embed. Timing: 2 warmup, 10 timed. EVT validation checks per-column expected values (even=1728.0, odd=1152.0).
 
 ## Key constraints
 
@@ -157,7 +184,7 @@ python3 sass_analysis.py cal_sass.txt --calibrate-compare --runtime cal_output.t
 
 ## Grid search findings (4 runs × 145 configs)
 
-Full parameter sweep results in `sweep_results.csv` (run 1), `sweep_results_run2.csv` (run 2), `sweep_results_run3.csv` (run 3), `sweep_results_run4.csv` (run 4). Run 4 is the definitive run after all correctness fixes (fence.proxy.async + is_split + OFF_STAGING alignment) — **145/145 valid, zero failures**. Key findings:
+Full parameter sweep results in `data/sweep_results.csv` (run 1), `data/sweep_results_run2.csv` (run 2), `data/sweep_results_run3.csv` (run 3), `data/sweep_results_run4.csv` (run 4). Run 4 is the definitive run after all correctness fixes (fence.proxy.async + is_split + OFF_STAGING alignment) — **145/145 valid, zero failures**. Key findings:
 
 ### Performance (valid configs only, sorted by impact)
 
