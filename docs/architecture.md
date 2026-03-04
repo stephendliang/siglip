@@ -1,9 +1,9 @@
 # SigLIP2 Vision Encoder — Persistent Megakernel Plan
 
-Target: B200 (148 SMs, cluster-of-4) / B300 (160 SMs, cluster-of-16)
+Target: B200 (148 SMs, cluster-of-2) / B300 (160 SMs, cluster-of-16)
 Model: google/siglip2-base-patch16-224 (86M vision encoder)
-Precision: MXFP8 (E4M3 values, E8M0 block scales, block size 32)
-ISA: tcgen05 WGMMA, TMA, cooperative grid launch
+Precision: FP8 E4M3 (per-tensor scaling)
+ISA: tcgen05 WGMMA, TMA, persistent grid
 Build: cross-compile on CPU-only VPS, run on target GPU
 
 ## Architecture Quick Reference
@@ -21,8 +21,7 @@ Build: cross-compile on CPU-only VPS, run on target GPU
 
 | Param               | Value                          |
 |----------------------|--------------------------------|
-| B (batch, B200)      | 592 (148 × 4 imgs/SM)         |
-| B (batch, B300)      | 640 (160 × 4 imgs/SM)         |
+| B (batch, B200)      | 4736 (current bench) / 592 (148 × 4 imgs/SM target) |
 | seq_len              | 196                            |
 | d_model              | 768                            |
 | d_ff                 | 3072                           |
@@ -31,248 +30,123 @@ Build: cross-compile on CPU-only VPS, run on target GPU
 | n_layers             | 12                             |
 | Total vision params  | ~93M (~93 MB in FP8)           |
 | SMEM/SM              | 228 KB                         |
-| DSMEM cluster-of-4   | 912 KB                         |
-| DSMEM cluster-of-16  | 3.6 MB                         |
 | HBM BW (B200)        | ~8 TB/s                        |
 
-## Codegen Approach
+## Development Approach
 
-The kernel is NOT written by hand. A Python3 codegen script (`gen.py`) emits the
-complete `.cu` file from parameterized templates. This ensures:
-
-1. **Consistency**: SMEM offsets, barrier IDs, register names, TMA descriptors are
-   all computed from root constants. Change one param, regenerate, rebuild.
-2. **Auditability**: The generator is ~400-600 lines of readable Python. The output
-   is thousands of lines of PTX inline asm that no human should read directly.
-3. **Tweakability**: Tile sizes, cluster size, double-buffer depth, snake ordering,
-   batch size — all configurable knobs at the top of gen.py.
-4. **Correctness**: Offset arithmetic, barrier numbering, and register allocation
-   are computed programmatically, not typed by hand.
-
-### gen.py structure
+The kernels are **hand-written inline PTX**, not codegen output. All shared infrastructure (pipeline, TMEM loads, TMA helpers, mbarrier ops, tile math) lives in `kernel_common.cuh`. Each kernel file `#define`s `N_DIM` before including the header — tile counts, K-iterations, and SMEM layout are derived automatically.
 
 ```
-@dataclass
-class HWConfig:
-    sm_count: int           # 148 or 160
-    smem_per_sm: int        # 228 KB
-    cluster_size: int       # 4 or 16
-    max_registers: int      # 255
-    ...
-
-@dataclass
-class ModelConfig:
-    d_model: int            # 768
-    d_ff: int               # 3072
-    n_heads: int            # 12
-    head_dim: int           # 64
-    seq_len: int            # 196
-    n_layers: int           # 12
-    ...
-
-@dataclass
-class TileConfig:           # derived from HW + Model
-    tile_m: int             # rows per tile
-    tile_n: int             # cols per tile
-    tile_k: int             # reduction dim per tile
-    ...
-
-def compute_smem_layout(hw, model, tile) -> SMEMLayout:
-    # computes byte offsets for weight buffer A, weight buffer B,
-    # activation scratch, attn matrix, barriers, etc.
-
-def emit_tma_descriptor_setup(...) -> str:     # host-side TMA init
-def emit_wgmma_tile_loop(...) -> str:          # the core MXFP8 matmul
-def emit_layernorm(...) -> str:                # warp-shuffle reduction
-def emit_softmax(...) -> str:                  # online softmax in regs
-def emit_gelu_tanh(...) -> str:                # fused activation
-def emit_residual_add(...) -> str:             # epilogue fusion
-def emit_grid_sync(...) -> str:                # cooperative groups sync
-def emit_cluster_barrier(...) -> str:          # cluster-level sync
-def emit_transformer_block(layer_idx) -> str:  # full block, calls above
-def emit_kernel() -> str:                      # top-level __global__
-def emit_host_main() -> str:                   # launch code
-def main():                                    # write .cu to disk
+edit kernel_common.cuh / megakernel.cu / fc1_gelu.cu → make → run on B200
 ```
 
-Workflow: edit gen.py → `python3 gen.py > megakernel.cu` → `make` → ship binary.
+Tuning parameters (STAGGER_CYCLES, MBAR_EARLY, INTERLEAVE_STRATEGY, etc.) are compile-time `#define`s overridable via `-D` flags. Grid search (`tools/grid_search.py`) sweeps parameter space automatically.
 
 ## Milestones
 
-### 1st Base — Patch Embed GEMM (tcgen05 proof of life)
+### 1st Base — Patch Embed GEMM [DONE]
 
-Prove: persistent cooperative kernel launches on all SMs, executes one MXFP8
-GEMM via tcgen05 WGMMA, grid syncs, produces correct output.
+Persistent warp-specialized kernel: [928256,768]×[768,768]^T + bias + pos_embed.
+**0.519 ms / 2108 TFLOPS** fused — 38% faster than cuBLAS end-to-end (0.835 ms).
 
-- [ ] gen.py scaffold: HWConfig, ModelConfig, TileConfig dataclasses. Derived
-      quantity computation (tiles per SM, SMEM layout, batch size).
-- [ ] emit_kernel(): cooperative grid launch, SM ID → row range mapping,
-      grid sync at end. Compiles with `nvcc -arch=sm_100a`.
-- [ ] emit_wgmma_tile_loop(): the MXFP8 matmul inner loop in inline PTX.
-      Parameterized by M_tile, N_tile, K_tile. TMA async copy for weights.
-      Patch embed GEMM: [B*196, 768] × [768, 768] + bias.
-      On cluster-of-4, weight (576 KB) fits in DSMEM — load once.
-- [ ] Position embedding add: lookup pos_embed[tok_idx % 196], elementwise add.
-      Fused into GEMM epilogue.
-- [ ] Input stub: curandGenerateUniform fills [B, 3, 224, 224].
-      Reshape to [B*196, 768] (gather 16×16×3 patches into rows).
-- [ ] Validation: host-side dump, compare vs PyTorch F.linear + pos_embed.
-      Establish MXFP8 error budget.
+- [x] Persistent grid on all 148 SMs, cta_group::2, cluster_dims(2,1,1)
+- [x] tcgen05.mma FP8 E4M3 WGMMA with TMA async loads
+- [x] Warp-specialized: W0 (TMA loads), W1 (MMA), W2-W5 (overlapped epilogue)
+- [x] Fused bias + pos_embed in epilogue (TMEM→CVT→add→STS→TMA store)
+- [x] TMEM double-buffered (single 512-col alloc), 4-stage SMEM pipeline
+- [x] Unified SWIZZLE_128B epilogue with interleaved TMA stores (F38+F40)
+- [x] Non-uniform validation, 1024-strided checksum + 32 CPU spot checks
+- [x] Grid search: 4 runs × 145 configs, 145/145 valid, parameter space exhausted
 
-### Rounding 1st — MLP (FC1 + GELU-tanh + FC2)
+### Rounding 1st — MLP (FC1 + GELU-tanh + FC2) [IN PROGRESS]
 
-Prove: can do the large non-square GEMMs with fused activation and tiled
-weight streaming for matrices that exceed cluster DSMEM.
+FC1 kernel written (`fc1_gelu.cu`), not yet run on B200.
 
-- [ ] FC1 GEMM: [B*196, 768] × [768, 3072] + bias.
-      Weight is 2.25 MB — does NOT fit cluster-of-4 DSMEM.
-      Tile along N: 3072/tile_n tiles, stream each [768, tile_n] slab.
-      (On B300 cluster-of-16, whole weight fits — codegen emits different
-      path based on hw.cluster_size.)
-- [ ] Fused GELU-tanh epilogue: applied in registers after each output tile,
-      before writeback. emit_gelu_tanh() generates the PTX
-      (tanh.approx.f32 or FP16 intrinsic).
-- [ ] FC2 GEMM: [B*196, 3072] × [3072, 768] + bias.
-      Tall-K matmul. Tile along K, accumulate partial sums.
-- [ ] Residual add fused into FC2 epilogue: load pre-MLP activation from
-      global, add in registers, write final output.
-- [ ] Grid sync after MLP.
-- [ ] Validate: random [B, 196, 768] → MLP path → compare vs PyTorch.
+- [x] FC1+GELU kernel: [928256,768]×[768,3072]^T + bias + GELU
+      N_DIM=3072, TILES_N=12, TOTAL_TILES=43,512. Same tile shape 256x256x128.
+      GELU fused in epilogue (tanhf approximation).
+      Shares all infrastructure via kernel_common.cuh.
+- [ ] Run FC1+GELU on B200, validate, tune (grid search with new tile count)
+- [ ] FC2 GEMM: [928256,3072]×[3072,768]^T + bias + residual add
+      K_DIM=3072 → K_ITERS=24 (vs 6). Tall-K matmul.
+      Residual add in epilogue (load pre-MLP activation from global).
+- [ ] Grid sync after MLP
+- [ ] Validate: random [B, 196, 768] → MLP path → compare vs PyTorch
 
 ### 2nd Base — Attention (QKV + Softmax + Out Projection)
 
-Prove: batched small-matmul attention with in-SMEM softmax works. Different
-character from the large GEMMs — tiny tiles, many independent heads.
+Different character from the large GEMMs — tiny tiles, many independent heads.
 
-- [ ] Q, K, V projections: three separate [B*196, 768] × [768, 768] GEMMs.
-      Each weight (576 KB) fits in cluster-of-4 DSMEM. Reuse the WGMMA
-      tile loop from 1st base.
-- [ ] Reshape for multi-head: [B, 196, 768] → [B*12, 196, 64].
-      Pure index arithmetic in the codegen, no data movement.
-- [ ] QK^T batched matmul: [196, 64] × [64, 196] → [196, 196] per head.
-      B*12 heads, ~48 heads per SM. Small tiles — emit HMMA (mma.sync)
-      rather than tcgen05 WGMMA (codegen picks based on tile size).
-      Output stays in SMEM (196*196*2B = 75 KB per head, fits).
-- [ ] Scale + softmax: divide by sqrt(64)=8, online softmax over 196
-      elements in warp shuffles. emit_softmax() in PTX. No global traffic.
-- [ ] Attn × V: [196, 196] × [196, 64] → [196, 64] per head.
-      Read softmax result from SMEM, V from global/SMEM.
-- [ ] Out projection: [B*196, 768] × [768, 768] + bias + residual add.
-      Same as patch embed GEMM shape.
-- [ ] Grid sync.
-- [ ] Validate: full attention path vs PyTorch.
+- [ ] Q, K, V projections: three [B*196, 768] × [768, 768] GEMMs
+      Same shape as patch embed — reuse megakernel's GEMM structure.
+- [ ] Reshape for multi-head: [B, 196, 768] → [B*12, 196, 64]
+      Pure index arithmetic, no data movement.
+- [ ] QK^T batched matmul: [196, 64] × [64, 196] → [196, 196] per head
+      B*12 heads. Small tiles — may need mma.sync instead of tcgen05 WGMMA.
+      Output stays in SMEM (196*196*2B = 75 KB per head).
+- [ ] Scale + softmax: divide by sqrt(64)=8, online softmax via warp shuffles
+- [ ] Attn × V: [196, 196] × [196, 64] → [196, 64] per head
+- [ ] Out projection: [B*196, 768] × [768, 768] + bias + residual add
+- [ ] Validate: full attention path vs PyTorch
 
-### Rounding 2nd — LayerNorm + Cluster-Level DSMEM Fusion
+### Rounding 2nd — LayerNorm + Cluster Fusion
 
-Prove: cluster barriers + DSMEM eliminate global memory roundtrips between
-sub-operations. This is WHERE THE TRT ADVANTAGE COMES FROM.
+Cluster barriers + DSMEM eliminate global memory roundtrips between sub-operations.
 
-- [ ] emit_layernorm(): reduce over dim=768 for mean/var using
-      __shfl_xor_sync. Apply gamma*(x-mean)/sqrt(var+eps)+beta.
-      768 = 24 warps of 32, or 1 warp doing 24 serial steps.
-- [ ] Cluster fusion pattern — the key optimization:
-      FC2 epilogue → residual add → LN1 of next sub-block, all
-      within DSMEM. Activation never touches global memory.
-      - FC2 output written to producer SM's SMEM.
-      - Cluster barrier (NOT grid sync).
-      - LN reads from DSMEM (local or remote SM's bank).
-      - Compute LN in-place, feed directly to next GEMM.
-- [ ] emit_cluster_barrier(): lighter than grid sync, only 4 (or 16)
-      SMs participate. Codegen assigns barrier IDs, avoids collisions.
-- [ ] Sync retardation strategy: grid sync ONLY between transformer
-      blocks. Within a block, cluster barriers suffice because each
-      cluster owns disjoint images (no cross-cluster activation deps).
-- [ ] B300 cluster-of-16 enhanced path: with 3.6 MB DSMEM, can cache
-      weight matrices (Q/K/V/Out at 576 KB each = 2.3 MB for all 4,
-      fits). Codegen emits weight-caching path when cluster_size >= 16.
-- [ ] Global memory traffic audit (computed by gen.py):
-      - Without fusion: ~6 global R/W of [B, 196, 768] per block.
-      - With cluster fusion: ~2 global R/W per block.
-      gen.py prints this analysis when run.
-- [ ] Validate: LN→Attn→res→LN→MLP→res fused sequence vs PyTorch.
-      Verify no deadlocks or races from cluster barriers.
+- [ ] LayerNorm: reduce over dim=768 for mean/var using __shfl_xor_sync
+- [ ] Cluster fusion pattern:
+      FC2 epilogue → residual add → LN of next sub-block, all within DSMEM.
+      Activation never touches global memory.
+      Cluster barrier (not grid sync) — only 2 SMs participate (cta_group::2).
+- [ ] Grid sync only between transformer blocks (disjoint image assignment per cluster)
 
-### 3rd Base — Full Transformer Block, Assembled
+### 3rd Base — Full Transformer Block
 
-Prove: all sub-components wire together into one correct, fused block.
-Integration milestone, no new primitives.
+Integration milestone — wire sub-components into one correct, fused block.
 
-- [ ] emit_transformer_block(layer_idx): calls emit_layernorm,
-      emit_wgmma_tile_loop (for Q/K/V/Out), emit_softmax,
-      emit_wgmma_tile_loop (for FC1/FC2), emit_gelu_tanh,
-      emit_residual_add, emit_cluster_barrier, emit_grid_sync.
-- [ ] SM ↔ image assignment formalized in codegen:
-      B200: 148 SMs, B=592, 4 imgs/SM, 784 tokens/SM.
-      Cluster of 4 → 16 imgs/cluster. Attention is intra-image (196
-      tokens), so NO cross-SM dependency during attention.
-- [ ] SMEM budget audit (computed by gen.py at generation time):
-      - Weight tile: ~64-128 KB
-      - Activation working tile: 128 toks × 128 dims = 16 KB
-      - Attention matrix: 75 KB per head (sequential over 48 heads/SM)
-      - Double-buffer overhead
-      gen.py asserts total < 228 KB or errors at generation time.
-- [ ] Validate: full block output vs PyTorch layer 0.
+- [ ] SM ↔ image assignment: 148 SMs, B images, images/SM, tokens/SM
+      Cluster of 2 → images/cluster. Attention is intra-image (196 tokens),
+      so NO cross-SM dependency during attention.
+- [ ] SMEM budget audit: weight tile + activation tile + attention matrix + double-buffer
+- [ ] Validate: full block output vs PyTorch layer 0
 
-### Rounding 3rd — 12-Layer Loop + Weight Double-Buffering
+### Rounding 3rd — 12-Layer Loop + Weight Streaming
 
-Prove: the block loop with pipelined weight streaming sustains throughput
-across full encoder depth.
-
-- [ ] Block loop: for (layer = 0; layer < 12; layer++) with weight
-      pointer arithmetic. Per-layer weight offset computed by gen.py
-      and baked into the generated code as constants.
-- [ ] Weight double-buffering:
-      - SMEM split: buffer A (compute) + buffer B (prefetch).
-      - While computing with layer i's weights from buffer A,
-        TMA async prefetch loads layer i+1's first tile into buffer B.
-      - Grid sync at layer boundary, flip buffers.
-      - Within a layer: pipeline W_j compute with W_{j+1} prefetch.
-- [ ] Total weight traffic: 12 × ~6.8 MB = ~82 MB streamed once.
-      At 8 TB/s = ~10 µs. Kernel is compute-bound, not memory-bound.
-- [ ] Post-LayerNorm after the 12-block loop.
-- [ ] gen.py emits a weight offset table as a __constant__ array.
-- [ ] Validate: full 12-layer output (before pooling head) vs PyTorch.
+- [ ] Block loop with weight pointer arithmetic. Per-layer weight offsets as constants.
+- [ ] Weight double-buffering: prefetch layer i+1's first tile during layer i compute
+- [ ] Total weight traffic: 12 × ~6.8 MB = ~82 MB. At 8 TB/s = ~10 µs (compute-bound).
+- [ ] Warp parking: different GEMM shapes (768×768 vs 768×3072) may need different
+      tile counts. Park excess warps/CTAs between phases.
 
 ### Home Run — Pooling Head + End-to-End
 
-Prove: pixels in → embedding out, single kernel launch, correct, fast.
+Single kernel launch: pixels in → embedding out.
 
-- [ ] Attention pooling head:
-      - Learned query [1, 768] broadcast across batch.
-      - K/V proj: [B*196, 768] × [768, 768] (standard).
-      - QK^T: [B, 12, 1, 196] — trivially small, 196 scores per head.
-      - Softmax over 196.
-      - Attn×V → [B, 12, 1, 64] → concat → [B, 768].
-      - Out proj: [B, 768] × [768, 768]. M=B only (592 or 640).
-- [ ] Pooling LN + MLP: [B, 768] → LN → FC1(3072) → GELU → FC2(768).
-      Tiny GEMMs (M=B). Possibly fits entirely in SMEM.
-- [ ] Output: [B, 768] written to global memory. Kernel returns.
-- [ ] Weight packing: gen.py emits a weight_layout.h with byte offsets
-      for every weight tensor in the contiguous buffer. Also emits a
-      Python script (pack_weights.py) that loads the HuggingFace
-      checkpoint, quantizes to MXFP8, and writes the binary blob.
-- [ ] Build system: Makefile.
-      nvcc -arch=sm_100a -O3 megakernel.cu -o siglip_vision -lcurand
-- [ ] Benchmark harness: 1000 iters (skip 100 warmup), report img/s,
-      FLOP/s, HBM BW utilization. Compare vs TensorRT FP8 baseline.
-- [ ] Full numerical validation vs PyTorch SiglipVisionModel.forward().
+- [ ] Attention pooling head: learned query, cross-attn over 196 tokens
+- [ ] Pooling LN + MLP: [B, 768] → LN → FC1(3072) → GELU → FC2(768). Tiny GEMMs.
+- [ ] Weight packing: Python script loads HuggingFace checkpoint, quantizes to FP8,
+      writes contiguous binary blob with offset table.
+- [ ] Benchmark vs TensorRT FP8 baseline
 
 ## File Layout
 
 ```
 siglip/
-├── CLAUDE.md              # LLM entry point — read first
-├── docs/
-│   ├── architecture.md    # this file — model specs, HW, codegen, milestones
-│   ├── tasks.md           # active optimization action items
-│   ├── profiling.md       # ncu/cuobjdump/sanitizer profiling playbook
-│   └── reference/
-│       ├── model.txt      # PyTorch model architecture dump
-│       └── sass_dump.txt  # SASS disassembly (large, load on demand)
-├── gen.py                 # THE codegen script — edit this, not .cu
-├── Makefile               # build rules
-├── megakernel.cu          # GENERATED — do not edit
-├── bench_sweep.sh         # M-size benchmark sweep
-├── pack_weights.py        # weight quantization + packing (future)
-└── validate.py            # PyTorch reference + comparison (future)
+├── CLAUDE.md              # Project overview — read first
+├── kernel_common.cuh      # Shared infrastructure (pipeline, TMEM, TMA, mbarriers)
+├── megakernel.cu          # Patch embed GEMM (N_DIM=768) — hand-written
+├── fc1_gelu.cu            # FC1+GELU GEMM (N_DIM=3072) — hand-written
+├── Makefile               # Build rules (sm_100a)
+├── tools/                 # Analysis & sweep scripts
+│   ├── grid_search.py     # Compile-time parameter sweep
+│   ├── sass_analysis.py   # SASS scheduling analyzer
+│   ├── analyze_timing.py  # clock64 timing → equilibrium analysis
+│   └── ...
+├── bench/                 # Baseline benchmarks (CUTLASS, cuBLAS, calibration)
+├── data/                  # Profiling data & sweep results
+└── docs/                  # Documentation
+    ├── architecture.md    # This file — model specs, milestones
+    ├── EXPERIMENTS.md     # Experiment log (F1-F40)
+    ├── FUTURE_PROPOSALS.md # Optimization roadmap
+    └── reference/         # Model dump, SASS disassembly
 ```

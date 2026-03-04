@@ -17,24 +17,16 @@ Batch = 4736 images x 196 patches = 928256 rows. Square weight matrix (768x768).
 
 The kernel is correct (non-uniform validation, checksum validated) and stable.
 
-## Current bottlenecks (clock64 timing build, post-F31)
+## Current bottlenecks (post-F40)
 
-The kernel is **epilogue-bound** in a balanced producer-consumer equilibrium. Per-tile cycle budget (pre-F40):
-
-```
-W1:       epi_wait(1,344) + TMA0(662) + K-loop(4,059) = 6,066
-Epilogue: ml_wait(1,538) + Phase1(4,345) + Phase2B(273) = 6,156
-```
-
-F40 interleaved TMA stores hide Phase 2 latency inside Phase 1 TMEM stall windows, reducing effective epilogue cost.
+The kernel is **epilogue-bound** in a balanced producer-consumer equilibrium. F38 unified the epilogue (all 256 cols through SWIZZLE_128B + TMA stores, eliminating the legacy Phase 2A manual LDS+STG path). F40 recovered the stall-window utilization by interleaving TMA stores during TMEM readback.
 
 **Key facts:**
-- Phase 1 TMEM readback = binding constraint. F40 overlaps TMA stores with TMEM stalls.
+- Phase 1 TMEM readback = binding constraint. Interleaved TMA stores (strategy 2, half-batch) fill TMEM stall windows.
 - K-loop: 4,059 cycles. Precomputed descriptors + manual unroll from F28.
 - TMA multicast not applicable (B is N-split across CTAs).
-- ~205 regs/thread (varies with `CVT_ADD_FUSED` and `PHASE1_UNROLL`), 0 spills. Limits occupancy to 1 CTA/SM.
-- Per-warp Phase 1 spread: 269 cycles (reduced from 330 by F31 stagger). Contention-based (confirmed by rg-swap diagnostic).
-- Timing build uses ~245 regs (distorts cycles vs production at ~205 regs). Wall clock is ground truth.
+- ~205-211 regs/thread (varies with `CVT_ADD_FUSED`, `PHASE1_UNROLL`, `MBAR_EARLY`), 0 spills. Limits occupancy to 1 CTA/SM.
+- Timing build uses ~245 regs (distorts cycles vs production). Wall clock is ground truth.
 
 Run `python3 tools/analyze_timing.py data/clock64_timing.txt` for full equilibrium analysis and what-if projections.
 Run `python3 tools/analyze_source_counters.py data/source_counters_raw.csv` for per-instruction stall breakdown.
@@ -46,7 +38,7 @@ Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1
 
 - **W0**: TMA async bulk loads (A + B tiles, both CTAs load independently)
 - **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
-- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols: x32 `tcgen05.ld` → BF16 add → CVT → `st.shared` to 4 SWIZZLE_128B staging regions, with **interleaved TMA stores** every 2 regions hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1
+- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols through 4 SWIZZLE_128B regions: x32 `tcgen05.ld` → epilogue op → CVT → `st.shared`, with **interleaved TMA stores** every 2 regions hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1. The epilogue op is kernel-specific: bias+pos_embed add (megakernel) or bias+GELU (fc1_gelu).
 
 TM=128 rows / 32 rows per warp = 4 row groups. With 4 epi warps (default), each warp owns a full row group (256 cols, `is_split=0`). With 5 epi warps, warp 4 shares row_group 0 via `ew % 4`, creating split warps (`is_split=1`) that each handle 128 cols (2 regions). `epilogue_store` is templated on `<NC_START, NC_END>` so the compiler sees constant loop bounds and `N_REGIONS = (NC_END - NC_START) / 64` is constexpr; unroll depth controlled by `PHASE1_UNROLL` (default 2).
 
@@ -62,16 +54,18 @@ The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile 
 
 ## Development workflow
 
-**Edit `megakernel.cu` directly.** It is the hand-tuned source of truth.
+All kernels share `kernel_common.cuh` (pipeline, TMEM loads, TMA helpers, mbarrier ops). Each `.cu` file `#define N_DIM` before including the header — tile counts and K-iter constants are derived automatically.
 
 ```
-edit megakernel.cu -> make -> ./siglip_vision
+edit kernel_common.cuh / megakernel.cu / fc1_gelu.cu -> make -> ./siglip_vision (or ./fc1_gelu)
 ```
 
 ## Repository structure
 
 ```
-megakernel.cu           # THE kernel — source of truth
+kernel_common.cuh       # Shared infrastructure (pipeline, TMEM, TMA, mbarriers)
+megakernel.cu           # Patch embed GEMM — [928256,768]×[768,768]^T + bias + pos_embed
+fc1_gelu.cu             # FC1+GELU GEMM — [928256,768]×[768,3072]^T + bias + GELU
 Makefile                # Build rules (sm_100a, nvcc flags)
 CLAUDE.md               # This file
 
@@ -127,6 +121,8 @@ docs/                   # Documentation & analysis
 ```bash
 make                    # compile megakernel.cu -> siglip_vision
 ./siglip_vision         # run on B200, prints timing + TFLOPS + checksum
+make fc1-gelu           # compile fc1_gelu.cu -> fc1_gelu
+./fc1_gelu              # run FC1+GELU kernel
 make timing && ./siglip_timing | tee data/clock64_timing.txt | python3 tools/analyze_timing.py
 ncu --set source --csv ./siglip_vision > data/source_counters_raw.csv && python3 tools/analyze_source_counters.py data/source_counters_raw.csv
 
@@ -175,8 +171,8 @@ Data init matches megakernel: A=0x3C (1.5), B alternating columns (even=1.5, odd
 - `cta_group::2` with `__cluster_dims__(2,1,1)` — 74 clusters of 2 CTAs
 - TMEM: 512 cols/SM total, single alloc of TN*2 for double buffering (learned from matmul_v7: two separate allocs deadlock, single alloc works)
 - SMEM: 228 KB/SM — current usage ~192 KB (4-stage pipeline + unified SWIZZLE_128B epilogue staging, ~36 KB free)
-- All inline PTX — no CUTLASS dependency for the kernel itself
-- `megakernel.cu` is hand-edited directly
+- All inline PTX — no CUTLASS dependency for the kernels themselves
+- Kernels are hand-edited directly; shared infrastructure lives in `kernel_common.cuh`
 - Validation: non-uniform B (alternating FP8 rows: 1.5/1.0 → distinct even/odd col accumulators), non-uniform bias/pos_embed, 1024 strided checksum + 32 CPU reference spot checks (valid=1 in @@RESULT)
 - **OFF_STAGING must be 1024-byte aligned** for SWIZZLE_128B correctness — TMA swizzle operates on absolute SMEM address bits `addr[6:4] ^= addr[9:7]`; misalignment causes systematic 8-col (16-byte) group swaps in output. Swizzle period = 8 rows x 128 bytes = 1024 bytes.
 - **`fence.proxy.async.shared::cta` required** before every TMA store that reads from SMEM written by `st.shared` — bridges sync→async memory proxies. Without it, TMA may read stale data (sporadic corruption).
