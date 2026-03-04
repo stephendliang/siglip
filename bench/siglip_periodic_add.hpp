@@ -35,12 +35,8 @@
 //   >::CollectiveOp;
 //
 //   // Set epilogue arguments:
-//   arguments.epilogue.thread = {
-//       {{}, {}},                                    // Sm100PeriodicAddNode args (inner)
-//       {}                                           // Sm90AccFetch args (empty)
-//   };
-//   // Then set the periodic add args:
-//   cute::get<0>(cute::get<0>(arguments.epilogue.thread)) = {d_combined, 196};
+//   arguments.epilogue.thread.op_1.ptr_combined = ptr;
+//   arguments.epilogue.thread.op_1.seq_len = 196;
 //
 
 #pragma once
@@ -61,7 +57,12 @@ using namespace cute;
 // Takes accumulator from child (Sm90AccFetch), adds values from a compact
 // periodic table indexed by global_row % seq_len, converts to output type.
 //
-// No SMEM, no TMA: loads directly from L2-resident global memory via __ldg().
+// No SMEM, no TMA: vectorized 128-bit loads from L2-resident global memory via __ldg().
+//
+// IMPORTANT: The relative coordinate tensor (tCcD) from ConsumerStoreArgs does NOT
+// give actual output (m,n) positions on SM100 — it's only for OOB predication.
+// We reconstruct the absolute coordinate tensor from the identity tensor, matching
+// the SM100 epilogue's own construction (sm100_epilogue_tma_warpspecialized.hpp).
 //
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -138,32 +139,23 @@ struct Sm100PeriodicAddNode {
   }
 
   // ── ConsumerStoreCallbacks ──
-  // Carries per-CTA state computed in get_consumer_store_callbacks,
+  // Carries per-CTA state including the ABSOLUTE coordinate tensor,
   // provides the visit() that does the actual periodic add.
 
-  template <class ThrCoordTensor, class ThrResidue>
+  template <class AbsCoordTensor>
   struct ConsumerStoreCallbacks : EmptyConsumerStoreCallbacks {
     CUTLASS_DEVICE
     ConsumerStoreCallbacks(
         Params const* params_ptr_,
-        int cta_m_base_,
-        int cta_n_base_,
         int N_dim_,
-        ThrCoordTensor tCcD_,
-        ThrResidue residue_tCcD_)
+        AbsCoordTensor tCcD_abs_)
       : params_ptr(params_ptr_)
-      , cta_m_base(cta_m_base_)
-      , cta_n_base(cta_n_base_)
       , N_dim(N_dim_)
-      , tCcD(tCcD_)
-      , residue_tCcD(residue_tCcD_) { }
+      , tCcD_abs(tCcD_abs_) { }
 
     Params const* params_ptr;
-    int cta_m_base;               // tile_coord_m * TileM — global M offset for this CTA
-    int cta_n_base;               // tile_coord_n * TileN — global N offset for this CTA
     int N_dim;                    // N dimension of the GEMM problem
-    ThrCoordTensor tCcD;          // (CPY,CPY_M,CPY_N,EPI_M,EPI_N) — per-thread coordinates
-    ThrResidue residue_tCcD;      // residue for OOB predication
+    AbsCoordTensor tCcD_abs;      // (T2R,T2R_M,T2R_N,EPI_M,EPI_N) — ABSOLUTE global coords
 
     // visit() is called per (epi_v, epi_m, epi_n) by the epilogue store loop.
     //
@@ -185,37 +177,56 @@ struct Sm100PeriodicAddNode {
       // Match megakernel numeric semantics:
       //   cvt.rn.bf16x2.f32  — FP32 accumulator → BF16 FIRST
       //   add.rn.bf16x2      — BF16 + BF16 table value (BF16-domain add)
-      // NOT: float(acc) + float(table) → BF16 (which would preserve FP32 precision through the add)
       using ConvertToBF16 = NumericArrayConverter<ElementOutput, ElementInput, FragmentSize, RoundStyle>;
 
       Array<ElementOutput, FragmentSize> frg_acc_bf16 = ConvertToBF16{}(frg_inputs);
       Array<ElementOutput, FragmentSize> frg_result;
 
-      auto tCcD_mn = tCcD(_,_,_, epi_m, epi_n);
+      // ── Vectorized table load ──
+      // SM100 T2R mapping guarantees: all FragmentSize elements in one visit() call
+      // share the same M-row with contiguous N-columns (SM100_TMEM_LOAD_32dp32b1x:
+      // each thread gets 32 consecutive N-values from one M-row of the epilogue subtile).
+      // Extract coordinates once from element 0, then do 128-bit vectorized loads.
+      auto tCcD_mn = tCcD_abs(_,_,_, epi_m, epi_n);
+      auto coord_0 = tCcD_mn(epi_v * FragmentSize);
+      int global_m = get<0>(coord_0);
+      int global_n = get<1>(coord_0);
+      int pos_row  = global_m % params_ptr->seq_len;
 
-      int const seq_len = params_ptr->seq_len;
-      ElementTable const* __restrict__ ptr = params_ptr->ptr_combined;
+      // Base address for this thread's contiguous N-column segment in the periodic table
+      __nv_bfloat16 const* __restrict__ base =
+          reinterpret_cast<__nv_bfloat16 const*>(params_ptr->ptr_combined)
+          + static_cast<long long>(pos_row) * N_dim + global_n;
 
+      // 128-bit vectorized loads: 8 BF16 values per int4 (= 4 loads for FragmentSize=32)
+      // N-columns are 128-bit aligned (thread starts at multiple-of-32 column offset,
+      // table rows are 768*2B = 1536B aligned, base allocation is 256B-aligned via cudaMalloc)
+      constexpr int BF16_PER_VEC = sizeof(int4) / sizeof(ElementTable);  // 16/2 = 8
+      constexpr int NUM_VECS = FragmentSize / BF16_PER_VEC;
+      constexpr int TAIL = FragmentSize % BF16_PER_VEC;
+
+      __nv_bfloat16 tbl_raw[FragmentSize];
+      {
+        int4 const* __restrict__ src = reinterpret_cast<int4 const*>(base);
+        int4* dst = reinterpret_cast<int4*>(tbl_raw);
+        CUTLASS_PRAGMA_UNROLL
+        for (int v = 0; v < NUM_VECS; ++v) {
+          dst[v] = __ldg(src + v);
+        }
+      }
+      // Handle non-multiple-of-8 FragmentSize (unlikely for SM100, but safe)
+      if constexpr (TAIL > 0) {
+        __nv_bfloat16 const* src_tail = base + NUM_VECS * BF16_PER_VEC;
+        CUTLASS_PRAGMA_UNROLL
+        for (int t = 0; t < TAIL; ++t) {
+          tbl_raw[NUM_VECS * BF16_PER_VEC + t] = __ldg(src_tail + t);
+        }
+      }
+
+      // BF16 add: bfloat16_t::operator+ uses __hadd on SM80+ (hardware add.rn.bf16)
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < FragmentSize; ++i) {
-        auto coord = tCcD_mn(epi_v * FragmentSize + i);
-        int local_m = get<0>(coord);
-        int local_n = get<1>(coord);
-
-        // Global coordinates — local_n is CTA-tile-local, needs tile N base
-        int global_m = cta_m_base + local_m;
-        int global_n = cta_n_base + local_n;
-        int pos_row  = global_m % seq_len;
-
-        // L2-resident load from compact [seq_len, N] table
-        // Cast to __nv_bfloat16* — __ldg() has no cutlass::bfloat16_t overload
-        __nv_bfloat16 raw = __ldg(reinterpret_cast<__nv_bfloat16 const*>(ptr) +
-                                  static_cast<long long>(pos_row) * N_dim + global_n);
-        ElementOutput tbl_val(raw);
-
-        // BF16 add: bfloat16_t::operator+ promotes to float, adds, rounds back —
-        // matches hardware add.rn.bf16x2 semantics: rn_bf16(float(a) + float(b))
-        frg_result[i] = frg_acc_bf16[i] + static_cast<ElementOutput>(tbl_val);
+        frg_result[i] = frg_acc_bf16[i] + ElementOutput(tbl_raw[i]);
       }
 
       return frg_result;
@@ -228,22 +239,24 @@ struct Sm100PeriodicAddNode {
   >
   CUTLASS_DEVICE auto
   get_consumer_store_callbacks(ConsumerStoreArgs<Args...> const& args) {
-    // Extract tile coordinates and problem shape
     auto [M, N, K, L] = args.problem_shape_mnkl;
     auto [tile_m, tile_n, tile_k, tile_l] = args.tile_coord_mnkl;
 
-    // CTA's base M and N offsets in the global output matrix
-    int cta_m_base = tile_m * cute::size<0>(args.tile_shape_mnk);
-    int cta_n_base = tile_n * cute::size<1>(args.tile_shape_mnk);
     int N_dim = static_cast<int>(cute::size(N));
 
-    return ConsumerStoreCallbacks<decltype(args.tCcD), decltype(args.residue_tCcD)>(
+    // Build ABSOLUTE coordinate tensor — the relative tCcD from ConsumerStoreArgs
+    // only works for predication, not for actual (m,n) position extraction on SM100.
+    // Replicate the SM100 epilogue's own construction from the identity tensor.
+    auto mD_crd = make_identity_tensor(make_shape(M, N));
+    auto cD_mn = local_tile(mD_crd, take<0,2>(args.tile_shape_mnk),
+                             make_coord(tile_m, tile_n));
+    auto thread_t2r = args.tiled_copy.get_thread_slice(args.thread_idx);
+    auto tCcD_abs = thread_t2r.partition_D(flat_divide(cD_mn, args.epi_tile));
+
+    return ConsumerStoreCallbacks<decltype(tCcD_abs)>(
         params_ptr,
-        cta_m_base,
-        cta_n_base,
         N_dim,
-        args.tCcD,
-        args.residue_tCcD);
+        tCcD_abs);
   }
 };
 

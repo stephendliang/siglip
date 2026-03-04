@@ -720,15 +720,19 @@ void try_config_family(
                 "1sm/1sm/S3",
                 d_A, d_B, d_C, d_D, d_combined,
                 M, N, K, seq_len, hw_info, ms_postadd_ref, d_bytes, results);
-        try_config_policy<TM,TN,TK,CM,CN,
-            cutlass::gemm::KernelTmaWarpSpecialized1SmSm100,
-            cutlass::epilogue::TmaWarpSpecialized1Sm,
-            4>(
-                tile_name.c_str(),
-                clust_name.c_str(),
-                "1sm/1sm/S4",
-                d_A, d_B, d_C, d_D, d_combined,
-                M, N, K, seq_len, hw_info, ms_postadd_ref, d_bytes, results);
+        // S4: guard against SMEM overflow — 4 stages of mainloop must leave room for epilogue
+        // Mainloop per stage = (TM*TK + TN*TK) bytes (FP8); need ~56KB headroom for epilogue
+        if constexpr (4 * (size_t(TM) * TK + size_t(TN) * TK) <= 172 * 1024) {
+            try_config_policy<TM,TN,TK,CM,CN,
+                cutlass::gemm::KernelTmaWarpSpecialized1SmSm100,
+                cutlass::epilogue::TmaWarpSpecialized1Sm,
+                4>(
+                    tile_name.c_str(),
+                    clust_name.c_str(),
+                    "1sm/1sm/S4",
+                    d_A, d_B, d_C, d_D, d_combined,
+                    M, N, K, seq_len, hw_info, ms_postadd_ref, d_bytes, results);
+        }
     }
 
     if constexpr (TM >= 128 && (CM % 2 == 0)) {
