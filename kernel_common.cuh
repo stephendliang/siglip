@@ -1,8 +1,8 @@
-// kernel_common.cuh — shared infrastructure for tcgen05 persistent megakernels
+// kernel_common.cuh — shared infrastructure for tcgen05 persistent GEMM kernels
 // B200 (SM100a), cta_group::2, __cluster_dims__(2,1,1)
 // Warp-specialized: Load(W0) | MMA(W1) | Epilogue(W2+)
 //
-// Usage: #define N_DIM <value> before including this header.
+// Usage: #define N_DIM and K_DIM before including this header.
 
 #pragma once
 
@@ -40,11 +40,32 @@
 #ifndef N_STAGES
 #define N_STAGES       4
 #endif
+#ifndef K_LOOP_UNROLL
+#define K_LOOP_UNROLL  N_STAGES
+#endif
+#ifndef W0_LOOP_UNROLL
+#define W0_LOOP_UNROLL  0    // W0 load K-iter loop: 0=no pragma, 1=no unroll, N=unroll by N
+#endif
+#ifndef SUB_MMA_UNROLL
+#define SUB_MMA_UNROLL  0    // Sub-MMA inner loop: 0=no pragma, 1=no unroll, N=unroll by N
+#endif
 
 // nvcc doesn't expand macros in #pragma unroll — use _Pragma instead
 #define _UNROLL_STR2(x) #x
 #define _UNROLL_STR(x) _UNROLL_STR2(unroll x)
 #define PRAGMA_UNROLL(n) _Pragma(_UNROLL_STR(n))
+
+// Conditional unroll macros — 0 means no pragma (compiler decides)
+#if W0_LOOP_UNROLL > 0
+#define MAYBE_UNROLL_W0 _Pragma(_UNROLL_STR(W0_LOOP_UNROLL))
+#else
+#define MAYBE_UNROLL_W0
+#endif
+#if SUB_MMA_UNROLL > 0
+#define MAYBE_UNROLL_SUB _Pragma(_UNROLL_STR(SUB_MMA_UNROLL))
+#else
+#define MAYBE_UNROLL_SUB
+#endif
 
 // ── Thread config ─────────────────────────────────────────────
 #define THREADS        (32 * (2 + NUM_EPI_WARPS))
@@ -57,7 +78,9 @@
 #define BATCH_SIZE     4736
 #define SEQ_LEN        196
 #define M_TOTAL        928256
-#define K_DIM          768
+#ifndef K_DIM
+#error "Define K_DIM before including kernel_common.cuh"
+#endif
 
 // ── Tile dimensions ───────────────────────────────────────────
 #define TM             128
@@ -66,7 +89,7 @@
 #define TILES_M        ((M_TOTAL + TM * 2 - 1) / (TM * 2))    // 3626
 #define TILES_N        (N_DIM / TN)
 #define TOTAL_TILES    (TILES_M * TILES_N)
-#define K_ITERS        (K_DIM / TK)                             // 6
+#define K_ITERS        (K_DIM / TK)
 #define MMA_K          32
 #define MMA_PER_KI     (TK / MMA_K)                             // 4
 
@@ -203,6 +226,7 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
             : \
             : "r"(buf * TN), "l"(da_), "l"(db_), "r"(IDESC), \
               "r"(0),"r"(0),"r"(0),"r"(0), "r"(0),"r"(0),"r"(0),"r"(0)); \
+        MAYBE_UNROLL_SUB \
         for (int sub_ = 1; sub_ < MMA_PER_KI; sub_++) { \
             da_ += 2; db_ += 2; \
             asm volatile( \

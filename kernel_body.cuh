@@ -1,15 +1,16 @@
-// kernel_body.cuh — shared kernel body for tcgen05 persistent megakernels
+// kernel_body.cuh — shared kernel body for tcgen05 persistent GEMM kernels
 // Contains epilogue_store template and persistent_gemm kernel template.
 // Each .cu file: #define N_DIM → #include "kernel_common.cuh" → define transform macros → #include "kernel_body.cuh"
 
 #pragma once
 
 // ── Epilogue operation selector ──────────────────────────────
-enum class EpilogueOp : int { BIAS_ADD = 0, BIAS_GELU = 1 };
+enum class EpilogueOp : int { BIAS_ADD = 0, BIAS_GELU = 1, BIAS_RESIDUAL = 2 };
 
 template<EpilogueOp Op> struct EpilogueSideData;
-template<> struct EpilogueSideData<EpilogueOp::BIAS_ADD>  { using type = const __nv_bfloat16*; };
-template<> struct EpilogueSideData<EpilogueOp::BIAS_GELU> { using type = const float*; };
+template<> struct EpilogueSideData<EpilogueOp::BIAS_ADD>      { using type = const __nv_bfloat16*; };
+template<> struct EpilogueSideData<EpilogueOp::BIAS_GELU>     { using type = const float*; };
+template<> struct EpilogueSideData<EpilogueOp::BIAS_RESIDUAL>  { using type = const float*; };
 template<EpilogueOp Op> using SideDataPtr = typename EpilogueSideData<Op>::type;
 
 // ── Stub macros for dead if-constexpr branches ───────────────
@@ -26,6 +27,12 @@ constexpr bool HAS_GELU_CVT = false;
 #else
 constexpr bool HAS_GELU_CVT = true;
 #endif
+#ifndef BIAS_RES_CVT_STS_V4
+#define BIAS_RES_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3,b4,b5,b6,b7, r0,r1,r2,r3, SADDR) ((void)0)
+constexpr bool HAS_BIAS_RES_CVT = false;
+#else
+constexpr bool HAS_BIAS_RES_CVT = true;
+#endif
 // Stub COMB_* constants for dead BIAS_ADD branch in fc1_gelu compilation
 #ifndef COMB_BLOCK_ROWS
 #define COMB_BLOCK_ROWS 1
@@ -35,7 +42,7 @@ constexpr bool HAS_GELU_CVT = true;
 #endif
 
 // ── Epilogue: TMEM → transform → CVT → swizzle SMEM regions → TMA tensor stores ──
-// Transform selected by Op: BIAS_ADD (combined table add) or BIAS_GELU (bias + GELU)
+// Transform selected by Op: BIAS_ADD (combined table), BIAS_GELU (bias+GELU), BIAS_RESIDUAL (bias+residual)
 
 template<int NC_START, int NC_END, EpilogueOp Op>
 static __device__ __forceinline__
@@ -47,6 +54,7 @@ void epilogue_store(
     int n_start,
     SideDataPtr<Op> __restrict__ side_data,
     __nv_bfloat16* __restrict__ C,
+    const __nv_bfloat16* __restrict__ residual,
     int cta_rank,
     uint32_t staging_saddr,
     uint32_t epi_mbar_addr,
@@ -66,6 +74,12 @@ void epilogue_store(
         comb_base = side_data
             + (long long)comb_block_row * COMB_COL_BLOCKS * COMB_BLOCK_ELEMS
             + comb_row_in_blk * COMB_BLOCK_COLS;
+    }
+
+    // BIAS_RESIDUAL: precompute row pointer into full residual matrix
+    const __nv_bfloat16* res_row = nullptr;
+    if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+        res_row = residual + (long long)(gm_base + lane) * N_DIM + n_start;
     }
 
     constexpr int N_REGIONS = (NC_END - NC_START) / 64;
@@ -101,16 +115,19 @@ void epilogue_store(
         uint4 craw0 = {}, craw1 = {};
         const __nv_bfloat16* comb_ptr = nullptr;
         float4 bv0 = {}, bv1 = {};
+        uint4 rv0 = {};
         if constexpr (Op == EpilogueOp::BIAS_ADD) {
             static_assert(HAS_CVT_ADD, "BIAS_ADD requires CVT_ADD_STS_V4 macro — define before #include \"kernel_body.cuh\"");
             comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
             craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
-        } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
-            static_assert(HAS_GELU_CVT, "BIAS_GELU requires GELU_CVT_STS_V4 macro — define before #include \"kernel_body.cuh\"");
+        } else if constexpr (Op == EpilogueOp::BIAS_GELU || Op == EpilogueOp::BIAS_RESIDUAL) {
             const float* bp = side_data + n_start + nc;
             bv0 = __ldg(reinterpret_cast<const float4*>(bp));
             bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
+            if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+                rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
+            }
         }
 
         TMEM_WAIT();
@@ -143,6 +160,7 @@ void epilogue_store(
                 CVT_ADD_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63, craw1.x,craw1.y,craw1.z,craw1.w, srow + (112 ^ xor_val));
             }
         } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
+            static_assert(HAS_GELU_CVT, "BIAS_GELU requires GELU_CVT_STS_V4 macro — define before #include \"kernel_body.cuh\"");
             const float* bp = side_data + n_start + nc;
             // First 32 cols: a0..a31
             {
@@ -171,6 +189,44 @@ void epilogue_store(
                 float4 bv14 = __ldg(reinterpret_cast<const float4*>(bp + 56));
                 float4 bv15 = __ldg(reinterpret_cast<const float4*>(bp + 60));
                 GELU_CVT_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63, bv14.x,bv14.y,bv14.z,bv14.w,bv15.x,bv15.y,bv15.z,bv15.w, srow + (112 ^ xor_val));
+            }
+        } else if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+            static_assert(HAS_BIAS_RES_CVT, "BIAS_RESIDUAL requires BIAS_RES_CVT_STS_V4 macro — define before #include \"kernel_body.cuh\"");
+            const float* bp = side_data + n_start + nc;
+            // First 32 cols: a0..a31
+            {
+                BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, rv0.x,rv0.y,rv0.z,rv0.w, srow + (0 ^ xor_val));
+                float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
+                float4 bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
+                uint4 rv1 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 8));
+                BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, bv2.x,bv2.y,bv2.z,bv2.w,bv3.x,bv3.y,bv3.z,bv3.w, rv1.x,rv1.y,rv1.z,rv1.w, srow + (16 ^ xor_val));
+                float4 bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
+                float4 bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
+                uint4 rv2 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 16));
+                BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, bv4.x,bv4.y,bv4.z,bv4.w,bv5.x,bv5.y,bv5.z,bv5.w, rv2.x,rv2.y,rv2.z,rv2.w, srow + (32 ^ xor_val));
+                float4 bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
+                float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
+                uint4 rv3 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 24));
+                BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, rv3.x,rv3.y,rv3.z,rv3.w, srow + (48 ^ xor_val));
+            }
+            // Second 32 cols: a32..a63
+            {
+                float4 bv8 = __ldg(reinterpret_cast<const float4*>(bp + 32));
+                float4 bv9 = __ldg(reinterpret_cast<const float4*>(bp + 36));
+                uint4 rv4 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 32));
+                BIAS_RES_CVT_STS_V4(a32,a33,a34,a35,a36,a37,a38,a39, bv8.x,bv8.y,bv8.z,bv8.w,bv9.x,bv9.y,bv9.z,bv9.w, rv4.x,rv4.y,rv4.z,rv4.w, srow + (64 ^ xor_val));
+                float4 bv10 = __ldg(reinterpret_cast<const float4*>(bp + 40));
+                float4 bv11 = __ldg(reinterpret_cast<const float4*>(bp + 44));
+                uint4 rv5 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 40));
+                BIAS_RES_CVT_STS_V4(a40,a41,a42,a43,a44,a45,a46,a47, bv10.x,bv10.y,bv10.z,bv10.w,bv11.x,bv11.y,bv11.z,bv11.w, rv5.x,rv5.y,rv5.z,rv5.w, srow + (80 ^ xor_val));
+                float4 bv12 = __ldg(reinterpret_cast<const float4*>(bp + 48));
+                float4 bv13 = __ldg(reinterpret_cast<const float4*>(bp + 52));
+                uint4 rv6 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 48));
+                BIAS_RES_CVT_STS_V4(a48,a49,a50,a51,a52,a53,a54,a55, bv12.x,bv12.y,bv12.z,bv12.w,bv13.x,bv13.y,bv13.z,bv13.w, rv6.x,rv6.y,rv6.z,rv6.w, srow + (96 ^ xor_val));
+                float4 bv14 = __ldg(reinterpret_cast<const float4*>(bp + 56));
+                float4 bv15 = __ldg(reinterpret_cast<const float4*>(bp + 60));
+                uint4 rv7 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 56));
+                BIAS_RES_CVT_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63, bv14.x,bv14.y,bv14.z,bv14.w,bv15.x,bv15.y,bv15.z,bv15.w, rv7.x,rv7.y,rv7.z,rv7.w, srow + (112 ^ xor_val));
             }
         }
 
@@ -233,16 +289,19 @@ void epilogue_store(
         const __nv_bfloat16* comb_ptr = nullptr;
         const float* bp = nullptr;
         float4 bv0 = {}, bv1 = {};
+        uint4 rv0 = {};
         if constexpr (Op == EpilogueOp::BIAS_ADD) {
             static_assert(HAS_CVT_ADD, "BIAS_ADD requires CVT_ADD_STS_V4 macro — define before #include \"kernel_body.cuh\"");
             comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
             craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
-        } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
-            static_assert(HAS_GELU_CVT, "BIAS_GELU requires GELU_CVT_STS_V4 macro — define before #include \"kernel_body.cuh\"");
+        } else if constexpr (Op == EpilogueOp::BIAS_GELU || Op == EpilogueOp::BIAS_RESIDUAL) {
             bp = side_data + n_start + nc;
             bv0 = __ldg(reinterpret_cast<const float4*>(bp));
             bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
+            if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+                rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
+            }
         }
 
         TMEM_WAIT();
@@ -264,6 +323,7 @@ void epilogue_store(
             CVT_ADD_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, craw0.x,craw0.y,craw0.z,craw0.w, srow + ((byte_base + 32) ^ xor_val));
             CVT_ADD_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, craw1.x,craw1.y,craw1.z,craw1.w, srow + ((byte_base + 48) ^ xor_val));
         } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
+            static_assert(HAS_GELU_CVT, "BIAS_GELU requires GELU_CVT_STS_V4 macro — define before #include \"kernel_body.cuh\"");
             GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, srow + (byte_base ^ xor_val));
             float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
             float4 bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
@@ -275,6 +335,22 @@ void epilogue_store(
             float4 bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
             float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
             GELU_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, srow + ((byte_base + 48) ^ xor_val));
+        } else if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+            static_assert(HAS_BIAS_RES_CVT, "BIAS_RESIDUAL requires BIAS_RES_CVT_STS_V4 macro — define before #include \"kernel_body.cuh\"");
+            BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, rv0.x,rv0.y,rv0.z,rv0.w, srow + (byte_base ^ xor_val));
+            float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
+            float4 bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
+            uint4 rv1 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 8));
+            BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, bv2.x,bv2.y,bv2.z,bv2.w,bv3.x,bv3.y,bv3.z,bv3.w, rv1.x,rv1.y,rv1.z,rv1.w, srow + ((byte_base + 16) ^ xor_val));
+
+            float4 bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
+            float4 bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
+            uint4 rv2 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 16));
+            BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, bv4.x,bv4.y,bv4.z,bv4.w,bv5.x,bv5.y,bv5.z,bv5.w, rv2.x,rv2.y,rv2.z,rv2.w, srow + ((byte_base + 32) ^ xor_val));
+            float4 bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
+            float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
+            uint4 rv3 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 24));
+            BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, rv3.x,rv3.y,rv3.z,rv3.w, srow + ((byte_base + 48) ^ xor_val));
         }
 
         // Interleaved TMA store(s) — region completes every 2 x32 iterations
@@ -333,7 +409,7 @@ void epilogue_store(
 
     if (lane == 0) {
         int row = gm_base;
-        #pragma unroll
+        PRAGMA_UNROLL(N_REGIONS)
         for (int r = 0; r < N_REGIONS; r++) {
             uint32_t src = staging_saddr + r * STAGING_REGION_BYTES;
             asm volatile(
@@ -377,7 +453,8 @@ persistent_gemm(
     const __grid_constant__ CUtensorMap tma_b,
     const __grid_constant__ CUtensorMap tma_c,
     SideDataPtr<Op> __restrict__ side_data,
-    __nv_bfloat16* __restrict__ C
+    __nv_bfloat16* __restrict__ C,
+    const __nv_bfloat16* __restrict__ residual
 #ifdef TIMING
     , long long* __restrict__ timing_buf
     , long long* __restrict__ spread_buf
@@ -470,6 +547,7 @@ persistent_gemm(
         if (warp == 0) {
             // ── LOAD WARP (W0) ──
             if (lane == 0) {
+                MAYBE_UNROLL_W0
                 for (int ki = 0; ki < K_ITERS; ki++) {
                     const int s = ki % N_STAGES;
                     const int k_start = ki * TK;
@@ -516,6 +594,7 @@ persistent_gemm(
                         : "r"(buf * TN), "l"(desc_a), "l"(desc_b), "r"(IDESC),
                           "r"(0),"r"(0),"r"(0),"r"(0),
                           "r"(0),"r"(0),"r"(0),"r"(0));
+                    MAYBE_UNROLL_SUB
                     for (int sub = 1; sub < MMA_PER_KI; sub++) {
                         desc_a += 2; desc_b += 2;
                         asm volatile(
@@ -532,7 +611,7 @@ persistent_gemm(
                     }
                 }
                 tcgen05_commit_mcast(mma_mbar[0], 0x3);
-                #pragma unroll
+                PRAGMA_UNROLL(K_LOOP_UNROLL)
                 for (int ki = 1; ki < K_ITERS; ki++) {
                     K_ITER_ACCUM(ki % N_STAGES);
                 }
@@ -595,19 +674,19 @@ persistent_gemm(
                 const uint32_t epi_mbar_masked = (epilogue_mbar_addr + prev_buf * 8) & 0xFEFFFFFF;
                 if (is_split) {
                     if (col_rank == 0)
-                        epilogue_store<0, TN/2, Op>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
+                        epilogue_store<0, TN/2, Op>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #ifdef TIMING
                             , epi_t1
 #endif
                         );
                     else
-                        epilogue_store<TN/2, TN, Op>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
+                        epilogue_store<TN/2, TN, Op>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #ifdef TIMING
                             , epi_t1
 #endif
                         );
                 } else {
-                    epilogue_store<0, TN, Op>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
+                    epilogue_store<0, TN, Op>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #ifdef TIMING
                         , epi_t1
 #endif
@@ -700,19 +779,19 @@ persistent_gemm(
 #endif
         if (is_split) {
             if (col_rank == 0)
-                epilogue_store<0, TN/2, Op>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, cta_rank, staging_saddr, 0, &tma_c
+                epilogue_store<0, TN/2, Op>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #ifdef TIMING
                     , drain_t1
 #endif
                 );
             else
-                epilogue_store<TN/2, TN, Op>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, cta_rank, staging_saddr, 0, &tma_c
+                epilogue_store<TN/2, TN, Op>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #ifdef TIMING
                     , drain_t1
 #endif
                 );
         } else {
-            epilogue_store<0, TN, Op>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, cta_rank, staging_saddr, 0, &tma_c
+            epilogue_store<0, TN, Op>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #ifdef TIMING
                 , drain_t1
 #endif

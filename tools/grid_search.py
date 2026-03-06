@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Compile-time grid search for megakernel.cu parameters.
+"""Compile-time grid search for SigLIP kernel parameters.
 
 Enumerates parameter combos, prunes invalid configs (SMEM budget, thread count),
 compiles with -D flags, runs with timeout + hang detection, collects results
 into a sorted table + CSV.
+
+Supports all three kernels: patch_embed (default), fc1_gelu, fc2.
 
 Usage:
     python3 grid_search.py --tier 1          # structure: N_STAGES x NUM_EPI_WARPS (~5 configs)
@@ -12,6 +14,7 @@ Usage:
     python3 grid_search.py --tier all        # sequential 1->2->3, pinning winners
     python3 grid_search.py --full-cross      # all parameters crossed (~3000 configs)
     python3 grid_search.py --only N_STAGES STAGGER_CYCLES --fix MBAR_EARLY=1
+    python3 grid_search.py --kernel fc2 --tier all   # sweep FC2 kernel
 """
 
 import argparse
@@ -24,7 +27,7 @@ import sys
 import tempfile
 import time
 
-# ── Defaults (match megakernel.cu #ifndef values) ──
+# ── Defaults (match kernel_common.cuh #ifndef values) ──
 DEFAULTS = {
     'N_STAGES': 4,
     'NUM_EPI_WARPS': 4,
@@ -35,6 +38,9 @@ DEFAULTS = {
     'PHASE1_UNROLL': 2,
     'SNAKE_ORDER': 1,
     'CVT_ADD_FUSED': 1,
+    'K_LOOP_UNROLL': 4,  # default = N_STAGES
+    'W0_LOOP_UNROLL': 0,  # 0=no pragma (compiler decides)
+    'SUB_MMA_UNROLL': 0,  # 0=no pragma (compiler decides)
 }
 
 # ── Parameter ranges ──
@@ -48,23 +54,33 @@ RANGES = {
     'PHASE1_UNROLL': [1, 2, 4],
     'SNAKE_ORDER': [0, 1],
     'CVT_ADD_FUSED': [0, 1],
+    'K_LOOP_UNROLL': [1, 2, 4, 6, 8],
+    'W0_LOOP_UNROLL': [0, 1, 4],
+    'SUB_MMA_UNROLL': [0, 1, 3],
 }
 
 # ── Tier definitions ──
 TIER_PARAMS = {
     1: ['N_STAGES', 'NUM_EPI_WARPS'],
     2: ['INTERLEAVE_STRATEGY', 'MBAR_EARLY', 'STAGGER_CYCLES', 'TMEM_LOAD_WIDTH'],
-    3: ['PHASE1_UNROLL', 'SNAKE_ORDER', 'CVT_ADD_FUSED'],
+    3: ['PHASE1_UNROLL', 'SNAKE_ORDER', 'CVT_ADD_FUSED', 'K_LOOP_UNROLL',
+        'W0_LOOP_UNROLL', 'SUB_MMA_UNROLL'],
+}
+
+# ── Kernel source files ──
+KERNELS = {
+    'patch_embed': 'patch_embed.cu',
+    'fc1_gelu': 'fc1_gelu.cu',
+    'fc2': 'fc2.cu',
 }
 
 # ── Build config ──
 NVCC = 'nvcc'
 ARCH = 'sm_100a'
-CFLAGS = f'-gencode arch=compute_100a,code={ARCH} -O3 --ptxas-options=-v'
+CFLAGS = f'-gencode arch=compute_100a,code={ARCH} -O3 -std=c++17 --ptxas-options=-v'
 LDFLAGS = '-lcurand -lcuda'
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
-SRC = os.path.join(ROOT_DIR, 'megakernel.cu')
 COMPILE_TIMEOUT = 120
 RUN_TIMEOUT = 30
 SMEM_LIMIT = 233472  # 228 KB
@@ -151,10 +167,10 @@ def make_dflags(cfg):
     return ' '.join(parts)
 
 
-def run_config(cfg, binary_path, repeat=1):
+def run_config(cfg, binary_path, src_path, repeat=1):
     """Compile and run a single config. Returns result dict."""
     dflags = make_dflags(cfg)
-    cmd = f'{NVCC} {CFLAGS} {dflags} {SRC} -o {binary_path} {LDFLAGS}'
+    cmd = f'{NVCC} {CFLAGS} {dflags} {src_path} -o {binary_path} {LDFLAGS}'
 
     result = {**cfg, 'status': 'UNKNOWN', 'ms': float('inf'), 'tflops': 0.0,
               'regs': 0, 'spills': 0, 'smem_kb': smem_kb(cfg), 'dflags': dflags}
@@ -259,7 +275,9 @@ def print_table(results, file=sys.stdout):
         best_ms = None
 
     header = (f'{"#":>3}  {"STG":>3}  {"EPI":>3}  {"INTER":>5}  {"MBAR":>4}  {"TMEM":>4}  '
-              f'{"STAG":>4}  {"PH1U":>4}  {"SNAKE":>5}  {"FUSE":>4}  {"REGS":>4}  {"SMEM":>7}  '
+              f'{"STAG":>4}  {"PH1U":>4}  {"SNAKE":>5}  {"FUSE":>4}  {"KLU":>3}  '
+              f'{"W0U":>3}  {"SMU":>3}  '
+              f'{"REGS":>4}  {"SMEM":>7}  '
               f'{"MS":>7}  {"TFLOPS":>7}  {"STATUS"}')
     print(header, file=file)
     print('-' * len(header), file=file)
@@ -276,7 +294,8 @@ def print_table(results, file=sys.stdout):
               f'{r["INTERLEAVE_STRATEGY"]:>5}  {r["MBAR_EARLY"]:>4}  '
               f'{r["TMEM_LOAD_WIDTH"]:>4}  {r["STAGGER_CYCLES"]:>4}  '
               f'{r["PHASE1_UNROLL"]:>4}  {r["SNAKE_ORDER"]:>5}  '
-              f'{r["CVT_ADD_FUSED"]:>4}  '
+              f'{r["CVT_ADD_FUSED"]:>4}  {r["K_LOOP_UNROLL"]:>3}  '
+              f'{r["W0_LOOP_UNROLL"]:>3}  {r["SUB_MMA_UNROLL"]:>3}  '
               f'{r["regs"]:>4}  {r["smem_kb"]:>6.1f}K  '
               f'{ms_str:>7}  {tflops_str:>7}  {status}',
               file=file)
@@ -291,7 +310,8 @@ def write_csv(results, path):
 
     fields = ['N_STAGES', 'NUM_EPI_WARPS', 'INTERLEAVE_STRATEGY', 'MBAR_EARLY',
               'TMEM_LOAD_WIDTH', 'STAGGER_CYCLES', 'PHASE1_UNROLL', 'SNAKE_ORDER',
-              'CVT_ADD_FUSED', 'regs', 'spills', 'smem_kb', 'ms', 'tflops', 'status', 'dflags']
+              'CVT_ADD_FUSED', 'K_LOOP_UNROLL', 'W0_LOOP_UNROLL', 'SUB_MMA_UNROLL',
+              'regs', 'spills', 'smem_kb', 'ms', 'tflops', 'status', 'dflags']
 
     with open(path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
@@ -300,7 +320,7 @@ def write_csv(results, path):
             writer.writerow(r)
 
 
-def run_sweep(sweep_params, fixed, repeat=1):
+def run_sweep(sweep_params, fixed, src_path, repeat=1):
     """Run a sweep over sweep_params with fixed values pinned."""
     configs = list(enumerate_configs(sweep_params, fixed))
 
@@ -334,7 +354,7 @@ def run_sweep(sweep_params, fixed, repeat=1):
         print(f'[{i+1}/{len(valid)}] {label} ...', end=' ', flush=True)
 
         t0 = time.time()
-        result = run_config(cfg, binary_path, repeat=repeat)
+        result = run_config(cfg, binary_path, src_path, repeat=repeat)
         dt = time.time() - t0
 
         if result['status'] == 'OK':
@@ -361,21 +381,28 @@ def get_best(results):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Grid search for megakernel.cu parameters')
+    parser = argparse.ArgumentParser(description='Grid search for SigLIP kernel parameters')
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--tier', choices=['1', '2', '3', 'all'],
                       help='Tiered search (1=structure, 2=epilogue, 3=tuning, all=sequential)')
     mode.add_argument('--full-cross', action='store_true',
                       help='Full cross-product of all parameters')
+    parser.add_argument('--kernel', choices=list(KERNELS.keys()), default='patch_embed',
+                        help='Kernel to sweep (default: patch_embed)')
     parser.add_argument('--fix', nargs='*', default=[], metavar='PARAM=VAL',
                         help='Pin specific parameters (e.g. --fix MBAR_EARLY=1 N_STAGES=4)')
     parser.add_argument('--only', nargs='*', default=[], metavar='PARAM',
                         help='Sweep only these parameters, pin rest at defaults')
     parser.add_argument('--repeat', type=int, default=1,
                         help='Run each config N times, report best (default: 1)')
-    parser.add_argument('--csv', default=os.path.join(ROOT_DIR, 'data', 'sweep_results.csv'),
-                        help='Output CSV path (default: data/sweep_results.csv)')
+    parser.add_argument('--csv', default=None,
+                        help='Output CSV path (default: data/sweep_<kernel>.csv)')
     args = parser.parse_args()
+
+    src_path = os.path.join(ROOT_DIR, KERNELS[args.kernel])
+    if args.csv is None:
+        args.csv = os.path.join(ROOT_DIR, 'data', f'sweep_{args.kernel}.csv')
+    print(f'Kernel: {args.kernel} ({KERNELS[args.kernel]})')
 
     # Parse --fix
     fixed_overrides = {}
@@ -406,7 +433,7 @@ def main():
             fixed.pop(p, None)
 
         print(f'=== Custom sweep: {", ".join(args.only)} ===')
-        results = run_sweep(sweep_params, fixed, repeat=args.repeat)
+        results = run_sweep(sweep_params, fixed, src_path, repeat=args.repeat)
         all_results.extend(results)
 
     elif args.full_cross:
@@ -418,7 +445,7 @@ def main():
             fixed.pop(p, None)
 
         print('=== Full cross-product sweep ===')
-        results = run_sweep(sweep_params, fixed, repeat=args.repeat)
+        results = run_sweep(sweep_params, fixed, src_path, repeat=args.repeat)
         all_results.extend(results)
 
     elif args.tier == 'all':
@@ -436,7 +463,7 @@ def main():
             fixed = {k: v for k, v in winners.items() if k not in sweep_params}
 
             print(f'\n=== Tier {tier_num}: {", ".join(sweep_params.keys())} ===')
-            results = run_sweep(sweep_params, fixed, repeat=args.repeat)
+            results = run_sweep(sweep_params, fixed, src_path, repeat=args.repeat)
             all_results.extend(results)
 
             best = get_best(results)
@@ -459,7 +486,7 @@ def main():
             fixed.pop(p, None)
 
         print(f'=== Tier {tier_num}: {", ".join(sweep_params.keys())} ===')
-        results = run_sweep(sweep_params, fixed, repeat=args.repeat)
+        results = run_sweep(sweep_params, fixed, src_path, repeat=args.repeat)
         all_results.extend(results)
 
     # Summary

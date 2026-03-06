@@ -1,6 +1,6 @@
-# SigLIP2 Vision Encoder — Persistent Megakernel
+# SigLIP2 Vision Encoder — Persistent GEMM Kernels
 
-Hand-tuned Blackwell (SM100a) persistent megakernel for `google/siglip2-base-patch16-224` patch embed GEMM.
+Hand-tuned Blackwell (SM100a) persistent kernels for `google/siglip2-base-patch16-224`.
 FP8 (E4M3) precision, tcgen05 WGMMA, TMA, `cta_group::2` with 2-CTA clusters. Cross-compiled on CPU VPS, runs on B200.
 
 ## Current state
@@ -9,7 +9,7 @@ FP8 (E4M3) precision, tcgen05 WGMMA, TMA, `cta_group::2` with 2-CTA clusters. Cr
 
 The kernel's value is **fusion**: the overlapped epilogue eliminates the 0.470 ms unfused pos_embed overhead entirely.
 
-cuBLAS pure GEMM is faster: 0.365 ms / 3001 TFLOPS (per-tensor FP8, best-of-8 algos, 256MB workspace).
+cuBLAS pure GEMM is faster: 0.365 ms / 3001 TFLOPS (per-tensor FP8, best-of-128 heuristics, 256MB workspace).
 Our effective TFLOPS (2090-2108) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
 
 GEMM: `[928256, 768] x [768, 768]^T` with fused bias + positional embedding add, BF16 output.
@@ -23,9 +23,9 @@ The kernel is **epilogue-bound** in a balanced producer-consumer equilibrium. F3
 
 **Key facts:**
 - Phase 1 TMEM readback = binding constraint. Interleaved TMA stores (strategy 2, half-batch) fill TMEM stall windows.
-- K-loop: 4,059 cycles. Precomputed descriptors + manual unroll from F28.
+- K-loop: 4,059 cycles. Precomputed descriptors, unroll controlled by `K_LOOP_UNROLL` (default `N_STAGES`).
 - TMA multicast not applicable (B is N-split across CTAs).
-- ~205-211 regs/thread (varies with `CVT_ADD_FUSED`, `PHASE1_UNROLL`, `MBAR_EARLY`), 0 spills. Limits occupancy to 1 CTA/SM.
+- ~161-254 regs/thread (varies with `K_LOOP_UNROLL`, `W0_LOOP_UNROLL`, `SUB_MMA_UNROLL`, `CVT_ADD_FUSED`, `PHASE1_UNROLL`, `MBAR_EARLY`; defaults: PE=205, FC1=~209, FC2=254), 0 spills. Limits occupancy to 1 CTA/SM.
 - Timing build uses ~245 regs (distorts cycles vs production). Wall clock is ground truth.
 
 Run `python3 tools/analyze_timing.py data/clock64_timing.txt` for full equilibrium analysis and what-if projections.
@@ -38,7 +38,7 @@ Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1
 
 - **W0**: TMA async bulk loads (A + B tiles, both CTAs load independently)
 - **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
-- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols through 4 SWIZZLE_128B regions: x32 `tcgen05.ld` → epilogue op → CVT → `st.shared`, with **interleaved TMA stores** every 2 regions hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1. The epilogue op is kernel-specific: bias+pos_embed add (megakernel) or bias+GELU (fc1_gelu).
+- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols through 4 SWIZZLE_128B regions: x32 `tcgen05.ld` → epilogue op → CVT → `st.shared`, with **interleaved TMA stores** every 2 regions hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1. The epilogue op is kernel-specific: bias+pos_embed add (patch_embed), bias+GELU (fc1_gelu), or bias+residual (fc2).
 
 TM=128 rows / 32 rows per warp = 4 row groups. With 4 epi warps (default), each warp owns a full row group (256 cols, `is_split=0`). With 5 epi warps, warp 4 shares row_group 0 via `ew % 4`, creating split warps (`is_split=1`) that each handle 128 cols (2 regions). `epilogue_store` is templated on `<NC_START, NC_END>` so the compiler sees constant loop bounds and `N_REGIONS = (NC_END - NC_START) / 64` is constexpr; unroll depth controlled by `PHASE1_UNROLL` (default 2).
 
@@ -49,23 +49,25 @@ The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile 
 - TMEM: single alloc of 512 cols (TN*2), double-buffered via column offset (buf*TN)
 - SMEM: 4-stage pipeline (131 KB) + epilogue staging (4 warps x 16,384 = 64 KB, SWIZZLE_128B) = ~197 KB total of 228 KB
 - Tiles: 3626 M-tiles x 3 N-tiles = 10,878 total, snake ordering
-- ~205-211 registers/thread, 0 spills (varies with `CVT_ADD_FUSED`, `PHASE1_UNROLL`, `MBAR_EARLY`)
+- ~161-254 registers/thread, 0 spills (varies with unroll params and epilogue type; PE defaults=205, FC2=254)
 - `NUM_EPI_WARPS` controls epilogue warp count (currently 4); `THREADS` derived as `32*(2+NUM_EPI_WARPS)`
 
 ## Development workflow
 
-All kernels share `kernel_common.cuh` (pipeline, TMEM loads, TMA helpers, mbarrier ops). Each `.cu` file `#define N_DIM` before including the header — tile counts and K-iter constants are derived automatically.
+All kernels share `kernel_common.cuh` (pipeline, TMEM loads, TMA helpers, mbarrier ops, tuning parameters) and `kernel_body.cuh` (epilogue_store template, persistent_gemm kernel template). Each `.cu` file `#define N_DIM` and `K_DIM`, defines its epilogue macro (e.g., `CVT_ADD_STS_V4`), then includes both headers — tile counts and K-iter constants are derived automatically.
 
 ```
-edit kernel_common.cuh / megakernel.cu / fc1_gelu.cu -> make -> ./siglip_vision (or ./fc1_gelu)
+edit kernel_common.cuh / kernel_body.cuh / patch_embed.cu / fc1_gelu.cu / fc2.cu -> make -> ./siglip_vision (or ./fc1_gelu, ./fc2)
 ```
 
 ## Repository structure
 
 ```
-kernel_common.cuh       # Shared infrastructure (pipeline, TMEM, TMA, mbarriers)
-megakernel.cu           # Patch embed GEMM — [928256,768]×[768,768]^T + bias + pos_embed
+kernel_common.cuh       # Shared infrastructure (pipeline, TMEM, TMA, mbarriers, tuning params)
+kernel_body.cuh         # Shared kernel body (epilogue_store template, persistent_gemm template)
+patch_embed.cu          # Patch embed GEMM — [928256,768]×[768,768]^T + bias + pos_embed
 fc1_gelu.cu             # FC1+GELU GEMM — [928256,768]×[768,3072]^T + bias + GELU
+fc2.cu                  # FC2 GEMM — [928256,3072]×[3072,768]^T + bias + residual
 Makefile                # Build rules (sm_100a, nvcc flags)
 CLAUDE.md               # This file
 
@@ -79,11 +81,12 @@ tools/                  # Analysis & sweep scripts
   compare_sass.py       # SASS dump diff tool
   stat_test.py          # Statistical significance testing
   bench_sweep.sh        # Shell-based sweep (legacy)
+  cutlass_sweep.sh      # Build + run all CUTLASS bench variants (max/standard)
 
 bench/                  # Benchmark & calibration kernels
-  cutlass_bench.cu      # CUTLASS tile/policy sweep with fused EVT path
+  cutlass_bench.cu      # CUTLASS tile/policy sweep (compile-time N/K/epilogue via -D flags)
   siglip_periodic_add.hpp # Custom EVT visitor (Sm100PeriodicAddNode)
-  cublas_bench.cu       # cuBLAS baseline benchmark (fused + unfused)
+  cublas_bench.cu       # cuBLAS baseline benchmark (compile-time N/K/epilogue via -D flags)
   calibration.cu        # SASS latency microbenchmarks (K1-K26)
   common.h              # Shared PTX helpers (mbarrier, TMA, tcgen05)
   profiler.h            # globaltimer-based kernel profiler
@@ -119,24 +122,43 @@ docs/                   # Documentation & analysis
 ## Build and run
 
 ```bash
-make                    # compile megakernel.cu -> siglip_vision
+make                    # compile patch_embed.cu -> siglip_vision
 ./siglip_vision         # run on B200, prints timing + TFLOPS + checksum
 make fc1-gelu           # compile fc1_gelu.cu -> fc1_gelu
 ./fc1_gelu              # run FC1+GELU kernel
+make fc2                # compile fc2.cu -> fc2
+./fc2                   # run FC2 kernel
 make timing && ./siglip_timing | tee data/clock64_timing.txt | python3 tools/analyze_timing.py
 ncu --set source --csv ./siglip_vision > data/source_counters_raw.csv && python3 tools/analyze_source_counters.py data/source_counters_raw.csv
 
-# CUTLASS grid search (single binary, sweeps all tile/cluster configs)
-make cutlass-bench      # ~1-2 min compile (26 CUTLASS template instantiations)
-./cutlass-bench         # full sweep (4736 imgs, ~5 min runtime)
-./cutlass-bench 1       # quick test (148 imgs, ~30s)
+# CUTLASS tile/policy sweep (compile-time N/K/epilogue via -D flags, one binary per epilogue)
+make cutlass-bench          # patch embed: N=768 K=768 PERIODIC_ADD (default)
+make cutlass-bench-fc1      # FC1: N=3072 K=768 GELU_BIAS
+make cutlass-bench-fc2      # FC2: N=768 K=3072 BIAS_ONLY
+./cutlass-bench [imgs_per_sm]  # default 32 → M=928256
 
-# CUTLASS extended search (stronger baseline)
-make cutlass-bench-max && ./cutlass-bench-max
+# CUTLASS extended sweep (more tile/cluster configs)
+make cutlass-bench-max          # extended patch embed
+make cutlass-bench-fc1-max      # extended FC1
+make cutlass-bench-fc2-max      # extended FC2
 
-# Megakernel parameter grid search
-python3 tools/grid_search.py --tier all        # sequential 1→2→3, pinning winners
-python3 tools/grid_search.py --full-cross      # all parameters crossed (~3000 configs)
+# Full CUTLASS sweep across all three layers (builds + runs)
+./tools/cutlass_sweep.sh              # max mode, 32 imgs/SM
+./tools/cutlass_sweep.sh 1            # quick test (1 img/SM = 148*196 rows)
+./tools/cutlass_sweep.sh 32 standard  # standard tile list only
+
+# cuBLAS baseline (compile-time N/K/epilogue, best-of-heuristics)
+make cublas-bench           # patch embed: N=768 K=768 PERIODIC_ADD
+make cublas-bench-fc1       # FC1: N=3072 K=768 GELU_BIAS
+make cublas-bench-fc2       # FC2: N=768 K=3072 BIAS_ONLY
+./cublas-bench [imgs_per_sm]  # default 32 → M=928256
+
+# Parameter grid search (any kernel)
+python3 tools/grid_search.py --tier all                    # sequential 1→2→3, pinning winners
+python3 tools/grid_search.py --full-cross                  # all parameters crossed
+python3 tools/grid_search.py --kernel fc2 --tier all       # FC2 sweep
+python3 tools/grid_search.py --kernel fc1_gelu --tier 3    # FC1 tier 3 only
+python3 tools/grid_search.py --only K_LOOP_UNROLL W0_LOOP_UNROLL SUB_MMA_UNROLL  # sweep specific params
 
 # SASS scheduling analysis
 cuobjdump --dump-sass siglip_vision > sass_dump.txt
@@ -155,15 +177,36 @@ python3 tools/sass_analysis.py cal_sass.txt --calibrate-compare --runtime cal_ou
 
 ### CUTLASS bench details
 
-`bench/cutlass_bench.cu` sweeps 26+ tile/cluster/policy configs (more with `-DCUTLASS_EXTENDED_SWEEP=1`). Six measurements per config:
-1. GEMM-only (beta=0, FP32 epilogue)
-2. Fused FP32 (beta=1)
-3. Fused BF16 (beta=1)
-4. **Fused EVT**: custom `SigLipPeriodicAdd` visitor (`bench/siglip_periodic_add.hpp`) fuses periodic table add in epilogue — truest apples-to-apples comparison
-5. PostAdd-only (unfused `apply_combined` kernel)
-6. GEMM+PostAdd (unfused two-kernel baseline)
+`bench/cutlass_bench.cu` is compile-time parameterized via `-D` flags (mirrors `cublas_bench.cu`):
+- `BENCH_N` (output dim, default 768), `BENCH_K` (reduction dim, default 768)
+- `BENCH_EPILOGUE`: `1`=PERIODIC_ADD (patch embed), `2`=GELU_BIAS (FC1), `3`=BIAS_ONLY (FC2)
+- `CUTLASS_EXTENDED_SWEEP=1` adds more tile/cluster/policy configs
 
-Data init matches megakernel: A=0x3C (1.5), B alternating columns (even=1.5, odd=1.0), non-uniform bias/pos_embed. Timing: 2 warmup, 10 timed. EVT validation checks per-column expected values (even=1728.0, odd=1152.0).
+Each binary sweeps tile shapes × cluster configs × scheduling policies (auto, 1SM, 2SM with explicit stage counts S3/S4/S5). Configs that exceed SM100a SMEM capacity (232448 bytes) are detected at compile time via `sizeof(SharedStorage)` and reported as ">SMEM" without crashing — `if constexpr` guards prevent the CUTLASS `static_assert` from firing.
+
+**SMEM overflow recovery**: Each Instance struct exposes `static constexpr size_t kSmemBytes = sizeof(typename GemmKernel_::SharedStorage)` — a host-side constexpr giving exact SMEM usage. Each `run()` method checks `if constexpr (kSmemBytes > cutlass::arch::sm100_smem_capacity_bytes)` and returns `-3.0f` (sentinel) in the true branch, while the `else` branch contains `gemm.run()`. Since `if constexpr` discards the false branch entirely, `GemmKernel_::operator()` (which contains the `static_assert`) is never instantiated. Result: always compiles, never crashes, prints ">SMEM" or "SKIP — SMEM exceeded".
+
+**PERIODIC_ADD** (patch embed): 6 measurements per config — GEMM-only (beta=0), fused FP32/BF16 (beta=1), fused EVT (`SigLipPeriodicAdd` custom visitor), PostAdd-only, GEMM+PostAdd. EVT validation checks spot-check values.
+
+**GELU_BIAS** (FC1): `BiasActGemmInstance<GELU_taylor>` using `LinCombPerColBiasEltAct`. 3 measurements — GEMM-only, fused bias+GELU, GEMM+unfused bias+GELU.
+
+**BIAS_ONLY** (FC2): `BiasActGemmInstance<Identity>` — same dispatch path as FC1 with identity activation. 3 measurements — GEMM-only, fused bias, GEMM+unfused bias.
+
+Data init: A=0x3C (FP8 1.5), B alternating columns (even=1.5, odd=1.0), non-uniform bias. Timing: 2 warmup, 10 timed. Sentinel values: -1.0f=can't implement, -2.0f=validation fail, -3.0f=SMEM exceeded.
+
+### cuBLAS bench details
+
+`bench/cublas_bench.cu` is compile-time parameterized via the same `-D` flags as CUTLASS (`BENCH_N`, `BENCH_K`, `BENCH_EPILOGUE`). Uses cublasLt with up to 128 algo heuristics and 256MB workspace.
+
+Tests both **MXFP8** (block-scaled Vec32 UE8M0) and **per-tensor FP8** paths. For each scaling mode, measures:
+1. GEMM-only (beta=0)
+2. Fused epilogue (beta=1 add for PERIODIC_ADD; cuBLAS GELU_BIAS/BIAS epilogue for FC1/FC2)
+3. Unfused (GEMM + post-kernel timed together)
+4. Post-kernel only (standalone unfused kernel)
+
+Reports best-of-all-heuristics for each measurement, plus overhead analysis (fused vs unfused delta). Timing: 3 warmup, 20 timed iters.
+
+`BENCH_EPILOGUE=0` (NONE) is also supported — GEMM-only benchmarking without any epilogue.
 
 ## Key constraints
 
@@ -194,6 +237,9 @@ Full parameter sweep results in `data/sweep_results.csv` (run 1), `data/sweep_re
 | N_STAGES | 4 | 4 | 3 too few (0.557 ms). 5 works but +20 regs for marginal gain. |
 | TMEM_LOAD_WIDTH | 32 | 32 | 64 burns 255 regs, ~10-20 TFLOPS slower than 32 (209 regs). |
 | CVT_ADD_FUSED | 0 or 1 | 1 | Equivalent within noise. |
+| K_LOOP_UNROLL | N_STAGES | N_STAGES | Controls W1 K-loop unroll. 1,2=runtime modulo (+stack), 4=compile-time stages. |
+| W0_LOOP_UNROLL | 0 | 0 | Controls W0 load warp K-iter loop. 0=compiler decides, 1=no unroll, N=unroll by N. |
+| SUB_MMA_UNROLL | 0 | 0 | Controls sub-MMA inner loop (3 iters). 0=compiler decides, 1=no unroll, 3=full. |
 | NUM_EPI_WARPS | 4 or 5 | 4 | 5 matches 4 in perf (~0.523 ms). All strategies work with both 4 and 5 warps. |
 
 ### Top configs (cross-run)
