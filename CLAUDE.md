@@ -52,6 +52,18 @@ The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile 
 - ~161-254 registers/thread, 0 spills (varies with unroll params and epilogue type; PE defaults=205, FC2=254)
 - `NUM_EPI_WARPS` controls epilogue warp count (currently 4); `THREADS` derived as `32*(2+NUM_EPI_WARPS)`
 
+## B200 task list
+
+**All build/run/profile commands require B200 hardware** ($5/hr rental). Cross-compilation works on any machine, but execution, profiling, and cuBLAS SASS capture require the target GPU.
+
+See **`TASKS.md`** for the full prioritized task list. Key items:
+
+1. **cuBLAS FP8 SASS capture** — cuBLAS FP8 GEMM kernels ship as zstd-compressed PTX in `libcublasLt.so` and are JIT-compiled by the CUDA driver at runtime. The SASS does not exist in the distributed binary (zero UTCQMMA in all sm_100 sections). Must run on B200 and capture via `ncu --set full` or from `~/.nv/ComputeCache/`.
+2. **FC1/FC2 grid search** — only patch_embed has been swept (4 runs × 145 configs). FC1 (N=3072) and FC2 (K=3072) have different tile/K-iter counts and may have different optimal parameters.
+3. **CUTLASS/cuBLAS sweep** — full benchmark comparison across all three layers.
+4. **ncu profiling** — fresh source counter profiles after any code changes.
+5. **Calibration expansion** — K13-K26 microbenchmarks for SASS decoder verification.
+
 ## Development workflow
 
 All kernels share `kernel_common.cuh` (pipeline, TMEM loads, TMA helpers, mbarrier ops, tuning parameters) and `kernel_body.cuh` (epilogue_store template, persistent_gemm kernel template). Each `.cu` file `#define N_DIM` and `K_DIM`, defines its epilogue macro (e.g., `CVT_ADD_STS_V4`), then includes both headers — tile counts and K-iter constants are derived automatically.
@@ -70,12 +82,14 @@ fc1_gelu.cu             # FC1+GELU GEMM — [928256,768]×[768,3072]^T + bias + 
 fc2.cu                  # FC2 GEMM — [928256,3072]×[3072,768]^T + bias + residual
 Makefile                # Build rules (sm_100a, nvcc flags)
 CLAUDE.md               # This file
+TASKS.md                # B200 task list — prioritized work for rental sessions
 
 tools/                  # Analysis & sweep scripts
   sass_analysis.py      # SASS scheduling analyzer (decodes control words, dep graphs, slack)
   grid_search.py        # Compile-time parameter sweep (tiered search, CSV output)
   analyze_timing.py     # clock64 timing → equilibrium analysis
   analyze_source_counters.py  # ncu SourceCounters CSV → stall breakdown
+  compare_all.py        # Unified benchmark: cuBLAS vs CUTLASS vs ours + ANOVA
   remote.py             # Remote B200 provisioning + sweep runner
   compare.py            # ncu CSV diff tool
   compare_sass.py       # SASS dump diff tool
@@ -104,6 +118,7 @@ data/                   # Profiling data & sweep results
   source_counters_raw.csv  # Raw ncu --set source --csv data
   clock64_timing*.txt   # Kernel printf from timing builds
   after.csv, baseline.csv  # ncu comparison data
+  compare.csv             # Raw samples from unified comparison (compare_all.py)
 
 ISSUES_CALIBRATION      # Calibration expansion design (K13-K26 kernel specs)
 
@@ -173,6 +188,12 @@ make calibration          # compile bench/calibration.cu
 cuobjdump --dump-sass calibration > cal_sass.txt
 python3 tools/sass_analysis.py cal_sass.txt --calibrate-compare                          # SASS-only
 python3 tools/sass_analysis.py cal_sass.txt --calibrate-compare --runtime cal_output.txt # compare vs runtime
+
+# Unified comparison (cuBLAS vs CUTLASS vs ours, ANOVA statistical analysis)
+make compare                                              # all layers, 10 runs, CSV output
+python3 tools/compare_all.py --runs 20 --csv data/compare.csv   # more runs for tighter CI
+python3 tools/compare_all.py --layer patch_embed --runs 5        # single layer, quick
+python3 tools/compare_all.py --grid-search                      # run grid search first
 ```
 
 ### CUTLASS bench details

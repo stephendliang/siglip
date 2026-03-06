@@ -9,7 +9,7 @@ CUTLASS_DIR = third_party/cutlass
 CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUTLASS_FLAGS = -std=c++17 --expt-relaxed-constexpr
 
-.PHONY: all clean timing fc1-gelu fc2 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool
+.PHONY: all clean timing fc1-gelu fc2 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare
 
 all: $(TARGET)
 
@@ -79,6 +79,13 @@ sweep-fast: tools/grid_search.py $(CU)
 
 sweep-full: tools/grid_search.py $(CU)
 	python3 tools/grid_search.py --full-cross
+
+# ── Unified comparison (cuBLAS vs CUTLASS vs ours, ANOVA) ──
+compare:
+	python3 tools/compare_all.py --csv data/compare.csv
+
+compare-fast:
+	python3 tools/compare_all.py --runs 5 --layer patch_embed --csv data/compare.csv
 
 clean:
 	rm -f $(TARGET) siglip_timing fc1-gelu fc2 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cublas-bench cublas-bench-fc1 cublas-bench-fc2 calibration
