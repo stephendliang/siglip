@@ -7,6 +7,7 @@
 // Each CTA loads own A (128 rows) + half B (128 cols). MMA produces 256×256 output.
 
 #define N_DIM          768
+#define K_DIM          768
 #include "kernel_common.cuh"
 
 #ifndef CVT_ADD_FUSED
@@ -212,7 +213,7 @@ int main() {
     // ── Warmup: 2 iterations ──
     printf("Launching warmup (2 iters)...\n");
     for (int _i = 0; _i < 2; _i++) {
-    persistent_gemm<EpilogueOp::BIAS_ADD><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_combined, d_C
+    persistent_gemm<EpilogueOp::BIAS_ADD><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_combined, d_C, nullptr
 #ifdef TIMING
         , d_timing, d_spread
 #endif
@@ -229,7 +230,7 @@ int main() {
     cudaEventCreate(&_t1);
     cudaEventRecord(_t0);
     for (int _i = 0; _i < 10; _i++) {
-    persistent_gemm<EpilogueOp::BIAS_ADD><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_combined, d_C
+    persistent_gemm<EpilogueOp::BIAS_ADD><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_combined, d_C, nullptr
 #ifdef TIMING
         , d_timing, d_spread
 #endif
@@ -246,7 +247,7 @@ int main() {
     cudaEventDestroy(_t1);
 
     // ── Checksum run ──
-    persistent_gemm<EpilogueOp::BIAS_ADD><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_combined, d_C
+    persistent_gemm<EpilogueOp::BIAS_ADD><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_combined, d_C, nullptr
 #ifdef TIMING
         , d_timing, d_spread
 #endif

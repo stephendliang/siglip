@@ -5,7 +5,7 @@
 //
 //   D[m, n] = bf16( bf16(acc[m, n]) + combined[m % seq_len, n] )
 //
-// Numeric semantics match the megakernel: FP32 acc → BF16 first (cvt.rn.bf16x2.f32),
+// Numeric semantics match the patch embed kernel: FP32 acc → BF16 first (cvt.rn.bf16x2.f32),
 // then BF16 + BF16 add (add.rn.bf16x2). NOT float-domain add then convert.
 //
 // where combined[i, j] = bias[j] + pos_embed[i, j] is precomputed on host.
@@ -174,7 +174,7 @@ struct Sm100PeriodicAddNode {
           int epi_n,
           Array<ElementInput, FragmentSize> const& frg_inputs) {
 
-      // Match megakernel numeric semantics:
+      // Match patch embed numeric semantics:
       //   cvt.rn.bf16x2.f32  — FP32 accumulator → BF16 FIRST
       //   add.rn.bf16x2      — BF16 + BF16 table value (BF16-domain add)
       using ConvertToBF16 = NumericArrayConverter<ElementOutput, ElementInput, FragmentSize, RoundStyle>;

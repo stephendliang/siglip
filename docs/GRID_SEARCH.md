@@ -8,7 +8,7 @@ Python sweep script that iterates over kernel parameter configurations, computes
 
 ## Parameter injection
 
-Wrap existing `#define` values in `#ifndef` guards in `megakernel.cu`:
+Wrap existing `#define` values in `#ifndef` guards in `patch_embed.cu`:
 
 ```c
 #ifndef TN
@@ -143,7 +143,7 @@ def is_valid(tn, n_stages, num_epi_warps, staging_pad):
     if num_epi_warps < 4:
         return False, f"NUM_EPI_WARPS={num_epi_warps} < 4: row_group 3 never written"
 
-    # SMEM budget — mirrors exact offset chain from megakernel.cu lines 32-41
+    # SMEM budget — mirrors exact offset chain from patch_embed.cu lines 32-41
     stage_bytes = TK * TM + TK * (tn // 2)   # A tile + B tile per CTA
     off_tmem = n_stages * stage_bytes
     off_tma_mbar = off_tmem + 8
@@ -217,7 +217,7 @@ This is especially critical for the TN sweep: if TMA_BYTES doesn't track TN, `mb
 
 ## Kernel output protocol
 
-Add one machine-readable line to `megakernel.cu`:
+Add one machine-readable line to `patch_embed.cu`:
 
 ```c
 printf("@@RESULT ms=%.3f tflops=%.2f checksum=%f c0=%.1f\n",

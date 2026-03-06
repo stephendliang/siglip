@@ -14,14 +14,14 @@ Phase 1:  TMEM → CVT+epilogue_op → STS staging (swizzle, 4 regions of 32x64 
 Phase 2:  cp.async.bulk.commit_group only — all TMA stores already issued inline
 ```
 
-The epilogue op is kernel-specific: bias+pos_embed add (megakernel.cu) or bias+GELU (fc1_gelu.cu).
+The epilogue op is kernel-specific: bias+pos_embed add (patch_embed.cu) or bias+GELU (fc1_gelu.cu).
 
 Grid search (4 runs x 145 configs) confirms parameter space is exhausted — all top configs within 0.001 ms.
 
 ## Next frontier: multi-kernel architecture
 
 The codebase now has `kernel_common.cuh` (shared pipeline/TMEM/TMA infrastructure) with two kernel files:
-- `megakernel.cu` — patch embed: [928256,768]x[768,768]^T + bias + pos_embed (N_DIM=768)
+- `patch_embed.cu` — patch embed: [928256,768]x[768,768]^T + bias + pos_embed (N_DIM=768)
 - `fc1_gelu.cu` — FC1+GELU: [928256,768]x[768,3072]^T + bias + GELU (N_DIM=3072)
 
 ### FC1+GELU tuning (next)
@@ -39,7 +39,7 @@ FC2: [928256,3072]x[3072,768]^T + bias + residual add. Tall-K (K_DIM=3072 → K_
 
 ### Attention (after MLP)
 
-Q/K/V/Out projections are same shape as patch embed (768x768). Can reuse megakernel.cu's epilogue structure with different fusion (no pos_embed). QK^T and softmax are entirely different — small per-head matmuls, not persistent megakernel territory.
+Q/K/V/Out projections are same shape as patch embed (768x768). Can reuse patch_embed.cu's epilogue structure with different fusion (no pos_embed). QK^T and softmax are entirely different — small per-head matmuls, not persistent kernel territory.
 
 ### Long-term: single persistent kernel
 

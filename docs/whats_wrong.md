@@ -25,7 +25,7 @@ Run each section **before and after** every optimization item in `docs/tasks.md`
 Source-level profiling requires `-lineinfo`:
 
 ```bash
-nvcc -gencode arch=compute_100a,code=sm_100a -O3 -lineinfo megakernel.cu -o siglip_vision -lcurand -lcuda
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -lineinfo patch_embed.cu -o siglip_vision -lcurand -lcuda
 ```
 
 This adds debug line mappings without affecting optimization. Use for `ncu --set source` runs.

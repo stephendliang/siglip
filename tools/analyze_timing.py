@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze clock64 timing output from the SigLIP megakernel timing build.
+"""Analyze clock64 timing output from the SigLIP patch embed timing build.
 
 Parses the kernel's printf output and computes derived metrics:
 equilibrium analysis, ceiling projections, bottleneck identification.

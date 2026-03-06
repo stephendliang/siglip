@@ -1,4 +1,4 @@
-// FC1+GELU kernel — derived from megakernel.cu (patch embed GEMM)
+// FC1+GELU kernel — derived from patch_embed.cu (patch embed GEMM)
 // Target: B200  Batch: 4736  GEMM: [928256,768]×[768,3072]^T + bias + GELU
 // Pipeline: 4-stage (parameterized)  K-iters: 6  MMA/iter: 4  idesc: 0x10400010
 // Warps: 2+NUM_EPI_WARPS  cta_group::2  __cluster_dims__(2,1,1)
@@ -8,6 +8,7 @@
 // Epilogue: FP32 acc + bias → GELU → BF16 CVT → SMEM staging → TMA store
 
 #define N_DIM          3072
+#define K_DIM          768
 #include "kernel_common.cuh"
 
 // ── GELU approximation (tanh version) ──
@@ -143,7 +144,7 @@ int main() {
     // ── Warmup: 2 iterations ──
     printf("Launching warmup (2 iters)...\n");
     for (int _i = 0; _i < 2; _i++) {
-    persistent_gemm<EpilogueOp::BIAS_GELU><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_C
+    persistent_gemm<EpilogueOp::BIAS_GELU><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, nullptr
 #ifdef TIMING
         , d_timing, d_spread
 #endif
@@ -160,7 +161,7 @@ int main() {
     cudaEventCreate(&_t1);
     cudaEventRecord(_t0);
     for (int _i = 0; _i < 10; _i++) {
-    persistent_gemm<EpilogueOp::BIAS_GELU><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_C
+    persistent_gemm<EpilogueOp::BIAS_GELU><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, nullptr
 #ifdef TIMING
         , d_timing, d_spread
 #endif
@@ -177,7 +178,7 @@ int main() {
     cudaEventDestroy(_t1);
 
     // ── Checksum run ──
-    persistent_gemm<EpilogueOp::BIAS_GELU><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_C
+    persistent_gemm<EpilogueOp::BIAS_GELU><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, nullptr
 #ifdef TIMING
         , d_timing, d_spread
 #endif

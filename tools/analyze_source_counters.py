@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze ncu SourceCounters CSV for the SigLIP megakernel.
+"""Analyze ncu SourceCounters CSV for the SigLIP patch embed kernel.
 
 Usage:
     python analyze_source_counters.py source_counters_raw.csv

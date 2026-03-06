@@ -318,7 +318,7 @@ The most powerful SASS analysis combines `ncu` source-level profiling with SASS 
 
 ```bash
 # Build with line info
-nvcc -gencode arch=compute_100a,code=sm_100a -O3 -lineinfo megakernel.cu -o siglip_vision -lcurand -lcuda
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -lineinfo patch_embed.cu -o siglip_vision -lcurand -lcuda
 
 # Profile with source-level detail
 ncu --set source --source-level all \
@@ -428,7 +428,7 @@ __device__ __noinline__ void epilogue_phase(...) {
 }
 ```
 
-This is the practical solution to the register union problem for the persistent megakernel. Each major phase (GEMM epilogue, flash attention, LayerNorm) gets independent register allocation. The call overhead is negligible at phase-transition frequency.
+This is the practical solution to the register union problem for the persistent kernel. Each major phase (GEMM epilogue, flash attention, LayerNorm) gets independent register allocation. The call overhead is negligible at phase-transition frequency.
 
 ### 4. Register pressure hints
 

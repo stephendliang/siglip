@@ -102,7 +102,7 @@ K19a/K19b — VIADD throughput/latency (75 occurrences)
 K20a/K20b — R2UR throughput/latency (408 occurrences — most frequent!)
 - "r2ur.result UR4, R5;" — cross-domain register transfer
 - PTX doesn't have a direct equivalent. Needs SASS-level inline or a trick.
-- Actually in the megakernel it appears as R2UR and R2UR.BROADCAST. The PTX for this is just referencing uniform registers from scalar
+- Actually in the patch embed kernel it appears as R2UR and R2UR.BROADCAST. The PTX for this is just referencing uniform registers from scalar
 context, or using mov from R to UR space.
 - Can use: asm volatile("mov.u32 %%ur0, %0;" :: "r"(val)); — maps to R2UR
 

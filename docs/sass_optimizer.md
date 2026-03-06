@@ -6,7 +6,7 @@ reorders instructions within basic blocks to achieve globally-optimal scheduling
 
 ## Why this exists
 
-ptxas is a good-enough scheduler but not optimal. On the megakernel K-loop:
+ptxas is a good-enough scheduler but not optimal. On the patch embed K-loop:
 - 24 UTCQMMA instructions, each with stall=10, min=7 (slack=3)
 - 8 SYNCS.PHASECHK instructions with stall=15, min=0 (slack=15)
 - Total: 238 cycles of static scheduling slack in 417 instructions
@@ -52,7 +52,7 @@ the approach.
 
 - [ ] Extract cubin from fatbin (`cuobjdump --dump-cubin` or parse fatbin header)
 - [ ] Parse ELF headers to find `.text.<kernel>` section (offset + size)
-  - megakernel: section index 0xe, offset 0x1700, size 0x8a80 (2216 instructions)
+  - patch_embed: section index 0xe, offset 0x1700, size 0x8a80 (2216 instructions)
   - each instruction = 16 bytes (128 bits)
 - [ ] Verify: instruction count matches sass_analysis.py output
 - [ ] Map SASS addresses to ELF byte offsets: `elf_offset = section_offset + addr`
@@ -290,7 +290,7 @@ Phase 1.1-1.2  Cubin parser + control word extraction     ██░░░░  ~1
 Phase 1.3-1.4  Stall patcher + writer                     ██░░░░  ~100 lines
 Phase 1.5      Loader (cuModuleLoad wrapper)               █░░░░░  ~80 lines (C)
 Phase 1.6-1.7  CLI + validation                            █░░░░░  ~50 lines
-------- validate Phase 1 on megakernel K-loop, measure delta -------
+------- validate Phase 1 on patch embed K-loop, measure delta -------
 Phase 2.1      Basic block extraction                      ██░░░░  ~200 lines
 Phase 2.2      Dependency graph builder (extend existing)  ███░░░  ~300 lines
 Phase 2.3      Solver integration (adapt CP solver)        ████░░  variable
@@ -301,7 +301,7 @@ Phase 3        Cross-block + profile-guided                ██████  r
 ```
 
 Phase 1 is the critical path. If restalling shows zero wall-clock improvement on
-the megakernel (confirming the equilibrium hypothesis), the tool is still valuable:
+the patch embed kernel (confirming the equilibrium hypothesis), the tool is still valuable:
 apply it to the epilogue section, or to other kernels where the equilibrium is
 different.
 
@@ -322,7 +322,7 @@ verify it loads.
 
 **Risk: cubin has a CAPMERC (capability mercury) section that depends on instruction layout.**
 Mitigation: The `.nv.capmerc.text.<kernel>` section exists in the ELF (size 0x2c8e
-for the megakernel). This is an NVIDIA-internal performance hint table. If
+for the patch embed kernel). This is an NVIDIA-internal performance hint table. If
 reordering corrupts it, the kernel may still run but lose hardware-level optimizations.
 Phase 1 (restall only) does not reorder instructions, so CAPMERC is safe. Phase 2
 may need to zero out or regenerate this section. Test: zero the section and measure

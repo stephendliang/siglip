@@ -1,4 +1,4 @@
-CALIBRATION STATUS — opcodes in megakernel SASS
+CALIBRATION STATUS — opcodes in patch embed SASS
   ================================================
 
   !! SASS AUDIT (nvcc 13.1 / sm_100a) — v3: feedback chains replace XOR accum !!

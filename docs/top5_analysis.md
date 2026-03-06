@@ -157,7 +157,7 @@ plateau, the K-loop itself (currently ~4,059 cycles) must be shortened, not just
 
 ```bash
 # Profile any config:
-nvcc -gencode arch=compute_100a,code=sm_100a -O3 <DFLAGS> megakernel.cu -o tmp -lcurand -lcuda
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 <DFLAGS> patch_embed.cu -o tmp -lcurand -lcuda
 ncu --metrics sm__pipe_tc_cycles_active.avg.pct_of_peak_sustained_elapsed,... -k patch_embed_gemm -c 1 ./tmp
 
 # Parse the CSV:

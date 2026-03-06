@@ -43,7 +43,7 @@ fi
 echo "Building ${#build_targets[@]} targets..."
 for target in "${build_targets[@]}"; do
     echo -n "  $target ... "
-    if make "$target" 2>&1 | tail -1 | grep -q "Error"; then
+    if ! make "$target" 2>&1; then
         echo "FAILED"
         echo "Build failed for $target. Run 'make $target' to see errors."
         exit 1

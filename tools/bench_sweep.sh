@@ -12,7 +12,7 @@ echo "---------------------------------------------------"
 
 for ips in 1 2 4 8 16 32; do
     M=$((ips * 148 * 196))
-    python3 gen.py --no-coop --imgs-per-sm $ips --warmup 2 --iters 10 -o megakernel.cu 2>/dev/null
+    python3 gen.py --no-coop --imgs-per-sm $ips --warmup 2 --iters 10 -o patch_embed.cu 2>/dev/null
     make siglip_vision 2>/dev/null
     result=$(./siglip_vision 2>&1)
     ms=$(echo "$result" | grep "Custom kernel:" | awk '{print $3}')

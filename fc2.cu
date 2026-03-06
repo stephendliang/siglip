@@ -112,6 +112,7 @@ int main() {
         int bpg = (int)((total + tpb - 1) / tpb);
         init_residual<<<bpg, tpb>>>(d_residual, N_DIM, total);
         CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
     printf("  Alloc + init done\n");
 

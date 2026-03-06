@@ -238,7 +238,7 @@ def provision(gpu_type, force=False):
         image=IMAGE,
         ssh_key_ids=ssh_key_ids,
         hostname=HOSTNAME,
-        description='siglip megakernel bench',
+        description='siglip kernel bench',
     )
     print(f'Instance created: {instance.id} (status: {instance.status})')
 
@@ -354,7 +354,7 @@ def fetch_file(ip, remote_path, local_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Remote B200 test runner for siglip megakernel')
+    parser = argparse.ArgumentParser(description='Remote B200 test runner for siglip kernels')
 
     # Instance lifecycle
     parser.add_argument('--list', action='store_true', help='List all instances')

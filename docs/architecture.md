@@ -37,7 +37,7 @@ Build: cross-compile on CPU-only VPS, run on target GPU
 The kernels are **hand-written inline PTX**, not codegen output. All shared infrastructure (pipeline, TMEM loads, TMA helpers, mbarrier ops, tile math) lives in `kernel_common.cuh`. Each kernel file `#define`s `N_DIM` before including the header — tile counts, K-iterations, and SMEM layout are derived automatically.
 
 ```
-edit kernel_common.cuh / megakernel.cu / fc1_gelu.cu → make → run on B200
+edit kernel_common.cuh / patch_embed.cu / fc1_gelu.cu → make → run on B200
 ```
 
 Tuning parameters (STAGGER_CYCLES, MBAR_EARLY, INTERLEAVE_STRATEGY, etc.) are compile-time `#define`s overridable via `-D` flags. Grid search (`tools/grid_search.py`) sweeps parameter space automatically.
@@ -78,7 +78,7 @@ FC1 kernel written (`fc1_gelu.cu`), not yet run on B200.
 Different character from the large GEMMs — tiny tiles, many independent heads.
 
 - [ ] Q, K, V projections: three [B*196, 768] × [768, 768] GEMMs
-      Same shape as patch embed — reuse megakernel's GEMM structure.
+      Same shape as patch embed — reuse patch_embed's GEMM structure.
 - [ ] Reshape for multi-head: [B, 196, 768] → [B*12, 196, 64]
       Pure index arithmetic, no data movement.
 - [ ] QK^T batched matmul: [196, 64] × [64, 196] → [196, 196] per head
@@ -134,7 +134,7 @@ Single kernel launch: pixels in → embedding out.
 siglip/
 ├── CLAUDE.md              # Project overview — read first
 ├── kernel_common.cuh      # Shared infrastructure (pipeline, TMEM, TMA, mbarriers)
-├── megakernel.cu          # Patch embed GEMM (N_DIM=768) — hand-written
+├── patch_embed.cu         # Patch embed GEMM (N_DIM=768) — hand-written
 ├── fc1_gelu.cu            # FC1+GELU GEMM (N_DIM=3072) — hand-written
 ├── Makefile               # Build rules (sm_100a)
 ├── tools/                 # Analysis & sweep scripts

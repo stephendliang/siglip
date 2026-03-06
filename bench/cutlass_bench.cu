@@ -1133,13 +1133,13 @@ int main(int argc, char** argv) {
     // epilogue_data: d_combined for PERIODIC_ADD, d_bias for GELU_BIAS/BIAS_ONLY
     const void* epilogue_data = nullptr;
     float ms_post_ref = -1.0f;
+    float *d_epi_bias = nullptr, *d_epi_pos = nullptr;
+    __nv_bfloat16 *d_epi_combined = nullptr;
 
     if constexpr (EPI == Epilogue::PERIODIC_ADD) {
-        float *d_bias, *d_pos;
-        __nv_bfloat16 *d_combined;
-        CUDA_CHECK(cudaMalloc(&d_bias, (size_t)N_DIM * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_pos, (size_t)SEQ_LEN * N_DIM * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_combined, (size_t)SEQ_LEN * N_DIM * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMalloc(&d_epi_bias, (size_t)N_DIM * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_epi_pos, (size_t)SEQ_LEN * N_DIM * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_epi_combined, (size_t)SEQ_LEN * N_DIM * sizeof(__nv_bfloat16)));
         {
             float* h_bias = (float*)malloc((size_t)N_DIM * sizeof(float));
             float* h_pos  = (float*)malloc((size_t)SEQ_LEN * N_DIM * sizeof(float));
@@ -1148,15 +1148,15 @@ int main(int argc, char** argv) {
             for (int r = 0; r < SEQ_LEN; r++)
                 for (int c = 0; c < N_DIM; c++)
                     h_pos[r * N_DIM + c] = (float)((r + 1) * 3);
-            CUDA_CHECK(cudaMemcpy(d_bias, h_bias, (size_t)N_DIM * sizeof(float), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(d_pos, h_pos, (size_t)SEQ_LEN * N_DIM * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_epi_bias, h_bias, (size_t)N_DIM * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_epi_pos, h_pos, (size_t)SEQ_LEN * N_DIM * sizeof(float), cudaMemcpyHostToDevice));
             free(h_bias);
             free(h_pos);
         }
         {
             int n_elem = SEQ_LEN * N_DIM;
             int tpb = 256;
-            precompute_combined<<<(n_elem + tpb - 1) / tpb, tpb>>>(d_bias, d_pos, d_combined, SEQ_LEN, N_DIM);
+            precompute_combined<<<(n_elem + tpb - 1) / tpb, tpb>>>(d_epi_bias, d_epi_pos, d_epi_combined, SEQ_LEN, N_DIM);
             CUDA_CHECK(cudaGetLastError());
         }
         // Tile combined into C
@@ -1166,7 +1166,7 @@ int main(int argc, char** argv) {
             for (int img = 0; img < num_images; img++) {
                 CUDA_CHECK(cudaMemcpy(
                     (char*)d_C + img * row_bytes,
-                    d_combined,
+                    d_epi_combined,
                     row_bytes,
                     cudaMemcpyDeviceToDevice));
             }
@@ -1174,31 +1174,29 @@ int main(int argc, char** argv) {
         printf("  C tiled to [%d, %d] (%.1f MB)\n\n", M, N_DIM, (double)sz_d / (1024*1024));
 
         ms_post_ref = bench_postadd_only(
-            reinterpret_cast<__nv_bfloat16*>(d_D), d_combined,
+            reinterpret_cast<__nv_bfloat16*>(d_D), d_epi_combined,
             M, N_DIM, SEQ_LEN, sz_d);
         printf("  PostAdd-only baseline: %.3f ms\n", ms_post_ref);
 
-        epilogue_data = d_combined;
-        // d_bias, d_pos, d_combined kept alive until end
+        epilogue_data = d_epi_combined;
     } else {
         // GELU_BIAS or BIAS_ONLY: allocate bias
-        float* d_bias;
-        CUDA_CHECK(cudaMalloc(&d_bias, (size_t)N_DIM * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_epi_bias, (size_t)N_DIM * sizeof(float)));
         {
             float* h_bias = (float*)malloc((size_t)N_DIM * sizeof(float));
             for (int c = 0; c < N_DIM; c++) h_bias[c] = (float)(c + 1);
-            CUDA_CHECK(cudaMemcpy(d_bias, h_bias, (size_t)N_DIM * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_epi_bias, h_bias, (size_t)N_DIM * sizeof(float), cudaMemcpyHostToDevice));
             free(h_bias);
         }
 
         bool do_gelu = (EPI == Epilogue::GELU_BIAS);
         ms_post_ref = bench_bias_act_only(
-            reinterpret_cast<__nv_bfloat16*>(d_D), d_bias,
+            reinterpret_cast<__nv_bfloat16*>(d_D), d_epi_bias,
             M, N_DIM, sz_d, do_gelu);
         printf("  Unfused %s kernel: %.3f ms\n",
                do_gelu ? "bias+GELU" : "bias-only", ms_post_ref);
 
-        epilogue_data = d_bias;
+        epilogue_data = d_epi_bias;
     }
 
     // ── Grid/policy search ──
@@ -1452,7 +1450,9 @@ int main(int argc, char** argv) {
     cudaFree(d_B);
     cudaFree(d_C);
     cudaFree(d_D);
-    // epilogue_data (d_combined/d_bias) and related allocs leak at exit — acceptable for a benchmark
+    cudaFree(d_epi_bias);
+    cudaFree(d_epi_pos);
+    cudaFree(d_epi_combined);
 
     return 0;
 #endif

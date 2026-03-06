@@ -1,6 +1,6 @@
 # Experiment Log
 
-Kernel: `patch_embed_gemm` — persistent megakernel for SigLIP2 patch embed GEMM.
+Kernel: `patch_embed_gemm` — persistent kernel for SigLIP2 patch embed GEMM.
 GEMM: `[928256, 768] x [768, 768]^T`, FP8 E4M3 inputs, BF16 output with fused bias + positional embedding.
 Target: B200 (SM100a), 148 SMs, `cta_group::2`, `__cluster_dims__(2,1,1)`.
 
@@ -1043,7 +1043,7 @@ All warps improved, not just W4/W5 — confirms pervasive contention across all 
 
 ### Changes
 
-Single file `megakernel.cu`, `epilogue_store` function only:
+Single file `patch_embed.cu`, `epilogue_store` function only:
 
 1. Removed `a16..a31` register declarations (32→16 float regs)
 2. Phase 1A: `TMEM_LOAD_X32` → `TMEM_LOAD` (x16), loop stride 32→16, 2 STS_V4 per iter instead of 4
