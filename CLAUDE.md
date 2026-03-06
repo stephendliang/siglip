@@ -91,10 +91,8 @@ tools/                  # Analysis & sweep scripts
   analyze_source_counters.py  # ncu SourceCounters CSV → stall breakdown
   compare_all.py        # Unified benchmark: cuBLAS vs CUTLASS vs ours + ANOVA
   remote.py             # Remote B200 provisioning + sweep runner
-  compare.py            # ncu CSV diff tool
+  ncu_diff.py           # ncu CSV diff tool
   compare_sass.py       # SASS dump diff tool
-  stat_test.py          # Statistical significance testing
-  bench_sweep.sh        # Shell-based sweep (legacy)
   cutlass_sweep.sh      # Build + run all CUTLASS bench variants (max/standard)
 
 bench/                  # Benchmark & calibration kernels

@@ -320,7 +320,7 @@ Every L1-bypass approach breaks this overlap:
 ## Profiling data — SMEM staging A/B comparison
 
 Profiled via `ncu --set detailed`, single kernel instance.
-Raw data: `baseline.csv` (pre-staging), `after.csv` (post-staging). Run `python compare.py baseline.csv after.csv`.
+Raw data: `baseline.csv` (pre-staging), `after.csv` (post-staging). Run `python ncu_diff.py baseline.csv after.csv`.
 
 ### Build stats (ptxas)
 
@@ -361,7 +361,7 @@ Raw data: `baseline.csv` (pre-staging), `after.csv` (post-staging). Run `python 
 
 Absolute excess sector count unchanged (44.56M — from split warps' V2 stores and combined BF16 global loads). Fraction dropped 50% → 33% because coalesced V4/V2 stores generate more "good" sectors. Store instruction count increased 2.5x (V4 16B replaces V8 32B), but each is fully coalesced.
 
-### Key compare.py findings (>5% relative change)
+### Key ncu_diff.py findings (>5% relative change)
 
 | Metric | Baseline | Staging | Change |
 |--------|----------|---------|--------|
@@ -1261,7 +1261,7 @@ Same session, reverted code, 10 runs:
 | x32 | 234 | 20 × LDTM.x32 | `siglip_x32` |
 | x64 | 255 | 12 × LDTM.x64 | `siglip_x64` |
 
-**Statistical test:** 30 runs per variant, Welch's t-test (pairwise) + one-way ANOVA. Script: `stat_test.py`.
+**Statistical test:** 30 runs per variant, Welch's t-test (pairwise) + one-way ANOVA. Script: `tools/compare_all.py`.
 
 ### Summary statistics (n=30)
 
