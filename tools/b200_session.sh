@@ -5,7 +5,7 @@
 #   1. Machine snapshot                          (~5 sec)
 #   2. Build + grid search + benchmark + ANOVA   (~30-90 min with grid search)
 #   3. ncu profiling (source counters + full)     (~5 min)
-#   4. cuBLAS SASS capture (per-layer JIT dump)   (~2 min)
+#   4. SASS dumps (our kernels + CUTLASS)           (~1 min)
 #
 # Usage:
 #   tmux new -s b200
@@ -111,31 +111,33 @@ if should_run 3; then
     log "Phase 3 complete"
 fi
 
-# ── Phase 4/4: cuBLAS SASS capture (~2 min) ──
+# ── Phase 4/4: SASS dumps (our kernels + CUTLASS) ──
+# cuobjdump on our binaries and CUTLASS bench binaries for scheduling analysis.
 if should_run 4; then
     log ""
-    log "==== PHASE 4/4: CUBLAS SASS CAPTURE ===="
-    for t in cublas-bench cublas-bench-fc1 cublas-bench-fc2; do
-        if ! make "$t" >> "$OUTDIR/session.log" 2>&1; then
-            log "FAIL build $t"
+    log "==== PHASE 4/4: SASS DUMPS ===="
+    for bin in patch_embed fc1-gelu fc2; do
+        if [ ! -x "./$bin" ]; then
+            log "SKIP SASS $bin: binary not found"
             continue
         fi
-        if [ -d ~/.nv/ComputeCache ]; then
-            rm -rf ~/.nv/ComputeCache/*
+        if cuobjdump --dump-sass "./$bin" > "$OUTDIR/sass_${bin}.txt" 2>&1; then
+            lines=$(wc -l < "$OUTDIR/sass_${bin}.txt")
+            log "SASS dumped: $bin ($lines lines)"
+        else
+            log "FAIL cuobjdump $bin"
         fi
-        "./$t" > "$OUTDIR/${t}.txt" 2>&1 || { log "FAIL run $t"; continue; }
-        cubins_found=0
-        while IFS= read -r cubin; do
-            base=$(basename "$cubin" .cubin)
-            if cuobjdump --dump-sass "$cubin" > "$OUTDIR/cublas_sass_${t}_${base}.txt" 2>&1; then
-                log "SASS captured: $t / $base"
-            else
-                log "FAIL cuobjdump on $t / $base"
-            fi
-            cubins_found=$((cubins_found + 1))
-        done < <(find ~/.nv/ComputeCache/ -name '*.cubin' 2>/dev/null)
-        if [ "$cubins_found" = 0 ]; then
-            log "WARN no cubins found for $t"
+    done
+    for bin in cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2; do
+        if [ ! -x "./$bin" ]; then
+            log "SKIP SASS $bin: binary not found"
+            continue
+        fi
+        if cuobjdump --dump-sass "./$bin" > "$OUTDIR/sass_${bin}.txt" 2>&1; then
+            lines=$(wc -l < "$OUTDIR/sass_${bin}.txt")
+            log "SASS dumped: $bin ($lines lines)"
+        else
+            log "FAIL cuobjdump $bin"
         fi
     done
     log "Phase 4 complete"

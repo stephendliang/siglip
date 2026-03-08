@@ -268,7 +268,14 @@ static float run_gemm_timed(GemmAdapter& gemm,
             return -1.0f;
         }
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
+    {
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            if (d_ws) cudaFree(d_ws);
+            return -1.0f;
+        }
+    }
 
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0);
@@ -277,7 +284,16 @@ static float run_gemm_timed(GemmAdapter& gemm,
     cudaEventRecord(t0);
     for (int i = 0; i < TIMED_ITERS; i++) gemm.run();
     cudaEventRecord(t1);
-    CUDA_CHECK(cudaEventSynchronize(t1));
+    {
+        cudaError_t err = cudaEventSynchronize(t1);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            cudaEventDestroy(t0);
+            cudaEventDestroy(t1);
+            if (d_ws) cudaFree(d_ws);
+            return -1.0f;
+        }
+    }
 
     float ms;
     cudaEventElapsedTime(&ms, t0, t1);
@@ -316,8 +332,21 @@ static float run_gemm_plus_post_timed(GemmAdapter& gemm,
         }
         post_fn();
     }
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            if (d_ws) cudaFree(d_ws);
+            return -1.0f;
+        }
+    }
+    {
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            if (d_ws) cudaFree(d_ws);
+            return -1.0f;
+        }
+    }
 
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0);
@@ -329,8 +358,25 @@ static float run_gemm_plus_post_timed(GemmAdapter& gemm,
         post_fn();
     }
     cudaEventRecord(t1);
-    CUDA_CHECK(cudaEventSynchronize(t1));
-    CUDA_CHECK(cudaGetLastError());
+    {
+        cudaError_t err = cudaEventSynchronize(t1);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            cudaEventDestroy(t0);
+            cudaEventDestroy(t1);
+            if (d_ws) cudaFree(d_ws);
+            return -1.0f;
+        }
+    }
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            cudaEventDestroy(t0);
+            cudaEventDestroy(t1);
+            if (d_ws) cudaFree(d_ws);
+            return -1.0f;
+        }
+    }
 
     float ms;
     cudaEventElapsedTime(&ms, t0, t1);

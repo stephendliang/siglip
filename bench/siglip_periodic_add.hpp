@@ -183,54 +183,71 @@ struct Sm100PeriodicAddNode {
       Array<ElementOutput, FragmentSize> frg_acc_bf16 = ConvertToBF16{}(frg_inputs);
       Array<ElementOutput, FragmentSize> frg_result;
 
-      /*
-      Vectorized table load — SM100 T2R mapping guarantees: all FragmentSize elements
-      in one visit() call share the same M-row with contiguous N-columns
-      (SM100_TMEM_LOAD_32dp32b1x: each thread gets 32 consecutive N-values from
-      one M-row of the epilogue subtile). Extract coords once, then 128-bit loads.
-      */
       auto tCcD_mn = tCcD_abs(_,_,_, epi_m, epi_n);
-      auto coord_0 = tCcD_mn(epi_v * FragmentSize);
-      int global_m = get<0>(coord_0);
-      int global_n = get<1>(coord_0);
-      int pos_row  = global_m % params_ptr->seq_len;
+      auto coord_first = tCcD_mn(epi_v * FragmentSize);
+      auto coord_last  = tCcD_mn(epi_v * FragmentSize + FragmentSize - 1);
+      int m_first = get<0>(coord_first), n_first = get<1>(coord_first);
+      int m_last  = get<0>(coord_last),  n_last  = get<1>(coord_last);
 
-      // Base address for this thread's contiguous N-column segment in the periodic table
-      __nv_bfloat16 const* __restrict__ base =
-          reinterpret_cast<__nv_bfloat16 const*>(params_ptr->ptr_combined)
-          + static_cast<long long>(pos_row) * N_dim + global_n;
+      __nv_bfloat16 const* __restrict__ tbl =
+          reinterpret_cast<__nv_bfloat16 const*>(params_ptr->ptr_combined);
 
       /*
-      128-bit vectorized loads: 8 BF16 values per int4 (= 4 loads for FragmentSize=32).
-      N-columns are 128-bit aligned (thread starts at multiple-of-32 column offset,
-      table rows are 768*2B = 1536B aligned, base allocation is 256B-aligned via cudaMalloc).
+      Fast path: all elements in same M-row with contiguous N-columns and
+      16-byte alignment → 128-bit vectorized loads. Covers 2sm configs
+      (SM100_TMEM_LOAD_32dp32b1x) where each visit() gets 32 consecutive
+      N-values from one row.
       */
-      constexpr int BF16_PER_VEC = sizeof(int4) / sizeof(ElementTable);  // 16/2 = 8
-      constexpr int NUM_VECS = FragmentSize / BF16_PER_VEC;
-      constexpr int TAIL = FragmentSize % BF16_PER_VEC;
+      if (m_first == m_last &&
+          n_last == n_first + FragmentSize - 1 &&
+          (n_first & 7) == 0) {
 
-      __nv_bfloat16 tbl_raw[FragmentSize];
-      {
-        int4 const* __restrict__ src = reinterpret_cast<int4 const*>(base);
-        int4* dst = reinterpret_cast<int4*>(tbl_raw);
-        CUTLASS_PRAGMA_UNROLL
-        for (int v = 0; v < NUM_VECS; ++v) {
-          dst[v] = __ldg(src + v);
-        }
-      }
-      // Handle non-multiple-of-8 FragmentSize (unlikely for SM100, but safe)
-      if constexpr (TAIL > 0) {
-        __nv_bfloat16 const* src_tail = base + NUM_VECS * BF16_PER_VEC;
-        CUTLASS_PRAGMA_UNROLL
-        for (int t = 0; t < TAIL; ++t) {
-          tbl_raw[NUM_VECS * BF16_PER_VEC + t] = __ldg(src_tail + t);
-        }
-      }
+        int pos_row = m_first % params_ptr->seq_len;
+        __nv_bfloat16 const* __restrict__ base =
+            tbl + static_cast<long long>(pos_row) * N_dim + n_first;
 
-      // BF16 add: bfloat16_t::operator+ uses __hadd on SM80+ (hardware add.rn.bf16)
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < FragmentSize; ++i) {
-        frg_result[i] = frg_acc_bf16[i] + ElementOutput(tbl_raw[i]);
+        constexpr int BF16_PER_VEC = sizeof(int4) / sizeof(ElementTable);  // 16/2 = 8
+        constexpr int NUM_VECS = FragmentSize / BF16_PER_VEC;
+        constexpr int TAIL = FragmentSize % BF16_PER_VEC;
+
+        __nv_bfloat16 tbl_raw[FragmentSize];
+        {
+          int4 const* __restrict__ src = reinterpret_cast<int4 const*>(base);
+          int4* dst = reinterpret_cast<int4*>(tbl_raw);
+          CUTLASS_PRAGMA_UNROLL
+          for (int v = 0; v < NUM_VECS; ++v) {
+            dst[v] = __ldg(src + v);
+          }
+        }
+        if constexpr (TAIL > 0) {
+          __nv_bfloat16 const* src_tail = base + NUM_VECS * BF16_PER_VEC;
+          CUTLASS_PRAGMA_UNROLL
+          for (int t = 0; t < TAIL; ++t) {
+            tbl_raw[NUM_VECS * BF16_PER_VEC + t] = __ldg(src_tail + t);
+          }
+        }
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < FragmentSize; ++i) {
+          frg_result[i] = frg_acc_bf16[i] + ElementOutput(tbl_raw[i]);
+        }
+
+      } else {
+
+        /*
+        Safe path: per-element coordinate extraction + scalar loads.
+        Handles all T2R layouts (1sm, non-contiguous N, multi-row fragments).
+        The 294 KB table is fully L2-resident on B200 (60 MB L2).
+        */
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < FragmentSize; ++i) {
+          auto coord_i = tCcD_mn(epi_v * FragmentSize + i);
+          int row = get<0>(coord_i) % params_ptr->seq_len;
+          int col = get<1>(coord_i);
+          frg_result[i] = frg_acc_bf16[i] +
+              ElementOutput(__ldg(tbl + static_cast<long long>(row) * N_dim + col));
+        }
+
       }
 
       return frg_result;

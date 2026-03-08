@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified benchmark comparison: cuBLAS vs CUTLASS vs our kernel.
+"""Unified benchmark comparison: CUTLASS vs our kernel.
 
 Builds all targets, runs each benchmark N times per layer, collects fused
 timing, sorts results, and performs one-way ANOVA + pairwise Welch's t-tests.
@@ -47,8 +47,6 @@ LAYERS = {
         'our_target': 'patch_embed',
         'our_binary': './patch_embed',
         'our_source': 'patch_embed.cu',
-        'cublas_target': 'cublas-bench',
-        'cublas_binary': './cublas-bench',
         'cutlass_target': 'cutlass-bench',
         'cutlass_target_max': 'cutlass-bench-max',
         'cutlass_binary': './cutlass-bench',
@@ -61,8 +59,6 @@ LAYERS = {
         'our_target': 'fc1-gelu',
         'our_binary': './fc1-gelu',
         'our_source': 'fc1_gelu.cu',
-        'cublas_target': 'cublas-bench-fc1',
-        'cublas_binary': './cublas-bench-fc1',
         'cutlass_target': 'cutlass-bench-fc1',
         'cutlass_target_max': 'cutlass-bench-fc1-max',
         'cutlass_binary': './cutlass-bench-fc1',
@@ -75,8 +71,6 @@ LAYERS = {
         'our_target': 'fc2',
         'our_binary': './fc2',
         'our_source': 'fc2.cu',
-        'cublas_target': 'cublas-bench-fc2',
-        'cublas_binary': './cublas-bench-fc2',
         'cutlass_target': 'cutlass-bench-fc2',
         'cutlass_target_max': 'cutlass-bench-fc2-max',
         'cutlass_binary': './cutlass-bench-fc2',
@@ -102,50 +96,6 @@ def parse_our_kernel(output):
             }
     return None
 
-
-def parse_cublas(output):
-    """Parse cuBLAS bench output. Returns dict of {metric: (ms, tflops, algo)}."""
-    results = {}
-    # Parse lines like:  Label                     0.365 ms  3001.0 TFLOPS  (algo #5)
-    for line in output.splitlines():
-        m = re.match(r'\s+(.+?)\s{2,}([\d.]+) ms\s+([\d.]+) TFLOPS\s+\(algo #(\d+)\)', line)
-        if m:
-            label = m.group(1).strip()
-            results[label] = {
-                'ms': float(m.group(2)),
-                'tflops': float(m.group(3)),
-                'algo': int(m.group(4)),
-            }
-    # Parse scaling mode context
-    current_mode = None
-    tagged = {}
-    for line in output.splitlines():
-        if 'MXFP8:' in line:
-            current_mode = 'mxfp8'
-        elif 'Per-tensor FP8:' in line:
-            current_mode = 'per_tensor'
-        m = re.match(r'\s+(.+?)\s{2,}([\d.]+) ms\s+([\d.]+) TFLOPS\s+\(algo #(\d+)\)', line)
-        if m and current_mode:
-            label = m.group(1).strip()
-            key = f"{current_mode}_{label}"
-            tagged[key] = {
-                'ms': float(m.group(2)),
-                'tflops': float(m.group(3)),
-                'algo': int(m.group(4)),
-            }
-    return tagged
-
-
-
-def parse_cublas_gemm_only(output):
-    """Extract best GEMM-only time from cuBLAS (fastest across scaling modes)."""
-    tagged = parse_cublas(output)
-    candidates = []
-    for prefix in ['per_tensor', 'mxfp8']:
-        key = f"{prefix}_GEMM only"
-        if key in tagged:
-            candidates.append(tagged[key]['ms'])
-    return min(candidates) if candidates else None
 
 
 def parse_cutlass_best_fused(output, epilogue):
@@ -250,55 +200,6 @@ def collect_our_samples(binary, n_runs, label="our kernel"):
               f"{parsed['tflops']:.0f} TFLOPS")
     return samples
 
-
-def parse_cublas_all_fused(output, epilogue):
-    """Extract fused times from cuBLAS output, keyed by scaling mode."""
-    tagged = parse_cublas(output)
-    fused_labels = {
-        'PERIODIC_ADD': 'GEMM + fused add (beta=1)',
-        'GELU_BIAS': 'GEMM + fused bias+GELU',
-        'BIAS_RESIDUAL': 'GEMM + fused bias',
-    }
-    unfused_labels = {
-        'PERIODIC_ADD': 'GEMM + unfused periodic add',
-        'GELU_BIAS': 'GEMM + unfused bias+GELU',
-        'BIAS_RESIDUAL': 'GEMM + unfused bias',
-    }
-    results = {}
-    for prefix in ['per_tensor', 'mxfp8']:
-        key = f"{prefix}_{fused_labels[epilogue]}"
-        if key in tagged:
-            results[prefix] = tagged[key]['ms']
-            continue
-        key = f"{prefix}_{unfused_labels[epilogue]}"
-        if key in tagged:
-            results[prefix] = tagged[key]['ms']
-    return results
-
-
-def collect_cublas_samples(binary, epilogue, n_runs, run_args=None):
-    """Run cuBLAS bench n_runs times. Returns dict of per-mode sample lists + gemm samples."""
-    mode_samples = {}  # 'per_tensor' -> [ms, ...], 'mxfp8' -> [ms, ...]
-    gemm_samples = []
-    for i in range(n_runs):
-        output, ok = run_binary(binary, timeout=120, args=run_args)
-        if not ok:
-            print(f"    cuBLAS run {i+1}/{n_runs}: FAILED")
-            continue
-        fused = parse_cublas_all_fused(output, epilogue)
-        gemm_ms = parse_cublas_gemm_only(output)
-        if not fused:
-            print(f"    cuBLAS run {i+1}/{n_runs}: could not parse fused time")
-            continue
-        parts = []
-        for mode, ms in sorted(fused.items()):
-            mode_samples.setdefault(mode, []).append(ms)
-            parts.append(f"{mode}={ms:.3f}")
-        if gemm_ms is not None:
-            gemm_samples.append(gemm_ms)
-        print(f"    cuBLAS run {i+1}/{n_runs}: {', '.join(parts)}"
-              f"{f' (GEMM-only: {gemm_ms:.3f})' if gemm_ms else ''}")
-    return mode_samples, gemm_samples
 
 
 def collect_cutlass_samples(binary, epilogue, n_runs, run_args=None):
@@ -479,7 +380,7 @@ def run_grid_search(kernel, tier='all', csv_dir=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Unified benchmark: cuBLAS vs CUTLASS vs our kernel')
+        description='Unified benchmark: CUTLASS vs our kernel')
     parser.add_argument('--layer', nargs='+', choices=list(LAYERS.keys()),
                         default=list(LAYERS.keys()),
                         help='Layers to benchmark (default: all)')
@@ -502,17 +403,17 @@ def main():
     os.chdir(ROOT_DIR)
 
     if args.imgs_per_sm != 32:
-        print(f"WARNING: --imgs-per-sm={args.imgs_per_sm} only affects cuBLAS/CUTLASS.")
+        print(f"WARNING: --imgs-per-sm={args.imgs_per_sm} only affects CUTLASS.")
         print("  Our kernels hardcode M_TOTAL=928256 (32 imgs/SM).")
         print("  Cross-implementation comparisons will be apples-to-oranges.")
         print()
 
     n_layers = len(args.layer)
-    n_targets = n_layers * 3  # our + cublas + cutlass per layer
+    n_targets = n_layers * 2  # our + cutlass per layer
     grid_configs = 673  # approx valid configs per kernel in --tier all
 
     print("=" * 72)
-    print("  Unified Benchmark: cuBLAS vs CUTLASS vs Our Kernel")
+    print("  Unified Benchmark: CUTLASS vs Our Kernel")
     print(f"  Layers: {', '.join(args.layer)}")
     print(f"  Runs per approach: {args.runs}")
     print(f"  CUTLASS mode: {args.cutlass_mode}")
@@ -528,7 +429,6 @@ def main():
         for layer_name in args.layer:
             layer = LAYERS[layer_name]
             targets.add(layer['our_target'])
-            targets.add(layer['cublas_target'])
             if args.cutlass_mode == 'max':
                 targets.add(layer['cutlass_target_max'])
             else:
@@ -572,11 +472,11 @@ def main():
 
     # ── Phase 3/4: Benchmark ──
     t_bench = time.time()
-    print(f"\n[Phase 3/4] BENCHMARK ({args.runs} runs x {n_layers} layers x 3 implementations)")
+    print(f"\n[Phase 3/4] BENCHMARK ({args.runs} runs x {n_layers} layers x 2 implementations)")
     all_raw = []  # for CSV: (layer, approach, run_idx, ms)
     layer_results = {}  # layer -> {approach: [ms, ...]}
 
-    # Build run args for bench binaries (cuBLAS/CUTLASS accept imgs_per_sm)
+    # Build run args for bench binaries (CUTLASS accepts imgs_per_sm)
     bench_args = [str(args.imgs_per_sm)] if args.imgs_per_sm != 32 else None
 
     for layer_name in args.layer:
@@ -597,21 +497,6 @@ def main():
             groups['Our kernel'] = our_samples
             for i, ms in enumerate(our_samples):
                 all_raw.append((layer_name, 'our_kernel', i, ms))
-
-        # cuBLAS
-        print(f"\n  cuBLAS ({layer['cublas_binary']}):")
-        cublas_modes, cublas_gemm = collect_cublas_samples(
-            layer['cublas_binary'], layer['epilogue'], args.runs,
-            run_args=bench_args)
-        for mode, samples in cublas_modes.items():
-            label = f"cuBLAS {mode}"
-            groups[label] = samples
-            for i, ms in enumerate(samples):
-                all_raw.append((layer_name, f'cublas_{mode}', i, ms))
-        if cublas_gemm:
-            groups['cuBLAS GEMM-only'] = cublas_gemm
-            for i, ms in enumerate(cublas_gemm):
-                all_raw.append((layer_name, 'cublas_gemm', i, ms))
 
         # CUTLASS
         print(f"\n  CUTLASS ({cutlass_binary}):")
@@ -668,24 +553,13 @@ def main():
         print(f"\n\n{'=' * 72}")
         print(f"  CROSS-LAYER SUMMARY (mean ms, fused)")
         print(f"{'=' * 72}")
-        print(f"  {'Layer':20s}  {'Our kernel':>12s}  {'cuBLAS':>12s}  {'CUTLASS':>12s}  {'Best':>12s}")
-        print("  " + "-" * 72)
+        print(f"  {'Layer':20s}  {'Our kernel':>12s}  {'CUTLASS':>12s}  {'Best':>12s}")
+        print("  " + "-" * 56)
         for layer_name in args.layer:
             groups = layer_results[layer_name]
 
-            # Find best cuBLAS mode for summary
-            cublas_best = None
-            cublas_label = 'cuBLAS'
-            for k, v in groups.items():
-                if k.startswith('cuBLAS') and 'GEMM-only' not in k and v:
-                    mean = np.mean(v)
-                    if cublas_best is None or mean < cublas_best:
-                        cublas_best = mean
-                        cublas_label = k
-
             row = {
                 'Our kernel': np.mean(groups['Our kernel']) if 'Our kernel' in groups and groups['Our kernel'] else None,
-                cublas_label: cublas_best,
                 'CUTLASS fused': np.mean(groups['CUTLASS fused']) if 'CUTLASS fused' in groups and groups['CUTLASS fused'] else None,
             }
             vals = {k: v for k, v in row.items() if v is not None}
@@ -695,7 +569,7 @@ def main():
                 return f"{v:12.4f}" if v is not None else f"{'n/a':>12s}"
 
             print(f"  {LAYERS[layer_name]['label']:20s}  "
-                  f"{fmt(row['Our kernel'])}  {fmt(row.get(cublas_label))}  "
+                  f"{fmt(row['Our kernel'])}  "
                   f"{fmt(row['CUTLASS fused'])}  {best}")
 
     # ── Save CSV ──

@@ -22,7 +22,7 @@ Paste the summary into Claude Code for interpretation.
 | 1 | Machine snapshot (nvidia-smi, clocks, git rev) | <1 min |
 | 2 | `compare_all.py --runs 20 --grid-search` (builds, benchmarks, ANOVA) | 25-30 min |
 | 3 | ncu source counters (all 3 kernels) + full profile | 5-10 min |
-| 4 | cuBLAS SASS capture (JIT cache dump) | 5 min |
+| 4 | SASS dumps (our kernels + CUTLASS bench) | 1 min |
 
 ## Manual follow-ups
 
@@ -30,8 +30,9 @@ Paste the summary into Claude Code for interpretation.
 # Analyze source counters
 python3 tools/analyze_source_counters.py data/session_*/source_counters_siglip_vision.csv
 
-# SASS analysis of cuBLAS captures
-python3 tools/sass_analysis.py data/session_*/cublas_sass_*.txt
+# SASS scheduling analysis (our kernels)
+python3 tools/sass_analysis.py data/session_*/sass_patch_embed.txt
+python3 tools/sass_analysis.py data/session_*/sass_cutlass-bench.txt
 
 # Calibration microbenchmarks (if needed)
 make calibration && ./calibration > data/session_*/cal_output.txt

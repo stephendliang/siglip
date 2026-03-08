@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Analyze a B200 session output directory.
 
-Reads machine info, compare.txt (ANOVA), ncu profiles, and cuBLAS SASS
-captures. Prints a structured summary for pasting into Claude Code.
+Reads machine info, compare.txt (ANOVA), ncu profiles, and SASS dumps.
+Prints a structured summary for pasting into Claude Code.
 
 Usage:
     python3 tools/analyze_session.py data/session_YYYYMMDD_HHMMSS/
@@ -47,7 +47,7 @@ def summarize_comparison(outdir):
     if not txt:
         return
 
-    print("=== Comparison (cuBLAS vs CUTLASS vs Ours) ===")
+    print("=== Comparison (CUTLASS vs Ours) ===")
 
     # compare_all.py output has ={72} lines around layer labels AND around
     # sub-headers (Summary Statistics, One-way ANOVA, Pairwise Welch's).
@@ -102,32 +102,25 @@ def summarize_ncu(outdir):
         print()
 
 
-def summarize_cublas_sass(outdir):
+def summarize_sass(outdir):
     try:
         sass_files = sorted(f for f in os.listdir(outdir)
-                            if f.startswith('cublas_sass_'))
+                            if f.startswith('sass_') and f.endswith('.txt'))
     except OSError:
         return
     if not sass_files:
         return
-    print("=== cuBLAS SASS Captures ===")
+    print("=== SASS Dumps ===")
     for f in sass_files:
         path = os.path.join(outdir, f)
         size = os.path.getsize(path)
         txt = read_file(path)
         mma_count = len(re.findall(r'UTCQMMA', txt)) if txt else 0
-        # Extract layer from filename: cublas_sass_cublas-bench-fc1_<hash>.txt
-        layer = "unknown"
-        m = re.match(r'cublas_sass_(cublas-bench(?:-fc[12])?)_', f)
-        if m:
-            tag = m.group(1)
-            layer = {'cublas-bench': 'patch_embed',
-                     'cublas-bench-fc1': 'FC1',
-                     'cublas-bench-fc2': 'FC2'}.get(tag, tag)
+        name = f.removeprefix('sass_').removesuffix('.txt')
         if size < 100:
-            print(f"  {f} [{layer}]: {size} bytes (likely empty — cuobjdump may have failed)")
+            print(f"  {name}: {size} bytes (likely empty)")
         else:
-            print(f"  {f} [{layer}]: {size:,} bytes, {mma_count} UTCQMMA instructions")
+            print(f"  {name}: {size:,} bytes, {mma_count} UTCQMMA instructions")
             if mma_count > 0:
                 print(f"    Analyze: python3 tools/sass_analysis.py {path}")
     print()
@@ -162,7 +155,7 @@ def main():
     summarize_machine(outdir)
     summarize_comparison(outdir)
     summarize_ncu(outdir)
-    summarize_cublas_sass(outdir)
+    summarize_sass(outdir)
     summarize_failures(outdir)
 
     print("Paste this output into Claude Code for interpretation.")

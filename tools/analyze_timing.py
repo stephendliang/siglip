@@ -7,7 +7,7 @@ equilibrium analysis, ceiling projections, bottleneck identification.
 Usage:
     ./siglip_timing 2>&1 | python3 analyze_timing.py
     python3 analyze_timing.py clock64_timing.txt
-    python3 analyze_timing.py clock64_timing.txt --cublas 3001  # override cuBLAS TFLOPS
+    python3 analyze_timing.py clock64_timing.txt --ref-tflops 3001  # override GEMM-only reference
 """
 import sys
 import re
@@ -160,7 +160,7 @@ def parse_timing(lines):
     return d
 
 
-def analyze(d, cublas_tflops=3001):
+def analyze(d, ref_tflops=3001):
     """Print derived analysis from parsed timing data."""
 
     # Check we have the minimum data
@@ -265,10 +265,10 @@ def analyze(d, cublas_tflops=3001):
         tflops_no_both = base_tflops * speedup_no_both
         print(f"  Also eliminate TMA0_wait:  {tile_no_both:,} cyc/tile  {speedup_no_both:.2f}x  → {tflops_no_both:.0f} TFLOPS")
 
-        # 3. Gap to cuBLAS
-        gap = cublas_tflops / base_tflops
-        print(f"  cuBLAS reference:          {cublas_tflops} TFLOPS  (gap: {gap:.2f}x)")
-        remaining = cublas_tflops / tflops_no_both if tflops_no_both > 0 else 999
+        # 3. Gap to GEMM-only reference
+        gap = ref_tflops / base_tflops
+        print(f"  GEMM-only reference:       {ref_tflops} TFLOPS  (gap: {gap:.2f}x)")
+        remaining = ref_tflops / tflops_no_both if tflops_no_both > 0 else 999
         print(f"  After eliminating all overhead: {remaining:.2f}x remaining gap (K-loop efficiency)")
         print()
 
@@ -408,7 +408,7 @@ def analyze(d, cublas_tflops=3001):
 
 
 if __name__ == '__main__':
-    cublas = 3001
+    ref_tflops = 3001
 
     if len(sys.argv) > 1 and not sys.argv[1].startswith('--'):
         with open(sys.argv[1]) as f:
@@ -417,8 +417,8 @@ if __name__ == '__main__':
         lines = sys.stdin.readlines()
 
     for i, arg in enumerate(sys.argv):
-        if arg == '--cublas' and i + 1 < len(sys.argv):
-            cublas = float(sys.argv[i + 1])
+        if arg == '--ref-tflops' and i + 1 < len(sys.argv):
+            ref_tflops = float(sys.argv[i + 1])
 
     d = parse_timing(lines)
-    analyze(d, cublas_tflops=cublas)
+    analyze(d, ref_tflops=ref_tflops)

@@ -61,7 +61,7 @@ All execution, profiling, and benchmarking requires B200 hardware. Cross-compila
 python3 tools/analyze_session.py data/session_*/     # structured summary (uses latest session dir)
 ```
 
-Phases: machine snapshot → `compare_all.py --runs 20 --grid-search` (ANOVA) → ncu profiling → cuBLAS SASS capture. All outputs to timestamped `data/session_*/`. See **`TASKS.md`** for manual follow-ups.
+Phases: machine snapshot → `compare_all.py --runs 20 --grid-search` (ANOVA) → ncu profiling → SASS dumps (our kernels + CUTLASS). All outputs to timestamped `data/session_*/`. See **`TASKS.md`** for manual follow-ups.
 
 ## Development workflow
 
@@ -104,7 +104,8 @@ tools/                  # Analysis & sweep scripts
   grid_search.py        # Compile-time parameter sweep (tiered search, CSV output)
   analyze_timing.py     # clock64 timing → equilibrium analysis
   analyze_source_counters.py  # ncu SourceCounters CSV → stall breakdown
-  compare_all.py        # Unified benchmark: cuBLAS vs CUTLASS vs ours + ANOVA
+  compare_all.py        # Unified benchmark: CUTLASS vs ours + ANOVA
+  analyze_sweep.py      # Grid search analysis: eta-squared, balanced subsets, RF importance
   remote.py             # Remote B200 provisioning + sweep runner
   ncu_diff.py           # ncu CSV diff tool
   compare_sass.py       # SASS dump diff tool
@@ -153,18 +154,16 @@ make cutlass-bench-fc2-max      # extended FC2
 ./tools/cutlass_sweep.sh 1            # quick test (1 img/SM = 148*196 rows)
 ./tools/cutlass_sweep.sh 32 standard  # standard tile list only
 
-# cuBLAS baseline (compile-time N/K/epilogue, best-of-heuristics)
-make cublas-bench           # patch embed: N=768 K=768 PERIODIC_ADD
-make cublas-bench-fc1       # FC1: N=3072 K=768 GELU_BIAS
-make cublas-bench-fc2       # FC2: N=768 K=3072 BIAS_RESIDUAL
-./cublas-bench [imgs_per_sm]  # default 32 → M=928256
-
 # Parameter grid search (any kernel)
 python3 tools/grid_search.py --tier all                    # sequential 1→2→3, pinning winners
 python3 tools/grid_search.py --full-cross                  # all parameters crossed
 python3 tools/grid_search.py --kernel fc2 --tier all       # FC2 sweep
 python3 tools/grid_search.py --kernel fc1_gelu --tier 3    # FC1 tier 3 only
 python3 tools/grid_search.py --only K_LOOP_UNROLL W0_LOOP_UNROLL SUB_MMA_UNROLL  # sweep specific params
+
+# Grid search analysis (eta-squared, balanced subsets, random forest)
+python3 tools/analyze_sweep.py data/sweep_results_run4.csv             # balanced PE data
+python3 tools/analyze_sweep.py data/session_*/sweep_*.csv              # all layers from session
 
 # SASS scheduling analysis
 cuobjdump --dump-sass patch_embed > sass_dump.txt
@@ -180,7 +179,7 @@ cuobjdump --dump-sass calibration > cal_sass.txt
 python3 tools/sass_analysis.py cal_sass.txt --calibrate-compare                          # SASS-only
 python3 tools/sass_analysis.py cal_sass.txt --calibrate-compare --runtime cal_output.txt # compare vs runtime
 
-# Unified comparison (cuBLAS vs CUTLASS vs ours, ANOVA statistical analysis)
+# Unified comparison (CUTLASS vs ours, ANOVA statistical analysis)
 make compare                                              # all layers, 10 runs, CSV output
 python3 tools/compare_all.py --runs 20 --csv data/compare.csv   # more runs for tighter CI
 python3 tools/compare_all.py --layer patch_embed --runs 5        # single layer, quick
@@ -204,11 +203,13 @@ Both `cutlass_bench.cu` and `cublas_bench.cu` are compile-time parameterized via
 - **`fence.proxy.async.shared::cta` required** before every TMA store that reads from SMEM written by `st.shared` — bridges sync→async memory proxies. Without it, TMA may read stale data (sporadic corruption).
 - ml_phase init must account for odd tile_start (start_buf-dependent)
 
-## Grid search findings (4 runs × 145 configs)
+## Grid search findings
 
-4 runs, 145/145 valid after all correctness fixes. Definitive results in `data/sweep_results_run4.csv`. All top configs within 0.001 ms — parameter search exhausted. Best: `MBAR_EARLY=1 STAGGER_CYCLES=160` → 0.519 ms / 2108 TFLOPS. Defaults → 0.524 ms / 2090 TFLOPS.
+Sweep data analyzed via `python3 tools/analyze_sweep.py` using eta-squared (ANOVA), balanced-subset eta-squared (controls for tiered search confounds), and random forest permutation importance. Tiered search data is heavily imbalanced (pinned params get 90%+ of configs) — only balanced η² and the run4 balanced sweep (145 configs) give trustworthy importance rankings.
 
-**Critical params** (wrong value costs 10-40%): `SNAKE_ORDER=1`, `PHASE1_UNROLL=2`, `INTERLEAVE_STRATEGY=2`.
-**Minor params**: `MBAR_EARLY=1` (+5-18 TFLOPS), `STAGGER_CYCLES=80-160`, `N_STAGES=4`, `TMEM_LOAD_WIDTH=32`.
-Everything else (CVT_ADD_FUSED, K_LOOP_UNROLL, W0_LOOP_UNROLL, SUB_MMA_UNROLL, NUM_EPI_WARPS) is within noise at defaults.
+**Patch embed** (run4, 145 balanced configs): parameter search exhausted — all top configs within 0.001 ms. Best: `MBAR_EARLY=1 STAGGER_CYCLES=160` → 0.519 ms / 2108 TFLOPS. Defaults → 0.524 ms / 2090 TFLOPS.
+
+**Cross-kernel universal defaults**: `SNAKE_ORDER=1`, `PHASE1_UNROLL=2`, `K_LOOP_UNROLL=4`, `W0_LOOP_UNROLL=0`, `TMEM_LOAD_WIDTH=32`.
+**Per-kernel tuning**: `INTERLEAVE_STRATEGY=2` (PE, FC2) vs `=1` (FC1) — N=3072 changes epilogue pattern.
+**Catastrophic values**: `PHASE1_UNROLL=4` (+2.4 ms on FC1), `NUM_EPI_WARPS=5` (+6 ms on FC1), `SNAKE_ORDER=0` (+49 us on PE).
 
