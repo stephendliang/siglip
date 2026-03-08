@@ -1,0 +1,386 @@
+========================================================================
+  Unified Benchmark: cuBLAS vs CUTLASS vs Our Kernel
+  Layers: patch_embed, fc1, fc2
+  Runs per approach: 20
+  CUTLASS mode: max
+  Grid search: 673 configs/layer x 3 layers (~168 min)
+========================================================================
+
+[Phase 1/4] BUILD (9 targets)
+  Building cublas-bench ... ok
+  Building cublas-bench-fc1 ... ok
+  Building cublas-bench-fc2 ... ok
+  Building cutlass-bench-fc1-max ... ok
+  Building cutlass-bench-fc2-max ... ok
+  Building cutlass-bench-max ... ok
+  Building fc1-gelu ... ok
+  Building fc2 ... ok
+  Building patch_embed ... ok
+  Build done in 782s
+
+[Phase 2/4] GRID SEARCH (~168 min, 673 configs/layer x 3 layers)
+  Each config: compile + run + validate. Progress in log files.
+
+  Running grid search for patch_embed (tier=all)
+  Log: /root/siglip/data/session_20260308_190511/grid_search_patch_embed.log
+  Winner dflags: -DCVT_ADD_FUSED=0 -DK_LOOP_UNROLL=6 -DSTAGGER_CYCLES=100 -DSUB_MMA_UNROLL=3
+
+  Running grid search for fc1_gelu (tier=all)
+  Log: /root/siglip/data/session_20260308_190511/grid_search_fc1_gelu.log
+  Winner dflags: -DCVT_ADD_FUSED=0 -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=0 -DSUB_MMA_UNROLL=1 -DW0_LOOP_UNROLL=1
+
+  Running grid search for fc2 (tier=all)
+  Log: /root/siglip/data/session_20260308_190511/grid_search_fc2.log
+  Winner dflags: -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=120 -DSUB_MMA_UNROLL=3 -DTMEM_LOAD_WIDTH=64
+
+  Rebuilding with grid search winners:
+  Rebuilding ./patch_embed with: -DCVT_ADD_FUSED=0 -DK_LOOP_UNROLL=6 -DSTAGGER_CYCLES=100 -DSUB_MMA_UNROLL=3 ... ok
+  Rebuilding ./fc1-gelu with: -DCVT_ADD_FUSED=0 -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=0 -DSUB_MMA_UNROLL=1 -DW0_LOOP_UNROLL=1 ... ok
+  Rebuilding ./fc2 with: -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=120 -DSUB_MMA_UNROLL=3 -DTMEM_LOAD_WIDTH=64 ... ok
+  Grid search done in 3909s
+
+[Phase 3/4] BENCHMARK (20 runs x 3 layers x 3 implementations)
+
+========================================================================
+  Patch Embed (768x768)
+========================================================================
+
+  Our kernel (./patch_embed):
+    our kernel run 1/20: 0.527 ms / 2078 TFLOPS
+    our kernel run 2/20: 0.527 ms / 2076 TFLOPS
+    our kernel run 3/20: 0.527 ms / 2077 TFLOPS
+    our kernel run 4/20: 0.527 ms / 2078 TFLOPS
+    our kernel run 5/20: 0.526 ms / 2083 TFLOPS
+    our kernel run 6/20: 0.526 ms / 2082 TFLOPS
+    our kernel run 7/20: 0.527 ms / 2076 TFLOPS
+    our kernel run 8/20: 0.526 ms / 2080 TFLOPS
+    our kernel run 9/20: 0.525 ms / 2084 TFLOPS
+    our kernel run 10/20: 0.526 ms / 2082 TFLOPS
+    our kernel run 11/20: 0.525 ms / 2085 TFLOPS
+    our kernel run 12/20: 0.525 ms / 2087 TFLOPS
+    our kernel run 13/20: 0.526 ms / 2082 TFLOPS
+    our kernel run 14/20: 0.527 ms / 2078 TFLOPS
+    our kernel run 15/20: 0.527 ms / 2079 TFLOPS
+    our kernel run 16/20: 0.524 ms / 2089 TFLOPS
+    our kernel run 17/20: 0.526 ms / 2082 TFLOPS
+    our kernel run 18/20: 0.525 ms / 2085 TFLOPS
+    our kernel run 19/20: 0.523 ms / 2093 TFLOPS
+    our kernel run 20/20: 0.526 ms / 2084 TFLOPS
+
+  cuBLAS (./cublas-bench):
+    cuBLAS run 1/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 2/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 3/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 4/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 5/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 6/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 7/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 8/20: mxfp8=0.574, per_tensor=0.558 (GEMM-only: 0.365)
+    cuBLAS run 9/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 10/20: mxfp8=0.574, per_tensor=0.558 (GEMM-only: 0.365)
+    cuBLAS run 11/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 12/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 13/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 14/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 15/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 16/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 17/20: mxfp8=0.574, per_tensor=0.558 (GEMM-only: 0.365)
+    cuBLAS run 18/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 19/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+    cuBLAS run 20/20: mxfp8=0.574, per_tensor=0.559 (GEMM-only: 0.365)
+
+  CUTLASS (./cutlass-bench-max):
+    CUTLASS run 1/20: FAILED
+    CUTLASS run 2/20: FAILED
+    CUTLASS run 3/20: FAILED
+    CUTLASS run 4/20: FAILED
+    CUTLASS run 5/20: FAILED
+    CUTLASS run 6/20: FAILED
+    CUTLASS run 7/20: FAILED
+    CUTLASS run 8/20: FAILED
+    CUTLASS run 9/20: FAILED
+    CUTLASS run 10/20: FAILED
+    CUTLASS run 11/20: FAILED
+    CUTLASS run 12/20: FAILED
+    CUTLASS run 13/20: FAILED
+    CUTLASS run 14/20: FAILED
+    CUTLASS run 15/20: FAILED
+    CUTLASS run 16/20: FAILED
+    CUTLASS run 17/20: FAILED
+    CUTLASS run 18/20: FAILED
+    CUTLASS run 19/20: FAILED
+    CUTLASS run 20/20: FAILED
+
+========================================================================
+  FC1+GELU (768x3072)
+========================================================================
+
+  Our kernel (./fc1-gelu):
+    our kernel run 1/20: 4.219 ms / 1038 TFLOPS
+    our kernel run 2/20: 4.219 ms / 1038 TFLOPS
+    our kernel run 3/20: 4.220 ms / 1038 TFLOPS
+    our kernel run 4/20: 4.221 ms / 1038 TFLOPS
+    our kernel run 5/20: 4.219 ms / 1038 TFLOPS
+    our kernel run 6/20: 4.220 ms / 1038 TFLOPS
+    our kernel run 7/20: 4.220 ms / 1038 TFLOPS
+    our kernel run 8/20: 4.221 ms / 1038 TFLOPS
+    our kernel run 9/20: 4.220 ms / 1038 TFLOPS
+    our kernel run 10/20: 4.220 ms / 1038 TFLOPS
+    our kernel run 11/20: 4.220 ms / 1038 TFLOPS
+    our kernel run 12/20: 4.218 ms / 1038 TFLOPS
+    our kernel run 13/20: 4.219 ms / 1038 TFLOPS
+    our kernel run 14/20: 4.222 ms / 1037 TFLOPS
+    our kernel run 15/20: 4.224 ms / 1037 TFLOPS
+    our kernel run 16/20: 4.221 ms / 1038 TFLOPS
+    our kernel run 17/20: 4.221 ms / 1038 TFLOPS
+    our kernel run 18/20: 4.221 ms / 1038 TFLOPS
+    our kernel run 19/20: 4.221 ms / 1038 TFLOPS
+    our kernel run 20/20: 4.220 ms / 1038 TFLOPS
+
+  cuBLAS (./cublas-bench-fc1):
+    cuBLAS run 1/20: mxfp8=4.381, per_tensor=4.318 (GEMM-only: 1.359)
+    cuBLAS run 2/20: mxfp8=4.381, per_tensor=4.317 (GEMM-only: 1.359)
+    cuBLAS run 3/20: mxfp8=4.381, per_tensor=4.317 (GEMM-only: 1.359)
+    cuBLAS run 4/20: mxfp8=4.380, per_tensor=4.317 (GEMM-only: 1.359)
+    cuBLAS run 5/20: mxfp8=4.379, per_tensor=4.316 (GEMM-only: 1.359)
+    cuBLAS run 6/20: mxfp8=4.380, per_tensor=4.317 (GEMM-only: 1.358)
+    cuBLAS run 7/20: mxfp8=4.380, per_tensor=4.317 (GEMM-only: 1.359)
+    cuBLAS run 8/20: mxfp8=4.381, per_tensor=4.317 (GEMM-only: 1.359)
+    cuBLAS run 9/20: mxfp8=4.381, per_tensor=4.318 (GEMM-only: 1.359)
+    cuBLAS run 10/20: mxfp8=4.381, per_tensor=4.318 (GEMM-only: 1.359)
+    cuBLAS run 11/20: mxfp8=4.381, per_tensor=4.318 (GEMM-only: 1.359)
+    cuBLAS run 12/20: mxfp8=4.381, per_tensor=4.318 (GEMM-only: 1.358)
+    cuBLAS run 13/20: mxfp8=4.381, per_tensor=4.318 (GEMM-only: 1.359)
+    cuBLAS run 14/20: mxfp8=4.381, per_tensor=4.318 (GEMM-only: 1.359)
+    cuBLAS run 15/20: mxfp8=4.381, per_tensor=4.318 (GEMM-only: 1.359)
+    cuBLAS run 16/20: mxfp8=4.381, per_tensor=4.318 (GEMM-only: 1.359)
+    cuBLAS run 17/20: mxfp8=4.381, per_tensor=4.318 (GEMM-only: 1.359)
+    cuBLAS run 18/20: mxfp8=4.381, per_tensor=4.318 (GEMM-only: 1.359)
+    cuBLAS run 19/20: mxfp8=4.381, per_tensor=4.318 (GEMM-only: 1.359)
+    cuBLAS run 20/20: mxfp8=4.381, per_tensor=4.318 (GEMM-only: 1.359)
+
+  CUTLASS (./cutlass-bench-fc1-max):
+    CUTLASS run 1/20: 2.317 ms (GEMM-only: 1.610 ms)
+    CUTLASS run 2/20: 2.318 ms (GEMM-only: 1.608 ms)
+    CUTLASS run 3/20: 2.317 ms (GEMM-only: 1.609 ms)
+    CUTLASS run 4/20: 2.317 ms (GEMM-only: 1.609 ms)
+    CUTLASS run 5/20: 2.318 ms (GEMM-only: 1.609 ms)
+    CUTLASS run 6/20: 2.317 ms (GEMM-only: 1.607 ms)
+    CUTLASS run 7/20: 2.317 ms (GEMM-only: 1.609 ms)
+    CUTLASS run 8/20: 2.317 ms (GEMM-only: 1.608 ms)
+    CUTLASS run 9/20: 2.317 ms (GEMM-only: 1.608 ms)
+    CUTLASS run 10/20: 2.317 ms (GEMM-only: 1.608 ms)
+    CUTLASS run 11/20: 2.317 ms (GEMM-only: 1.609 ms)
+    CUTLASS run 12/20: 2.317 ms (GEMM-only: 1.608 ms)
+    CUTLASS run 13/20: 2.317 ms (GEMM-only: 1.608 ms)
+    CUTLASS run 14/20: 2.317 ms (GEMM-only: 1.609 ms)
+    CUTLASS run 15/20: 2.317 ms (GEMM-only: 1.610 ms)
+    CUTLASS run 16/20: 2.317 ms (GEMM-only: 1.607 ms)
+    CUTLASS run 17/20: 2.318 ms (GEMM-only: 1.609 ms)
+    CUTLASS run 18/20: 2.317 ms (GEMM-only: 1.608 ms)
+    CUTLASS run 19/20: 2.317 ms (GEMM-only: 1.609 ms)
+    CUTLASS run 20/20: 2.317 ms (GEMM-only: 1.609 ms)
+
+========================================================================
+  FC2+Bias (3072x768)
+========================================================================
+
+  Our kernel (./fc2):
+    our kernel run 1/20: 1.512 ms / 2896 TFLOPS
+    our kernel run 2/20: 1.510 ms / 2900 TFLOPS
+    our kernel run 3/20: 1.513 ms / 2895 TFLOPS
+    our kernel run 4/20: 1.515 ms / 2892 TFLOPS
+    our kernel run 5/20: 1.516 ms / 2889 TFLOPS
+    our kernel run 6/20: 1.517 ms / 2887 TFLOPS
+    our kernel run 7/20: 1.512 ms / 2896 TFLOPS
+    our kernel run 8/20: 1.513 ms / 2894 TFLOPS
+    our kernel run 9/20: 1.517 ms / 2886 TFLOPS
+    our kernel run 10/20: 1.512 ms / 2897 TFLOPS
+    our kernel run 11/20: 1.513 ms / 2895 TFLOPS
+    our kernel run 12/20: 1.512 ms / 2897 TFLOPS
+    our kernel run 13/20: 1.512 ms / 2897 TFLOPS
+    our kernel run 14/20: 1.513 ms / 2896 TFLOPS
+    our kernel run 15/20: 1.515 ms / 2891 TFLOPS
+    our kernel run 16/20: 1.512 ms / 2897 TFLOPS
+    our kernel run 17/20: 1.516 ms / 2890 TFLOPS
+    our kernel run 18/20: 1.508 ms / 2904 TFLOPS
+    our kernel run 19/20: 1.513 ms / 2894 TFLOPS
+    our kernel run 20/20: 1.512 ms / 2897 TFLOPS
+
+  cuBLAS (./cublas-bench-fc2):
+    cuBLAS run 1/20: mxfp8=1.554, per_tensor=1.526 (GEMM-only: 1.038)
+    cuBLAS run 2/20: mxfp8=1.541, per_tensor=1.509 (GEMM-only: 1.035)
+    cuBLAS run 3/20: mxfp8=1.561, per_tensor=1.505 (GEMM-only: 1.038)
+    cuBLAS run 4/20: mxfp8=1.561, per_tensor=1.512 (GEMM-only: 1.031)
+    cuBLAS run 5/20: mxfp8=1.560, per_tensor=1.499 (GEMM-only: 1.033)
+    cuBLAS run 6/20: mxfp8=1.558, per_tensor=1.513 (GEMM-only: 1.020)
+    cuBLAS run 7/20: mxfp8=1.573, per_tensor=1.528 (GEMM-only: 1.020)
+    cuBLAS run 8/20: mxfp8=1.569, per_tensor=1.511 (GEMM-only: 1.043)
+    cuBLAS run 9/20: mxfp8=1.573, per_tensor=1.528 (GEMM-only: 1.042)
+    cuBLAS run 10/20: mxfp8=1.552, per_tensor=1.524 (GEMM-only: 1.039)
+    cuBLAS run 11/20: mxfp8=1.576, per_tensor=1.515 (GEMM-only: 1.029)
+    cuBLAS run 12/20: mxfp8=1.571, per_tensor=1.515 (GEMM-only: 1.035)
+    cuBLAS run 13/20: mxfp8=1.560, per_tensor=1.515 (GEMM-only: 1.043)
+    cuBLAS run 14/20: mxfp8=1.564, per_tensor=1.493 (GEMM-only: 1.039)
+    cuBLAS run 15/20: mxfp8=1.570, per_tensor=1.521 (GEMM-only: 1.039)
+    cuBLAS run 16/20: mxfp8=1.548, per_tensor=1.517 (GEMM-only: 1.036)
+    cuBLAS run 17/20: mxfp8=1.542, per_tensor=1.521 (GEMM-only: 1.039)
+    cuBLAS run 18/20: mxfp8=1.564, per_tensor=1.520 (GEMM-only: 1.020)
+    cuBLAS run 19/20: mxfp8=1.560, per_tensor=1.497 (GEMM-only: 1.035)
+    cuBLAS run 20/20: mxfp8=1.560, per_tensor=1.521 (GEMM-only: 1.043)
+
+  CUTLASS (./cutlass-bench-fc2-max):
+    CUTLASS run 1/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 2/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 3/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 4/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 5/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 6/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 7/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 8/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 9/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 10/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 11/20: 1.144 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 12/20: 1.143 ms (GEMM-only: 1.145 ms)
+    CUTLASS run 13/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 14/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 15/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 16/20: 1.142 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 17/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 18/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 19/20: 1.143 ms (GEMM-only: 1.144 ms)
+    CUTLASS run 20/20: 1.143 ms (GEMM-only: 1.144 ms)
+  Benchmark done in 853s
+
+[Phase 4/4] STATISTICAL ANALYSIS
+
+########################################################################
+ #  RESULTS & STATISTICAL ANALYSIS
+########################################################################
+
+========================================================================
+  Patch Embed (768x768)
+========================================================================
+
+                           Summary Statistics                           
+========================================================================
+  Our kernel            n=20  mean=0.5259  std=0.0011  min=0.5230  max=0.5270  median=0.5260  IQR=0.0020
+  cuBLAS mxfp8          n=20  mean=0.5740  std=0.0000  min=0.5740  max=0.5740  median=0.5740  IQR=0.0000
+  cuBLAS per_tensor     n=20  mean=0.5588  std=0.0004  min=0.5580  max=0.5590  median=0.5590  IQR=0.0000
+
+  Ranking (fastest first):
+    #1: Our kernel            0.5259 ms (best)
+    #2: cuBLAS per_tensor     0.5588 ms (+32.9 us vs best)
+    #3: cuBLAS mxfp8          0.5740 ms (+48.1 us vs best)
+
+                             One-way ANOVA                              
+========================================================================
+  F(2, 57) = 26166.173,  p = 3.50e-85  (significant)
+
+                        Pairwise Welchs t-tests                         
+========================================================================
+  Comparison                              t-stat     p-value        d   Sig       Delta
+  --------------------------------------------------------------------------------
+/usr/lib/python3/dist-packages/scipy/stats/_axis_nan_policy.py:523: RuntimeWarning: Precision loss occurred in moment calculation due to catastrophic cancellation. This occurs when the data are nearly identical. Results may be unreliable.
+  res = hypotest_fun_out(*samples, **kwds)
+         Our kernel vs cuBLAS mxfp8      -192.198    1.03e-32  -60.778   ***     -48.1 us
+         Our kernel vs cuBLAS per_tensor  -125.129    3.98e-34  -39.569   ***     -32.9 us
+       cuBLAS mxfp8 vs cuBLAS per_tensor   184.941    2.13e-32   58.484   ***     +15.2 us
+
+  n = 20-20 runs, alpha = 0.05
+  ns = not significant, * p<0.05, ** p<0.01, *** p<0.001
+
+  GEMM-only reference (not fused):
+    cuBLAS GEMM-only      mean=0.3650 ms  std=0.0000
+
+========================================================================
+  FC1+GELU (768x3072)
+========================================================================
+
+                           Summary Statistics                           
+========================================================================
+  Our kernel            n=20  mean=4.2203  std=0.0013  min=4.2180  max=4.2240  median=4.2200  IQR=0.0013
+  cuBLAS mxfp8          n=20  mean=4.3807  std=0.0006  min=4.3790  max=4.3810  median=4.3810  IQR=0.0000
+  cuBLAS per_tensor     n=20  mean=4.3176  std=0.0006  min=4.3160  max=4.3180  median=4.3180  IQR=0.0010
+  CUTLASS fused         n=20  mean=2.3171  std=0.0004  min=2.3170  max=2.3180  median=2.3170  IQR=0.0000
+
+  Ranking (fastest first):
+    #1: CUTLASS fused         2.3171 ms (best)
+    #2: Our kernel            4.2203 ms (+1903.2 us vs best)
+    #3: cuBLAS per_tensor     4.3176 ms (+2000.4 us vs best)
+    #4: cuBLAS mxfp8          4.3807 ms (+2063.6 us vs best)
+
+                             One-way ANOVA                              
+========================================================================
+  F(3, 76) = 31924885.907,  p = 1.07e-231  (significant)
+
+                        Pairwise Welchs t-tests                         
+========================================================================
+  Comparison                              t-stat     p-value        d   Sig       Delta
+  --------------------------------------------------------------------------------
+         Our kernel vs cuBLAS mxfp8      -507.722    9.94e-53  -160.556   ***    -160.4 us
+         Our kernel vs cuBLAS per_tensor  -303.719    9.39e-49  -96.044   ***     -97.3 us
+         Our kernel vs CUTLASS fused     6293.430    2.78e-70  1990.157   ***   +1903.2 us
+       cuBLAS mxfp8 vs cuBLAS per_tensor   347.491    9.41e-68  109.886   ***     +63.2 us
+       cuBLAS mxfp8 vs CUTLASS fused     13962.985   1.41e-113  4415.484   ***   +2063.6 us
+  cuBLAS per_tensor vs CUTLASS fused     12753.039   2.77e-107  4032.865   ***   +2000.4 us
+
+  n = 20-20 runs, alpha = 0.05
+  ns = not significant, * p<0.05, ** p<0.01, *** p<0.001
+
+  GEMM-only reference (not fused):
+    cuBLAS GEMM-only      mean=1.3589 ms  std=0.0003
+    CUTLASS GEMM-only     mean=1.6085 ms  std=0.0008
+
+========================================================================
+  FC2+Bias (3072x768)
+========================================================================
+
+                           Summary Statistics                           
+========================================================================
+  Our kernel            n=20  mean=1.5131  std=0.0023  min=1.5080  max=1.5170  median=1.5130  IQR=0.0030
+  cuBLAS mxfp8          n=20  mean=1.5608  std=0.0099  min=1.5410  max=1.5760  median=1.5605  IQR=0.0123
+  cuBLAS per_tensor     n=20  mean=1.5145  std=0.0100  min=1.4930  max=1.5280  median=1.5150  IQR=0.0105
+  CUTLASS fused         n=20  mean=1.1430  std=0.0003  min=1.1420  max=1.1440  median=1.1430  IQR=0.0000
+
+  Ranking (fastest first):
+    #1: CUTLASS fused         1.1430 ms (best)
+    #2: Our kernel            1.5131 ms (+370.1 us vs best)
+    #3: cuBLAS per_tensor     1.5145 ms (+371.5 us vs best)
+    #4: cuBLAS mxfp8          1.5608 ms (+417.8 us vs best)
+
+                             One-way ANOVA                              
+========================================================================
+  F(3, 76) = 14937.966,  p = 3.43e-105  (significant)
+
+                        Pairwise Welchs t-tests                         
+========================================================================
+  Comparison                              t-stat     p-value        d   Sig       Delta
+  --------------------------------------------------------------------------------
+         Our kernel vs cuBLAS mxfp8       -21.072    1.29e-15   -6.664   ***     -47.7 us
+         Our kernel vs cuBLAS per_tensor    -0.589    5.62e-01   -0.186    ns      -1.4 us
+         Our kernel vs CUTLASS fused      719.579    3.74e-45  227.551   ***    +370.1 us
+       cuBLAS mxfp8 vs cuBLAS per_tensor    14.755    2.58e-17    4.666   ***     +46.3 us
+       cuBLAS mxfp8 vs CUTLASS fused      189.348    1.19e-32   59.877   ***    +417.8 us
+  cuBLAS per_tensor vs CUTLASS fused      166.009    1.46e-31   52.497   ***    +371.5 us
+
+  n = 20-20 runs, alpha = 0.05
+  ns = not significant, * p<0.05, ** p<0.01, *** p<0.001
+
+  GEMM-only reference (not fused):
+    cuBLAS GEMM-only      mean=1.0349 ms  std=0.0075
+    CUTLASS GEMM-only     mean=1.1440 ms  std=0.0002
+
+
+========================================================================
+  CROSS-LAYER SUMMARY (mean ms, fused)
+========================================================================
+  Layer                   Our kernel        cuBLAS       CUTLASS          Best
+  ------------------------------------------------------------------------
+  Patch Embed (768x768)        0.5259        0.5588           n/a  Our kernel
+  FC1+GELU (768x3072)         4.2203        4.3176        2.3171  CUTLASS fused
+  FC2+Bias (3072x768)         1.5131        1.5145        1.1430  CUTLASS fused
+
+Raw samples saved to: /root/siglip/data/session_20260308_190511/compare.csv
+
+Done. 20 runs x 3 layers in 5544s (92.4 min).
