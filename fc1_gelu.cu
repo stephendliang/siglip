@@ -14,37 +14,107 @@ Epilogue: FP32 acc + bias → GELU → BF16 CVT → SMEM staging → TMA store
 #include "kernel_common.cuh"
 
 /*
-GELU approximation (tanh version)
+GELU approximation (tanh version) — host only, for validation
 GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 */
-static __host__ __device__ __forceinline__ float gelu_fwd(float x) {
-    const float k = 0.7978845608f;  // sqrt(2/pi)
+static __host__ __forceinline__ float gelu_fwd(float x) {
+    const float k = 0.7978845608f;
     return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
 }
 
 /*
-Fused bias+GELU+CVT+STS macro
-Adds FP32 bias to 8 FP32 accumulators, applies GELU, converts to 4 BF16x2,
-stores 16B to SMEM.  GELU requires C++ (tanhf), so bias+GELU is done in C++;
-CVT+STS uses asm-local regs to avoid global register inflation.
+Fused bias+GELU+CVT+STS — all in one asm block.
+Computes GELU(acc+bias) → BF16 CVT → SMEM store using tanh.approx.f32
+(single SFU instruction) instead of software tanhf().
+
+For each lane i:
+  x = fi + bi                    (acc + bias)
+  inner = 0.7978845608 * x * (1 + 0.044715 * x²)
+  t = tanh.approx(inner)
+  gi = 0.5 * x * (1 + t)         = 0.5 * (x + x*t)
+
+All intermediates in asm-local regs to avoid register inflation.
 */
 #define GELU_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3,b4,b5,b6,b7, SADDR) \
     do { \
-        float _g0 = gelu_fwd((f0)+(b0)), _g1 = gelu_fwd((f1)+(b1)); \
-        float _g2 = gelu_fwd((f2)+(b2)), _g3 = gelu_fwd((f3)+(b3)); \
-        float _g4 = gelu_fwd((f4)+(b4)), _g5 = gelu_fwd((f5)+(b5)); \
-        float _g6 = gelu_fwd((f6)+(b6)), _g7 = gelu_fwd((f7)+(b7)); \
         asm volatile( \
             "{\n\t" \
-            ".reg .b32 b0, b1, b2, b3;\n\t" \
-            "cvt.rn.bf16x2.f32 b0, %1, %0;\n\t" \
-            "cvt.rn.bf16x2.f32 b1, %3, %2;\n\t" \
-            "cvt.rn.bf16x2.f32 b2, %5, %4;\n\t" \
-            "cvt.rn.bf16x2.f32 b3, %7, %6;\n\t" \
-            "st.shared.v4.b32 [%8], {b0,b1,b2,b3};\n\t" \
+            ".reg .f32 x0,x1,x2,x3,x4,x5,x6,x7;\n\t" \
+            ".reg .f32 t0,t1,t2,t3,t4,t5,t6,t7;\n\t" \
+            ".reg .f32 g0,g1,g2,g3,g4,g5,g6,g7;\n\t" \
+            ".reg .b32 o0,o1,o2,o3;\n\t" \
+            /* x = acc + bias */ \
+            "add.f32 x0, %0, %8;\n\t" \
+            "add.f32 x1, %1, %9;\n\t" \
+            "add.f32 x2, %2, %10;\n\t" \
+            "add.f32 x3, %3, %11;\n\t" \
+            "add.f32 x4, %4, %12;\n\t" \
+            "add.f32 x5, %5, %13;\n\t" \
+            "add.f32 x6, %6, %14;\n\t" \
+            "add.f32 x7, %7, %15;\n\t" \
+            /* t = tanh.approx(k * x * (1 + k1 * x²))
+               rewritten as: inner = k*x + (k*k1)*x³
+               where k = 0.7978845608, k1 = 0.044715, k*k1 = 0.035677408136 */ \
+            "mul.f32 t0, x0, x0;\n\t" /* t = x² */ \
+            "mul.f32 t1, x1, x1;\n\t" \
+            "mul.f32 t2, x2, x2;\n\t" \
+            "mul.f32 t3, x3, x3;\n\t" \
+            "mul.f32 t4, x4, x4;\n\t" \
+            "mul.f32 t5, x5, x5;\n\t" \
+            "mul.f32 t6, x6, x6;\n\t" \
+            "mul.f32 t7, x7, x7;\n\t" \
+            "fma.rn.f32 t0, t0, 0f3D122279, 0f3F4C422A;\n\t" /* t = (k*k1)*x² + k */ \
+            "fma.rn.f32 t1, t1, 0f3D122279, 0f3F4C422A;\n\t" \
+            "fma.rn.f32 t2, t2, 0f3D122279, 0f3F4C422A;\n\t" \
+            "fma.rn.f32 t3, t3, 0f3D122279, 0f3F4C422A;\n\t" \
+            "fma.rn.f32 t4, t4, 0f3D122279, 0f3F4C422A;\n\t" \
+            "fma.rn.f32 t5, t5, 0f3D122279, 0f3F4C422A;\n\t" \
+            "fma.rn.f32 t6, t6, 0f3D122279, 0f3F4C422A;\n\t" \
+            "fma.rn.f32 t7, t7, 0f3D122279, 0f3F4C422A;\n\t" \
+            "mul.f32 t0, t0, x0;\n\t"  /* t = x * ((k*k1)*x² + k) = k*x*(1 + k1*x²) */ \
+            "mul.f32 t1, t1, x1;\n\t" \
+            "mul.f32 t2, t2, x2;\n\t" \
+            "mul.f32 t3, t3, x3;\n\t" \
+            "mul.f32 t4, t4, x4;\n\t" \
+            "mul.f32 t5, t5, x5;\n\t" \
+            "mul.f32 t6, t6, x6;\n\t" \
+            "mul.f32 t7, t7, x7;\n\t" \
+            "tanh.approx.f32 t0, t0;\n\t" \
+            "tanh.approx.f32 t1, t1;\n\t" \
+            "tanh.approx.f32 t2, t2;\n\t" \
+            "tanh.approx.f32 t3, t3;\n\t" \
+            "tanh.approx.f32 t4, t4;\n\t" \
+            "tanh.approx.f32 t5, t5;\n\t" \
+            "tanh.approx.f32 t6, t6;\n\t" \
+            "tanh.approx.f32 t7, t7;\n\t" \
+            /* g = 0.5 * (x + x*t) = 0.5 * x * (1 + t) */ \
+            "fma.rn.f32 g0, x0, t0, x0;\n\t" /* g = x*t + x */ \
+            "fma.rn.f32 g1, x1, t1, x1;\n\t" \
+            "fma.rn.f32 g2, x2, t2, x2;\n\t" \
+            "fma.rn.f32 g3, x3, t3, x3;\n\t" \
+            "fma.rn.f32 g4, x4, t4, x4;\n\t" \
+            "fma.rn.f32 g5, x5, t5, x5;\n\t" \
+            "fma.rn.f32 g6, x6, t6, x6;\n\t" \
+            "fma.rn.f32 g7, x7, t7, x7;\n\t" \
+            "mul.f32 g0, g0, 0f3F000000;\n\t" /* g *= 0.5 */ \
+            "mul.f32 g1, g1, 0f3F000000;\n\t" \
+            "mul.f32 g2, g2, 0f3F000000;\n\t" \
+            "mul.f32 g3, g3, 0f3F000000;\n\t" \
+            "mul.f32 g4, g4, 0f3F000000;\n\t" \
+            "mul.f32 g5, g5, 0f3F000000;\n\t" \
+            "mul.f32 g6, g6, 0f3F000000;\n\t" \
+            "mul.f32 g7, g7, 0f3F000000;\n\t" \
+            /* CVT to BF16x2 + STS */ \
+            "cvt.rn.bf16x2.f32 o0, g1, g0;\n\t" \
+            "cvt.rn.bf16x2.f32 o1, g3, g2;\n\t" \
+            "cvt.rn.bf16x2.f32 o2, g5, g4;\n\t" \
+            "cvt.rn.bf16x2.f32 o3, g7, g6;\n\t" \
+            "st.shared.v4.b32 [%16], {o0,o1,o2,o3};\n\t" \
             "}" \
-            :: "f"(_g0),"f"(_g1),"f"(_g2),"f"(_g3), \
-               "f"(_g4),"f"(_g5),"f"(_g6),"f"(_g7), \
+            :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
+               "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
+               "f"(b0),"f"(b1),"f"(b2),"f"(b3), \
+               "f"(b4),"f"(b5),"f"(b6),"f"(b7), \
                "r"(SADDR) \
             : "memory"); \
     } while(0)
