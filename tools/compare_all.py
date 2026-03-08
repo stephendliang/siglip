@@ -82,7 +82,7 @@ LAYERS = {
         'cutlass_binary': './cutlass-bench-fc2',
         'cutlass_binary_max': './cutlass-bench-fc2-max',
         'N': 768, 'K': 3072,
-        'epilogue': 'BIAS_ONLY',
+        'epilogue': 'BIAS_RESIDUAL',
         'label': 'FC2+Bias (3072x768)',
     },
 }
@@ -151,7 +151,7 @@ def parse_cublas_gemm_only(output):
 def parse_cutlass_best_fused(output, epilogue):
     """Extract best fused time from CUTLASS bench output."""
     # For PERIODIC_ADD, look for "Best Fused EVT" or "Best GEMM+PostAdd"
-    # For GELU_BIAS / BIAS_ONLY, look for "Best Fused"
+    # For GELU_BIAS / BIAS_RESIDUAL, look for "Best Fused"
     best_ms = None
 
     if epilogue == 'PERIODIC_ADD':
@@ -257,12 +257,12 @@ def parse_cublas_all_fused(output, epilogue):
     fused_labels = {
         'PERIODIC_ADD': 'GEMM + fused add (beta=1)',
         'GELU_BIAS': 'GEMM + fused bias+GELU',
-        'BIAS_ONLY': 'GEMM + fused bias',
+        'BIAS_RESIDUAL': 'GEMM + fused bias',
     }
     unfused_labels = {
         'PERIODIC_ADD': 'GEMM + unfused periodic add',
         'GELU_BIAS': 'GEMM + unfused bias+GELU',
-        'BIAS_ONLY': 'GEMM + unfused bias',
+        'BIAS_RESIDUAL': 'GEMM + unfused bias',
     }
     results = {}
     for prefix in ['per_tensor', 'mxfp8']:

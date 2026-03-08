@@ -140,7 +140,7 @@ ncu --set source --csv ./patch_embed > data/source_counters_raw.csv && python3 t
 # CUTLASS tile/policy sweep (compile-time N/K/epilogue via -D flags, one binary per epilogue)
 make cutlass-bench          # patch embed: N=768 K=768 PERIODIC_ADD (default)
 make cutlass-bench-fc1      # FC1: N=3072 K=768 GELU_BIAS
-make cutlass-bench-fc2      # FC2: N=768 K=3072 BIAS_ONLY
+make cutlass-bench-fc2      # FC2: N=768 K=3072 BIAS_RESIDUAL
 ./cutlass-bench [imgs_per_sm]  # default 32 → M=928256
 
 # CUTLASS extended sweep (more tile/cluster configs)
@@ -156,7 +156,7 @@ make cutlass-bench-fc2-max      # extended FC2
 # cuBLAS baseline (compile-time N/K/epilogue, best-of-heuristics)
 make cublas-bench           # patch embed: N=768 K=768 PERIODIC_ADD
 make cublas-bench-fc1       # FC1: N=3072 K=768 GELU_BIAS
-make cublas-bench-fc2       # FC2: N=768 K=3072 BIAS_ONLY
+make cublas-bench-fc2       # FC2: N=768 K=3072 BIAS_RESIDUAL
 ./cublas-bench [imgs_per_sm]  # default 32 → M=928256
 
 # Parameter grid search (any kernel)
@@ -189,7 +189,7 @@ python3 tools/compare_all.py --grid-search                      # run grid searc
 
 ### Bench details
 
-Both `cutlass_bench.cu` and `cublas_bench.cu` are compile-time parameterized via `-D` flags: `BENCH_N`, `BENCH_K`, `BENCH_EPILOGUE` (`1`=PERIODIC_ADD, `2`=GELU_BIAS, `3`=BIAS_ONLY, `0`=NONE). CUTLASS adds `CUTLASS_EXTENDED_SWEEP=1` for more tile/cluster configs. Configs exceeding SMEM capacity return sentinel `-3.0f`. cuBLAS tests both MXFP8 and per-tensor FP8 with up to 128 algo heuristics.
+Both `cutlass_bench.cu` and `cublas_bench.cu` are compile-time parameterized via `-D` flags: `BENCH_N`, `BENCH_K`, `BENCH_EPILOGUE` (`1`=PERIODIC_ADD, `2`=GELU_BIAS, `3`=BIAS_RESIDUAL, `0`=NONE). CUTLASS adds `CUTLASS_EXTENDED_SWEEP=1` for more tile/cluster configs. Configs exceeding SMEM capacity return sentinel `-3.0f`. cuBLAS tests both MXFP8 and per-tensor FP8 with up to 128 algo heuristics.
 
 ## Key constraints
 

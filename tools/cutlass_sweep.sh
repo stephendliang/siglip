@@ -67,7 +67,7 @@ echo ""
             cutlass-bench-fc1|cutlass-bench-fc1-max)
                 label="FC1 (N=3072, K=768, GELU_BIAS)" ;;
             cutlass-bench-fc2|cutlass-bench-fc2-max)
-                label="FC2 (N=768, K=3072, BIAS_ONLY)" ;;
+                label="FC2 (N=768, K=3072, BIAS_RESIDUAL)" ;;
         esac
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

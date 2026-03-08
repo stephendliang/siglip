@@ -7,11 +7,11 @@ Compile-time config (via -D flags):
   BENCH_EPILOGUE   Epilogue type (int):
     1 = PERIODIC_ADD — fused periodic table add (patch embed)
     2 = GELU_BIAS    — fused bias + GELU_taylor (FC1)
-    3 = BIAS_ONLY    — fused bias only (FC2)
+    3 = BIAS_RESIDUAL — fused bias + residual add (FC2)
 
 Build:  make cutlass-bench        (patch embed: N=768, K=768, PERIODIC_ADD)
         make cutlass-bench-fc1    (FC1: N=3072, K=768, GELU_BIAS)
-        make cutlass-bench-fc2    (FC2: N=768, K=3072, BIAS_ONLY)
+        make cutlass-bench-fc2    (FC2: N=768, K=3072, BIAS_RESIDUAL)
         make cutlass-bench-max    (extended patch embed sweep)
 */
 
@@ -54,7 +54,7 @@ Build:  make cutlass-bench        (patch embed: N=768, K=768, PERIODIC_ADD)
 
 using namespace cute;
 
-enum class Epilogue : int { PERIODIC_ADD = 1, GELU_BIAS = 2, BIAS_ONLY = 3 };
+enum class Epilogue : int { PERIODIC_ADD = 1, GELU_BIAS = 2, BIAS_RESIDUAL = 3 };
 constexpr Epilogue EPI = static_cast<Epilogue>(BENCH_EPILOGUE);
 constexpr int N_DIM = BENCH_N;
 constexpr int K_DIM = BENCH_K;
@@ -162,6 +162,36 @@ __global__ void apply_bias_only(
     #pragma unroll
     for (int i = 0; i < 8; i++) {
         dp[i] = __float2bfloat16(__bfloat162float(dp[i]) + b[i]);
+    }
+    *reinterpret_cast<uint4*>(D + base) = dv;
+}
+
+__global__ void fill_residual_bf16(__nv_bfloat16* d, long long n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i] = __float2bfloat16((float)(i % 256));
+}
+
+/* Unfused bias+residual kernel for FC2 two-kernel baseline.
+   Reads D (GEMM output) + residual + bias, writes D = D + bias + residual. */
+__global__ void apply_bias_residual(
+    __nv_bfloat16* __restrict__ D,
+    const __nv_bfloat16* __restrict__ residual,
+    const float* __restrict__ bias,
+    int N, long long total_v8) {
+    long long vid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (vid >= total_v8) return;
+    long long base = vid * 8;
+    int col = (int)(base % N);
+    uint4 dv = *reinterpret_cast<uint4*>(D + base);
+    uint4 rv = *reinterpret_cast<const uint4*>(residual + base);
+    __nv_bfloat16* dp = reinterpret_cast<__nv_bfloat16*>(&dv);
+    const __nv_bfloat16* rp = reinterpret_cast<const __nv_bfloat16*>(&rv);
+    float4 bv0 = __ldg(reinterpret_cast<const float4*>(bias + col));
+    float4 bv1 = __ldg(reinterpret_cast<const float4*>(bias + col + 4));
+    float b[8] = {bv0.x, bv0.y, bv0.z, bv0.w, bv1.x, bv1.y, bv1.z, bv1.w};
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        dp[i] = __float2bfloat16(__bfloat162float(dp[i]) + b[i] + __bfloat162float(rp[i]));
     }
     *reinterpret_cast<uint4*>(D + base) = dv;
 }
@@ -598,7 +628,7 @@ struct BiasActGemmInstance {
                      const float* d_bias,
                      int M, int N, int K,
                      cutlass::KernelHardwareInfo& hw_info,
-                     size_t d_bytes) {
+                     size_t d_bytes, float beta = 0.0f) {
         if constexpr (kSmemBytes > cutlass::arch::sm100_smem_capacity_bytes) {
             return -3.0f;
         } else {
@@ -628,7 +658,7 @@ struct BiasActGemmInstance {
             };
 
             arguments.epilogue.thread.alpha = 1.0f;
-            arguments.epilogue.thread.beta = 0.0f;
+            arguments.epilogue.thread.beta = beta;
             arguments.epilogue.thread.bias_ptr = d_bias;
 
             Gemm_ gemm;
@@ -732,6 +762,42 @@ static float bench_bias_act_only(
     return ms;
 }
 
+static float bench_bias_residual_only(
+    __nv_bfloat16* d_D,
+    const __nv_bfloat16* d_residual,
+    const float* d_bias,
+    int M, int N,
+    size_t d_bytes
+) {
+    long long total_v8 = (long long)M * N / 8;
+    int blocks = (int)((total_v8 + POSTADD_TPB - 1) / POSTADD_TPB);
+    if (d_bytes > 0) CUDA_CHECK(cudaMemset(d_D, 0, d_bytes));
+
+    for (int i = 0; i < WARMUP_ITERS; i++)
+        apply_bias_residual<<<blocks, POSTADD_TPB>>>(d_D, d_residual, d_bias, N, total_v8);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0);
+    cudaEventCreate(&t1);
+
+    cudaEventRecord(t0);
+    for (int i = 0; i < TIMED_ITERS; i++)
+        apply_bias_residual<<<blocks, POSTADD_TPB>>>(d_D, d_residual, d_bias, N, total_v8);
+    cudaEventRecord(t1);
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    CUDA_CHECK(cudaGetLastError());
+
+    float ms;
+    cudaEventElapsedTime(&ms, t0, t1);
+    ms /= TIMED_ITERS;
+
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
+    return ms;
+}
+
 // Validation
 
 // Validate fused EVT output: spot-check strided samples against CPU reference.
@@ -775,7 +841,8 @@ static bool validate_fused_evt(void* d_D, int M, int N, int K, int seq_len) {
     return true;
 }
 
-static bool validate_bias_act_fused(void* d_D, int M, int N, int K, bool do_gelu) {
+static bool validate_bias_act_fused(void* d_D, void* d_C_residual,
+                                    int M, int N, int K, bool do_gelu) {
     using BF16 = cutlass::bfloat16_t;
     struct Spot { int r, c; };
     Spot spots[] = {{0,0}, {0,1}, {0,2}, {0,3}, {0,N-1},
@@ -786,6 +853,15 @@ static bool validate_bias_act_fused(void* d_D, int M, int N, int K, bool do_gelu
         float gemm = (float)K * 1.5f * b_val;
         float bias = (float)(s.c + 1);
         float pre_act = gemm + bias;
+
+        if (d_C_residual) {
+            BF16 res_bf16;
+            CUDA_CHECK(cudaMemcpy(&res_bf16,
+                reinterpret_cast<BF16*>(d_C_residual) + (long long)s.r * N + s.c,
+                sizeof(BF16), cudaMemcpyDeviceToHost));
+            pre_act += float(res_bf16);
+        }
+
         float expected_f32 = do_gelu ? host_gelu_taylor(pre_act) : pre_act;
         BF16 expected_bf16(expected_f32);
 
@@ -815,7 +891,7 @@ template <
 void try_config_policy(
     const char* tile_str, const char* cluster_str, const char* policy_str,
     void* d_A, void* d_B, void* d_C, void* d_D,
-    const void* epilogue_data,  // d_combined (PERIODIC_ADD) or d_bias (GELU_BIAS/BIAS_ONLY)
+    const void* epilogue_data,  // d_combined (PERIODIC_ADD) or d_bias (GELU_BIAS/BIAS_RESIDUAL)
     int M, int N, int K, int seq_len,
     cutlass::KernelHardwareInfo& hw_info,
     float ms_post_ref,
@@ -878,7 +954,7 @@ void try_config_policy(
         auto d_bias = reinterpret_cast<const float*>(epilogue_data);
         r.ms_fused = BGI::run(d_A, d_B, d_C, d_D, d_bias, M, N, K, hw_info, d_bytes);
 
-        if (r.ms_fused > 0 && !validate_bias_act_fused(d_D, M, N, K, true))
+        if (r.ms_fused > 0 && !validate_bias_act_fused(d_D, nullptr, M, N, K, true))
             r.ms_fused = -2.0f;
 
         long long total_v8 = (long long)M * N / 8;
@@ -896,9 +972,9 @@ void try_config_policy(
     {
         using BOI = BiasActGemmInstance<cutlass::epilogue::thread::Identity,TM,TN,TK,CM,CN,MainloopSchedule,EpilogueSchedule,MainloopStages>;
         auto d_bias = reinterpret_cast<const float*>(epilogue_data);
-        r.ms_fused = BOI::run(d_A, d_B, d_C, d_D, d_bias, M, N, K, hw_info, d_bytes);
+        r.ms_fused = BOI::run(d_A, d_B, d_C, d_D, d_bias, M, N, K, hw_info, d_bytes, 1.0f);
 
-        if (r.ms_fused > 0 && !validate_bias_act_fused(d_D, M, N, K, false))
+        if (r.ms_fused > 0 && !validate_bias_act_fused(d_D, d_C, M, N, K, false))
             r.ms_fused = -2.0f;
 
         long long total_v8 = (long long)M * N / 8;
@@ -907,8 +983,9 @@ void try_config_policy(
         r.ms_gemm_post = GI::run_gemm_plus_post(
             d_A, d_B, d_C, d_D, M, N, K, hw_info, 1.0f, 0.0f, d_bytes,
             [&]() {
-                apply_bias_only<<<blocks, POSTADD_TPB>>>(
+                apply_bias_residual<<<blocks, POSTADD_TPB>>>(
                     reinterpret_cast<__nv_bfloat16*>(d_D),
+                    reinterpret_cast<const __nv_bfloat16*>(d_C),
                     const_cast<float*>(d_bias), N, total_v8);
             });
     }
@@ -1090,7 +1167,7 @@ int main(int argc, char** argv) {
     const char* epi_name =
         EPI == Epilogue::PERIODIC_ADD ? "PERIODIC_ADD (patch embed)" :
         EPI == Epilogue::GELU_BIAS    ? "GELU_BIAS (FC1)" :
-                                        "BIAS_ONLY (FC2)";
+                                        "BIAS_RESIDUAL (FC2)";
 
     printf("CUTLASS SM100a FP8 Grid Search — %s\n", epi_name);
     printf("  [%d, %d] x [%d, %d]^T  (imgs_per_sm=%d, %d images)\n",
@@ -1127,7 +1204,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemset(d_C, 0, sz_d));
     CUDA_CHECK(cudaMemset(d_D, 0, sz_d));
 
-    // epilogue_data: d_combined for PERIODIC_ADD, d_bias for GELU_BIAS/BIAS_ONLY
+    // epilogue_data: d_combined for PERIODIC_ADD, d_bias for GELU_BIAS/BIAS_RESIDUAL
     const void* epilogue_data = nullptr;
     float ms_post_ref = -1.0f;
     float *d_epi_bias = nullptr, *d_epi_pos = nullptr;
@@ -1177,7 +1254,7 @@ int main(int argc, char** argv) {
 
         epilogue_data = d_epi_combined;
     } else {
-        // GELU_BIAS or BIAS_ONLY: allocate bias
+        // GELU_BIAS or BIAS_RESIDUAL: allocate bias
         CUDA_CHECK(cudaMalloc(&d_epi_bias, (size_t)N_DIM * sizeof(float)));
         {
             float* h_bias = (float*)malloc((size_t)N_DIM * sizeof(float));
@@ -1186,12 +1263,32 @@ int main(int argc, char** argv) {
             free(h_bias);
         }
 
-        bool do_gelu = (EPI == Epilogue::GELU_BIAS);
-        ms_post_ref = bench_bias_act_only(
-            reinterpret_cast<__nv_bfloat16*>(d_D), d_epi_bias,
-            M, N_DIM, sz_d, do_gelu);
-        printf("  Unfused %s kernel: %.3f ms\n",
-               do_gelu ? "bias+GELU" : "bias-only", ms_post_ref);
+        /* BIAS_RESIDUAL: fill d_C with per-element varying residual data.
+           Values 0-255 cycle per element — every cache line has unique data,
+           preventing L2/HBM compression shortcuts. */
+        if constexpr (EPI == Epilogue::BIAS_RESIDUAL) {
+            long long n_elem = (long long)M * N_DIM;
+            int tpb = 256;
+            fill_residual_bf16<<<(int)((n_elem + tpb - 1) / tpb), tpb>>>(
+                reinterpret_cast<__nv_bfloat16*>(d_C), n_elem);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            printf("  C filled with residual data [%d, %d] (%.1f MB)\n",
+                   M, N_DIM, (double)sz_d / (1024*1024));
+        }
+
+        if constexpr (EPI == Epilogue::GELU_BIAS) {
+            ms_post_ref = bench_bias_act_only(
+                reinterpret_cast<__nv_bfloat16*>(d_D), d_epi_bias,
+                M, N_DIM, sz_d, true);
+            printf("  Unfused bias+GELU kernel: %.3f ms\n", ms_post_ref);
+        } else {
+            ms_post_ref = bench_bias_residual_only(
+                reinterpret_cast<__nv_bfloat16*>(d_D),
+                reinterpret_cast<const __nv_bfloat16*>(d_C),
+                d_epi_bias, M, N_DIM, sz_d);
+            printf("  Unfused bias+residual kernel: %.3f ms\n", ms_post_ref);
+        }
 
         epilogue_data = d_epi_bias;
     }
@@ -1382,8 +1479,8 @@ int main(int argc, char** argv) {
                    best_gemm_post->policy_str.c_str(),
                    best_gemm_post->ms_gemm_post, tflops(best_gemm_post->ms_gemm_post));
     } else {
-        const char* fused_label = (EPI == Epilogue::GELU_BIAS) ? "Fused bias+GELU" : "Fused bias";
-        const char* post_label  = (EPI == Epilogue::GELU_BIAS) ? "bias+GELU" : "bias-only";
+        const char* fused_label = (EPI == Epilogue::GELU_BIAS) ? "Fused bias+GELU" : "Fused bias+residual";
+        const char* post_label  = (EPI == Epilogue::GELU_BIAS) ? "bias+GELU" : "bias+residual";
 
         printf("%s SM100a FP8 — [%d, %d] x [%d, %d]^T + %s\n",
                (EPI == Epilogue::GELU_BIAS) ? "FC1" : "FC2",
