@@ -6,10 +6,12 @@
 #define WARMUP 64
 
 extern "C" __global__ void k1_f2fp_throughput(long long* out) {
-    // 16 independent F2FP feedback chains: each accumulator feeds back as one
-    // f32 input to cvt, cvt output replaces accumulator. Loop-carried dependency
-    // through the target instruction itself prevents ptxas loop elimination.
-    // No XOR needed — cvt IS the accumulation. Zero overhead instructions.
+    /*
+    16 independent F2FP feedback chains: each accumulator feeds back as one
+    f32 input to cvt, cvt output replaces accumulator. Loop-carried dependency
+    through the target instruction itself prevents ptxas loop elimination.
+    No XOR needed — cvt IS the accumulation. Zero overhead instructions.
+    */
     volatile unsigned* gin = (volatile unsigned*)(out + 16);
     unsigned f0=gin[0], f1=gin[1], f2=gin[2], f3=gin[3];
     unsigned f4=gin[4], f5=gin[5], f6=gin[6], f7=gin[7];

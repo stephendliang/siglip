@@ -1,21 +1,23 @@
-// cuBLASLt FP8 GEMM benchmark with compile-time configurable dimensions and epilogue.
-//
-// Compile-time config (via -D flags):
-//   BENCH_N          Output dimension         (default: 768)
-//   BENCH_K          Reduction dimension       (default: 768)
-//   BENCH_EPILOGUE   Epilogue type (int):
-//     0 = NONE         — GEMM-only
-//     1 = PERIODIC_ADD — beta=1 fused add (patch embed)
-//     2 = GELU_BIAS    — cuBLAS GELU_BIAS epilogue (FC1)
-//     3 = BIAS_ONLY    — cuBLAS BIAS epilogue (FC2)
-//
-// Usage: ./cublas-bench [imgs_per_sm]   (default: 32)
-//   M = imgs_per_sm * SM_COUNT * 196
-//
-// Examples:
-//   Patch embed: make cublas-bench       (N=768, K=768,  PERIODIC_ADD)
-//   FC1:         make cublas-bench-fc1   (N=3072, K=768, GELU_BIAS)
-//   FC2:         make cublas-bench-fc2   (N=768, K=3072, BIAS_ONLY)
+/*
+cuBLASLt FP8 GEMM benchmark with compile-time configurable dimensions and epilogue.
+
+Compile-time config (via -D flags):
+  BENCH_N          Output dimension         (default: 768)
+  BENCH_K          Reduction dimension       (default: 768)
+  BENCH_EPILOGUE   Epilogue type (int):
+    0 = NONE         — GEMM-only
+    1 = PERIODIC_ADD — beta=1 fused add (patch embed)
+    2 = GELU_BIAS    — cuBLAS GELU_BIAS epilogue (FC1)
+    3 = BIAS_ONLY    — cuBLAS BIAS epilogue (FC2)
+
+Usage: ./cublas-bench [imgs_per_sm]   (default: 32)
+  M = imgs_per_sm * SM_COUNT * 196
+
+Examples:
+  Patch embed: make cublas-bench       (N=768, K=768,  PERIODIC_ADD)
+  FC1:         make cublas-bench-fc1   (N=3072, K=768, GELU_BIAS)
+  FC2:         make cublas-bench-fc2   (N=768, K=3072, BIAS_ONLY)
+*/
 
 #include <cstdio>
 #include <cstdlib>
@@ -25,7 +27,7 @@
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
 
-// ── Compile-time configuration ──
+// Compile-time configuration
 
 #ifndef BENCH_N
 #define BENCH_N 768
@@ -76,7 +78,7 @@ constexpr const char* POST_LABEL[] = {"", "PostAdd-only", "Bias+GELU-only", "Bia
     } \
 } while(0)
 
-// ── Unfused post-kernels ──
+// Unfused post-kernels
 
 __global__ void precompute_combined(
     const float* __restrict__ bias, const float* __restrict__ pos_embed,
@@ -156,7 +158,7 @@ __global__ void apply_bias_only(
     *reinterpret_cast<uint4*>(D + base) = dv;
 }
 
-// ── Benchmark helpers ──
+// Benchmark helpers
 
 struct BenchResult { float ms; int algo_idx; };
 
@@ -270,7 +272,7 @@ static float to_tflops(double flops, float ms) {
     return ms > 0 ? (float)(flops / ms / 1e9) : 0.0f;
 }
 
-// ── Main ──
+// Main
 
 int main(int argc, char** argv) {
     setbuf(stdout, NULL);
@@ -296,7 +298,7 @@ int main(int argc, char** argv) {
     printf("  Shape: [%d,%d] x [%d,%d]^T%s  (imgs_per_sm=%d)\n",
            M, K_DIM, K_DIM, N_DIM, EPI_SUFFIX[E], imgs_per_sm);
 
-    // ── Common allocations ──
+    // Common allocations
 
     void* d_A = nullptr;
     void* d_B = nullptr;
@@ -320,7 +322,7 @@ int main(int argc, char** argv) {
     void* d_workspace = nullptr;
     CUDA_CHECK(cudaMalloc(&d_workspace, WORKSPACE_BYTES));
 
-    // ── Epilogue-specific allocations ──
+    // Epilogue-specific allocations
 
     float* d_bias = nullptr;
     float* d_pos = nullptr;
@@ -353,7 +355,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemset(d_bias, 0, (size_t)N_DIM * sizeof(float)));
     }
 
-    // ── cuBLASLt setup ──
+    // cuBLASLt setup
 
     cublasLtHandle_t lt;
     CUBLAS_CHECK(cublasLtCreate(&lt));
@@ -442,9 +444,12 @@ int main(int argc, char** argv) {
     } else if constexpr (EPI == Epilogue::GELU_BIAS || EPI == Epilogue::BIAS_ONLY) {
         desc_fused_mxfp8 = make_desc(true, true);
         desc_fused_plain = make_desc(false, true);
-        CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
-            lt, desc_fused_mxfp8, layoutA, layoutB, layoutC, layoutC,
-            pref, MAX_ALGOS, heur_fused_mxfp8, &n_fused_mxfp8));
+        {
+            cublasStatus_t ms = cublasLtMatmulAlgoGetHeuristic(
+                lt, desc_fused_mxfp8, layoutA, layoutB, layoutC, layoutC,
+                pref, MAX_ALGOS, heur_fused_mxfp8, &n_fused_mxfp8);
+            if (ms != CUBLAS_STATUS_SUCCESS) n_fused_mxfp8 = 0;
+        }
         cublasStatus_t fs = cublasLtMatmulAlgoGetHeuristic(
             lt, desc_fused_plain, layoutA, layoutB, layoutC, layoutC,
             pref, MAX_ALGOS, heur_fused_plain, &n_fused_plain);
@@ -462,7 +467,7 @@ int main(int argc, char** argv) {
 
     printf("  Workspace: %zu MB, timed iters=%d\n\nBenchmarking...\n", WORKSPACE_BYTES >> 20, TIMED_ITERS);
 
-    // ── GEMM-only ──
+    // GEMM-only
 
     BenchResult mxfp8_gemm = bench_best_algo(lt, desc_mxfp8, &alpha,
         d_B, layoutA, d_A, layoutB, &beta0, d_D, layoutC, d_D, layoutC,
@@ -474,7 +479,7 @@ int main(int argc, char** argv) {
             d_B, layoutA, d_A, layoutB, &beta0, d_D, layoutC, d_D, layoutC,
             heur_plain, n_plain, d_workspace, WORKSPACE_BYTES, sz_d, t0, t1);
 
-    // ── Fused + unfused + post-only ──
+    // Fused + unfused + post-only
 
     BenchResult mxfp8_fused = {-1.0f, -1}, mxfp8_unfused = {-1.0f, -1};
     BenchResult plain_fused = {-1.0f, -1}, plain_unfused = {-1.0f, -1};
@@ -521,7 +526,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ── Results ──
+    // Results
 
     printf("\n══════════════════════════════════════════════════════════════════════════\n");
     printf("cuBLASLt FP8 Results (M=%d N=%d K=%d%s)\n", M, N_DIM, K_DIM, EPI_SUFFIX[E]);
@@ -573,7 +578,7 @@ int main(int argc, char** argv) {
             oh("PerTensor", plain_gemm, plain_fused, plain_unfused);
     }
 
-    // ── Cleanup ──
+    // Cleanup
 
     CUDA_CHECK(cudaEventDestroy(t0));
     CUDA_CHECK(cudaEventDestroy(t1));

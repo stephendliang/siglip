@@ -1,18 +1,19 @@
-// CUTLASS 4.x SM100a per-tensor FP8 GEMM policy + tile grid search
-// ═══════════════════════════════════════════════════════════════
-//
-// Compile-time config (via -D flags):
-//   BENCH_N          Output dimension         (default: 768)
-//   BENCH_K          Reduction dimension       (default: 768)
-//   BENCH_EPILOGUE   Epilogue type (int):
-//     1 = PERIODIC_ADD — fused periodic table add (patch embed)
-//     2 = GELU_BIAS    — fused bias + GELU_taylor (FC1)
-//     3 = BIAS_ONLY    — fused bias only (FC2)
-//
-// Build:  make cutlass-bench        (patch embed: N=768, K=768, PERIODIC_ADD)
-//         make cutlass-bench-fc1    (FC1: N=3072, K=768, GELU_BIAS)
-//         make cutlass-bench-fc2    (FC2: N=768, K=3072, BIAS_ONLY)
-//         make cutlass-bench-max    (extended patch embed sweep)
+/*
+CUTLASS 4.x SM100a per-tensor FP8 GEMM policy + tile grid search
+
+Compile-time config (via -D flags):
+  BENCH_N          Output dimension         (default: 768)
+  BENCH_K          Reduction dimension       (default: 768)
+  BENCH_EPILOGUE   Epilogue type (int):
+    1 = PERIODIC_ADD — fused periodic table add (patch embed)
+    2 = GELU_BIAS    — fused bias + GELU_taylor (FC1)
+    3 = BIAS_ONLY    — fused bias only (FC2)
+
+Build:  make cutlass-bench        (patch embed: N=768, K=768, PERIODIC_ADD)
+        make cutlass-bench-fc1    (FC1: N=3072, K=768, GELU_BIAS)
+        make cutlass-bench-fc2    (FC2: N=768, K=3072, BIAS_ONLY)
+        make cutlass-bench-max    (extended patch embed sweep)
+*/
 
 #include <cstdio>
 #include <cstdlib>
@@ -35,7 +36,7 @@
 #include <cuda_bf16.h>
 #include "cutlass/epilogue/thread/activation.h"
 
-// ── Compile-time configuration ──
+// Compile-time configuration
 
 #ifndef BENCH_N
 #define BENCH_N 768
@@ -76,7 +77,7 @@ static_assert(BENCH_EPILOGUE >= 1 && BENCH_EPILOGUE <= 3, "BENCH_EPILOGUE must b
     } \
 } while(0)
 
-// ── Unfused post-processing kernels ──
+// Unfused post-processing kernels
 
 __global__ void precompute_combined(
     const float* __restrict__ bias,
@@ -170,9 +171,7 @@ static float host_gelu_taylor(float x) {
     return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
 }
 
-// ═══════════════════════════════════════════════════════════════
 // CUTLASS kernel templates — per-tensor FP8 E4M3, BF16 output
-// ═══════════════════════════════════════════════════════════════
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
@@ -213,7 +212,7 @@ struct StageCountSelector<0, CarveoutBytes> {
     using Type = cutlass::gemm::collective::StageCountAutoCarveout<CarveoutBytes>;
 };
 
-// ── Timing helper: warmup + event-timed loop ──
+// Timing helper: warmup + event-timed loop
 
 template <typename GemmAdapter>
 static float run_gemm_timed(GemmAdapter& gemm,
@@ -313,7 +312,7 @@ static float run_gemm_plus_post_timed(GemmAdapter& gemm,
     return ms;
 }
 
-// ── GemmInstance: full CUTLASS type chain parameterized on tile, cluster, epilogue compute type ──
+// GemmInstance: full CUTLASS type chain parameterized on tile, cluster, epilogue compute type
 
 template <
     int TM, int TN, int TK, int CM, int CN,
@@ -451,7 +450,7 @@ struct GemmInstance {
     }
 };
 
-// ── FusedPeriodicGemmInstance: GEMM + periodic table add fused in epilogue via custom EVT ──
+// FusedPeriodicGemmInstance: GEMM + periodic table add fused in epilogue via custom EVT
 #if BENCH_EPILOGUE == 1
 
 template <
@@ -544,7 +543,7 @@ struct FusedPeriodicGemmInstance {
 
 #endif // BENCH_EPILOGUE == 1
 
-// ── BiasActGemmInstance: GEMM + per-col bias + activation fused in epilogue ──
+// BiasActGemmInstance: GEMM + per-col bias + activation fused in epilogue
 // ActivationFn: GELU_taylor (FC1), Identity (FC2)
 
 template <
@@ -638,7 +637,7 @@ struct BiasActGemmInstance {
     }
 };
 
-// ── Grid search dispatch ──
+// Grid search dispatch
 
 struct ConfigResult {
     std::string tile_str;
@@ -733,7 +732,7 @@ static float bench_bias_act_only(
     return ms;
 }
 
-// ── Validation ──
+// Validation
 
 // Validate fused EVT output: spot-check strided samples against CPU reference.
 static bool validate_fused_evt(void* d_D, int M, int N, int K, int seq_len) {
@@ -805,7 +804,7 @@ static bool validate_bias_act_fused(void* d_D, int M, int N, int K, bool do_gelu
     return true;
 }
 
-// ── Unified try_config_policy ──
+// Unified try_config_policy
 
 template <
     int TM, int TN, int TK, int CM, int CN,
@@ -953,7 +952,7 @@ void try_config_policy(
     results.push_back(r);
 }
 
-// ── Unified try_config_family ──
+// Unified try_config_family
 
 template <int TM, int TN, int TK, int CM, int CN>
 void try_config_family(
@@ -1064,9 +1063,7 @@ void try_config_family(
 
 #endif // CUTLASS_ARCH_MMA_SM100_SUPPORTED
 
-// ═══════════════════════════════════════════════════════════════
 // Main
-// ═══════════════════════════════════════════════════════════════
 
 int main(int argc, char** argv) {
     setbuf(stdout, NULL);
@@ -1105,7 +1102,7 @@ int main(int argc, char** argv) {
     hw_info.device_id = device;
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
-    // ── Allocate data ──
+    // Allocate data
     size_t sz_a  = (size_t)M * K_DIM;
     size_t sz_b  = (size_t)N_DIM * K_DIM;
     size_t sz_d  = (size_t)M * N_DIM * sizeof(ElementD);
@@ -1199,7 +1196,7 @@ int main(int argc, char** argv) {
         epilogue_data = d_epi_bias;
     }
 
-    // ── Grid/policy search ──
+    // Grid/policy search
     std::vector<ConfigResult> results;
 
 #if CUTLASS_EXTENDED_SWEEP
@@ -1289,7 +1286,7 @@ int main(int argc, char** argv) {
 #endif
     }
 
-    // ── Sort by primary fused metric ──
+    // Sort by primary fused metric
     std::sort(results.begin(), results.end(), [](const ConfigResult& a, const ConfigResult& b) {
         float av = a.ms_fused > 0 ? a.ms_fused : 1e9f;
         float bv = b.ms_fused > 0 ? b.ms_fused : 1e9f;
@@ -1302,7 +1299,7 @@ int main(int argc, char** argv) {
         return a3 < b3;
     });
 
-    // ── Results table ──
+    // Results table
     auto tflops = [&](float ms) -> float {
         return ms > 0 ? (float)(flops / ms / 1e9) : 0.0f;
     };

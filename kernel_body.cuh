@@ -1,10 +1,12 @@
-// kernel_body.cuh — shared kernel body for tcgen05 persistent GEMM kernels
-// Contains epilogue_store template and persistent_gemm kernel template.
-// Each .cu file: #define N_DIM → #include "kernel_common.cuh" → define transform macros → #include "kernel_body.cuh"
+/*
+kernel_body.cuh — shared kernel body for tcgen05 persistent GEMM kernels
+Contains epilogue_store template and persistent_gemm kernel template.
+Each .cu file: #define N_DIM → #include "kernel_common.cuh" → define transform macros → #include "kernel_body.cuh"
+*/
 
 #pragma once
 
-// ── Epilogue operation selector ──────────────────────────────
+// Epilogue operation selector
 enum class EpilogueOp : int { BIAS_ADD = 0, BIAS_GELU = 1, BIAS_RESIDUAL = 2 };
 
 template<EpilogueOp Op> struct EpilogueSideData;
@@ -13,8 +15,10 @@ template<> struct EpilogueSideData<EpilogueOp::BIAS_GELU>     { using type = con
 template<> struct EpilogueSideData<EpilogueOp::BIAS_RESIDUAL>  { using type = const float*; };
 template<EpilogueOp Op> using SideDataPtr = typename EpilogueSideData<Op>::type;
 
-// ── Stub macros for dead if-constexpr branches ───────────────
-// Preprocessor expands before template instantiation; stubs provide syntactically valid no-ops.
+/*
+Stub macros for dead if-constexpr branches —
+preprocessor expands before template instantiation; stubs provide syntactically valid no-ops.
+*/
 #ifndef CVT_ADD_STS_V4
 #define CVT_ADD_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, c0,c1,c2,c3, SADDR) ((void)0)
 constexpr bool HAS_CVT_ADD = false;
@@ -41,8 +45,10 @@ constexpr bool HAS_BIAS_RES_CVT = true;
 #define COMB_BLOCK_ELEMS 1
 #endif
 
-// ── Epilogue: TMEM → transform → CVT → swizzle SMEM regions → TMA tensor stores ──
-// Transform selected by Op: BIAS_ADD (combined table), BIAS_GELU (bias+GELU), BIAS_RESIDUAL (bias+residual)
+/*
+Epilogue: TMEM → transform → CVT → swizzle SMEM regions → TMA tensor stores
+Transform selected by Op: BIAS_ADD (combined table), BIAS_GELU (bias+GELU), BIAS_RESIDUAL (bias+residual)
+*/
 
 template<int NC_START, int NC_END, EpilogueOp Op>
 static __device__ __forceinline__
@@ -100,7 +106,7 @@ void epilogue_store(
     float a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47;
     float a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63;
 
-    // ═══ Phase 1: all cols → swizzle regions, x64 stride ═══
+    // Phase 1: all cols → swizzle regions, x64 stride
     TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                   a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                   a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47,
@@ -117,7 +123,6 @@ void epilogue_store(
         float4 bv0 = {}, bv1 = {};
         uint4 rv0 = {};
         if constexpr (Op == EpilogueOp::BIAS_ADD) {
-            static_assert(HAS_CVT_ADD, "BIAS_ADD requires CVT_ADD_STS_V4 macro — define before #include \"kernel_body.cuh\"");
             comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
             craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
@@ -138,7 +143,6 @@ void epilogue_store(
 
         // Transform: accumulator → (op-specific) → BF16 → SMEM
         if constexpr (Op == EpilogueOp::BIAS_ADD) {
-            // First 32 cols: a0..a31
             {
                 CVT_ADD_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, craw0.x,craw0.y,craw0.z,craw0.w, srow + (0 ^ xor_val));
                 CVT_ADD_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, craw1.x,craw1.y,craw1.z,craw1.w, srow + (16 ^ xor_val));
@@ -147,7 +151,6 @@ void epilogue_store(
                 CVT_ADD_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, craw0.x,craw0.y,craw0.z,craw0.w, srow + (32 ^ xor_val));
                 CVT_ADD_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, craw1.x,craw1.y,craw1.z,craw1.w, srow + (48 ^ xor_val));
             }
-            // Second 32 cols: a32..a63
             {
                 const __nv_bfloat16* comb_ptr2 = comb_base + (long long)((n_start + nc + 32) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
                 craw0 = *reinterpret_cast<const uint4*>(comb_ptr2);
@@ -160,9 +163,7 @@ void epilogue_store(
                 CVT_ADD_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63, craw1.x,craw1.y,craw1.z,craw1.w, srow + (112 ^ xor_val));
             }
         } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
-            static_assert(HAS_GELU_CVT, "BIAS_GELU requires GELU_CVT_STS_V4 macro — define before #include \"kernel_body.cuh\"");
             const float* bp = side_data + n_start + nc;
-            // First 32 cols: a0..a31
             {
                 GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, srow + (0 ^ xor_val));
                 float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
@@ -175,7 +176,6 @@ void epilogue_store(
                 float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
                 GELU_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, srow + (48 ^ xor_val));
             }
-            // Second 32 cols: a32..a63
             {
                 float4 bv8 = __ldg(reinterpret_cast<const float4*>(bp + 32));
                 float4 bv9 = __ldg(reinterpret_cast<const float4*>(bp + 36));
@@ -193,7 +193,6 @@ void epilogue_store(
         } else if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
             static_assert(HAS_BIAS_RES_CVT, "BIAS_RESIDUAL requires BIAS_RES_CVT_STS_V4 macro — define before #include \"kernel_body.cuh\"");
             const float* bp = side_data + n_start + nc;
-            // First 32 cols: a0..a31
             {
                 BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, rv0.x,rv0.y,rv0.z,rv0.w, srow + (0 ^ xor_val));
                 float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
@@ -209,7 +208,6 @@ void epilogue_store(
                 uint4 rv3 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 24));
                 BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, rv3.x,rv3.y,rv3.z,rv3.w, srow + (48 ^ xor_val));
             }
-            // Second 32 cols: a32..a63
             {
                 float4 bv8 = __ldg(reinterpret_cast<const float4*>(bp + 32));
                 float4 bv9 = __ldg(reinterpret_cast<const float4*>(bp + 36));
@@ -277,7 +275,7 @@ void epilogue_store(
     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
     float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
 
-    // ═══ Phase 1: all cols → swizzle regions, x32 stride ═══
+    // Phase 1: all cols → swizzle regions, x32 stride
     LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                  taddr_base + NC_START);
@@ -291,7 +289,6 @@ void epilogue_store(
         float4 bv0 = {}, bv1 = {};
         uint4 rv0 = {};
         if constexpr (Op == EpilogueOp::BIAS_ADD) {
-            static_assert(HAS_CVT_ADD, "BIAS_ADD requires CVT_ADD_STS_V4 macro — define before #include \"kernel_body.cuh\"");
             comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
             craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
@@ -323,7 +320,6 @@ void epilogue_store(
             CVT_ADD_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, craw0.x,craw0.y,craw0.z,craw0.w, srow + ((byte_base + 32) ^ xor_val));
             CVT_ADD_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, craw1.x,craw1.y,craw1.z,craw1.w, srow + ((byte_base + 48) ^ xor_val));
         } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
-            static_assert(HAS_GELU_CVT, "BIAS_GELU requires GELU_CVT_STS_V4 macro — define before #include \"kernel_body.cuh\"");
             GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, srow + (byte_base ^ xor_val));
             float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
             float4 bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
@@ -336,7 +332,6 @@ void epilogue_store(
             float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
             GELU_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, srow + ((byte_base + 48) ^ xor_val));
         } else if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
-            static_assert(HAS_BIAS_RES_CVT, "BIAS_RESIDUAL requires BIAS_RES_CVT_STS_V4 macro — define before #include \"kernel_body.cuh\"");
             BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, rv0.x,rv0.y,rv0.z,rv0.w, srow + (byte_base ^ xor_val));
             float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
             float4 bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
@@ -441,9 +436,9 @@ void epilogue_store(
 #endif
 }
 
-// ═════════════════════════════════════════════════════════════
-// Persistent GEMM — warp-specialized tcgen05 (cta_group::2)
-// ═════════════════════════════════════════════════════════════
+/*
+Persistent GEMM — warp-specialized tcgen05 (cta_group::2)
+*/
 
 template<EpilogueOp Op>
 __global__ void __launch_bounds__(THREADS, 1)
@@ -472,7 +467,7 @@ persistent_gemm(
     const int cluster_id = sm_id / 2;
     const int num_clusters = SM_COUNT / 2;
 
-    // ── Mbarrier init ──
+    // Mbarrier init
     if (tid == 0) {
         for (int s = 0; s < N_STAGES; s++) {
             mbar_init(smem_to_uint(smem + OFF_TMA_MBAR + s * 8), 2);
@@ -487,7 +482,7 @@ persistent_gemm(
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
-    // ── TMEM alloc ──
+    // TMEM alloc
     if (warp == 1) {
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
             :: "r"(smem_to_uint(smem + OFF_TMEM)), "r"(TMEM_COLS));
@@ -545,7 +540,7 @@ persistent_gemm(
         const int n_start = tn * TN;
 
         if (warp == 0) {
-            // ── LOAD WARP (W0) ──
+            // LOAD WARP (W0)
             if (lane == 0) {
                 MAYBE_UNROLL_W0
                 for (int ki = 0; ki < K_ITERS; ki++) {
@@ -564,7 +559,7 @@ persistent_gemm(
                 }
             }
         } else if (warp == 1) {
-            // ── MMA WARP (W1) ──
+            // MMA WARP (W1)
             if (lane == 0 && cta_rank == 0) {
 #ifdef TIMING
                 t_tile_start = clock64();
@@ -636,7 +631,7 @@ persistent_gemm(
 #endif
             }
         } else {
-            // ── OVERLAPPED EPILOGUE (W2+) ──
+            // OVERLAPPED EPILOGUE (W2+)
             const int ew = warp - 2;
             const int row_group = ew % 4;
             const int is_split = (row_group < (NUM_EPI_WARPS - 4)) ? 1 : 0;
@@ -749,7 +744,7 @@ persistent_gemm(
     }
 #endif
 
-    // ── DRAIN (W2+ only): epilogue for the last tile ──
+    // DRAIN (W2+ only): epilogue for the last tile
     if (warp >= 2) {
         const int ew = warp - 2;
         const int row_group = ew % 4;
@@ -804,7 +799,7 @@ persistent_gemm(
         __syncwarp();
     }
 
-    // ── Cluster sync + TMEM dealloc ──
+    // Cluster sync + TMEM dealloc
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
@@ -814,9 +809,9 @@ persistent_gemm(
     }
 }
 
-// ═════════════════════════════════════════════════════════════
-// Host timing readback + analysis (shared between all kernels)
-// ═════════════════════════════════════════════════════════════
+/*
+Host timing readback + analysis (shared between all kernels)
+*/
 
 #ifdef TIMING
 static int cmp_ll(const void* a, const void* b) {
@@ -831,7 +826,7 @@ static void print_timing(long long* d_timing, long long* d_spread, size_t spread
     long long* h_spread = (long long*)malloc(spread_bytes);
     CUDA_CHECK(cudaMemcpy(h_spread, d_spread, spread_bytes, cudaMemcpyDeviceToHost));
 
-    // ── Aggregate W1 data across clusters ──
+    // Aggregate W1 data across clusters
     long long g_epi = 0, g_tma0 = 0, g_kloop = 0, g_total = 0;
     long long g_min_kloop = 0x7FFFFFFFFFFFFFFFLL, g_max_kloop = 0;
     long long g_min_total = 0x7FFFFFFFFFFFFFFFLL, g_max_total = 0;
@@ -864,7 +859,7 @@ static void print_timing(long long* d_timing, long long* d_spread, size_t spread
            g_min_total > 0 ? (double)g_max_total / g_min_total : 0.0);
     printf("  Expected total cycles (wall clock): %.0f\n", _ms * 1e-3 * clock_ghz * 1e9);
 
-    // ── Per-warp Phase 1 data ──
+    // Per-warp Phase 1 data
     long long gw_sum_p1[NUM_EPI_WARPS] = {0};
     long long gw_min_p1[NUM_EPI_WARPS], gw_max_p1[NUM_EPI_WARPS];
     int gw_count[NUM_EPI_WARPS] = {0};
@@ -897,7 +892,7 @@ static void print_timing(long long* d_timing, long long* d_spread, size_t spread
     }
     int total_epi_tiles = gw_count[1];
 
-    // ── Per-warp p95 and inter-warp spread ──
+    // Per-warp p95 and inter-warp spread
     int n_spread_tiles = 0;
     for (int c = 0; c < 74; c++) {
         int ts = (int)((long long)c * TOTAL_TILES / 74);
@@ -966,7 +961,7 @@ static void print_timing(long long* d_timing, long long* d_spread, size_t spread
     else
         printf("  => ASYMMETRIC (avg spread %lld >= 200 cyc): port-queued or bank-conflict bias, F27 has a target\n", warp_avg_spread);
 
-    // ── Backward-compat: W3/ew=1 full phase timing ──
+    // Backward-compat: W3/ew=1 full phase timing
     printf("\n=== EPILOGUE PHASE TIMING (W3/ew=1, %d tiles across 74 clusters) ===\n", total_epi_tiles);
     if (total_epi_tiles > 0) {
         long long avg_ml = g_eml / total_epi_tiles;

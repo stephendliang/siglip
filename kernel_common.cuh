@@ -1,8 +1,10 @@
-// kernel_common.cuh — shared infrastructure for tcgen05 persistent GEMM kernels
-// B200 (SM100a), cta_group::2, __cluster_dims__(2,1,1)
-// Warp-specialized: Load(W0) | MMA(W1) | Epilogue(W2+)
-//
-// Usage: #define N_DIM and K_DIM before including this header.
+/*
+kernel_common.cuh — shared infrastructure for tcgen05 persistent GEMM kernels
+B200 (SM100a), cta_group::2, __cluster_dims__(2,1,1)
+Warp-specialized: Load(W0) | MMA(W1) | Epilogue(W2+)
+
+Usage: #define N_DIM and K_DIM before including this header.
+*/
 
 #pragma once
 
@@ -12,10 +14,10 @@
 #include <cstdio>
 #include <cstdlib>
 
-// ── Hardware ──────────────────────────────────────────────────
+// Hardware
 #define SM_COUNT       148
 
-// ── Tuning parameters (overridable via -D at compile time) ───
+// Tuning parameters (overridable via -D at compile time)
 #ifndef NUM_EPI_WARPS
 #define NUM_EPI_WARPS  4
 #endif
@@ -67,11 +69,12 @@
 #define MAYBE_UNROLL_SUB
 #endif
 
-// ── Thread config ─────────────────────────────────────────────
+// Thread config
 #define THREADS        (32 * (2 + NUM_EPI_WARPS))
 
-// ── Problem dimensions ────────────────────────────────────────
-// N_DIM must be defined before including this header
+/*
+Problem dimensions — N_DIM must be defined before including this header
+*/
 #ifndef N_DIM
 #error "Define N_DIM before including kernel_common.cuh"
 #endif
@@ -82,7 +85,7 @@
 #error "Define K_DIM before including kernel_common.cuh"
 #endif
 
-// ── Tile dimensions ───────────────────────────────────────────
+// Tile dimensions
 #define TM             128
 #define TN             256
 #define TK             128
@@ -93,7 +96,7 @@
 #define MMA_K          32
 #define MMA_PER_KI     (TK / MMA_K)                             // 4
 
-// ── Pipeline / SMEM layout ────────────────────────────────────
+// Pipeline / SMEM layout
 #define STAGE_BYTES    32768                                      // 16KB A + 16KB B per stage
 #define OFF_TMEM           (N_STAGES * STAGE_BYTES)
 #define OFF_TMA_MBAR       (OFF_TMEM + 8)
@@ -106,19 +109,19 @@
 #define STAGING_WARP_BYTES        (4 * STAGING_REGION_BYTES)                         // 16384 bytes per warp (4 regions x 4096)
 #define SMEM_BYTES                ((OFF_STAGING + NUM_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
 
-// ── WGMMA / TMEM constants ───────────────────────────────────
+// WGMMA / TMEM constants
 #define TMEM_COLS      512
 #define IDESC          0x10400010U
 #define SBO            1024
 #define TMA_BYTES      32768
 
-// ── Timing instrumentation ────────────────────────────────────
+// Timing instrumentation
 #ifdef TIMING
 #define TIMING_CLUSTER_STRIDE 32
 #define MAX_SPREAD_TILES 148
 #endif
 
-// ── Error check macros ────────────────────────────────────────
+// Error check macros
 
 #define CUDA_CHECK(x) do { \
     cudaError_t e_ = (x); \
@@ -137,7 +140,7 @@
     } \
 } while(0)
 
-// ── Device helpers ────────────────────────────────────────────
+// Device helpers
 
 static __device__ __forceinline__
 uint32_t smem_to_uint(const void* p) {
@@ -207,9 +210,11 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
         :: "r"(mbar_addr), "h"(cta_mask) : "memory");
 }
 
-// ── K-iteration macro (accumulating, for ki >= 1) ─────────────
-// Used for ki=1..K_ITERS-1 where accumulator is already initialized.
-// S is the stage index (0..N_STAGES-1); works with runtime values but best with constants.
+/*
+K-iteration macro (accumulating, for ki >= 1)
+Used for ki=1..K_ITERS-1 where accumulator is already initialized.
+S is the stage index (0..N_STAGES-1); works with runtime values but best with constants.
+*/
 #define K_ITER_ACCUM(S) do { \
     mbar_wait(tma_mbar[S], tma_phase[S]); \
     tma_phase[S] ^= 1; \
@@ -244,7 +249,7 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
     tcgen05_commit_mcast(mma_mbar[S], 0x3); \
 } while(0)
 
-// ── TMEM load macros ──────────────────────────────────────────
+// TMEM load macros
 
 #define TMEM_LOAD(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15, TADDR) \
     asm volatile( \

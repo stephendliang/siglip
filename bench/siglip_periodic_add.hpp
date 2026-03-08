@@ -1,43 +1,41 @@
-// SM100a Epilogue Visitor: Periodic Table Addition for SigLIP2 Vision Encoder
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// Fuses a periodic [seq_len, N] BF16 table add into the GEMM epilogue:
-//
-//   D[m, n] = bf16( bf16(acc[m, n]) + combined[m % seq_len, n] )
-//
-// Numeric semantics match the patch embed kernel: FP32 acc → BF16 first (cvt.rn.bf16x2.f32),
-// then BF16 + BF16 add (add.rn.bf16x2). NOT float-domain add then convert.
-//
-// where combined[i, j] = bias[j] + pos_embed[i, j] is precomputed on host.
-// The table (196 × 768 × 2B = 294 KB) is L2-resident on B200.
-//
-// Architecture: SM100a (Blackwell) only.
-// Integration: CUTLASS 4.x CollectiveBuilder, EVT-based epilogue fusion.
-//
-// This avoids:
-//   - Full [M, N] C matrix read (saves ~1.33 GB HBM traffic vs beta=1 fusion)
-//   - Separate unfused post-add kernel (saves kernel launch + full D round-trip)
-//
-// Usage with CUTLASS CollectiveBuilder:
-//
-//   // Pass as FusionOpOrCallbacks — NOT a tagged FusionOp, uses passthrough
-//   using FusionOp = cutlass::epilogue::fusion::SigLipPeriodicAdd<>;
-//
-//   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-//       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
-//       TileShape, ClusterShape,
-//       cutlass::epilogue::collective::EpilogueTileAuto,
-//       float, float,               // ElementAccumulator, ElementCompute
-//       void, LayoutC, AlignC,      // void C — no source load needed
-//       ElementD, LayoutD, AlignD,
-//       cutlass::epilogue::collective::EpilogueScheduleAuto,
-//       FusionOp
-//   >::CollectiveOp;
-//
-//   // Set epilogue arguments:
-//   arguments.epilogue.thread.op_1.ptr_combined = ptr;
-//   arguments.epilogue.thread.op_1.seq_len = 196;
-//
+/*
+SM100a Epilogue Visitor: Periodic Table Addition for SigLIP2 Vision Encoder
+
+Fuses a periodic [seq_len, N] BF16 table add into the GEMM epilogue:
+
+  D[m, n] = bf16( bf16(acc[m, n]) + combined[m % seq_len, n] )
+
+Numeric semantics match the patch embed kernel: FP32 acc → BF16 first (cvt.rn.bf16x2.f32),
+then BF16 + BF16 add (add.rn.bf16x2). NOT float-domain add then convert.
+
+where combined[i, j] = bias[j] + pos_embed[i, j] is precomputed on host.
+The table (196 × 768 × 2B = 294 KB) is L2-resident on B200.
+
+Architecture: SM100a (Blackwell) only.
+Integration: CUTLASS 4.x CollectiveBuilder, EVT-based epilogue fusion.
+
+This avoids:
+  - Full [M, N] C matrix read (saves ~1.33 GB HBM traffic vs beta=1 fusion)
+  - Separate unfused post-add kernel (saves kernel launch + full D round-trip)
+
+Usage with CUTLASS CollectiveBuilder:
+
+  using FusionOp = cutlass::epilogue::fusion::SigLipPeriodicAdd<>;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+      TileShape, ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      float, float,
+      void, LayoutC, AlignC,
+      ElementD, LayoutD, AlignD,
+      cutlass::epilogue::collective::EpilogueScheduleAuto,
+      FusionOp
+  >::CollectiveOp;
+
+  arguments.epilogue.thread.op_1.ptr_combined = ptr;
+  arguments.epilogue.thread.op_1.seq_len = 196;
+*/
 
 #pragma once
 
@@ -50,21 +48,19 @@ namespace cutlass::epilogue::fusion {
 
 using namespace cute;
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
-//
-// Sm100PeriodicAddNode — Custom EVT compute node for SM100a
-//
-// Takes accumulator from child (Sm90AccFetch), adds values from a compact
-// periodic table indexed by global_row % seq_len, converts to output type.
-//
-// No SMEM, no TMA: vectorized 128-bit loads from L2-resident global memory via __ldg().
-//
-// IMPORTANT: The relative coordinate tensor (tCcD) from ConsumerStoreArgs does NOT
-// give actual output (m,n) positions on SM100 — it's only for OOB predication.
-// We reconstruct the absolute coordinate tensor from the identity tensor, matching
-// the SM100 epilogue's own construction (sm100_epilogue_tma_warpspecialized.hpp).
-//
-/////////////////////////////////////////////////////////////////////////////////////////////////
+/*
+Sm100PeriodicAddNode — Custom EVT compute node for SM100a
+
+Takes accumulator from child (Sm90AccFetch), adds values from a compact
+periodic table indexed by global_row % seq_len, converts to output type.
+
+No SMEM, no TMA: vectorized 128-bit loads from L2-resident global memory via __ldg().
+
+IMPORTANT: The relative coordinate tensor (tCcD) from ConsumerStoreArgs does NOT
+give actual output (m,n) positions on SM100 — it's only for OOB predication.
+We reconstruct the absolute coordinate tensor from the identity tensor, matching
+the SM100 epilogue's own construction (sm100_epilogue_tma_warpspecialized.hpp).
+*/
 
 template <
   class ElementOutput_,     // Output element type (typically bfloat16_t)
@@ -138,9 +134,10 @@ struct Sm100PeriodicAddNode {
     return EmptyProducerLoadCallbacks{};
   }
 
-  // ── ConsumerStoreCallbacks ──
-  // Carries per-CTA state including the ABSOLUTE coordinate tensor,
-  // provides the visit() that does the actual periodic add.
+  /*
+  ConsumerStoreCallbacks — carries per-CTA state including the ABSOLUTE
+  coordinate tensor, provides the visit() that does the actual periodic add.
+  */
 
   template <class AbsCoordTensor>
   struct ConsumerStoreCallbacks : EmptyConsumerStoreCallbacks {
@@ -157,14 +154,16 @@ struct Sm100PeriodicAddNode {
     int N_dim;                    // N dimension of the GEMM problem
     AbsCoordTensor tCcD_abs;      // (T2R,T2R_M,T2R_N,EPI_M,EPI_N) — ABSOLUTE global coords
 
-    // visit() is called per (epi_v, epi_m, epi_n) by the epilogue store loop.
-    //
-    // frg_acc    = raw FP32 accumulator from TMEM (always available)
-    // frg_inputs = output of child node Sm90AccFetch (= frg_acc, the accumulator)
-    // epi_v      = fragment index within the epilogue subtile for this thread
-    // epi_m/n    = epilogue subtile indices within the CTA tile
-    //
-    // Returns Array<ElementOutput, FragmentSize> written to D via TMA store.
+    /*
+    visit() is called per (epi_v, epi_m, epi_n) by the epilogue store loop.
+
+    frg_acc    = raw FP32 accumulator from TMEM (always available)
+    frg_inputs = output of child node Sm90AccFetch (= frg_acc, the accumulator)
+    epi_v      = fragment index within the epilogue subtile for this thread
+    epi_m/n    = epilogue subtile indices within the CTA tile
+
+    Returns Array<ElementOutput, FragmentSize> written to D via TMA store.
+    */
 
     template <typename ElementAccumulator, typename ElementInput, int FragmentSize>
     CUTLASS_DEVICE Array<ElementOutput, FragmentSize>
@@ -174,19 +173,22 @@ struct Sm100PeriodicAddNode {
           int epi_n,
           Array<ElementInput, FragmentSize> const& frg_inputs) {
 
-      // Match patch embed numeric semantics:
-      //   cvt.rn.bf16x2.f32  — FP32 accumulator → BF16 FIRST
-      //   add.rn.bf16x2      — BF16 + BF16 table value (BF16-domain add)
+      /*
+      Match patch embed numeric semantics:
+        cvt.rn.bf16x2.f32  — FP32 accumulator → BF16 FIRST
+        add.rn.bf16x2      — BF16 + BF16 table value (BF16-domain add)
+      */
       using ConvertToBF16 = NumericArrayConverter<ElementOutput, ElementInput, FragmentSize, RoundStyle>;
 
       Array<ElementOutput, FragmentSize> frg_acc_bf16 = ConvertToBF16{}(frg_inputs);
       Array<ElementOutput, FragmentSize> frg_result;
 
-      // ── Vectorized table load ──
-      // SM100 T2R mapping guarantees: all FragmentSize elements in one visit() call
-      // share the same M-row with contiguous N-columns (SM100_TMEM_LOAD_32dp32b1x:
-      // each thread gets 32 consecutive N-values from one M-row of the epilogue subtile).
-      // Extract coordinates once from element 0, then do 128-bit vectorized loads.
+      /*
+      Vectorized table load — SM100 T2R mapping guarantees: all FragmentSize elements
+      in one visit() call share the same M-row with contiguous N-columns
+      (SM100_TMEM_LOAD_32dp32b1x: each thread gets 32 consecutive N-values from
+      one M-row of the epilogue subtile). Extract coords once, then 128-bit loads.
+      */
       auto tCcD_mn = tCcD_abs(_,_,_, epi_m, epi_n);
       auto coord_0 = tCcD_mn(epi_v * FragmentSize);
       int global_m = get<0>(coord_0);
@@ -198,9 +200,11 @@ struct Sm100PeriodicAddNode {
           reinterpret_cast<__nv_bfloat16 const*>(params_ptr->ptr_combined)
           + static_cast<long long>(pos_row) * N_dim + global_n;
 
-      // 128-bit vectorized loads: 8 BF16 values per int4 (= 4 loads for FragmentSize=32)
-      // N-columns are 128-bit aligned (thread starts at multiple-of-32 column offset,
-      // table rows are 768*2B = 1536B aligned, base allocation is 256B-aligned via cudaMalloc)
+      /*
+      128-bit vectorized loads: 8 BF16 values per int4 (= 4 loads for FragmentSize=32).
+      N-columns are 128-bit aligned (thread starts at multiple-of-32 column offset,
+      table rows are 768*2B = 1536B aligned, base allocation is 256B-aligned via cudaMalloc).
+      */
       constexpr int BF16_PER_VEC = sizeof(int4) / sizeof(ElementTable);  // 16/2 = 8
       constexpr int NUM_VECS = FragmentSize / BF16_PER_VEC;
       constexpr int TAIL = FragmentSize % BF16_PER_VEC;

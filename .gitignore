@@ -1,13 +1,17 @@
 # Build artifacts
-siglip_vision
-siglip_timing
-siglip_best
-siglip_x32
-siglip_x64
+patch_embed
+patch_embed_timing
 cutlass-bench
 cutlass-bench-max
-cutlass-256x256x64
+cutlass-bench-fc1
+cutlass-bench-fc2
+cutlass-bench-fc1-max
+cutlass-bench-fc2-max
 cublas-bench
+cublas-bench-fc1
+cublas-bench-fc2
+fc1-gelu
+fc2
 calibration
 
 # SASS dumps (large, regenerable)

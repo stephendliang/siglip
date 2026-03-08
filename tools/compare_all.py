@@ -26,6 +26,9 @@ import sys
 import time
 from collections import defaultdict
 
+# Force line-buffered stdout so tee/log files flush per-line
+sys.stdout.reconfigure(line_buffering=True)
+
 try:
     import numpy as np
     from scipy import stats
@@ -41,8 +44,8 @@ ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 
 LAYERS = {
     'patch_embed': {
-        'our_target': 'siglip_vision',
-        'our_binary': './siglip_vision',
+        'our_target': 'patch_embed',
+        'our_binary': './patch_embed',
         'our_source': 'patch_embed.cu',
         'cublas_target': 'cublas-bench',
         'cublas_binary': './cublas-bench',
@@ -133,47 +136,16 @@ def parse_cublas(output):
     return tagged
 
 
-def parse_cublas_best_fused(output, epilogue):
-    """Extract the best fused time from cuBLAS output for fair comparison."""
-    tagged = parse_cublas(output)
-
-    # Priority: per-tensor fused > mxfp8 fused > per-tensor gemm+unfused
-    fused_labels = {
-        'PERIODIC_ADD': 'GEMM + fused add (beta=1)',
-        'GELU_BIAS': 'GEMM + fused bias+GELU',
-        'BIAS_ONLY': 'GEMM + fused bias',
-    }
-    unfused_labels = {
-        'PERIODIC_ADD': 'GEMM + unfused periodic add',
-        'GELU_BIAS': 'GEMM + unfused bias+GELU',
-        'BIAS_ONLY': 'GEMM + unfused bias',
-    }
-
-    fused_label = fused_labels[epilogue]
-    unfused_label = unfused_labels[epilogue]
-
-    # Try per-tensor fused first, then mxfp8 fused, then unfused
-    for prefix in ['per_tensor', 'mxfp8']:
-        key = f"{prefix}_{fused_label}"
-        if key in tagged:
-            return tagged[key]['ms'], f"cuBLAS {prefix} fused"
-
-    for prefix in ['per_tensor', 'mxfp8']:
-        key = f"{prefix}_{unfused_label}"
-        if key in tagged:
-            return tagged[key]['ms'], f"cuBLAS {prefix} unfused"
-
-    return None, None
-
 
 def parse_cublas_gemm_only(output):
-    """Extract best GEMM-only time from cuBLAS (reference)."""
+    """Extract best GEMM-only time from cuBLAS (fastest across scaling modes)."""
     tagged = parse_cublas(output)
+    candidates = []
     for prefix in ['per_tensor', 'mxfp8']:
         key = f"{prefix}_GEMM only"
         if key in tagged:
-            return tagged[key]['ms']
-    return None
+            candidates.append(tagged[key]['ms'])
+    return min(candidates) if candidates else None
 
 
 def parse_cutlass_best_fused(output, epilogue):
@@ -228,13 +200,31 @@ def build_targets(targets, verbose=False):
     return True
 
 
+def rebuild_with_dflags(source, binary, dflags):
+    """Rebuild a kernel binary with custom -D flags from grid search."""
+    nvcc = 'nvcc'
+    arch = 'sm_100a'
+    cflags = f'-gencode arch=compute_100a,code={arch} -O3 -std=c++17 --ptxas-options=-v'
+    ldflags = '-lcurand -lcuda'
+    cmd = f'{nvcc} {cflags} {dflags} {source} -o {binary} {ldflags}'
+    print(f"  Rebuilding {binary} with: {dflags} ...", end=' ', flush=True)
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=ROOT_DIR)
+    if result.returncode != 0:
+        print("FAILED")
+        print(result.stderr[-500:])
+        return False
+    print("ok")
+    return True
+
+
 # ── Run helpers ──
 
-def run_binary(binary, timeout=60):
+def run_binary(binary, timeout=60, args=None):
     """Run a binary, return (stdout, success)."""
+    cmd = [binary] + (args or [])
     try:
         result = subprocess.run(
-            [binary], capture_output=True, text=True, timeout=timeout, cwd=ROOT_DIR)
+            cmd, capture_output=True, text=True, timeout=timeout, cwd=ROOT_DIR)
         return result.stdout + result.stderr, result.returncode == 0
     except subprocess.TimeoutExpired:
         return "", False
@@ -261,34 +251,62 @@ def collect_our_samples(binary, n_runs, label="our kernel"):
     return samples
 
 
-def collect_cublas_samples(binary, epilogue, n_runs):
-    """Run cuBLAS bench n_runs times, return list of best fused ms values."""
-    samples = []
+def parse_cublas_all_fused(output, epilogue):
+    """Extract fused times from cuBLAS output, keyed by scaling mode."""
+    tagged = parse_cublas(output)
+    fused_labels = {
+        'PERIODIC_ADD': 'GEMM + fused add (beta=1)',
+        'GELU_BIAS': 'GEMM + fused bias+GELU',
+        'BIAS_ONLY': 'GEMM + fused bias',
+    }
+    unfused_labels = {
+        'PERIODIC_ADD': 'GEMM + unfused periodic add',
+        'GELU_BIAS': 'GEMM + unfused bias+GELU',
+        'BIAS_ONLY': 'GEMM + unfused bias',
+    }
+    results = {}
+    for prefix in ['per_tensor', 'mxfp8']:
+        key = f"{prefix}_{fused_labels[epilogue]}"
+        if key in tagged:
+            results[prefix] = tagged[key]['ms']
+            continue
+        key = f"{prefix}_{unfused_labels[epilogue]}"
+        if key in tagged:
+            results[prefix] = tagged[key]['ms']
+    return results
+
+
+def collect_cublas_samples(binary, epilogue, n_runs, run_args=None):
+    """Run cuBLAS bench n_runs times. Returns dict of per-mode sample lists + gemm samples."""
+    mode_samples = {}  # 'per_tensor' -> [ms, ...], 'mxfp8' -> [ms, ...]
     gemm_samples = []
     for i in range(n_runs):
-        output, ok = run_binary(binary, timeout=120)
+        output, ok = run_binary(binary, timeout=120, args=run_args)
         if not ok:
             print(f"    cuBLAS run {i+1}/{n_runs}: FAILED")
             continue
-        ms, desc = parse_cublas_best_fused(output, epilogue)
+        fused = parse_cublas_all_fused(output, epilogue)
         gemm_ms = parse_cublas_gemm_only(output)
-        if ms is None:
+        if not fused:
             print(f"    cuBLAS run {i+1}/{n_runs}: could not parse fused time")
             continue
-        samples.append(ms)
+        parts = []
+        for mode, ms in sorted(fused.items()):
+            mode_samples.setdefault(mode, []).append(ms)
+            parts.append(f"{mode}={ms:.3f}")
         if gemm_ms is not None:
             gemm_samples.append(gemm_ms)
-        suffix = f" (GEMM-only: {gemm_ms:.3f} ms)" if gemm_ms else ""
-        print(f"    cuBLAS run {i+1}/{n_runs}: {ms:.3f} ms [{desc}]{suffix}")
-    return samples, gemm_samples
+        print(f"    cuBLAS run {i+1}/{n_runs}: {', '.join(parts)}"
+              f"{f' (GEMM-only: {gemm_ms:.3f})' if gemm_ms else ''}")
+    return mode_samples, gemm_samples
 
 
-def collect_cutlass_samples(binary, epilogue, n_runs):
+def collect_cutlass_samples(binary, epilogue, n_runs, run_args=None):
     """Run CUTLASS bench n_runs times, return list of best fused ms values."""
     samples = []
     gemm_samples = []
     for i in range(n_runs):
-        output, ok = run_binary(binary, timeout=300)
+        output, ok = run_binary(binary, timeout=300, args=run_args)
         if not ok:
             print(f"    CUTLASS run {i+1}/{n_runs}: FAILED")
             continue
@@ -401,32 +419,59 @@ def run_anova(groups, layer_label):
 
 # ── Grid search (optional) ──
 
-def run_grid_search(kernel, tier='all'):
-    """Run grid search and return the best config's dflags."""
-    print(f"\n  Running grid search for {kernel} (tier={tier})...")
-    cmd = [sys.executable, os.path.join(SCRIPT_DIR, 'grid_search.py'),
+def run_grid_search(kernel, tier='all', csv_dir=None):
+    """Run grid search and return the best config's dflags.
+
+    Streams grid_search.py output to a log file (unbuffered) so progress
+    survives SSH disconnects. Parses the log file afterward for the winner.
+    """
+    log_dir = csv_dir or os.path.join(ROOT_DIR, 'data')
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f'grid_search_{kernel}.log')
+
+    print(f"\n  Running grid search for {kernel} (tier={tier})")
+    print(f"  Log: {log_path}")
+    cmd = [sys.executable, '-u',  # unbuffered python output
+           os.path.join(SCRIPT_DIR, 'grid_search.py'),
            '--kernel', kernel, '--tier', tier]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, cwd=ROOT_DIR)
-    if result.returncode != 0:
-        print(f"  Grid search failed: {result.stderr[-300:]}")
+    if csv_dir:
+        cmd.extend(['--csv', os.path.join(csv_dir, f'sweep_{kernel}.csv')])
+
+    with open(log_path, 'w') as log_f:
+        proc = subprocess.run(cmd, stdout=log_f, stderr=subprocess.STDOUT,
+                              timeout=7200, cwd=ROOT_DIR)
+
+    if proc.returncode != 0:
+        print(f"  Grid search failed (exit {proc.returncode}), see {log_path}")
         return None
 
-    # Find the best config from output
-    best_ms = None
-    best_dflags = None
-    for line in result.stdout.splitlines():
-        # Grid search prints: [N/M] dflags ... ms / TFLOPS
-        m = re.search(r'([\d.]+) ms / [\d.]+ TFLOPS', line)
-        if m:
-            ms = float(m.group(1))
-            if best_ms is None or ms < best_ms:
-                best_ms = ms
-                # Extract dflags from the line
-                dm = re.search(r'\] (.+?) \.\.\.', line)
-                best_dflags = dm.group(1).strip() if dm else ''
+    # Parse the log file for the winner
+    log_text = open(log_path).read()
 
-    if best_ms is not None:
-        print(f"  Best: {best_ms:.3f} ms  dflags: {best_dflags or '(defaults)'}")
+    # Prefer @@GRID_WINNER (composite pinned winner from --tier all),
+    # fall back to final "Best:" line for single-tier runs.
+    best_dflags = None
+    for line in log_text.splitlines():
+        m = re.match(r'@@GRID_WINNER (.+)', line)
+        if m:
+            best_dflags = m.group(1).strip()
+            break
+
+    if best_dflags is None:
+        for line in log_text.splitlines():
+            m = re.match(r'Best:\s+(.+?)\s+→', line)
+            if m:
+                best_dflags = m.group(1).strip()
+
+    if best_dflags is None:
+        print("  Grid search produced no winner")
+        return None
+
+    if not best_dflags or best_dflags == '(defaults)':
+        print(f"  Best config is defaults — no rebuild needed")
+        return None
+
+    print(f"  Winner dflags: {best_dflags}")
     return best_dflags
 
 
@@ -456,16 +501,29 @@ def main():
 
     os.chdir(ROOT_DIR)
 
+    if args.imgs_per_sm != 32:
+        print(f"WARNING: --imgs-per-sm={args.imgs_per_sm} only affects cuBLAS/CUTLASS.")
+        print("  Our kernels hardcode M_TOTAL=928256 (32 imgs/SM).")
+        print("  Cross-implementation comparisons will be apples-to-oranges.")
+        print()
+
+    n_layers = len(args.layer)
+    n_targets = n_layers * 3  # our + cublas + cutlass per layer
+    grid_configs = 673  # approx valid configs per kernel in --tier all
+
     print("=" * 72)
     print("  Unified Benchmark: cuBLAS vs CUTLASS vs Our Kernel")
     print(f"  Layers: {', '.join(args.layer)}")
     print(f"  Runs per approach: {args.runs}")
     print(f"  CUTLASS mode: {args.cutlass_mode}")
+    if args.grid_search:
+        print(f"  Grid search: {grid_configs} configs/layer x {n_layers} layers (~{grid_configs * n_layers * 5 // 60} min)")
     print("=" * 72)
 
-    # ── Build phase ──
+    # ── Phase 1/4: Build ──
+    t_start = time.time()
     if not args.skip_build:
-        print("\nBuild phase:")
+        print(f"\n[Phase 1/4] BUILD ({n_targets} targets)")
         targets = set()
         for layer_name in args.layer:
             layer = LAYERS[layer_name]
@@ -479,18 +537,47 @@ def main():
         if not build_targets(sorted(targets), verbose=True):
             print("\nBuild failed. Aborting.")
             sys.exit(1)
-        print()
+        print(f"  Build done in {time.time() - t_start:.0f}s")
+    else:
+        print(f"\n[Phase 1/4] BUILD — skipped (--skip-build)")
 
-    # ── Optional grid search ──
+    # ── Phase 2/4: Grid search ──
+    grid_dflags = {}  # layer_name -> best dflags string
+    # Route grid search CSV output to same dir as --csv if provided
+    grid_csv_dir = os.path.dirname(os.path.join(ROOT_DIR, args.csv)) if args.csv else None
     if args.grid_search:
-        print("\nGrid search phase:")
+        t_grid = time.time()
+        print(f"\n[Phase 2/4] GRID SEARCH (~{grid_configs * n_layers * 5 // 60} min, "
+              f"{grid_configs} configs/layer x {n_layers} layers)")
+        print(f"  Each config: compile + run + validate. Progress in log files.")
         for layer_name in args.layer:
             kernel_name = layer_name if layer_name != 'fc1' else 'fc1_gelu'
-            run_grid_search(kernel_name, args.grid_tier)
+            best = run_grid_search(kernel_name, args.grid_tier, csv_dir=grid_csv_dir)
+            if best:
+                grid_dflags[layer_name] = best
 
-    # ── Collection phase ──
+        # Rebuild our kernels with winning configs
+        if grid_dflags:
+            print("\n  Rebuilding with grid search winners:")
+            for layer_name, dflags in grid_dflags.items():
+                layer = LAYERS[layer_name]
+                if not rebuild_with_dflags(layer['our_source'], layer['our_binary'],
+                                           dflags):
+                    print(f"\nFATAL: rebuild failed for {layer_name} with dflags: {dflags}")
+                    print("Cannot benchmark with grid search winners. Aborting.")
+                    sys.exit(1)
+        print(f"  Grid search done in {time.time() - t_grid:.0f}s")
+    else:
+        print(f"\n[Phase 2/4] GRID SEARCH — skipped (no --grid-search)")
+
+    # ── Phase 3/4: Benchmark ──
+    t_bench = time.time()
+    print(f"\n[Phase 3/4] BENCHMARK ({args.runs} runs x {n_layers} layers x 3 implementations)")
     all_raw = []  # for CSV: (layer, approach, run_idx, ms)
     layer_results = {}  # layer -> {approach: [ms, ...]}
+
+    # Build run args for bench binaries (cuBLAS/CUTLASS accept imgs_per_sm)
+    bench_args = [str(args.imgs_per_sm)] if args.imgs_per_sm != 32 else None
 
     for layer_name in args.layer:
         layer = LAYERS[layer_name]
@@ -513,12 +600,14 @@ def main():
 
         # cuBLAS
         print(f"\n  cuBLAS ({layer['cublas_binary']}):")
-        cublas_fused, cublas_gemm = collect_cublas_samples(
-            layer['cublas_binary'], layer['epilogue'], args.runs)
-        if cublas_fused:
-            groups['cuBLAS fused'] = cublas_fused
-            for i, ms in enumerate(cublas_fused):
-                all_raw.append((layer_name, 'cublas_fused', i, ms))
+        cublas_modes, cublas_gemm = collect_cublas_samples(
+            layer['cublas_binary'], layer['epilogue'], args.runs,
+            run_args=bench_args)
+        for mode, samples in cublas_modes.items():
+            label = f"cuBLAS {mode}"
+            groups[label] = samples
+            for i, ms in enumerate(samples):
+                all_raw.append((layer_name, f'cublas_{mode}', i, ms))
         if cublas_gemm:
             groups['cuBLAS GEMM-only'] = cublas_gemm
             for i, ms in enumerate(cublas_gemm):
@@ -527,7 +616,8 @@ def main():
         # CUTLASS
         print(f"\n  CUTLASS ({cutlass_binary}):")
         cutlass_fused, cutlass_gemm = collect_cutlass_samples(
-            cutlass_binary, layer['epilogue'], args.runs)
+            cutlass_binary, layer['epilogue'], args.runs,
+            run_args=bench_args)
         if cutlass_fused:
             groups['CUTLASS fused'] = cutlass_fused
             for i, ms in enumerate(cutlass_fused):
@@ -539,9 +629,12 @@ def main():
 
         layer_results[layer_name] = groups
 
-    # ── Analysis phase ──
+    print(f"  Benchmark done in {time.time() - t_bench:.0f}s")
 
-    print(f"\n\n{'#' * 72}")
+    # ── Phase 4/4: Analysis ──
+    print(f"\n[Phase 4/4] STATISTICAL ANALYSIS")
+
+    print(f"\n{'#' * 72}")
     print(f"{'#':>2}  RESULTS & STATISTICAL ANALYSIS")
     print(f"{'#' * 72}")
 
@@ -579,10 +672,22 @@ def main():
         print("  " + "-" * 72)
         for layer_name in args.layer:
             groups = layer_results[layer_name]
-            row = {'Our kernel': None, 'cuBLAS fused': None, 'CUTLASS fused': None}
-            for k in row:
-                if k in groups and groups[k]:
-                    row[k] = np.mean(groups[k])
+
+            # Find best cuBLAS mode for summary
+            cublas_best = None
+            cublas_label = 'cuBLAS'
+            for k, v in groups.items():
+                if k.startswith('cuBLAS') and 'GEMM-only' not in k and v:
+                    mean = np.mean(v)
+                    if cublas_best is None or mean < cublas_best:
+                        cublas_best = mean
+                        cublas_label = k
+
+            row = {
+                'Our kernel': np.mean(groups['Our kernel']) if 'Our kernel' in groups and groups['Our kernel'] else None,
+                cublas_label: cublas_best,
+                'CUTLASS fused': np.mean(groups['CUTLASS fused']) if 'CUTLASS fused' in groups and groups['CUTLASS fused'] else None,
+            }
             vals = {k: v for k, v in row.items() if v is not None}
             best = min(vals, key=vals.get) if vals else "?"
 
@@ -590,7 +695,7 @@ def main():
                 return f"{v:12.4f}" if v is not None else f"{'n/a':>12s}"
 
             print(f"  {LAYERS[layer_name]['label']:20s}  "
-                  f"{fmt(row['Our kernel'])}  {fmt(row['cuBLAS fused'])}  "
+                  f"{fmt(row['Our kernel'])}  {fmt(row.get(cublas_label))}  "
                   f"{fmt(row['CUTLASS fused'])}  {best}")
 
     # ── Save CSV ──
@@ -605,7 +710,8 @@ def main():
                 writer.writerow(row)
         print(f"\nRaw samples saved to: {csv_path}")
 
-    print(f"\nDone. {args.runs} runs x {len(args.layer)} layers x 3 approaches.")
+    elapsed = time.time() - t_start
+    print(f"\nDone. {args.runs} runs x {n_layers} layers in {elapsed:.0f}s ({elapsed/60:.1f} min).")
 
 
 if __name__ == '__main__':

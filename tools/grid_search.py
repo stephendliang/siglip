@@ -27,6 +27,9 @@ import sys
 import tempfile
 import time
 
+# Force unbuffered stdout so log files get flushed per-line
+sys.stdout.reconfigure(line_buffering=True)
+
 # ── Defaults (match kernel_common.cuh #ifndef values) ──
 DEFAULTS = {
     'N_STAGES': 4,
@@ -474,6 +477,10 @@ def main():
                       f'→ {best["ms"]:.3f} ms / {best["tflops"]:.0f} TFLOPS')
             else:
                 print(f'\nTier {tier_num}: no valid results!')
+
+        # Print the composite pinned winner (all tiers combined)
+        composite_dflags = make_dflags(winners)
+        print(f'\n@@GRID_WINNER {composite_dflags or "(defaults)"}')
 
     else:
         # Single tier

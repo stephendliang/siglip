@@ -1,21 +1,25 @@
-// FC2 kernel — MLP downprojection + residual add
-// Target: B200  Batch: 4736  GEMM: [928256,3072]×[3072,768]^T + bias + residual
-// Pipeline: 4-stage (parameterized)  K-iters: 24  MMA/iter: 4  idesc: 0x10400010
-// Warps: 2+NUM_EPI_WARPS  cta_group::2  __cluster_dims__(2,1,1)
-// Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2+,x32 TMEM ld,interleaved TMA stores)  BF16 output
-// tcgen05.mma.cta_group::2.kind::f8f6f4  (E4M3 × E4M3 → FP32)
-// Each CTA loads own A (128 rows) + half B (128 cols). MMA produces 256×256 output.
-// Epilogue: FP32 acc + bias + residual(BF16) → BF16 CVT → SMEM staging → TMA store
+/*
+FC2 kernel — MLP downprojection + residual add
+Target: B200  Batch: 4736  GEMM: [928256,3072]×[3072,768]^T + bias + residual
+Pipeline: 4-stage (parameterized)  K-iters: 24  MMA/iter: 4  idesc: 0x10400010
+Warps: 2+NUM_EPI_WARPS  cta_group::2  __cluster_dims__(2,1,1)
+Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2+,x32 TMEM ld,interleaved TMA stores)  BF16 output
+tcgen05.mma.cta_group::2.kind::f8f6f4  (E4M3 × E4M3 → FP32)
+Each CTA loads own A (128 rows) + half B (128 cols). MMA produces 256×256 output.
+Epilogue: FP32 acc + bias + residual(BF16) → BF16 CVT → SMEM staging → TMA store
+*/
 
 #define N_DIM          768
 #define K_DIM          3072
 #include "kernel_common.cuh"
 
-// ── Fused bias+residual+CVT+STS macro ──
-// Adds FP32 bias to 8 FP32 accumulators, extracts BF16 residual to F32, adds,
-// converts to 4 BF16x2, stores 16B to SMEM.
-// Uses asm-local .reg to avoid global register inflation.
-// f0-f7: FP32 accumulators, b0-b7: FP32 bias, r0-r3: BF16x2 residual pairs
+/*
+Fused bias+residual+CVT+STS macro
+Adds FP32 bias to 8 FP32 accumulators, extracts BF16 residual to F32, adds,
+converts to 4 BF16x2, stores 16B to SMEM.
+Uses asm-local .reg to avoid global register inflation.
+f0-f7: FP32 accumulators, b0-b7: FP32 bias, r0-r3: BF16x2 residual pairs
+*/
 #define BIAS_RES_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3,b4,b5,b6,b7, r0,r1,r2,r3, SADDR) \
     asm volatile( \
         "{\n\t" \
@@ -55,7 +59,7 @@
 
 #include "kernel_body.cuh"
 
-// ── Device init kernel for residual matrix ──
+// Device init kernel for residual matrix
 __global__ void init_residual(__nv_bfloat16* __restrict__ res, int n_dim, long long total) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < total) {
@@ -65,9 +69,7 @@ __global__ void init_residual(__nv_bfloat16* __restrict__ res, int n_dim, long l
     }
 }
 
-// ═════════════════════════════════════════════════════════════
 // Host
-// ═════════════════════════════════════════════════════════════
 
 int main() {
     setbuf(stdout, NULL);
@@ -85,8 +87,10 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_residual, (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&d_C,        (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16)));
 
-    // A: uniform 0x3C (=1.5 in FP8 E4M3)
-    // B: alternating rows — even rows 0x3C (1.5), odd rows 0x38 (1.0)
+    /*
+    A: uniform 0x3C (=1.5 in FP8 E4M3)
+    B: alternating rows — even rows 0x3C (1.5), odd rows 0x38 (1.0)
+    */
     CUDA_CHECK(cudaMemset(d_A, 0x3C, (size_t)M_TOTAL * K_DIM));
     {
         uint8_t* h_B = (uint8_t*)malloc((size_t)N_DIM * K_DIM);
@@ -172,7 +176,7 @@ int main() {
     CUDA_CHECK(cudaMemset(d_spread, 0, spread_bytes));
 #endif
 
-    // ── Warmup: 2 iterations ──
+    // Warmup: 2 iterations
     printf("Launching warmup (2 iters)...\n");
     for (int _i = 0; _i < 2; _i++) {
     persistent_gemm<EpilogueOp::BIAS_RESIDUAL><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual
@@ -185,7 +189,7 @@ int main() {
     CUDA_CHECK(cudaDeviceSynchronize());
     printf("  Warmup done.\n");
 
-    // ── Timed: 10 iterations ──
+    // Timed: 10 iterations
     printf("Timing: 10 iterations...\n");
     cudaEvent_t _t0, _t1;
     cudaEventCreate(&_t0);
@@ -208,7 +212,7 @@ int main() {
     cudaEventDestroy(_t0);
     cudaEventDestroy(_t1);
 
-    // ── Checksum run ──
+    // Checksum run
     persistent_gemm<EpilogueOp::BIAS_RESIDUAL><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual
 #ifdef TIMING
         , d_timing, d_spread
@@ -228,8 +232,10 @@ int main() {
             cksum += (double)__bfloat162float(h_C[(long long)i * stride]);
     }
 
-    // CPU reference spot checks: 32 positions spread across the matrix
-    // Kernel computes: bf16(gemm_f32 + bias_f32 + bf16_to_f32(residual_bf16))
+    /*
+    CPU reference spot checks: 32 positions spread across the matrix
+    Kernel computes: bf16(gemm_f32 + bias_f32 + bf16_to_f32(residual_bf16))
+    */
     int errors = 0;
     {
         for (int spot = 0; spot < 32; spot++) {

@@ -2,7 +2,7 @@ NVCC     = nvcc
 ARCH     = sm_100a
 CFLAGS   = -gencode arch=compute_100a,code=$(ARCH) -O3 -std=c++17 --ptxas-options=-v
 LDFLAGS  = -lcurand -lcuda
-TARGET   = siglip_vision
+TARGET   = patch_embed
 CU       = patch_embed.cu
 
 CUTLASS_DIR = third_party/cutlass
@@ -17,7 +17,7 @@ $(TARGET): $(CU) kernel_common.cuh kernel_body.cuh
 	$(NVCC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 timing: $(CU) kernel_common.cuh kernel_body.cuh
-	$(NVCC) $(CFLAGS) -DTIMING $< -o siglip_timing $(LDFLAGS)
+	$(NVCC) $(CFLAGS) -DTIMING $< -o patch_embed_timing $(LDFLAGS)
 
 # ── FC1+GELU kernel ──
 fc1-gelu: fc1_gelu.cu kernel_common.cuh kernel_body.cuh
@@ -88,5 +88,5 @@ compare-fast:
 	python3 tools/compare_all.py --runs 5 --layer patch_embed --csv data/compare.csv
 
 clean:
-	rm -f $(TARGET) siglip_timing fc1-gelu fc2 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cublas-bench cublas-bench-fc1 cublas-bench-fc2 calibration
+	rm -f $(TARGET) patch_embed_timing fc1-gelu fc2 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cublas-bench cublas-bench-fc1 cublas-bench-fc2 calibration
 	rm -rf sass/

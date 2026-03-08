@@ -1,10 +1,12 @@
-// Hand-tuned from gen.py output — TK=128, SWIZZLE_128B, 4-stage pipeline
-// Target: B200  Batch: 4736  GEMM: [928256,768]×[768,768]^T
-// Pipeline: 4-stage (parameterized)  K-iters: 6  MMA/iter: 4  idesc: 0x10400010
-// Warps: 2+NUM_EPI_WARPS  cta_group::2  __cluster_dims__(2,1,1)
-// Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2+,x32 TMEM ld,interleaved TMA stores)  BF16 output
-// tcgen05.mma.cta_group::2.kind::f8f6f4  (E4M3 × E4M3 → FP32)
-// Each CTA loads own A (128 rows) + half B (128 cols). MMA produces 256×256 output.
+/*
+Hand-tuned from gen.py output — TK=128, SWIZZLE_128B, 4-stage pipeline
+Target: B200  Batch: 4736  GEMM: [928256,768]×[768,768]^T
+Pipeline: 4-stage (parameterized)  K-iters: 6  MMA/iter: 4  idesc: 0x10400010
+Warps: 2+NUM_EPI_WARPS  cta_group::2  __cluster_dims__(2,1,1)
+Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2+,x32 TMEM ld,interleaved TMA stores)  BF16 output
+tcgen05.mma.cta_group::2.kind::f8f6f4  (E4M3 × E4M3 → FP32)
+Each CTA loads own A (128 rows) + half B (128 cols). MMA produces 256×256 output.
+*/
 
 #define N_DIM          768
 #define K_DIM          768
@@ -36,10 +38,12 @@ __device__ __forceinline__ uint32_t cvt_add_bf16x2(float lo, float hi, uint32_t 
         "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" \
         :: "r"(SADDR), "r"(b0), "r"(b1), "r"(b2), "r"(b3) : "memory")
 
-// ── Fused CVT+ADD+STS macro — asm-local .reg intermediates avoid global register inflation ──
-// Converts 4 pairs of FP32 accumulators to BF16x2, adds combined BF16x2, stores 16B to SMEM.
-// With CVT_ADD_FUSED=1, b0-b3 are .reg locals invisible to ptxas's register allocator.
-// With CVT_ADD_FUSED=0, falls back to cvt_add_bf16x2() + STS_V4 (global regs).
+/*
+Fused CVT+ADD+STS macro — asm-local .reg intermediates avoid global register inflation.
+Converts 4 pairs of FP32 accumulators to BF16x2, adds combined BF16x2, stores 16B to SMEM.
+With CVT_ADD_FUSED=1, b0-b3 are .reg locals invisible to ptxas's register allocator.
+With CVT_ADD_FUSED=0, falls back to cvt_add_bf16x2() + STS_V4 (global regs).
+*/
 
 #if CVT_ADD_FUSED
 #define CVT_ADD_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, c0,c1,c2,c3, SADDR) \
@@ -74,7 +78,7 @@ __device__ __forceinline__ uint32_t cvt_add_bf16x2(float lo, float hi, uint32_t 
 
 #include "kernel_body.cuh"
 
-// ── Host precompute kernel: bias[c] + pos_embed[r,c] → BF16 combined[r,c] ──
+// Host precompute kernel: bias[c] + pos_embed[r,c] → BF16 combined[r,c]
 
 __global__ void precompute_combined(
     const float* __restrict__ bias,
@@ -97,9 +101,7 @@ __global__ void precompute_combined(
     }
 }
 
-// ═════════════════════════════════════════════════════════════
 // Host
-// ═════════════════════════════════════════════════════════════
 
 int main() {
     setbuf(stdout, NULL);
@@ -118,8 +120,10 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_combined, (size_t)COMB_PADDED_ROWS * N_DIM * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&d_C,    (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16)));
 
-    // A: uniform 0x3C (=1.5 in FP8 E4M3)
-    // B: alternating rows — even rows 0x3C (1.5), odd rows 0x38 (1.0)
+    /*
+    A: uniform 0x3C (=1.5 in FP8 E4M3)
+    B: alternating rows — even rows 0x3C (1.5), odd rows 0x38 (1.0)
+    */
     CUDA_CHECK(cudaMemset(d_A, 0x3C, (size_t)M_TOTAL * K_DIM));
     {
         uint8_t* h_B = (uint8_t*)malloc((size_t)N_DIM * K_DIM);
@@ -210,7 +214,7 @@ int main() {
     CUDA_CHECK(cudaMemset(d_spread, 0, spread_bytes));
 #endif
 
-    // ── Warmup: 2 iterations ──
+    // Warmup: 2 iterations
     printf("Launching warmup (2 iters)...\n");
     for (int _i = 0; _i < 2; _i++) {
     persistent_gemm<EpilogueOp::BIAS_ADD><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_combined, d_C, nullptr
@@ -223,7 +227,7 @@ int main() {
     CUDA_CHECK(cudaDeviceSynchronize());
     printf("  Warmup done.\n");
 
-    // ── Timed: 10 iterations ──
+    // Timed: 10 iterations
     printf("Timing: 10 iterations...\n");
     cudaEvent_t _t0, _t1;
     cudaEventCreate(&_t0);
@@ -246,7 +250,7 @@ int main() {
     cudaEventDestroy(_t0);
     cudaEventDestroy(_t1);
 
-    // ── Checksum run ──
+    // Checksum run
     persistent_gemm<EpilogueOp::BIAS_ADD><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_combined, d_C, nullptr
 #ifdef TIMING
         , d_timing, d_spread

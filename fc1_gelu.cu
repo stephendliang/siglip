@@ -1,27 +1,33 @@
-// FC1+GELU kernel — derived from patch_embed.cu (patch embed GEMM)
-// Target: B200  Batch: 4736  GEMM: [928256,768]×[768,3072]^T + bias + GELU
-// Pipeline: 4-stage (parameterized)  K-iters: 6  MMA/iter: 4  idesc: 0x10400010
-// Warps: 2+NUM_EPI_WARPS  cta_group::2  __cluster_dims__(2,1,1)
-// Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2+,x32 TMEM ld,interleaved TMA stores)  BF16 output
-// tcgen05.mma.cta_group::2.kind::f8f6f4  (E4M3 × E4M3 → FP32)
-// Each CTA loads own A (128 rows) + half B (128 cols). MMA produces 256×256 output.
-// Epilogue: FP32 acc + bias → GELU → BF16 CVT → SMEM staging → TMA store
+/*
+FC1+GELU kernel — derived from patch_embed.cu (patch embed GEMM)
+Target: B200  Batch: 4736  GEMM: [928256,768]×[768,3072]^T + bias + GELU
+Pipeline: 4-stage (parameterized)  K-iters: 6  MMA/iter: 4  idesc: 0x10400010
+Warps: 2+NUM_EPI_WARPS  cta_group::2  __cluster_dims__(2,1,1)
+Warp-specialized: Load(W0) | MMA(W1,cta_group::2,CTA0 only) | Epilogue(W2+,x32 TMEM ld,interleaved TMA stores)  BF16 output
+tcgen05.mma.cta_group::2.kind::f8f6f4  (E4M3 × E4M3 → FP32)
+Each CTA loads own A (128 rows) + half B (128 cols). MMA produces 256×256 output.
+Epilogue: FP32 acc + bias → GELU → BF16 CVT → SMEM staging → TMA store
+*/
 
 #define N_DIM          3072
 #define K_DIM          768
 #include "kernel_common.cuh"
 
-// ── GELU approximation (tanh version) ──
-// GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+/*
+GELU approximation (tanh version)
+GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+*/
 static __host__ __device__ __forceinline__ float gelu_fwd(float x) {
     const float k = 0.7978845608f;  // sqrt(2/pi)
     return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
 }
 
-// ── Fused bias+GELU+CVT+STS macro ──
-// Adds FP32 bias to 8 FP32 accumulators, applies GELU, converts to 4 BF16x2,
-// stores 16B to SMEM.  GELU requires C++ (tanhf), so bias+GELU is done in C++;
-// CVT+STS uses asm-local regs to avoid global register inflation.
+/*
+Fused bias+GELU+CVT+STS macro
+Adds FP32 bias to 8 FP32 accumulators, applies GELU, converts to 4 BF16x2,
+stores 16B to SMEM.  GELU requires C++ (tanhf), so bias+GELU is done in C++;
+CVT+STS uses asm-local regs to avoid global register inflation.
+*/
 #define GELU_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3,b4,b5,b6,b7, SADDR) \
     do { \
         float _g0 = gelu_fwd((f0)+(b0)), _g1 = gelu_fwd((f1)+(b1)); \
@@ -45,9 +51,7 @@ static __host__ __device__ __forceinline__ float gelu_fwd(float x) {
 
 #include "kernel_body.cuh"
 
-// ═════════════════════════════════════════════════════════════
 // Host
-// ═════════════════════════════════════════════════════════════
 
 int main() {
     setbuf(stdout, NULL);
@@ -64,8 +68,10 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_bias,  (size_t)N_DIM  * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_C,    (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16)));
 
-    // A: uniform 0x3C (=1.5 in FP8 E4M3)
-    // B: alternating rows — even rows 0x3C (1.5), odd rows 0x38 (1.0)
+    /*
+    A: uniform 0x3C (=1.5 in FP8 E4M3)
+    B: alternating rows — even rows 0x3C (1.5), odd rows 0x38 (1.0)
+    */
     CUDA_CHECK(cudaMemset(d_A, 0x3C, (size_t)M_TOTAL * K_DIM));
     {
         uint8_t* h_B = (uint8_t*)malloc((size_t)N_DIM * K_DIM);
@@ -141,7 +147,7 @@ int main() {
     CUDA_CHECK(cudaMemset(d_spread, 0, spread_bytes));
 #endif
 
-    // ── Warmup: 2 iterations ──
+    // Warmup: 2 iterations
     printf("Launching warmup (2 iters)...\n");
     for (int _i = 0; _i < 2; _i++) {
     persistent_gemm<EpilogueOp::BIAS_GELU><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, nullptr
@@ -154,7 +160,7 @@ int main() {
     CUDA_CHECK(cudaDeviceSynchronize());
     printf("  Warmup done.\n");
 
-    // ── Timed: 10 iterations ──
+    // Timed: 10 iterations
     printf("Timing: 10 iterations...\n");
     cudaEvent_t _t0, _t1;
     cudaEventCreate(&_t0);
@@ -177,7 +183,7 @@ int main() {
     cudaEventDestroy(_t0);
     cudaEventDestroy(_t1);
 
-    // ── Checksum run ──
+    // Checksum run
     persistent_gemm<EpilogueOp::BIAS_GELU><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, nullptr
 #ifdef TIMING
         , d_timing, d_spread
