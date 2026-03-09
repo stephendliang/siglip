@@ -117,11 +117,43 @@ void epilogue_store(
     for (int nc = NC_START; nc < NC_END; nc += 64) {
         const uint32_t srow = srow_base + ((nc - NC_START) >> 6) * STAGING_REGION_BYTES;
 
-        // Preload side data (fills TMEM latency window)
+        // Side-data variables
         uint4 craw0 = {}, craw1 = {};
         const __nv_bfloat16* comb_ptr = nullptr;
         float4 bv0 = {}, bv1 = {};
         uint4 rv0 = {};
+#if PRELOAD_MODE == 2
+        uint4 craw2 = {}, craw3 = {}, craw4 = {}, craw5 = {}, craw6 = {}, craw7 = {};
+#endif
+
+#if PRELOAD_MODE >= 1
+        // Preload side data (fills TMEM latency window)
+        if constexpr (Op == EpilogueOp::BIAS_ADD) {
+            comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
+            craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
+            craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
+#if PRELOAD_MODE == 2
+            craw2 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
+            craw3 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
+            const __nv_bfloat16* comb_ptr2_pre = comb_base + (long long)((n_start + nc + 32) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
+            craw4 = *reinterpret_cast<const uint4*>(comb_ptr2_pre);
+            craw5 = *reinterpret_cast<const uint4*>(comb_ptr2_pre + 8);
+            craw6 = *reinterpret_cast<const uint4*>(comb_ptr2_pre + 16);
+            craw7 = *reinterpret_cast<const uint4*>(comb_ptr2_pre + 24);
+#endif
+        } else if constexpr (Op == EpilogueOp::BIAS_GELU || Op == EpilogueOp::BIAS_RESIDUAL) {
+            const float* bp = side_data + n_start + nc;
+            bv0 = __ldg(reinterpret_cast<const float4*>(bp));
+            bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
+            if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+                rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
+            }
+        }
+#endif
+
+        TMEM_WAIT();
+
+#if PRELOAD_MODE == 0
         if constexpr (Op == EpilogueOp::BIAS_ADD) {
             comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
@@ -134,8 +166,7 @@ void epilogue_store(
                 rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
             }
         }
-
-        TMEM_WAIT();
+#endif
 
         if (MBAR_EARLY && nc + 64 >= NC_END) {
             if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
@@ -143,6 +174,20 @@ void epilogue_store(
 
         // Transform: accumulator → (op-specific) → BF16 → SMEM
         if constexpr (Op == EpilogueOp::BIAS_ADD) {
+#if PRELOAD_MODE == 2
+            {
+                CVT_ADD_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, craw0.x,craw0.y,craw0.z,craw0.w, srow + (0 ^ xor_val));
+                CVT_ADD_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, craw1.x,craw1.y,craw1.z,craw1.w, srow + (16 ^ xor_val));
+                CVT_ADD_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, craw2.x,craw2.y,craw2.z,craw2.w, srow + (32 ^ xor_val));
+                CVT_ADD_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, craw3.x,craw3.y,craw3.z,craw3.w, srow + (48 ^ xor_val));
+            }
+            {
+                CVT_ADD_STS_V4(a32,a33,a34,a35,a36,a37,a38,a39, craw4.x,craw4.y,craw4.z,craw4.w, srow + (64 ^ xor_val));
+                CVT_ADD_STS_V4(a40,a41,a42,a43,a44,a45,a46,a47, craw5.x,craw5.y,craw5.z,craw5.w, srow + (80 ^ xor_val));
+                CVT_ADD_STS_V4(a48,a49,a50,a51,a52,a53,a54,a55, craw6.x,craw6.y,craw6.z,craw6.w, srow + (96 ^ xor_val));
+                CVT_ADD_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63, craw7.x,craw7.y,craw7.z,craw7.w, srow + (112 ^ xor_val));
+            }
+#else
             {
                 CVT_ADD_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, craw0.x,craw0.y,craw0.z,craw0.w, srow + (0 ^ xor_val));
                 CVT_ADD_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, craw1.x,craw1.y,craw1.z,craw1.w, srow + (16 ^ xor_val));
@@ -162,6 +207,7 @@ void epilogue_store(
                 CVT_ADD_STS_V4(a48,a49,a50,a51,a52,a53,a54,a55, craw0.x,craw0.y,craw0.z,craw0.w, srow + (96 ^ xor_val));
                 CVT_ADD_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63, craw1.x,craw1.y,craw1.z,craw1.w, srow + (112 ^ xor_val));
             }
+#endif
         } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
             const float* bp = side_data + n_start + nc;
             {
@@ -228,6 +274,16 @@ void epilogue_store(
             }
         }
 
+#if PREFETCH_BEFORE_STORE
+        if (nc + 64 < NC_END) {
+            TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                          a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47,
+                          a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
+                          taddr_base + nc + 64);
+        }
+#endif
+
         // Interleaved TMA store(s) — fence.proxy.async bridges sync→async proxy
         if (INTERLEAVE_STRATEGY == 1) {
             __syncwarp();
@@ -263,6 +319,7 @@ void epilogue_store(
             }
         }
 
+#if !PREFETCH_BEFORE_STORE
         if (nc + 64 < NC_END) {
             TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                           a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
@@ -270,6 +327,7 @@ void epilogue_store(
                           a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
                           taddr_base + nc + 64);
         }
+#endif
     }
 #else  // TMEM_LOAD_WIDTH 16 or 32
     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
@@ -282,12 +340,39 @@ void epilogue_store(
 
     PRAGMA_UNROLL(PHASE1_UNROLL)
     for (int nc = NC_START; nc < NC_END; nc += 32) {
-        // Preload side data (fills TMEM latency window)
+        // Side-data variables
         uint4 craw0 = {}, craw1 = {};
         const __nv_bfloat16* comb_ptr = nullptr;
         const float* bp = nullptr;
         float4 bv0 = {}, bv1 = {};
         uint4 rv0 = {};
+#if PRELOAD_MODE == 2
+        uint4 craw2 = {}, craw3 = {};
+#endif
+
+#if PRELOAD_MODE >= 1
+        // Preload side data (fills TMEM latency window)
+        if constexpr (Op == EpilogueOp::BIAS_ADD) {
+            comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
+            craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
+            craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
+#if PRELOAD_MODE == 2
+            craw2 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
+            craw3 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
+#endif
+        } else if constexpr (Op == EpilogueOp::BIAS_GELU || Op == EpilogueOp::BIAS_RESIDUAL) {
+            bp = side_data + n_start + nc;
+            bv0 = __ldg(reinterpret_cast<const float4*>(bp));
+            bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
+            if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+                rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
+            }
+        }
+#endif
+
+        TMEM_WAIT();
+
+#if PRELOAD_MODE == 0
         if constexpr (Op == EpilogueOp::BIAS_ADD) {
             comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
@@ -300,8 +385,7 @@ void epilogue_store(
                 rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
             }
         }
-
-        TMEM_WAIT();
+#endif
 
         if (MBAR_EARLY && nc + 32 >= NC_END) {
             if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
@@ -312,6 +396,12 @@ void epilogue_store(
 
         // Transform: accumulator → (op-specific) → BF16 → SMEM
         if constexpr (Op == EpilogueOp::BIAS_ADD) {
+#if PRELOAD_MODE == 2
+            CVT_ADD_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, craw0.x,craw0.y,craw0.z,craw0.w, srow + (byte_base ^ xor_val));
+            CVT_ADD_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, craw1.x,craw1.y,craw1.z,craw1.w, srow + ((byte_base + 16) ^ xor_val));
+            CVT_ADD_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, craw2.x,craw2.y,craw2.z,craw2.w, srow + ((byte_base + 32) ^ xor_val));
+            CVT_ADD_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, craw3.x,craw3.y,craw3.z,craw3.w, srow + ((byte_base + 48) ^ xor_val));
+#else
             CVT_ADD_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, craw0.x,craw0.y,craw0.z,craw0.w, srow + (byte_base ^ xor_val));
             CVT_ADD_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, craw1.x,craw1.y,craw1.z,craw1.w, srow + ((byte_base + 16) ^ xor_val));
 
@@ -319,6 +409,7 @@ void epilogue_store(
             craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
             CVT_ADD_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, craw0.x,craw0.y,craw0.z,craw0.w, srow + ((byte_base + 32) ^ xor_val));
             CVT_ADD_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, craw1.x,craw1.y,craw1.z,craw1.w, srow + ((byte_base + 48) ^ xor_val));
+#endif
         } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
             GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, srow + (byte_base ^ xor_val));
             float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
@@ -347,6 +438,14 @@ void epilogue_store(
             uint4 rv3 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 24));
             BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, rv3.x,rv3.y,rv3.z,rv3.w, srow + ((byte_base + 48) ^ xor_val));
         }
+
+#if PREFETCH_BEFORE_STORE
+        if (nc + 32 < NC_END) {
+            LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                         a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                         taddr_base + nc + 32);
+        }
+#endif
 
         // Interleaved TMA store(s) — region completes every 2 x32 iterations
         if (INTERLEAVE_STRATEGY == 1 && ((nc - NC_START) & 63) == 32) {
@@ -383,11 +482,13 @@ void epilogue_store(
             }
         }
 
+#if !PREFETCH_BEFORE_STORE
         if (nc + 32 < NC_END) {
             LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                          taddr_base + nc + 32);
         }
+#endif
     }
 #endif
 

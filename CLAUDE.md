@@ -25,7 +25,7 @@ The kernel is **epilogue-bound** in a balanced producer-consumer equilibrium. F3
 - Phase 1 TMEM readback = binding constraint. Interleaved TMA stores (strategy 2, half-batch) fill TMEM stall windows.
 - K-loop: 4,059 cycles. Precomputed descriptors, unroll controlled by `K_LOOP_UNROLL` (default `N_STAGES`).
 - TMA multicast not applicable (B is N-split across CTAs).
-- ~161-254 regs/thread (varies with `K_LOOP_UNROLL`, `W0_LOOP_UNROLL`, `SUB_MMA_UNROLL`, `CVT_ADD_FUSED`, `PHASE1_UNROLL`, `MBAR_EARLY`; defaults: PE=205, FC1=~209, FC2=254), 0 spills. Limits occupancy to 1 CTA/SM.
+- ~161-254 regs/thread (varies with `K_LOOP_UNROLL`, `W0_LOOP_UNROLL`, `SUB_MMA_UNROLL`, `CVT_ADD_FUSED`, `PHASE1_UNROLL`, `MBAR_EARLY`, `PREFETCH_BEFORE_STORE`; defaults: PE=205, FC1=~242, FC2=254), 0 spills. Limits occupancy to 1 CTA/SM.
 - Timing build uses ~245 regs (distorts cycles vs production). Wall clock is ground truth.
 
 Run `python3 tools/analyze_timing.py data/clock64_timing.txt` for full equilibrium analysis and what-if projections.
@@ -38,7 +38,7 @@ Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1
 
 - **W0**: TMA async bulk loads (A + B tiles, both CTAs load independently)
 - **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
-- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols through 4 SWIZZLE_128B regions: x32 `tcgen05.ld` → epilogue op → CVT → `st.shared`, with **interleaved TMA stores** every 2 regions hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1. The epilogue op is kernel-specific: bias+pos_embed add (patch_embed), bias+GELU (fc1_gelu), or bias+residual (fc2).
+- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols through 4 SWIZZLE_128B regions: x32 `tcgen05.ld` → epilogue op → CVT → `st.shared`, with **interleaved TMA stores** every 2 regions hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1. The epilogue op is kernel-specific: bias+pos_embed add (patch_embed), bias+GELU (fc1_gelu), or bias+residual (fc2). Side-data LDG placement controlled by `PRELOAD_MODE` (0=after TMEM_WAIT, 1=partial preload before, 2=full preload for BIAS_ADD only). Next-tile TMEM prefetch timing controlled by `PREFETCH_BEFORE_STORE` (0=after TMA stores, 1=before).
 
 TM=128 rows / 32 rows per warp = 4 row groups. With 4 epi warps (default), each warp owns a full row group (256 cols, `is_split=0`). With 5 epi warps, warp 4 shares row_group 0 via `ew % 4`, creating split warps (`is_split=1`) that each handle 128 cols (2 regions). `epilogue_store` is templated on `<NC_START, NC_END>` so the compiler sees constant loop bounds and `N_REGIONS = (NC_END - NC_START) / 64` is constexpr; unroll depth controlled by `PHASE1_UNROLL` (default 2).
 
@@ -155,7 +155,7 @@ make cutlass-bench-fc2-max      # extended FC2
 ./tools/cutlass_sweep.sh 32 standard  # standard tile list only
 
 # Parameter grid search (any kernel)
-python3 tools/grid_search.py --tier all                    # sequential 1→2→3, pinning winners
+python3 tools/grid_search.py --tier all                    # sequential 1→2→3→4, pinning winners
 python3 tools/grid_search.py --full-cross                  # all parameters crossed
 python3 tools/grid_search.py --kernel fc2 --tier all       # FC2 sweep
 python3 tools/grid_search.py --kernel fc1_gelu --tier 3    # FC1 tier 3 only
@@ -209,7 +209,8 @@ Sweep data analyzed via `python3 tools/analyze_sweep.py` using eta-squared (ANOV
 
 **Patch embed** (run4, 145 balanced configs): parameter search exhausted — all top configs within 0.001 ms. Best: `MBAR_EARLY=1 STAGGER_CYCLES=160` → 0.519 ms / 2108 TFLOPS. Defaults → 0.524 ms / 2090 TFLOPS.
 
-**Cross-kernel universal defaults**: `SNAKE_ORDER=1`, `PHASE1_UNROLL=2`, `K_LOOP_UNROLL=4`, `W0_LOOP_UNROLL=0`, `TMEM_LOAD_WIDTH=32`.
+**Cross-kernel universal defaults**: `SNAKE_ORDER=1`, `PHASE1_UNROLL=2`, `K_LOOP_UNROLL=4`, `W0_LOOP_UNROLL=0`, `TMEM_LOAD_WIDTH=32`, `PRELOAD_MODE=1`, `PREFETCH_BEFORE_STORE=0`.
 **Per-kernel tuning**: `INTERLEAVE_STRATEGY=2` (PE, FC2) vs `=1` (FC1) — N=3072 changes epilogue pattern.
 **Catastrophic values**: `PHASE1_UNROLL=4` (+2.4 ms on FC1), `NUM_EPI_WARPS=5` (+6 ms on FC1), `SNAKE_ORDER=0` (+49 us on PE).
+**Epilogue scheduling** (tier 4): `PRELOAD_MODE` (0/1/2) × `PREFETCH_BEFORE_STORE` (0/1) = 6 configs. PRELOAD_MODE=2 is BIAS_ADD only (full preload of all 8 uint4 before TMEM_WAIT); GELU/RESIDUAL silently fall back to mode 1. PREFETCH_BEFORE_STORE=1 adds ~14 regs on PE (205→219); FC2 stays at 254 (allocator at ceiling).
 

@@ -11,7 +11,8 @@ Usage:
     python3 grid_search.py --tier 1          # structure: N_STAGES x NUM_EPI_WARPS (~5 configs)
     python3 grid_search.py --tier 2          # epilogue: INTER x MBAR x STAG x TMEM (~128 configs)
     python3 grid_search.py --tier 3          # tuning: PHASE1_UNROLL x SNAKE_ORDER (~6 configs)
-    python3 grid_search.py --tier all        # sequential 1->2->3, pinning winners
+    python3 grid_search.py --tier 4          # scheduling: PRELOAD_MODE x PREFETCH_BEFORE_STORE (6 configs)
+    python3 grid_search.py --tier all        # sequential 1->2->3->4, pinning winners
     python3 grid_search.py --full-cross      # all parameters crossed (~3000 configs)
     python3 grid_search.py --only N_STAGES STAGGER_CYCLES --fix MBAR_EARLY=1
     python3 grid_search.py --kernel fc2 --tier all   # sweep FC2 kernel
@@ -44,6 +45,8 @@ DEFAULTS = {
     'K_LOOP_UNROLL': 4,  # default = N_STAGES
     'W0_LOOP_UNROLL': 0,  # 0=no pragma (compiler decides)
     'SUB_MMA_UNROLL': 0,  # 0=no pragma (compiler decides)
+    'PRELOAD_MODE': 1,
+    'PREFETCH_BEFORE_STORE': 0,
 }
 
 # ── Parameter ranges ──
@@ -60,6 +63,8 @@ RANGES = {
     'K_LOOP_UNROLL': [1, 2, 4, 6, 8],
     'W0_LOOP_UNROLL': [0, 1, 4],
     'SUB_MMA_UNROLL': [0, 1, 3],
+    'PRELOAD_MODE': [0, 1, 2],
+    'PREFETCH_BEFORE_STORE': [0, 1],
 }
 
 # ── Tier definitions ──
@@ -68,6 +73,7 @@ TIER_PARAMS = {
     2: ['INTERLEAVE_STRATEGY', 'MBAR_EARLY', 'STAGGER_CYCLES', 'TMEM_LOAD_WIDTH'],
     3: ['PHASE1_UNROLL', 'SNAKE_ORDER', 'CVT_ADD_FUSED', 'K_LOOP_UNROLL',
         'W0_LOOP_UNROLL', 'SUB_MMA_UNROLL'],
+    4: ['PRELOAD_MODE', 'PREFETCH_BEFORE_STORE'],
 }
 
 # ── Kernel source files ──
@@ -279,7 +285,7 @@ def print_table(results, file=sys.stdout):
 
     header = (f'{"#":>3}  {"STG":>3}  {"EPI":>3}  {"INTER":>5}  {"MBAR":>4}  {"TMEM":>4}  '
               f'{"STAG":>4}  {"PH1U":>4}  {"SNAKE":>5}  {"FUSE":>4}  {"KLU":>3}  '
-              f'{"W0U":>3}  {"SMU":>3}  '
+              f'{"W0U":>3}  {"SMU":>3}  {"PRLD":>4}  {"PFBS":>4}  '
               f'{"REGS":>4}  {"SMEM":>7}  '
               f'{"MS":>7}  {"TFLOPS":>7}  {"STATUS"}')
     print(header, file=file)
@@ -299,6 +305,7 @@ def print_table(results, file=sys.stdout):
               f'{r["PHASE1_UNROLL"]:>4}  {r["SNAKE_ORDER"]:>5}  '
               f'{r["CVT_ADD_FUSED"]:>4}  {r["K_LOOP_UNROLL"]:>3}  '
               f'{r["W0_LOOP_UNROLL"]:>3}  {r["SUB_MMA_UNROLL"]:>3}  '
+              f'{r["PRELOAD_MODE"]:>4}  {r["PREFETCH_BEFORE_STORE"]:>4}  '
               f'{r["regs"]:>4}  {r["smem_kb"]:>6.1f}K  '
               f'{ms_str:>7}  {tflops_str:>7}  {status}',
               file=file)
@@ -314,6 +321,7 @@ def write_csv(results, path):
     fields = ['N_STAGES', 'NUM_EPI_WARPS', 'INTERLEAVE_STRATEGY', 'MBAR_EARLY',
               'TMEM_LOAD_WIDTH', 'STAGGER_CYCLES', 'PHASE1_UNROLL', 'SNAKE_ORDER',
               'CVT_ADD_FUSED', 'K_LOOP_UNROLL', 'W0_LOOP_UNROLL', 'SUB_MMA_UNROLL',
+              'PRELOAD_MODE', 'PREFETCH_BEFORE_STORE',
               'regs', 'spills', 'smem_kb', 'ms', 'tflops', 'status', 'dflags']
 
     with open(path, 'w', newline='') as f:
@@ -386,8 +394,8 @@ def get_best(results):
 def main():
     parser = argparse.ArgumentParser(description='Grid search for SigLIP kernel parameters')
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument('--tier', choices=['1', '2', '3', 'all'],
-                      help='Tiered search (1=structure, 2=epilogue, 3=tuning, all=sequential)')
+    mode.add_argument('--tier', choices=['1', '2', '3', '4', 'all'],
+                      help='Tiered search (1=structure, 2=epilogue, 3=tuning, 4=scheduling, all=sequential)')
     mode.add_argument('--full-cross', action='store_true',
                       help='Full cross-product of all parameters')
     parser.add_argument('--kernel', choices=list(KERNELS.keys()), default='patch_embed',
@@ -456,7 +464,7 @@ def main():
         winners = dict(DEFAULTS)
         winners.update(fixed_overrides)
 
-        for tier_num in [1, 2, 3]:
+        for tier_num in [1, 2, 3, 4]:
             tier_params = TIER_PARAMS[tier_num]
             sweep_params = {p: RANGES[p] for p in tier_params if p not in fixed_overrides}
             if not sweep_params:

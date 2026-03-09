@@ -51,6 +51,12 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef SUB_MMA_UNROLL
 #define SUB_MMA_UNROLL  0    // Sub-MMA inner loop: 0=no pragma, 1=no unroll, N=unroll by N
 #endif
+#ifndef PRELOAD_MODE
+#define PRELOAD_MODE 1         // 0=no preload, 1=partial (current), 2=full (BIAS_ADD only)
+#endif
+#ifndef PREFETCH_BEFORE_STORE
+#define PREFETCH_BEFORE_STORE 0  // 0=after TMA stores, 1=before TMA stores
+#endif
 
 // nvcc doesn't expand macros in #pragma unroll — use _Pragma instead
 #define _UNROLL_STR2(x) #x
