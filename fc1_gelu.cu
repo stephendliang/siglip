@@ -23,101 +23,195 @@ static __host__ __forceinline__ float gelu_fwd(float x) {
 }
 
 /*
-Fused bias+GELU+CVT+STS — all in one asm block.
-Computes GELU(acc+bias) → BF16 CVT → SMEM store using tanh.approx.f32
-(single SFU instruction) instead of software tanhf().
+BF16x2 pack + SMEM store for 8 values — shared by all GELU variants.
+CVT and STS stay in asm (hardware-specific, no C++ equivalent).
+*/
+static __device__ __forceinline__ void cvt_sts_v4(
+    float g0, float g1, float g2, float g3,
+    float g4, float g5, float g6, float g7,
+    uint32_t saddr
+) {
+    uint32_t o0, o1, o2, o3;
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o0) : "f"(g0), "f"(g1));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o1) : "f"(g2), "f"(g3));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o2) : "f"(g4), "f"(g5));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o3) : "f"(g6), "f"(g7));
+    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+        :: "r"(saddr), "r"(o0), "r"(o1), "r"(o2), "r"(o3) : "memory");
+}
 
-For each lane i:
-  x = fi + bi                    (acc + bias)
-  inner = 0.7978845608 * x * (1 + 0.044715 * x²)
-  t = tanh.approx(inner)
-  gi = 0.5 * x * (1 + t)         = 0.5 * (x + x*t)
+/* ── GELU variants (selected by GELU_VARIANT compile-time flag) ── */
 
-All intermediates in asm-local regs to avoid register inflation.
+#if GELU_VARIANT == 0
+/*
+Variant 0 (default): asm tanh.approx, scalar.
+8 ops/element: 4 pre-tanh (FADD, FMUL, FFMA, FMUL), 1 MUFU, 3 post-tanh (FMUL, FADD, FMUL).
+*/
+static __device__ __forceinline__ float gelu_approx(float acc, float bias) {
+    float x = acc + bias;
+    float inner = x * (0.7978845608f + 0.035677408136f * x * x);
+    float t;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(inner));
+    return 0.5f * (x + x * t);
+}
+
+#elif GELU_VARIANT == 1
+/*
+Variant 1: pure tanhf(), same algebra as variant 0.
+No asm constraint — compiler has full scheduling freedom.
+nvcc maps tanhf() to MUFU.TANH on SM100a.
+*/
+static __device__ __forceinline__ float gelu_approx(float acc, float bias) {
+    float x = acc + bias;
+    float inner = x * (0.7978845608f + 0.035677408136f * x * x);
+    float t = tanhf(inner);
+    return 0.5f * (x + x * t);
+}
+
+#elif GELU_VARIANT == 2
+/*
+Variant 2: tanhf() + half_x reorder.
+Shifts work before tanh: 5 pre-tanh ops, 2 post-tanh ops.
+Critical path 32 cycles (saves serial FMUL(0.5*sum) by pre-computing half_x).
+*/
+static __device__ __forceinline__ float gelu_approx(float acc, float bias) {
+    float x = acc + bias;
+    float half_x = 0.5f * x;
+    float inner = x * (0.7978845608f + 0.035677408136f * x * x);
+    float t = tanhf(inner);
+    return half_x + half_x * t;
+}
+
+#elif GELU_VARIANT == 3
+/*
+Variant 3: __fmaf_rn intrinsics.
+7 ops/element — fuses FMUL+FADD post-tanh into one FFMA.
+8 fewer instructions per 8-element group. Critical path: 32 cycles.
+*/
+static __device__ __forceinline__ float gelu_approx(float acc, float bias) {
+    float x = acc + bias;
+    float x_sq = x * x;
+    float inner = x * __fmaf_rn(0.035677408136f, x_sq, 0.7978845608f);
+    float t = tanhf(inner);
+    return 0.5f * __fmaf_rn(x, t, x);
+}
+#endif
+
+#if GELU_VARIANT <= 3
+/* Scalar variants: call gelu_approx per element */
+#define GELU_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3,b4,b5,b6,b7, SADDR) \
+    cvt_sts_v4( \
+        gelu_approx(f0, b0), gelu_approx(f1, b1), \
+        gelu_approx(f2, b2), gelu_approx(f3, b3), \
+        gelu_approx(f4, b4), gelu_approx(f5, b5), \
+        gelu_approx(f6, b6), gelu_approx(f7, b7), \
+        (SADDR) \
+    )
+
+#elif GELU_VARIANT == 4
+/*
+Variant 4: batched-8, asm tanh.
+Explicit 3-phase: all pre-tanh, all 8 MUFU back-to-back, all post-tanh.
+Forces maximum MUFU throughput utilization.
+~40 live FP32 regs for GELU alone (tight at FC1 baseline ~242).
 */
 #define GELU_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3,b4,b5,b6,b7, SADDR) \
     do { \
-        asm volatile( \
-            "{\n\t" \
-            ".reg .f32 x0,x1,x2,x3,x4,x5,x6,x7;\n\t" \
-            ".reg .f32 t0,t1,t2,t3,t4,t5,t6,t7;\n\t" \
-            ".reg .f32 g0,g1,g2,g3,g4,g5,g6,g7;\n\t" \
-            ".reg .b32 o0,o1,o2,o3;\n\t" \
-            /* x = acc + bias */ \
-            "add.f32 x0, %0, %8;\n\t" \
-            "add.f32 x1, %1, %9;\n\t" \
-            "add.f32 x2, %2, %10;\n\t" \
-            "add.f32 x3, %3, %11;\n\t" \
-            "add.f32 x4, %4, %12;\n\t" \
-            "add.f32 x5, %5, %13;\n\t" \
-            "add.f32 x6, %6, %14;\n\t" \
-            "add.f32 x7, %7, %15;\n\t" \
-            /* t = tanh.approx(k * x * (1 + k1 * x²))
-               rewritten as: inner = k*x + (k*k1)*x³
-               where k = 0.7978845608, k1 = 0.044715, k*k1 = 0.035677408136 */ \
-            "mul.f32 t0, x0, x0;\n\t" /* t = x² */ \
-            "mul.f32 t1, x1, x1;\n\t" \
-            "mul.f32 t2, x2, x2;\n\t" \
-            "mul.f32 t3, x3, x3;\n\t" \
-            "mul.f32 t4, x4, x4;\n\t" \
-            "mul.f32 t5, x5, x5;\n\t" \
-            "mul.f32 t6, x6, x6;\n\t" \
-            "mul.f32 t7, x7, x7;\n\t" \
-            "fma.rn.f32 t0, t0, 0f3D122279, 0f3F4C422A;\n\t" /* t = (k*k1)*x² + k */ \
-            "fma.rn.f32 t1, t1, 0f3D122279, 0f3F4C422A;\n\t" \
-            "fma.rn.f32 t2, t2, 0f3D122279, 0f3F4C422A;\n\t" \
-            "fma.rn.f32 t3, t3, 0f3D122279, 0f3F4C422A;\n\t" \
-            "fma.rn.f32 t4, t4, 0f3D122279, 0f3F4C422A;\n\t" \
-            "fma.rn.f32 t5, t5, 0f3D122279, 0f3F4C422A;\n\t" \
-            "fma.rn.f32 t6, t6, 0f3D122279, 0f3F4C422A;\n\t" \
-            "fma.rn.f32 t7, t7, 0f3D122279, 0f3F4C422A;\n\t" \
-            "mul.f32 t0, t0, x0;\n\t"  /* t = x * ((k*k1)*x² + k) = k*x*(1 + k1*x²) */ \
-            "mul.f32 t1, t1, x1;\n\t" \
-            "mul.f32 t2, t2, x2;\n\t" \
-            "mul.f32 t3, t3, x3;\n\t" \
-            "mul.f32 t4, t4, x4;\n\t" \
-            "mul.f32 t5, t5, x5;\n\t" \
-            "mul.f32 t6, t6, x6;\n\t" \
-            "mul.f32 t7, t7, x7;\n\t" \
-            "tanh.approx.f32 t0, t0;\n\t" \
-            "tanh.approx.f32 t1, t1;\n\t" \
-            "tanh.approx.f32 t2, t2;\n\t" \
-            "tanh.approx.f32 t3, t3;\n\t" \
-            "tanh.approx.f32 t4, t4;\n\t" \
-            "tanh.approx.f32 t5, t5;\n\t" \
-            "tanh.approx.f32 t6, t6;\n\t" \
-            "tanh.approx.f32 t7, t7;\n\t" \
-            /* g = 0.5 * (x + x*t) = 0.5 * x * (1 + t) */ \
-            "fma.rn.f32 g0, x0, t0, x0;\n\t" /* g = x*t + x */ \
-            "fma.rn.f32 g1, x1, t1, x1;\n\t" \
-            "fma.rn.f32 g2, x2, t2, x2;\n\t" \
-            "fma.rn.f32 g3, x3, t3, x3;\n\t" \
-            "fma.rn.f32 g4, x4, t4, x4;\n\t" \
-            "fma.rn.f32 g5, x5, t5, x5;\n\t" \
-            "fma.rn.f32 g6, x6, t6, x6;\n\t" \
-            "fma.rn.f32 g7, x7, t7, x7;\n\t" \
-            "mul.f32 g0, g0, 0f3F000000;\n\t" /* g *= 0.5 */ \
-            "mul.f32 g1, g1, 0f3F000000;\n\t" \
-            "mul.f32 g2, g2, 0f3F000000;\n\t" \
-            "mul.f32 g3, g3, 0f3F000000;\n\t" \
-            "mul.f32 g4, g4, 0f3F000000;\n\t" \
-            "mul.f32 g5, g5, 0f3F000000;\n\t" \
-            "mul.f32 g6, g6, 0f3F000000;\n\t" \
-            "mul.f32 g7, g7, 0f3F000000;\n\t" \
-            /* CVT to BF16x2 + STS */ \
-            "cvt.rn.bf16x2.f32 o0, g1, g0;\n\t" \
-            "cvt.rn.bf16x2.f32 o1, g3, g2;\n\t" \
-            "cvt.rn.bf16x2.f32 o2, g5, g4;\n\t" \
-            "cvt.rn.bf16x2.f32 o3, g7, g6;\n\t" \
-            "st.shared.v4.b32 [%16], {o0,o1,o2,o3};\n\t" \
-            "}" \
-            :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
-               "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
-               "f"(b0),"f"(b1),"f"(b2),"f"(b3), \
-               "f"(b4),"f"(b5),"f"(b6),"f"(b7), \
-               "r"(SADDR) \
-            : "memory"); \
+        float x0 = (f0)+(b0), x1 = (f1)+(b1), x2 = (f2)+(b2), x3 = (f3)+(b3); \
+        float x4 = (f4)+(b4), x5 = (f5)+(b5), x6 = (f6)+(b6), x7 = (f7)+(b7); \
+        float i0 = x0*(0.7978845608f + 0.035677408136f*x0*x0); \
+        float i1 = x1*(0.7978845608f + 0.035677408136f*x1*x1); \
+        float i2 = x2*(0.7978845608f + 0.035677408136f*x2*x2); \
+        float i3 = x3*(0.7978845608f + 0.035677408136f*x3*x3); \
+        float i4 = x4*(0.7978845608f + 0.035677408136f*x4*x4); \
+        float i5 = x5*(0.7978845608f + 0.035677408136f*x5*x5); \
+        float i6 = x6*(0.7978845608f + 0.035677408136f*x6*x6); \
+        float i7 = x7*(0.7978845608f + 0.035677408136f*x7*x7); \
+        float t0, t1, t2, t3, t4, t5, t6, t7; \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t0) : "f"(i0)); \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t1) : "f"(i1)); \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t2) : "f"(i2)); \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t3) : "f"(i3)); \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t4) : "f"(i4)); \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t5) : "f"(i5)); \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t6) : "f"(i6)); \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t7) : "f"(i7)); \
+        cvt_sts_v4( \
+            0.5f*(x0+x0*t0), 0.5f*(x1+x1*t1), \
+            0.5f*(x2+x2*t2), 0.5f*(x3+x3*t3), \
+            0.5f*(x4+x4*t4), 0.5f*(x5+x5*t5), \
+            0.5f*(x6+x6*t6), 0.5f*(x7+x7*t7), \
+            (SADDR)); \
     } while(0)
+
+#elif GELU_VARIANT == 5
+/*
+Variant 5: batched-4+4, asm tanh.
+Split into two groups of 4 — lower peak register pressure (~24 live).
+Group 2 pre-tanh can overlap with group 1 post-tanh.
+*/
+#define GELU_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3,b4,b5,b6,b7, SADDR) \
+    do { \
+        float x0 = (f0)+(b0), x1 = (f1)+(b1), x2 = (f2)+(b2), x3 = (f3)+(b3); \
+        float i0 = x0*(0.7978845608f + 0.035677408136f*x0*x0); \
+        float i1 = x1*(0.7978845608f + 0.035677408136f*x1*x1); \
+        float i2 = x2*(0.7978845608f + 0.035677408136f*x2*x2); \
+        float i3 = x3*(0.7978845608f + 0.035677408136f*x3*x3); \
+        float t0, t1, t2, t3; \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t0) : "f"(i0)); \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t1) : "f"(i1)); \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t2) : "f"(i2)); \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t3) : "f"(i3)); \
+        float g0 = 0.5f*(x0+x0*t0), g1 = 0.5f*(x1+x1*t1); \
+        float g2 = 0.5f*(x2+x2*t2), g3 = 0.5f*(x3+x3*t3); \
+        float x4 = (f4)+(b4), x5 = (f5)+(b5), x6 = (f6)+(b6), x7 = (f7)+(b7); \
+        float i4 = x4*(0.7978845608f + 0.035677408136f*x4*x4); \
+        float i5 = x5*(0.7978845608f + 0.035677408136f*x5*x5); \
+        float i6 = x6*(0.7978845608f + 0.035677408136f*x6*x6); \
+        float i7 = x7*(0.7978845608f + 0.035677408136f*x7*x7); \
+        float t4, t5, t6, t7; \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t4) : "f"(i4)); \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t5) : "f"(i5)); \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t6) : "f"(i6)); \
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t7) : "f"(i7)); \
+        cvt_sts_v4( \
+            g0, g1, g2, g3, \
+            0.5f*(x4+x4*t4), 0.5f*(x5+x5*t5), \
+            0.5f*(x6+x6*t6), 0.5f*(x7+x7*t7), \
+            (SADDR)); \
+    } while(0)
+
+#elif GELU_VARIANT == 6
+/*
+Variant 6: batched-8, tanhf().
+Same explicit phasing as variant 4 but tanhf() instead of asm.
+Maximum compiler freedom + explicit batching.
+*/
+#define GELU_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3,b4,b5,b6,b7, SADDR) \
+    do { \
+        float x0 = (f0)+(b0), x1 = (f1)+(b1), x2 = (f2)+(b2), x3 = (f3)+(b3); \
+        float x4 = (f4)+(b4), x5 = (f5)+(b5), x6 = (f6)+(b6), x7 = (f7)+(b7); \
+        float i0 = x0*(0.7978845608f + 0.035677408136f*x0*x0); \
+        float i1 = x1*(0.7978845608f + 0.035677408136f*x1*x1); \
+        float i2 = x2*(0.7978845608f + 0.035677408136f*x2*x2); \
+        float i3 = x3*(0.7978845608f + 0.035677408136f*x3*x3); \
+        float i4 = x4*(0.7978845608f + 0.035677408136f*x4*x4); \
+        float i5 = x5*(0.7978845608f + 0.035677408136f*x5*x5); \
+        float i6 = x6*(0.7978845608f + 0.035677408136f*x6*x6); \
+        float i7 = x7*(0.7978845608f + 0.035677408136f*x7*x7); \
+        float t0 = tanhf(i0), t1 = tanhf(i1), t2 = tanhf(i2), t3 = tanhf(i3); \
+        float t4 = tanhf(i4), t5 = tanhf(i5), t6 = tanhf(i6), t7 = tanhf(i7); \
+        cvt_sts_v4( \
+            0.5f*(x0+x0*t0), 0.5f*(x1+x1*t1), \
+            0.5f*(x2+x2*t2), 0.5f*(x3+x3*t3), \
+            0.5f*(x4+x4*t4), 0.5f*(x5+x5*t5), \
+            0.5f*(x6+x6*t6), 0.5f*(x7+x7*t7), \
+            (SADDR)); \
+    } while(0)
+
+#else
+#error "Unknown GELU_VARIANT"
+#endif
 
 #include "kernel_body.cuh"
 

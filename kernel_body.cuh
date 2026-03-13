@@ -65,6 +65,11 @@ void epilogue_store(
     uint32_t staging_saddr,
     uint32_t epi_mbar_addr,
     const CUtensorMap* tma_c_desc
+#if TMA_RESIDUAL
+    , const CUtensorMap* tma_res_desc
+    , uint32_t res_mbar_addr
+    , uint32_t res_staging_saddr
+#endif
 #ifdef TIMING
     , long long& t_phase1_end
 #endif
@@ -99,6 +104,188 @@ void epilogue_store(
     // Swizzle constants (loop-invariant)
     const uint32_t xor_val = (lane & 7) << 4;
     const uint32_t srow_base = staging_saddr + lane * STAGING_REGION_ROW_BYTES;
+
+#if TMA_RESIDUAL
+    /*
+    Two-pass TMA residual epilogue: loads residual via TMA into SMEM (coalesced)
+    instead of scattered per-lane __ldg. Each pass processes 128 cols using
+    output regions 0-1 and residual regions 2-3. Phase toggles twice per call
+    (2 passes) so mbarrier phase is consistent across calls.
+    */
+    if constexpr (Op == EpilogueOp::BIAS_RESIDUAL && (NC_END - NC_START) >= 256) {
+        constexpr int PASS_COLS = 128;
+        constexpr int NUM_PASSES = (NC_END - NC_START) / PASS_COLS;
+        const int taddr_base = tmem_addr + ((cta_rank * 128 + row_group * 32) << 16);
+        int res_phase = 0;
+
+        float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
+        float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
+
+        for (int pass = 0; pass < NUM_PASSES; pass++) {
+            const int pnc_s = NC_START + pass * PASS_COLS;
+            const int pnc_e = pnc_s + PASS_COLS;
+
+            /* Issue residual TMA first — flies while we wait for prior stores.
+               Residual targets regions 2-3 (mbarrier-tracked), output stores
+               target regions 0-1 (commit_group-tracked): no SMEM conflict. */
+            if (lane == 0) {
+                mbar_arrive_expect_tx(res_mbar_addr, 2 * STAGING_REGION_BYTES);
+                tma_load_2d_cta(res_staging_saddr, tma_res_desc,
+                                n_start + pnc_s, gm_base, res_mbar_addr);
+                tma_load_2d_cta(res_staging_saddr + STAGING_REGION_BYTES, tma_res_desc,
+                                n_start + pnc_s + 64, gm_base, res_mbar_addr);
+            }
+
+            /* Between passes: wait for previous pass's output TMA stores */
+            if (pass > 0) {
+                if (lane == 0) {
+                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                }
+                __syncwarp();
+            }
+
+            /* Start TMEM readback — overlaps with TMA residual in-flight */
+            LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                         a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                         taddr_base + pnc_s);
+
+            /* Wait for residual TMA */
+            mbar_wait(res_mbar_addr, res_phase);
+            res_phase ^= 1;
+
+            /* Process 4 × 32-col chunks within this pass */
+            PRAGMA_UNROLL(PHASE1_UNROLL)
+            for (int nc = pnc_s; nc < pnc_e; nc += 32) {
+                /* Preload all 32 bias floats (L1-hot, fills TMEM stall window) */
+                const float* bp = side_data + n_start + nc;
+                float4 bv0 = __ldg(reinterpret_cast<const float4*>(bp));
+                float4 bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
+                float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
+                float4 bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
+                float4 bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
+                float4 bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
+                float4 bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
+                float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
+
+                /* Load residual from SMEM (TMA-loaded, coalesced) with swizzle */
+                const int res_ri = (nc - pnc_s) >> 6;
+                const int res_bb = ((nc - pnc_s) & 63) * 2;
+                const uint32_t rs = res_staging_saddr
+                    + res_ri * STAGING_REGION_BYTES + lane * STAGING_REGION_ROW_BYTES;
+                uint4 rv0, rv1, rv2, rv3;
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w)
+                    : "r"(rs + (res_bb ^ xor_val)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(rv1.x),"=r"(rv1.y),"=r"(rv1.z),"=r"(rv1.w)
+                    : "r"(rs + ((res_bb + 16) ^ xor_val)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w)
+                    : "r"(rs + ((res_bb + 32) ^ xor_val)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w)
+                    : "r"(rs + ((res_bb + 48) ^ xor_val)));
+
+                TMEM_WAIT();
+
+                if (MBAR_EARLY && pass == NUM_PASSES - 1 && nc + 32 >= pnc_e) {
+                    if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
+                }
+
+                /* Transform: acc + bias + residual → BF16 → output SMEM regions 0-1 */
+                const uint32_t srow = srow_base
+                    + ((nc - pnc_s) >> 6) * STAGING_REGION_BYTES;
+                const int byte_base = ((nc - pnc_s) & 63) * 2;
+
+                BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                    bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w,
+                    rv0.x,rv0.y,rv0.z,rv0.w, srow + (byte_base ^ xor_val));
+                BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                    bv2.x,bv2.y,bv2.z,bv2.w,bv3.x,bv3.y,bv3.z,bv3.w,
+                    rv1.x,rv1.y,rv1.z,rv1.w, srow + ((byte_base + 16) ^ xor_val));
+                BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                    bv4.x,bv4.y,bv4.z,bv4.w,bv5.x,bv5.y,bv5.z,bv5.w,
+                    rv2.x,rv2.y,rv2.z,rv2.w, srow + ((byte_base + 32) ^ xor_val));
+                BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                    bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w,
+                    rv3.x,rv3.y,rv3.z,rv3.w, srow + ((byte_base + 48) ^ xor_val));
+
+#if PREFETCH_BEFORE_STORE
+                if (nc + 32 < pnc_e) {
+                    LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                                 a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                                 taddr_base + nc + 32);
+                }
+#endif
+
+                /* Interleaved TMA stores within 128-col pass (2 output regions) */
+                if (INTERLEAVE_STRATEGY == 1 && ((nc - pnc_s) & 63) == 32) {
+                    int ri = (nc - pnc_s) >> 6;
+                    __syncwarp();
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    if (lane == 0) {
+                        uint32_t src = staging_saddr + ri * STAGING_REGION_BYTES;
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                            :: "l"(tma_c_desc), "r"(n_start + pnc_s + ri * 64),
+                               "r"(gm_base), "r"(src) : "memory");
+                    }
+                } else if (INTERLEAVE_STRATEGY >= 2
+                           && ((nc - pnc_s) & 63) == 32
+                           && (((nc - pnc_s) >> 6) & 1) == 1) {
+                    __syncwarp();
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    if (lane == 0) {
+                        uint32_t src0 = staging_saddr;
+                        uint32_t src1 = staging_saddr + STAGING_REGION_BYTES;
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                            :: "l"(tma_c_desc), "r"(n_start + pnc_s),
+                               "r"(gm_base), "r"(src0) : "memory");
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                            :: "l"(tma_c_desc), "r"(n_start + pnc_s + 64),
+                               "r"(gm_base), "r"(src1) : "memory");
+                    }
+                }
+
+#if !PREFETCH_BEFORE_STORE
+                if (nc + 32 < pnc_e) {
+                    LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                                 a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                                 taddr_base + nc + 32);
+                }
+#endif
+            }
+
+            /* Commit this pass's TMA output stores */
+            if (INTERLEAVE_STRATEGY == 0) {
+                __syncwarp();
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                if (lane == 0) {
+                    for (int r = 0; r < 2; r++) {
+                        uint32_t src = staging_saddr + r * STAGING_REGION_BYTES;
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                            :: "l"(tma_c_desc), "r"(n_start + pnc_s + r * 64),
+                               "r"(gm_base), "r"(src) : "memory");
+                    }
+                    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+                }
+            } else {
+                if (lane == 0) {
+                    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+                }
+            }
+        }
+
+#ifdef TIMING
+        t_phase1_end = clock64();
+#endif
+        if (!MBAR_EARLY && epi_mbar_addr) mbar_arrive(epi_mbar_addr);
+        return;
+    }
+#endif
 
 #if TMEM_LOAD_WIDTH == 64
     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
@@ -348,6 +535,8 @@ void epilogue_store(
         uint4 rv0 = {};
 #if PRELOAD_MODE == 2
         uint4 craw2 = {}, craw3 = {};
+        float4 bv2 = {}, bv3 = {}, bv4 = {}, bv5 = {}, bv6 = {}, bv7 = {};
+        uint4 rv1 = {}, rv2 = {}, rv3 = {};
 #endif
 
 #if PRELOAD_MODE >= 1
@@ -364,6 +553,30 @@ void epilogue_store(
             bp = side_data + n_start + nc;
             bv0 = __ldg(reinterpret_cast<const float4*>(bp));
             bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
+#if PRELOAD_MODE == 2
+            /* Full preload: all 32 bias values before TMEM_WAIT.
+               Fills the TMEM latency window with useful LDG traffic and
+               removes interleaved LDG from the GELU critical path. */
+            if constexpr (Op == EpilogueOp::BIAS_GELU) {
+                bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
+                bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
+                bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
+                bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
+                bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
+                bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
+            }
+            if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+                bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
+                bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
+                bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
+                bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
+                bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
+                bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
+                rv1 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 8));
+                rv2 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 16));
+                rv3 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 24));
+            }
+#endif
             if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                 rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
             }
@@ -411,6 +624,15 @@ void epilogue_store(
             CVT_ADD_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, craw1.x,craw1.y,craw1.z,craw1.w, srow + ((byte_base + 48) ^ xor_val));
 #endif
         } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
+#if PRELOAD_MODE == 2
+            /* All 32 bias values already loaded before TMEM_WAIT —
+               no interleaved LDG between GELU calls. Compiler sees all
+               4 GELU blocks without intervening memory ops. */
+            GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, srow + (byte_base ^ xor_val));
+            GELU_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, bv2.x,bv2.y,bv2.z,bv2.w,bv3.x,bv3.y,bv3.z,bv3.w, srow + ((byte_base + 16) ^ xor_val));
+            GELU_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, bv4.x,bv4.y,bv4.z,bv4.w,bv5.x,bv5.y,bv5.z,bv5.w, srow + ((byte_base + 32) ^ xor_val));
+            GELU_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, srow + ((byte_base + 48) ^ xor_val));
+#else
             GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, srow + (byte_base ^ xor_val));
             float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
             float4 bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
@@ -422,7 +644,15 @@ void epilogue_store(
             float4 bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
             float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
             GELU_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, srow + ((byte_base + 48) ^ xor_val));
+#endif
         } else if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+#if PRELOAD_MODE == 2
+            /* All bias + residual preloaded before TMEM_WAIT — no interleaved LDG */
+            BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, rv0.x,rv0.y,rv0.z,rv0.w, srow + (byte_base ^ xor_val));
+            BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, bv2.x,bv2.y,bv2.z,bv2.w,bv3.x,bv3.y,bv3.z,bv3.w, rv1.x,rv1.y,rv1.z,rv1.w, srow + ((byte_base + 16) ^ xor_val));
+            BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, bv4.x,bv4.y,bv4.z,bv4.w,bv5.x,bv5.y,bv5.z,bv5.w, rv2.x,rv2.y,rv2.z,rv2.w, srow + ((byte_base + 32) ^ xor_val));
+            BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, rv3.x,rv3.y,rv3.z,rv3.w, srow + ((byte_base + 48) ^ xor_val));
+#else
             BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, rv0.x,rv0.y,rv0.z,rv0.w, srow + (byte_base ^ xor_val));
             float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
             float4 bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
@@ -437,6 +667,7 @@ void epilogue_store(
             float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
             uint4 rv3 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 24));
             BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, rv3.x,rv3.y,rv3.z,rv3.w, srow + ((byte_base + 48) ^ xor_val));
+#endif
         }
 
 #if PREFETCH_BEFORE_STORE
@@ -551,6 +782,9 @@ persistent_gemm(
     SideDataPtr<Op> __restrict__ side_data,
     __nv_bfloat16* __restrict__ C,
     const __nv_bfloat16* __restrict__ residual
+#if TMA_RESIDUAL
+    , const __grid_constant__ CUtensorMap tma_res
+#endif
 #ifdef TIMING
     , long long* __restrict__ timing_buf
     , long long* __restrict__ spread_buf
@@ -578,6 +812,10 @@ persistent_gemm(
             mbar_init(smem_to_uint(smem + OFF_MAINLOOP_MBAR + i * 8), 1);
             mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR + i * 8), NUM_EPI_WARPS * 2 * 32);
         }
+#if TMA_RESIDUAL
+        for (int w = 0; w < NUM_EPI_WARPS; w++)
+            mbar_init(smem_to_uint(smem + OFF_RES_MBAR + w * 8), 1);
+#endif
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
@@ -771,18 +1009,27 @@ persistent_gemm(
                 if (is_split) {
                     if (col_rank == 0)
                         epilogue_store<0, TN/2, Op>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
+#if TMA_RESIDUAL
+                            , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
 #ifdef TIMING
                             , epi_t1
 #endif
                         );
                     else
                         epilogue_store<TN/2, TN, Op>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
+#if TMA_RESIDUAL
+                            , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
 #ifdef TIMING
                             , epi_t1
 #endif
                         );
                 } else {
                     epilogue_store<0, TN, Op>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
+#if TMA_RESIDUAL
+                        , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
 #ifdef TIMING
                         , epi_t1
 #endif
@@ -876,18 +1123,27 @@ persistent_gemm(
         if (is_split) {
             if (col_rank == 0)
                 epilogue_store<0, TN/2, Op>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
+#if TMA_RESIDUAL
+                    , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
 #ifdef TIMING
                     , drain_t1
 #endif
                 );
             else
                 epilogue_store<TN/2, TN, Op>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
+#if TMA_RESIDUAL
+                    , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
 #ifdef TIMING
                     , drain_t1
 #endif
                 );
         } else {
             epilogue_store<0, TN, Op>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
+#if TMA_RESIDUAL
+                , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
 #ifdef TIMING
                 , drain_t1
 #endif

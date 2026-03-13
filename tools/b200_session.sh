@@ -78,7 +78,7 @@ if should_run 2; then
     log "Monitor: tail -f $OUTDIR/compare.txt"
     log "Grid search logs: tail -f $OUTDIR/grid_search_*.log"
     python3 tools/compare_all.py \
-        --runs 20 \
+        --runs 10 \
         --cutlass-mode max \
         --grid-search \
         --csv "$OUTDIR/compare.csv" \

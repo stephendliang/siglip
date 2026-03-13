@@ -14,18 +14,18 @@ CUTLASS_FLAGS = -std=c++17 --expt-relaxed-constexpr
 all: $(TARGET)
 
 $(TARGET): $(CU) kernel_common.cuh kernel_body.cuh
-	$(NVCC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
 
 timing: $(CU) kernel_common.cuh kernel_body.cuh
 	$(NVCC) $(CFLAGS) -DTIMING $< -o patch_embed_timing $(LDFLAGS)
 
 # ── FC1+GELU kernel ──
 fc1-gelu: fc1_gelu.cu kernel_common.cuh kernel_body.cuh
-	$(NVCC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
 
 # ── FC2 kernel ──
 fc2: fc2.cu kernel_common.cuh kernel_body.cuh
-	$(NVCC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
 
 # ── CUTLASS benchmark (per-tensor FP8, grid search) ──
 cutlass-bench: bench/cutlass_bench.cu bench/siglip_periodic_add.hpp

@@ -28,7 +28,7 @@ Usage: #define N_DIM and K_DIM before including this header.
 #define TMEM_LOAD_WIDTH 32   // 32=1×x32 per 32-col chunk (default), 16=2×x16, 64=1×x64
 #endif
 #ifndef INTERLEAVE_STRATEGY
-#define INTERLEAVE_STRATEGY 2  // 0=all-at-end, 1=per-region, 2=half-batch, 3=three-plus-one
+#define INTERLEAVE_STRATEGY 2  // 0=all-at-end(CUTLASS-style), 1=per-region, 2=half-batch, 3=three-plus-one
 #endif
 #ifndef MBAR_EARLY
 #define MBAR_EARLY 0           // 0=after Phase 1, 1=after last TMEM_WAIT
@@ -52,10 +52,16 @@ Usage: #define N_DIM and K_DIM before including this header.
 #define SUB_MMA_UNROLL  0    // Sub-MMA inner loop: 0=no pragma, 1=no unroll, N=unroll by N
 #endif
 #ifndef PRELOAD_MODE
-#define PRELOAD_MODE 1         // 0=no preload, 1=partial (current), 2=full (BIAS_ADD only)
+#define PRELOAD_MODE 1         // 0=no preload, 1=partial (8 bias), 2=full (all side-data before TMEM_WAIT)
 #endif
 #ifndef PREFETCH_BEFORE_STORE
 #define PREFETCH_BEFORE_STORE 0  // 0=after TMA stores, 1=before TMA stores
+#endif
+#ifndef GELU_VARIANT
+#define GELU_VARIANT 0           // 0=asm tanh, 1=tanhf, 2=tanhf+half_x, 3=fmaf, 4=batch8-asm, 5=batch4+4-asm, 6=batch8-tanhf
+#endif
+#ifndef TMA_RESIDUAL
+#define TMA_RESIDUAL 0           // 0=__ldg residual (default), 1=TMA residual via SMEM staging
 #endif
 
 // nvcc doesn't expand macros in #pragma unroll — use _Pragma instead
@@ -109,7 +115,13 @@ Problem dimensions — N_DIM must be defined before including this header
 #define OFF_MMA_MBAR       (OFF_TMA_MBAR + N_STAGES * 8)
 #define OFF_MAINLOOP_MBAR  (OFF_MMA_MBAR + N_STAGES * 8)
 #define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
+#if TMA_RESIDUAL
+#define OFF_RES_MBAR       (OFF_EPILOGUE_MBAR + 16)
+#define OFF_STAGING        ((OFF_RES_MBAR + NUM_EPI_WARPS * 8 + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
+#define RES_STAGING_OFFSET (2 * STAGING_REGION_BYTES)   // residual regions start after 2 output regions per warp
+#else
 #define OFF_STAGING        ((OFF_EPILOGUE_MBAR + 16 + 1023) & ~1023)  // 1024-align for SWIZZLE_128B (addr[6:4] ^= addr[9:7])
+#endif
 #define STAGING_REGION_ROW_BYTES  128                                               // 64 BF16 cols = 128 bytes (SWIZZLE_128B)
 #define STAGING_REGION_BYTES      (32 * STAGING_REGION_ROW_BYTES)                   // 4096 bytes per region (32 rows x 128B)
 #define STAGING_WARP_BYTES        (4 * STAGING_REGION_BYTES)                         // 16384 bytes per warp (4 regions x 4096)
@@ -204,6 +216,16 @@ void tma_load_2d(uint32_t smem_dst, const void* tma_desc,
                   int32_t c0, int32_t c1, uint32_t mbar) {
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2"
+        " [%0], [%1, {%2, %3}], [%4];"
+        :: "r"(smem_dst), "l"(tma_desc), "r"(c0), "r"(c1), "r"(mbar)
+        : "memory");
+}
+
+static __device__ __forceinline__
+void tma_load_2d_cta(uint32_t smem_dst, const void* tma_desc,
+                      int32_t c0, int32_t c1, uint32_t mbar) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3}], [%4];"
         :: "r"(smem_dst), "l"(tma_desc), "r"(c0), "r"(c1), "r"(mbar)
         : "memory");

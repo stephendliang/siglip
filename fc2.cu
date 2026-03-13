@@ -163,6 +163,23 @@ int main() {
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }
 
+#if TMA_RESIDUAL
+    CUtensorMap h_tma_res;
+    {
+        uint64_t dims[2]    = {(uint64_t)N_DIM, (uint64_t)M_TOTAL};
+        uint64_t strides[1] = {(uint64_t)N_DIM * sizeof(__nv_bfloat16)};
+        uint32_t box[2]     = {64, 32};
+        uint32_t estrides[2]= {1, 1};
+        CU_CHECK(cuTensorMapEncodeTiled(&h_tma_res,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_residual,
+            dims, strides, box, estrides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    }
+#endif
+
     CUDA_CHECK(cudaFuncSetAttribute(persistent_gemm<EpilogueOp::BIAS_RESIDUAL>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     printf("  TMA descriptors + func attr done\n");
@@ -180,6 +197,9 @@ int main() {
     printf("Launching warmup (2 iters)...\n");
     for (int _i = 0; _i < 2; _i++) {
     persistent_gemm<EpilogueOp::BIAS_RESIDUAL><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual
+#if TMA_RESIDUAL
+        , h_tma_res
+#endif
 #ifdef TIMING
         , d_timing, d_spread
 #endif
@@ -197,6 +217,9 @@ int main() {
     cudaEventRecord(_t0);
     for (int _i = 0; _i < 10; _i++) {
     persistent_gemm<EpilogueOp::BIAS_RESIDUAL><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual
+#if TMA_RESIDUAL
+        , h_tma_res
+#endif
 #ifdef TIMING
         , d_timing, d_spread
 #endif
@@ -214,6 +237,9 @@ int main() {
 
     // Checksum run
     persistent_gemm<EpilogueOp::BIAS_RESIDUAL><<<SM_COUNT, THREADS, SMEM_BYTES>>>(h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual
+#if TMA_RESIDUAL
+        , h_tma_res
+#endif
 #ifdef TIMING
         , d_timing, d_spread
 #endif
