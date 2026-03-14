@@ -1,0 +1,231 @@
+========================================================================
+  Unified Benchmark: CUTLASS vs Our Kernel
+  Layers: patch_embed, fc1, fc2
+  Runs per approach: 10
+  CUTLASS mode: max
+  Grid search: 673 configs/layer x 3 layers (~168 min)
+========================================================================
+
+[Phase 1/4] BUILD (6 targets)
+  Building cutlass-bench-fc1-max ... ok
+  Building cutlass-bench-fc2-max ... ok
+  Building cutlass-bench-max ... ok
+  Building fc1-gelu ... ok
+  Building fc2 ... ok
+  Building patch_embed ... ok
+  Build done in 1518s
+
+[Phase 2/4] GRID SEARCH (~168 min, 673 configs/layer x 3 layers)
+  Each config: compile + run + validate. Progress in log files.
+
+  Running grid search for patch_embed (tier=all, top-k=3)
+  Log: /root/siglip/data/session_20260314_034416/grid_search_patch_embed.log
+  Winner dflags: -DCVT_ADD_FUSED=0 -DK_LOOP_UNROLL=8 -DPREFETCH_BEFORE_STORE=1 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSUB_MMA_UNROLL=3
+
+  Running grid search for fc1_gelu (tier=all, top-k=3)
+  Log: /root/siglip/data/session_20260314_034416/grid_search_fc1_gelu.log
+  Winner dflags: -DGELU_VARIANT=5 -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=2 -DMBAR_EARLY=1 -DNUM_EPI_WARPS=5 -DPREFETCH_BEFORE_STORE=1 -DPRELOAD_MODE=2 -DSTAGGER_CYCLES=0 -DSUB_MMA_UNROLL=1 -DW0_LOOP_UNROLL=1
+
+  Running grid search for fc2 (tier=all, top-k=3)
+  Log: /root/siglip/data/session_20260314_034416/grid_search_fc2.log
+  Winner dflags: -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=8 -DPHASE1_UNROLL=4 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSUB_MMA_UNROLL=3
+
+  Rebuilding with grid search winners:
+  Rebuilding ./patch_embed with: -DCVT_ADD_FUSED=0 -DK_LOOP_UNROLL=8 -DPREFETCH_BEFORE_STORE=1 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSUB_MMA_UNROLL=3 ... ok
+  Rebuilding ./fc1-gelu with: -DGELU_VARIANT=5 -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=2 -DMBAR_EARLY=1 -DNUM_EPI_WARPS=5 -DPREFETCH_BEFORE_STORE=1 -DPRELOAD_MODE=2 -DSTAGGER_CYCLES=0 -DSUB_MMA_UNROLL=1 -DW0_LOOP_UNROLL=1 ... ok
+  Rebuilding ./fc2 with: -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=8 -DPHASE1_UNROLL=4 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSUB_MMA_UNROLL=3 ... ok
+  Grid search done in 15246s
+
+[Phase 3/4] BENCHMARK (10 runs x 3 layers x 2 implementations)
+
+========================================================================
+  Patch Embed (768x768)
+========================================================================
+
+  Our kernel (./patch_embed):
+    our kernel run 1/10: 0.527 ms / 2077 TFLOPS
+    our kernel run 2/10: 0.527 ms / 2078 TFLOPS
+    our kernel run 3/10: 0.526 ms / 2080 TFLOPS
+    our kernel run 4/10: 0.524 ms / 2090 TFLOPS
+    our kernel run 5/10: 0.528 ms / 2075 TFLOPS
+    our kernel run 6/10: 0.526 ms / 2082 TFLOPS
+    our kernel run 7/10: 0.528 ms / 2075 TFLOPS
+    our kernel run 8/10: 0.529 ms / 2071 TFLOPS
+    our kernel run 9/10: 0.525 ms / 2085 TFLOPS
+    our kernel run 10/10: 0.525 ms / 2087 TFLOPS
+
+  CUTLASS (./cutlass-bench-max):
+    CUTLASS run 1/10: 0.535 ms (GEMM-only: 0.412 ms)
+    CUTLASS run 2/10: 0.535 ms (GEMM-only: 0.411 ms)
+    CUTLASS run 3/10: 0.536 ms (GEMM-only: 0.412 ms)
+    CUTLASS run 4/10: 0.536 ms (GEMM-only: 0.413 ms)
+    CUTLASS run 5/10: 0.537 ms (GEMM-only: 0.415 ms)
+    CUTLASS run 6/10: 0.537 ms (GEMM-only: 0.414 ms)
+    CUTLASS run 7/10: 0.535 ms (GEMM-only: 0.412 ms)
+    CUTLASS run 8/10: 0.535 ms (GEMM-only: 0.412 ms)
+    CUTLASS run 9/10: 0.537 ms (GEMM-only: 0.413 ms)
+    CUTLASS run 10/10: 0.535 ms (GEMM-only: 0.412 ms)
+
+========================================================================
+  FC1+GELU (768x3072)
+========================================================================
+
+  Our kernel (./fc1-gelu):
+    our kernel run 1/10: 2.408 ms / 1819 TFLOPS
+    our kernel run 2/10: 2.408 ms / 1819 TFLOPS
+    our kernel run 3/10: 2.409 ms / 1818 TFLOPS
+    our kernel run 4/10: 2.409 ms / 1818 TFLOPS
+    our kernel run 5/10: 2.409 ms / 1818 TFLOPS
+    our kernel run 6/10: 2.409 ms / 1818 TFLOPS
+    our kernel run 7/10: 2.410 ms / 1818 TFLOPS
+    our kernel run 8/10: 2.408 ms / 1819 TFLOPS
+    our kernel run 9/10: 2.410 ms / 1818 TFLOPS
+    our kernel run 10/10: 2.409 ms / 1818 TFLOPS
+
+  CUTLASS (./cutlass-bench-fc1-max):
+    CUTLASS run 1/10: 2.323 ms (GEMM-only: 1.611 ms)
+    CUTLASS run 2/10: 2.323 ms (GEMM-only: 1.614 ms)
+    CUTLASS run 3/10: 2.323 ms (GEMM-only: 1.613 ms)
+    CUTLASS run 4/10: 2.323 ms (GEMM-only: 1.613 ms)
+    CUTLASS run 5/10: 2.323 ms (GEMM-only: 1.613 ms)
+    CUTLASS run 6/10: 2.323 ms (GEMM-only: 1.613 ms)
+    CUTLASS run 7/10: 2.323 ms (GEMM-only: 1.613 ms)
+    CUTLASS run 8/10: 2.323 ms (GEMM-only: 1.613 ms)
+    CUTLASS run 9/10: 2.323 ms (GEMM-only: 1.612 ms)
+    CUTLASS run 10/10: 2.322 ms (GEMM-only: 1.615 ms)
+
+========================================================================
+  FC2+Bias (3072x768)
+========================================================================
+
+  Our kernel (./fc2):
+    our kernel run 1/10: 1.657 ms / 2644 TFLOPS
+    our kernel run 2/10: 1.658 ms / 2642 TFLOPS
+    our kernel run 3/10: 1.657 ms / 2643 TFLOPS
+    our kernel run 4/10: 1.661 ms / 2636 TFLOPS
+    our kernel run 5/10: 1.660 ms / 2639 TFLOPS
+    our kernel run 6/10: 1.662 ms / 2636 TFLOPS
+    our kernel run 7/10: 1.661 ms / 2637 TFLOPS
+    our kernel run 8/10: 1.659 ms / 2641 TFLOPS
+    our kernel run 9/10: 1.659 ms / 2641 TFLOPS
+    our kernel run 10/10: 1.659 ms / 2641 TFLOPS
+
+  CUTLASS (./cutlass-bench-fc2-max):
+    CUTLASS run 1/10: 1.224 ms (GEMM-only: 1.145 ms)
+    CUTLASS run 2/10: 1.223 ms (GEMM-only: 1.146 ms)
+    CUTLASS run 3/10: 1.223 ms (GEMM-only: 1.146 ms)
+    CUTLASS run 4/10: 1.223 ms (GEMM-only: 1.146 ms)
+    CUTLASS run 5/10: 1.225 ms (GEMM-only: 1.147 ms)
+    CUTLASS run 6/10: 1.223 ms (GEMM-only: 1.147 ms)
+    CUTLASS run 7/10: 1.223 ms (GEMM-only: 1.147 ms)
+    CUTLASS run 8/10: 1.225 ms (GEMM-only: 1.146 ms)
+    CUTLASS run 9/10: 1.223 ms (GEMM-only: 1.147 ms)
+    CUTLASS run 10/10: 1.224 ms (GEMM-only: 1.147 ms)
+  Benchmark done in 474s
+
+[Phase 4/4] STATISTICAL ANALYSIS
+
+########################################################################
+ #  RESULTS & STATISTICAL ANALYSIS
+########################################################################
+
+========================================================================
+  Patch Embed (768x768)
+========================================================================
+
+                           Summary Statistics                           
+========================================================================
+  Our kernel            n=10  mean=0.5265  std=0.0016  min=0.5240  max=0.5290  median=0.5265  IQR=0.0025
+  CUTLASS fused         n=10  mean=0.5358  std=0.0009  min=0.5350  max=0.5370  median=0.5355  IQR=0.0018
+
+  Ranking (fastest first):
+    #1: Our kernel            0.5265 ms (best)
+    #2: CUTLASS fused         0.5358 ms (+9.3 us vs best)
+
+                             One-way ANOVA                              
+========================================================================
+  F(1, 18) = 258.608,  p = 4.00e-12  (significant)
+
+                        Pairwise Welchs t-tests                         
+========================================================================
+  Comparison                              t-stat     p-value        d   Sig       Delta
+  --------------------------------------------------------------------------------
+         Our kernel vs CUTLASS fused      -16.081    1.26e-10   -7.192   ***      -9.3 us
+
+  n = 10-10 runs, alpha = 0.05
+  ns = not significant, * p<0.05, ** p<0.01, *** p<0.001
+
+  GEMM-only reference (not fused):
+    CUTLASS GEMM-only     mean=0.4126 ms  std=0.0012
+
+========================================================================
+  FC1+GELU (768x3072)
+========================================================================
+
+                           Summary Statistics                           
+========================================================================
+  Our kernel            n=10  mean=2.4089  std=0.0007  min=2.4080  max=2.4100  median=2.4090  IQR=0.0008
+  CUTLASS fused         n=10  mean=2.3229  std=0.0003  min=2.3220  max=2.3230  median=2.3230  IQR=0.0000
+
+  Ranking (fastest first):
+    #1: CUTLASS fused         2.3229 ms (best)
+    #2: Our kernel            2.4089 ms (+86.0 us vs best)
+
+                             One-way ANOVA                              
+========================================================================
+  F(1, 18) = 114765.517,  p = 1.06e-35  (significant)
+
+                        Pairwise Welchs t-tests                         
+========================================================================
+  Comparison                              t-stat     p-value        d   Sig       Delta
+  --------------------------------------------------------------------------------
+         Our kernel vs CUTLASS fused      338.771    1.30e-25  151.503   ***     +86.0 us
+
+  n = 10-10 runs, alpha = 0.05
+  ns = not significant, * p<0.05, ** p<0.01, *** p<0.001
+
+  GEMM-only reference (not fused):
+    CUTLASS GEMM-only     mean=1.6130 ms  std=0.0011
+
+========================================================================
+  FC2+Bias (3072x768)
+========================================================================
+
+                           Summary Statistics                           
+========================================================================
+  Our kernel            n=10  mean=1.6593  std=0.0017  min=1.6570  max=1.6620  median=1.6590  IQR=0.0025
+  CUTLASS fused         n=10  mean=1.2236  std=0.0008  min=1.2230  max=1.2250  median=1.2230  IQR=0.0010
+
+  Ranking (fastest first):
+    #1: CUTLASS fused         1.2236 ms (best)
+    #2: Our kernel            1.6593 ms (+435.7 us vs best)
+
+                             One-way ANOVA                              
+========================================================================
+  F(1, 18) = 525695.511,  p = 1.20e-41  (significant)
+
+                        Pairwise Welchs t-tests                         
+========================================================================
+  Comparison                              t-stat     p-value        d   Sig       Delta
+  --------------------------------------------------------------------------------
+         Our kernel vs CUTLASS fused      725.049    1.12e-31  324.252   ***    +435.7 us
+
+  n = 10-10 runs, alpha = 0.05
+  ns = not significant, * p<0.05, ** p<0.01, *** p<0.001
+
+  GEMM-only reference (not fused):
+    CUTLASS GEMM-only     mean=1.1464 ms  std=0.0007
+
+
+========================================================================
+  CROSS-LAYER SUMMARY (mean ms, fused)
+========================================================================
+  Layer                   Our kernel       CUTLASS          Best
+  --------------------------------------------------------
+  Patch Embed (768x768)        0.5265        0.5358  Our kernel
+  FC1+GELU (768x3072)         2.4089        2.3229  CUTLASS fused
+  FC2+Bias (3072x768)         1.6593        1.2236  CUTLASS fused
+
+Raw samples saved to: /root/siglip/data/session_20260314_034416/compare.csv
+
+Done. 10 runs x 3 layers in 17238s (287.3 min).

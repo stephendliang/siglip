@@ -67,7 +67,7 @@ RANGES = {
     'SUB_MMA_UNROLL': [0, 1, 3],
     'PRELOAD_MODE': [0, 1, 2],
     'PREFETCH_BEFORE_STORE': [0, 1],
-    'GELU_VARIANT': [0, 1, 2, 3, 4, 5, 6],
+    'GELU_VARIANT': [0, 4, 5],  # V1,2,3,6 use software tanhf() → 9.1ms catastrophic (4x slower)
     'TMA_RESIDUAL': [0, 1],
 }
 
@@ -376,22 +376,34 @@ def write_csv(results, path):
             writer.writerow(r)
 
 
-def run_sweep(sweep_params, fixed, src_path, repeat=1, kernel='patch_embed'):
-    """Run a sweep over sweep_params with fixed values pinned."""
+def run_sweep(sweep_params, fixed, src_path, repeat=1, kernel='patch_embed', seen_cfgs=None):
+    """Run a sweep over sweep_params with fixed values pinned.
+
+    seen_cfgs: optional set of dflags strings already evaluated (for top-k dedup).
+    """
     configs = list(enumerate_configs(sweep_params, fixed))
 
     # Pre-compile pruning
     valid = []
     pruned = 0
+    deduped = 0
     for cfg in configs:
         ok, reason = is_valid(cfg, kernel=kernel)
-        if ok:
-            valid.append(cfg)
-        else:
+        if not ok:
             pruned += 1
+            continue
+        # Dedup across branches (top-k mode)
+        if seen_cfgs is not None:
+            sig = make_dflags(cfg)
+            if sig in seen_cfgs:
+                deduped += 1
+                continue
+            seen_cfgs.add(sig)
+        valid.append(cfg)
 
     total = len(configs)
-    print(f'Sweep: {total} total, {len(valid)} valid, {pruned} pruned')
+    dedup_msg = f', {deduped} deduped' if deduped else ''
+    print(f'Sweep: {total} total, {len(valid)} valid, {pruned} pruned{dedup_msg}')
     if not valid:
         print('No valid configs!')
         return []
@@ -436,6 +448,27 @@ def get_best(results):
     return min(ok, key=lambda r: r['ms'])
 
 
+def get_top_k(results, tier_params, k=3):
+    """Return up to k distinct param-value combos from the best OK configs.
+
+    "Distinct" means configs that differ in at least one tier_param value.
+    This avoids running the next tier with k copies of the same pinned state.
+    """
+    ok = sorted([r for r in results if r['status'] == 'OK'], key=lambda r: r['ms'])
+    if not ok:
+        return []
+    seen = set()
+    top = []
+    for r in ok:
+        sig = tuple(r[p] for p in tier_params)
+        if sig not in seen:
+            seen.add(sig)
+            top.append(r)
+            if len(top) >= k:
+                break
+    return top
+
+
 def main():
     parser = argparse.ArgumentParser(description='Grid search for SigLIP kernel parameters')
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -451,6 +484,8 @@ def main():
                         help='Sweep only these parameters, pin rest at defaults')
     parser.add_argument('--repeat', type=int, default=1,
                         help='Run each config N times, report best (default: 1)')
+    parser.add_argument('--top-k', type=int, default=3, dest='top_k',
+                        help='Carry top-k branches between tiers (default: 3, 1=greedy)')
     parser.add_argument('--csv', default=None,
                         help='Output CSV path (default: data/sweep_<kernel>.csv)')
     args = parser.parse_args()
@@ -505,9 +540,11 @@ def main():
         all_results.extend(results)
 
     elif args.tier == 'all':
-        # Sequential tiers, pinning winners
-        winners = dict(DEFAULTS)
-        winners.update(fixed_overrides)
+        # Sequential tiers, top-k pinning (explores k branches per tier)
+        k = args.top_k
+        # Each branch is a dict of pinned param values
+        branches = [dict(DEFAULTS)]
+        branches[0].update(fixed_overrides)
 
         for tier_num in [1, 2, 3, 4, 5]:
             tier_params = TIER_PARAMS[tier_num]
@@ -516,23 +553,55 @@ def main():
                 print(f'\n=== Tier {tier_num}: all params pinned by --fix, skipping ===')
                 continue
 
-            fixed = {k: v for k, v in winners.items() if k not in sweep_params}
-
             print(f'\n=== Tier {tier_num}: {", ".join(sweep_params.keys())} ===')
-            results = run_sweep(sweep_params, fixed, src_path, repeat=args.repeat, kernel=args.kernel)
-            all_results.extend(results)
 
-            best = get_best(results)
-            if best:
-                for p in tier_params:
-                    winners[p] = best[p]
-                print(f'\nTier {tier_num} winner: {make_dflags(best) or "(defaults)"} '
+            # Run sweep for each branch, dedup configs to avoid re-running
+            tier_results = []
+            seen_cfgs = set()
+            for bi, branch in enumerate(branches):
+                fixed = {k_: v for k_, v in branch.items() if k_ not in sweep_params}
+                if len(branches) > 1:
+                    print(f'  Branch {bi+1}/{len(branches)}: {make_dflags(branch) or "(defaults)"}')
+                results = run_sweep(sweep_params, fixed, src_path, repeat=args.repeat, kernel=args.kernel,
+                                    seen_cfgs=seen_cfgs)
+                tier_results.extend(results)
+
+            all_results.extend(tier_results)
+
+            top = get_top_k(tier_results, tier_params, k=k)
+            if top:
+                # Build new branches from top-k winners
+                new_branches = []
+                for i, t in enumerate(top):
+                    b = dict(branches[0])  # start from current best branch
+                    for p in tier_params:
+                        b[p] = t[p]
+                    # Also inherit any non-tier params from the branch that produced this result
+                    for br in branches:
+                        fixed_sig = tuple(br.get(p) for p in tier_params)
+                        result_sig = tuple(t[p] for p in tier_params)
+                        if fixed_sig == result_sig:
+                            b.update(br)
+                            for p in tier_params:
+                                b[p] = t[p]
+                            break
+                    new_branches.append(b)
+
+                branches = new_branches
+                best = top[0]
+                tier_label = f'Tier {tier_num} winner'
+                if len(top) > 1:
+                    tier_label += f' (top-{len(top)})'
+                print(f'\n{tier_label}: {make_dflags(best) or "(defaults)"} '
                       f'→ {best["ms"]:.3f} ms / {best["tflops"]:.0f} TFLOPS')
+                for i, t in enumerate(top[1:], 2):
+                    print(f'  #{i}: {make_dflags(t) or "(defaults)"} '
+                          f'→ {t["ms"]:.3f} ms / {t["tflops"]:.0f} TFLOPS')
             else:
                 print(f'\nTier {tier_num}: no valid results!')
 
-        # Print the composite pinned winner (all tiers combined)
-        composite_dflags = make_dflags(winners)
+        # Print the composite pinned winner (best branch)
+        composite_dflags = make_dflags(branches[0])
         print(f'\n@@GRID_WINNER {composite_dflags or "(defaults)"}')
 
     else:

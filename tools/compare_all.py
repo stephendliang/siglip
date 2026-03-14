@@ -320,7 +320,7 @@ def run_anova(groups, layer_label):
 
 # ── Grid search (optional) ──
 
-def run_grid_search(kernel, tier='all', csv_dir=None):
+def run_grid_search(kernel, tier='all', csv_dir=None, top_k=3):
     """Run grid search and return the best config's dflags.
 
     Streams grid_search.py output to a log file (unbuffered) so progress
@@ -330,11 +330,12 @@ def run_grid_search(kernel, tier='all', csv_dir=None):
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, f'grid_search_{kernel}.log')
 
-    print(f"\n  Running grid search for {kernel} (tier={tier})")
+    print(f"\n  Running grid search for {kernel} (tier={tier}, top-k={top_k})")
     print(f"  Log: {log_path}")
     cmd = [sys.executable, '-u',  # unbuffered python output
            os.path.join(SCRIPT_DIR, 'grid_search.py'),
-           '--kernel', kernel, '--tier', tier]
+           '--kernel', kernel, '--tier', tier,
+           '--top-k', str(top_k)]
     if csv_dir:
         cmd.extend(['--csv', os.path.join(csv_dir, f'sweep_{kernel}.csv')])
 
@@ -392,6 +393,8 @@ def main():
                         help='Run grid search before repeated measurements')
     parser.add_argument('--grid-tier', default='all',
                         help='Grid search tier (default: all)')
+    parser.add_argument('--top-k', type=int, default=3,
+                        help='Top-k branches for grid search (default: 3, 1=greedy)')
     parser.add_argument('--cutlass-mode', choices=['standard', 'max'], default='max',
                         help='CUTLASS sweep mode (default: max)')
     parser.add_argument('--csv', default=None,
@@ -452,7 +455,8 @@ def main():
         print(f"  Each config: compile + run + validate. Progress in log files.")
         for layer_name in args.layer:
             kernel_name = layer_name if layer_name != 'fc1' else 'fc1_gelu'
-            best = run_grid_search(kernel_name, args.grid_tier, csv_dir=grid_csv_dir)
+            best = run_grid_search(kernel_name, args.grid_tier, csv_dir=grid_csv_dir,
+                                       top_k=args.top_k)
             if best:
                 grid_dflags[layer_name] = best
 
