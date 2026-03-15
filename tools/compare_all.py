@@ -398,6 +398,8 @@ def main():
                         help='Top-k branches for grid search (default: 3, 1=greedy)')
     parser.add_argument('--cutlass-mode', choices=['standard', 'max'], default='max',
                         help='CUTLASS sweep mode (default: max)')
+    parser.add_argument('--no-cutlass', action='store_true',
+                        help='Skip CUTLASS build, benchmark, and comparison')
     parser.add_argument('--csv', default=None,
                         help='Save raw samples to CSV')
     parser.add_argument('--imgs-per-sm', type=int, default=32,
@@ -413,14 +415,18 @@ def main():
         print()
 
     n_layers = len(args.layer)
-    n_targets = n_layers * 2  # our + cutlass per layer
+    n_targets = n_layers * (1 if args.no_cutlass else 2)
     grid_configs = 60  # approx valid configs per kernel with per-kernel tiers
 
     print("=" * 72)
-    print("  Unified Benchmark: CUTLASS vs Our Kernel")
+    if args.no_cutlass:
+        print("  Grid Search + Benchmark (our kernels only)")
+    else:
+        print("  Unified Benchmark: CUTLASS vs Our Kernel")
     print(f"  Layers: {', '.join(args.layer)}")
     print(f"  Runs per approach: {args.runs}")
-    print(f"  CUTLASS mode: {args.cutlass_mode}")
+    if not args.no_cutlass:
+        print(f"  CUTLASS mode: {args.cutlass_mode}")
     if args.grid_search:
         print(f"  Grid search: ~{grid_configs} configs/layer x {n_layers} layers (~{grid_configs * n_layers * 5 // 60} min) [tier={args.grid_tier}]")
     print("=" * 72)
@@ -470,7 +476,9 @@ def main():
         print(f"\n[Phase 2/5] GRID SEARCH — skipped (no --grid-search)")
 
     # ── Phase 3/5: Build CUTLASS (deferred to avoid blocking grid search) ──
-    if not args.skip_build:
+    if args.no_cutlass:
+        print(f"\n[Phase 3/5] BUILD CUTLASS — skipped (--no-cutlass)")
+    elif not args.skip_build:
         cutlass_targets = set()
         for layer_name in args.layer:
             layer = LAYERS[layer_name]
@@ -514,18 +522,19 @@ def main():
                 all_raw.append((layer_name, 'our_kernel', i, ms))
 
         # CUTLASS
-        print(f"\n  CUTLASS ({cutlass_binary}):")
-        cutlass_fused, cutlass_gemm = collect_cutlass_samples(
-            cutlass_binary, layer['epilogue'], args.runs,
-            run_args=bench_args)
-        if cutlass_fused:
-            groups['CUTLASS fused'] = cutlass_fused
-            for i, ms in enumerate(cutlass_fused):
-                all_raw.append((layer_name, 'cutlass_fused', i, ms))
-        if cutlass_gemm:
-            groups['CUTLASS GEMM-only'] = cutlass_gemm
-            for i, ms in enumerate(cutlass_gemm):
-                all_raw.append((layer_name, 'cutlass_gemm', i, ms))
+        if not args.no_cutlass:
+            print(f"\n  CUTLASS ({cutlass_binary}):")
+            cutlass_fused, cutlass_gemm = collect_cutlass_samples(
+                cutlass_binary, layer['epilogue'], args.runs,
+                run_args=bench_args)
+            if cutlass_fused:
+                groups['CUTLASS fused'] = cutlass_fused
+                for i, ms in enumerate(cutlass_fused):
+                    all_raw.append((layer_name, 'cutlass_fused', i, ms))
+            if cutlass_gemm:
+                groups['CUTLASS GEMM-only'] = cutlass_gemm
+                for i, ms in enumerate(cutlass_gemm):
+                    all_raw.append((layer_name, 'cutlass_gemm', i, ms))
 
         layer_results[layer_name] = groups
 

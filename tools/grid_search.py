@@ -71,7 +71,7 @@ RANGES = {
     'MBAR_EARLY': [0, 1],
     'STAGGER_CYCLES': [0, 40, 60, 80, 100, 120, 160, 200],
     'PHASE1_UNROLL': [1, 2, 4],
-    'SNAKE_ORDER': [0, 1],
+    'SNAKE_ORDER': [1],  # pinned — SNAKE=0 is catastrophic (+49μs PE, never wins)
     'CVT_ADD_FUSED': [0, 1],
     'K_LOOP_UNROLL': [1, 2, 4, 6, 8],
     'W0_LOOP_UNROLL': [0, 1, 4],
@@ -93,7 +93,7 @@ RANGES = {
 TIER_PARAMS = {
     1: ['N_STAGES', 'NUM_EPI_WARPS'],
     2: ['INTERLEAVE_STRATEGY', 'MBAR_EARLY', 'STAGGER_CYCLES', 'TMEM_LOAD_WIDTH'],
-    3: ['PHASE1_UNROLL', 'SNAKE_ORDER', 'CVT_ADD_FUSED', 'K_LOOP_UNROLL',
+    3: ['PHASE1_UNROLL', 'CVT_ADD_FUSED', 'K_LOOP_UNROLL',
         'W0_LOOP_UNROLL', 'SUB_MMA_UNROLL'],
     4: ['PRELOAD_MODE', 'PREFETCH_BEFORE_STORE', 'BATCH_EPILOGUE', 'TMA_RESIDUAL', 'STORE_TIMING',
         'EPILOGUE_LOOP', 'STS_WIDTH', 'EPI_SYNC', 'NUM_PASSES_PARAM'],
@@ -104,30 +104,37 @@ TIER_PARAMS = {
 # Ordered by balanced-η² from existing sweep data. Noise params (η²<0.01 with
 # adequate N_bal) are omitted — pinned at KERNEL_BASES values and never swept.
 # Tier 1: known dominant. Tier 2: known secondary. Tier 3: untested, need data.
-# Source: session_20260315 (FC1), session_20260314 (FC2, PE). See docs/SEARCH_ANALYSIS.md.
+# Source: session_20260315 (FC1, FC2), session_20260314 (PE). See docs/SEARCH_ANALYSIS.md.
 # Invalidate after structural kernel changes (new epilogue ops, tile config changes).
 KERNEL_TIERS = {
     'fc1_gelu': {
         1: ['GELU_VARIANT', 'STORE_TIMING', 'INTERLEAVE_STRATEGY'],
-        2: ['PHASE1_UNROLL', 'SNAKE_ORDER', 'PRELOAD_MODE', 'BATCH_EPILOGUE'],
+        2: ['PHASE1_UNROLL', 'PRELOAD_MODE', 'BATCH_EPILOGUE'],
         3: ['EPILOGUE_LOOP', 'STS_WIDTH', 'EPI_SYNC', 'GELU_VECTOR_WIDTH'],
     },
     'fc2': {
-        1: ['N_STAGES', 'K_LOOP_UNROLL'],
-        2: ['W0_LOOP_UNROLL'],
-        3: ['STORE_TIMING', 'BATCH_EPILOGUE', 'TMA_RESIDUAL', 'STS_WIDTH',
-            'EPILOGUE_LOOP', 'EPI_SYNC', 'NUM_PASSES_PARAM'],
+        1: ['N_STAGES', 'K_LOOP_UNROLL', 'TMA_RESIDUAL'],
+        2: ['INTERLEAVE_STRATEGY', 'PHASE1_UNROLL'],
+        3: ['BATCH_EPILOGUE', 'STORE_TIMING', 'STS_WIDTH', 'PRELOAD_MODE'],
+        4: ['EPILOGUE_LOOP', 'EPI_SYNC', 'NUM_PASSES_PARAM'],
     },
     'patch_embed': {
         1: ['N_STAGES', 'K_LOOP_UNROLL', 'W0_LOOP_UNROLL'],
-        2: ['PHASE1_UNROLL', 'SNAKE_ORDER'],
+        2: ['PHASE1_UNROLL'],
         3: ['EPILOGUE_LOOP', 'EPI_SYNC', 'STORE_TIMING'],
     },
 }
 
+# Structural params: always branch both values, never prune by dynamic-k.
+# These change pipeline depth or fundamental kernel structure — later tiers
+# may interact differently with each value, so both must survive.
+BRANCH_PARAMS = {
+    'fc2': {'N_STAGES'},
+}
+
 # Best-known configs per kernel (pin non-swept params here).
 # Derived from sweep winners — noise params locked at their winning values.
-# FC1: 2.247ms winner from session_20260315. FC2: 1.651ms from session_20260314.
+# FC1: 2.267ms winner from session_20260315. FC2: 1.471ms from session_20260315.
 # PE: 0.525ms from session_20260314 (effectively exhausted).
 KERNEL_BASES = {
     'fc1_gelu': {
@@ -137,10 +144,9 @@ KERNEL_BASES = {
         'CVT_ADD_FUSED': 1, 'NUM_EPI_WARPS': 4,
     },
     'fc2': {
-        'N_STAGES': 4, 'INTERLEAVE_STRATEGY': 1, 'MBAR_EARLY': 0,
-        'STAGGER_CYCLES': 100, 'SNAKE_ORDER': 1, 'PHASE1_UNROLL': 2,
-        'SUB_MMA_UNROLL': 0, 'PREFETCH_BEFORE_STORE': 0,
-        'PRELOAD_MODE': 0, 'TMEM_LOAD_WIDTH': 32,
+        'MBAR_EARLY': 0, 'STAGGER_CYCLES': 100,
+        'W0_LOOP_UNROLL': 0, 'SUB_MMA_UNROLL': 0,
+        'PREFETCH_BEFORE_STORE': 0, 'TMEM_LOAD_WIDTH': 32,
         'CVT_ADD_FUSED': 1, 'NUM_EPI_WARPS': 4,
     },
     'patch_embed': {
@@ -703,6 +709,38 @@ def print_eta_summary(results, params):
         print(f'  η²: {", ".join(parts)}')
 
 
+def print_top_lock_summary(results, all_params, top_ns=(5, 10, 20)):
+    """Print top-k universality analysis. Returns locks at the widest top-N."""
+    ok = [r for r in results if r['status'] == 'OK']
+    if len(ok) < 5:
+        return []
+    best_locks = []
+    parts = []
+    for p in all_params:
+        # Find the widest top-N where this param is still locked
+        max_n = 0
+        locked_val = None
+        base_rate = 1.0
+        ok_sorted = sorted(ok, key=lambda r: r['ms'])
+        for n in top_ns:
+            if n > len(ok_sorted):
+                break
+            top_vals = set(r[p] for r in ok_sorted[:n])
+            if len(top_vals) == 1:
+                max_n = n
+                locked_val = top_vals.pop()
+                n_with = sum(1 for r in ok_sorted if r[p] == locked_val)
+                base_rate = n_with / len(ok_sorted)
+            else:
+                break
+        if max_n >= 5 and base_rate < 0.70:
+            parts.append(f'{p}={locked_val}(top{max_n},{base_rate:.0%})')
+            best_locks.append((p, locked_val, base_rate, max_n))
+    if parts:
+        print(f'  top-lock: {", ".join(parts)}')
+    return best_locks
+
+
 def load_best_from_csv(kernel):
     """Load the best config from the most recent sweep CSV for this kernel."""
     csv_dir = os.path.join(ROOT_DIR, 'data')
@@ -898,6 +936,7 @@ def main():
 
         branches = [dict(base)]
         branches[0].update(fixed_overrides)
+        auto_pinned = {}  # params locked at top across tiers (informative base rate)
 
         for tier_num in tier_nums:
             tier_params = ktiers[tier_num]
@@ -924,6 +963,14 @@ def main():
             all_results.extend(tier_results)
             print_eta_summary(tier_results, list(sweep_params.keys()))
 
+            # Top-lock analysis: find params universally locked at the top
+            # Uses all params seen so far (not just this tier) to catch cross-tier locks
+            all_swept_so_far = [p for tn in tier_nums if tn <= tier_num
+                                for p in ktiers.get(tn, [])]
+            tier_locks = print_top_lock_summary(tier_results, all_swept_so_far)
+            for p, v, _br, _n in tier_locks:
+                auto_pinned[p] = v
+
             top = get_top_k(tier_results, tier_params, k=k)
             if top:
                 # Dynamic k: reduce branching when winner is clear
@@ -934,8 +981,28 @@ def main():
                         k_eff = 1
                     elif gap_pct > 0.5:
                         k_eff = min(k_eff, 2)
-                    if k_eff < len(top):
-                        print(f'\n  Gap: {gap_pct:.2f}% → k_eff={k_eff} (from {len(top)})')
+
+                # Structural params: ensure each distinct value survives
+                branch_ps = BRANCH_PARAMS.get(args.kernel, set()) & set(tier_params)
+                if branch_ps:
+                    needed = set()
+                    for t in top:
+                        needed.add(tuple(t[p] for p in sorted(branch_ps)))
+                    k_min = len(needed)
+                    if k_eff < k_min:
+                        # Find minimum k_eff that covers all structural values
+                        covered = set()
+                        for i, t in enumerate(top):
+                            covered.add(tuple(t[p] for p in sorted(branch_ps)))
+                            if len(covered) >= k_min:
+                                k_eff = i + 1
+                                break
+                        bp_str = ', '.join(sorted(branch_ps))
+                        print(f'\n  Branch params ({bp_str}): k_eff raised to {k_eff} '
+                              f'(preserving {k_min} distinct values)')
+
+                if k_eff < len(top) and not branch_ps:
+                    print(f'\n  Gap: {gap_pct:.2f}% → k_eff={k_eff} (from {len(top)})')
 
                 # Build new branches from top-k winners
                 new_branches = []
@@ -944,6 +1011,9 @@ def main():
                     b = dict(branches[parent_idx])
                     for p in tier_params:
                         b[p] = t[p]
+                    # Pin auto-locked params into branches
+                    for p, v in auto_pinned.items():
+                        b[p] = v
                     new_branches.append(b)
 
                 branches = new_branches
@@ -1006,6 +1076,11 @@ def main():
 
             if not any_interaction:
                 print(f'\nNo applicable interactions for {args.kernel}')
+
+        # Print auto-pinned params from top-lock analysis
+        if auto_pinned:
+            pin_parts = [f'{p}={v}' for p, v in sorted(auto_pinned.items())]
+            print(f'\nTop-locked params: {", ".join(pin_parts)}')
 
         # Print the composite pinned winner (best branch)
         composite_dflags = make_dflags(branches[0])

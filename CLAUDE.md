@@ -5,32 +5,60 @@ FP8 (E4M3) precision, tcgen05 WGMMA, TMA, `cta_group::2` with 2-CTA clusters. Cr
 
 ## Current state
 
-**0.519 ms / 2108 TFLOPS** fused (GEMM + bias + pos_embed) with `MBAR_EARLY=1 STAGGER_CYCLES=160` — **38% faster** than cuBLAS end-to-end (0.835 ms = best GEMM + unfused pos_embed). Defaults produce 0.524 ms / 2090 TFLOPS.
+Three fused GEMM kernels for the vision encoder MLP:
 
-The kernel's value is **fusion**: the overlapped epilogue eliminates the 0.470 ms unfused pos_embed overhead entirely.
+| Kernel | Shape | Epilogue | Best ms | TFLOPS | Regs | vs CUTLASS fused |
+|--------|-------|----------|---------|--------|------|------------------|
+| **patch_embed** | [928256,768]×[768,768]^T | bias + pos_embed | 0.525 | 2085 | 174-214 | **2% faster** (0.536) |
+| **fc1_gelu** | [928256,768]×[768,3072]^T | bias + GELU | 2.267 | 1932 | 244 | **3% faster** (2.323) |
+| **fc2** | [928256,3072]×[3072,768]^T | bias + residual | 1.471 | 2977 | 255 | **20% slower** (1.224) |
 
-cuBLAS pure GEMM is faster: 0.365 ms / 3001 TFLOPS (per-tensor FP8, best-of-128 heuristics, 256MB workspace).
-Our effective TFLOPS (2090-2108) counts fused epilogue time in the denominator — not a fair GEMM-only comparison.
+Batch = 4736 images × 196 patches = 928256 rows. BF16 output, FP8 inputs.
 
-GEMM: `[928256, 768] x [768, 768]^T` with fused bias + positional embedding add, BF16 output.
-Batch = 4736 images x 196 patches = 928256 rows. Square weight matrix (768x768).
+The kernels' value is **fusion**: overlapped epilogues eliminate unfused overhead entirely. All three are correct (non-uniform validation, checksum validated) and stable.
 
-The kernel is correct (non-uniform validation, checksum validated) and stable.
+**PE is exhausted** — 145 balanced configs all within 0.001ms. No parameter moves the needle.
+**FC1** — won via interaction sweeps finding GV=4+IS=0+PH1U=4. Prior best 2.247ms (IS=1+ST=1).
+**FC2** — biggest opportunity. 20% gap to CUTLASS. New restructured tiers (IS/PH1U now swept, N_STAGES=4 preserved via BRANCH_PARAMS) haven't been tested yet.
 
-## Current bottlenecks (post-F40)
+## Grid search
 
-The kernel is **epilogue-bound** in a balanced producer-consumer equilibrium. F38 unified the epilogue (all 256 cols through SWIZZLE_128B + TMA stores, eliminating the legacy Phase 2A manual LDS+STG path). F40 recovered the stall-window utilization by interleaving TMA stores during TMEM readback.
+The primary optimization tool. Per-kernel tiered parameter sweep with top-lock analysis, interaction sweeps, and dynamic branching.
 
-**Key facts:**
-- Phase 1 TMEM readback = binding constraint. Interleaved TMA stores (strategy 2, half-batch) fill TMEM stall windows.
-- K-loop: 4,059 cycles. Precomputed descriptors, unroll controlled by `K_LOOP_UNROLL` (default `N_STAGES`).
-- TMA multicast not applicable (B is N-split across CTAs).
-- ~161-254 regs/thread (varies with `K_LOOP_UNROLL`, `W0_LOOP_UNROLL`, `SUB_MMA_UNROLL`, `CVT_ADD_FUSED`, `PHASE1_UNROLL`, `MBAR_EARLY`, `PREFETCH_BEFORE_STORE`, `GELU_VARIANT`, `TMA_RESIDUAL`, `BATCH_EPILOGUE`, `GELU_VECTOR_WIDTH`, `STORE_TIMING`, `EPILOGUE_LOOP`, `STS_WIDTH`, `EPI_SYNC`, `NUM_PASSES_PARAM`; defaults: PE=205, FC1=~242, FC2=254), 0 spills. Limits occupancy to 1 CTA/SM.
-- Timing build uses ~245 regs (distorts cycles vs production). Wall clock is ground truth.
+### How it works
 
-Run `python3 tools/analyze_timing.py data/clock64_timing.txt` for full equilibrium analysis and what-if projections.
-Run `python3 tools/analyze_source_counters.py data/source_counters_raw.csv` for per-instruction stall breakdown.
-See `docs/EXPERIMENTS.md` for experiments (F1-F40) with hypotheses, results, and analysis.
+1. **Per-kernel tiers**: Each kernel has ordered tiers of params (most impactful first). Sweep tier 1, carry top-k winners as branches into tier 2, etc.
+2. **Top-lock analysis**: After each tier, checks if any param is universally locked at the top (single value in all top-5/10/20 results, base rate <70%). Auto-pins into subsequent tier branches.
+3. **Dynamic k**: Reduces branching when the gap is clear (>2% → k=1, >0.5% → k≤2). Structural params (`BRANCH_PARAMS`) override this — N_STAGES always branches both values for FC2.
+4. **Interaction sweeps**: After all tiers, tests cross-tier param combinations (e.g., epilogue: BATCH_EPILOGUE × IS × PRELOAD_MODE). Skipped only if ALL params in the group are noise (not in any tier).
+5. **Inline η²**: Per-param eta-squared printed after each tier/interaction.
+
+### Per-kernel tier ordering
+
+Based on balanced-η² from session_20260315. Params not in any tier are pinned at `KERNEL_BASES` values.
+
+**FC1** (K=768, N=3072, 12 N-tiles):
+- Tier 1: `GELU_VARIANT`, `STORE_TIMING`, `INTERLEAVE_STRATEGY` — IS is dominant (η²=0.533)
+- Tier 2: `PHASE1_UNROLL`, `PRELOAD_MODE`, `BATCH_EPILOGUE` — PH1U=4 is critical (η²=0.842)
+- Tier 3: `EPILOGUE_LOOP`, `STS_WIDTH`, `EPI_SYNC`, `GELU_VECTOR_WIDTH`
+- Pinned: N_STAGES=5 (mandatory, 23% slower at 4), KLU=5, SMU=3
+
+**FC2** (K=3072, N=768, 3 N-tiles, 24 K-iterations):
+- Tier 1: `N_STAGES`, `K_LOOP_UNROLL`, `TMA_RESIDUAL` — TMAR=1 is key (η²=0.435)
+- Tier 2: `INTERLEAVE_STRATEGY`, `PHASE1_UNROLL` — untested with TMAR=1 baseline
+- Tier 3: `BATCH_EPILOGUE`, `STORE_TIMING`, `STS_WIDTH`, `PRELOAD_MODE`
+- Tier 4: `EPILOGUE_LOOP`, `EPI_SYNC`, `NUM_PASSES_PARAM`
+- N_STAGES is a `BRANCH_PARAM` — both 4 and 5 always survive dynamic-k
+
+**PE** (K=768, N=768, 3 N-tiles): Exhausted. Tiers exist but return same 0.525ms.
+
+### Key findings
+
+- **SNAKE_ORDER=1**: Mandatory (pinned). SNAKE=0 is catastrophic (+49μs PE, never wins anywhere).
+- **FC1 breakthrough**: GV=4+IS=0+PH1U=4 found via interaction sweeps, not tier search. IS=3 won tier 1 but IS=0 was the real winner.
+- **FC2 constraint**: 255 regs at N_STAGES=5 — allocator ceiling. N_STAGES=4 frees 1 reg (254) but was 8.5% slower without TMAR=1. Untested with full param sweep.
+- **Top-lock vs η²**: η² catches params that create spread. Top-lock catches params required for peak. Complementary — η² says what to avoid, top-lock says what to pin.
+- **Tiered data is confounded**: Raw η², RF, Pearson/Spearman all give wrong rankings. Only balanced-subset η² works.
 
 ## Kernel structure
 
@@ -38,38 +66,55 @@ Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1
 
 - **W0**: TMA async bulk loads (A + B tiles, both CTAs load independently)
 - **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
-- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols through 4 SWIZZLE_128B regions: x32 `tcgen05.ld` → epilogue op → CVT → `st.shared`, with **interleaved TMA stores** every 2 regions hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1. The epilogue op is kernel-specific: bias+pos_embed add (patch_embed), bias+GELU (fc1_gelu), or bias+residual (fc2). Side-data LDG placement controlled by `PRELOAD_MODE` (0=after TMEM_WAIT, 1=partial preload before, 2=full preload before TMEM_WAIT — all three epilogue types). Next-tile TMEM prefetch timing controlled by `PREFETCH_BEFORE_STORE` (0=after TMA stores, 1=before). FC2 residual loading controlled by `TMA_RESIDUAL` (0=scattered `__ldg`, 1=TMA coalesced via SMEM staging with two-pass 128-col structure, 2=TMA preloaded before mainloop wait — first-pass residual TMA flies during idle, `epilogue_store` skips pass 0 load via `FIRST_PASS_PRELOADED` template param). Epilogue compute/store phasing controlled by `BATCH_EPILOGUE` (0=fused compute+CVT+STS per 8 elems, 1=compute all then batch `cvt_sts_v4` — eliminates MUFU drain/refill cycles for GELU, eliminates compute→STS serialization for RESIDUAL; requires `GELU_VARIANT` 0-3 for FC1 via `HAS_GELU_APPROX`). GELU batch size within `BATCH_EPILOGUE=1` controlled by `GELU_VECTOR_WIDTH` (8=per-group, 16=two-batch, 32=full-batch; FC1 only). TMA store placement controlled by `STORE_TIMING` (0=inline per `INTERLEAVE_STRATEGY`, 1=all stores batched after Phase 1 with single fence — overrides inline stores). Epilogue unroll controlled by `EPILOGUE_LOOP` (0=unrolled per `PHASE1_UNROLL`, 1=`#pragma unroll 1` loop body — forces `PHASE1_UNROLL=1`, requires `STORE_TIMING=1`). Store width controlled by `STS_WIDTH` (16=1x `cvt_sts_v4` per 8 elems, 32=`cvt_sts_v8` batches 16 CVTs then 2x `st.shared.v4` — requires `BATCH_EPILOGUE=1`, FC1/FC2 only). Warp entry synchronization controlled by `EPI_SYNC` (0=independent warp poll, 1=`bar.sync 1` across all epi warps before epilogue — makes `STAGGER_CYCLES` redundant). FC2 TMA_RESIDUAL pass count controlled by `NUM_PASSES_PARAM` (0=auto 128 cols/pass, 4=64 cols/pass with 1 TMA load per pass — FC2 only, requires `TMA_RESIDUAL>0`).
+- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols through 4 SWIZZLE_128B regions: x32 `tcgen05.ld` → epilogue op → CVT → `st.shared`, with **interleaved TMA stores** hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1.
 
-TM=128 rows / 32 rows per warp = 4 row groups. With 4 epi warps (default), each warp owns a full row group (256 cols, `is_split=0`). With 5 epi warps, warp 4 shares row_group 0 via `ew % 4`, creating split warps (`is_split=1`) that each handle 128 cols (2 regions). `epilogue_store` is templated on `<NC_START, NC_END, Op, FIRST_PASS_PRELOADED>` so the compiler sees constant loop bounds and `N_REGIONS = (NC_END - NC_START) / 64` is constexpr; unroll depth controlled by `PHASE1_UNROLL` (default 2). `is_split`/`col_rank` are compiled out with `#if NUM_EPI_WARPS > 4` guards when not needed.
+Epilogue ops: bias+pos_embed (PE), bias+GELU (FC1), bias+residual (FC2). FC2's residual loads a full [M,N] matrix — heaviest epilogue, memory-bound. FC1's GELU is compute-bound. PE's add is trivial.
 
-The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile N (double-buffered TMEM, mbarrier-protected). Prev-tile coordinates are hoisted above the mainloop wait (pure arithmetic). After the tile loop, W2-5 run a drain epilogue for the last tile (same coord-hoisting pattern).
+The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile N (double-buffered TMEM, mbarrier-protected).
 
 ### Tile config
-- Tile: 256x256x128 (M=2x128 from cta_group::2, N=256, K=128)
-- TMEM: single alloc of 512 cols (TN*2), double-buffered via column offset (buf*TN)
-- SMEM: 4-stage pipeline (131 KB) + epilogue staging (4 warps x 16,384 = 64 KB, SWIZZLE_128B) = ~197 KB total of 228 KB
-- Tiles: 3626 M-tiles x 3 N-tiles = 10,878 total, snake ordering
-- ~161-254 registers/thread, 0 spills (varies with unroll params and epilogue type; PE defaults=205, FC2=254)
-- `NUM_EPI_WARPS` controls epilogue warp count (currently 4); `THREADS` derived as `32*(2+NUM_EPI_WARPS)`
+- Tile: 256×256×128 (M=2×128 from cta_group::2, N=256, K=128)
+- TMEM: single alloc of 512 cols (TN*2), double-buffered via column offset
+- SMEM: 4-stage pipeline (131 KB) + epilogue staging (64 KB, SWIZZLE_128B) = ~197 KB of 228 KB
+- Tiles: 3626 M-tiles × N_TILES (3 for PE/FC2, 12 for FC1), snake ordering
+- K-iterations: 6 (PE/FC1, K=768) or 24 (FC2, K=3072)
 
 ## B200 sessions
 
-All execution, profiling, and benchmarking requires B200 hardware. Cross-compilation works anywhere. Never debug interactively on the server — run the automated session, download data, analyze locally.
+All execution, profiling, and benchmarking requires B200 hardware. Cross-compilation works anywhere.
 
 ```bash
-./tools/b200_session.sh                              # full session (~45 min), always run full
-python3 tools/analyze_session.py data/session_*/     # structured summary (uses latest session dir)
+./tools/b200_session.sh                    # grid search + benchmark (no CUTLASS, default)
+./tools/b200_session.sh --cutlass          # include CUTLASS build + comparison
+python3 tools/analyze_session.py data/session_*/
 ```
 
-Phases: machine snapshot → `compare_all.py --runs 20 --grid-search` (ANOVA) → ncu profiling → SASS dumps (our kernels + CUTLASS). All outputs to timestamped `data/session_*/`. See **`TASKS.md`** for manual follow-ups.
+Phases: machine snapshot → grid search + benchmark → ncu profiling → SASS dumps. Autocommits session data to git. All outputs to timestamped `data/session_*/`.
 
 ## Development workflow
 
-All kernels share `kernel_common.cuh` (pipeline, TMEM loads, TMA helpers, mbarrier ops, tuning parameters, `cvt_sts_v4`/`cvt_sts_v8` helpers, `BF16X2_TO_F32_NV` non-volatile unpack macro) and `kernel_body.cuh` (epilogue_store template, persistent_gemm kernel template). Each `.cu` file `#define N_DIM` and `K_DIM`, defines its epilogue macro (e.g., `CVT_ADD_STS_V4`), then includes both headers — tile counts and K-iter constants are derived automatically. FC1's GELU epilogue has 7 variants (0-6) selected by `GELU_VARIANT`: scalar (0-3) vary algebra/intrinsics, batched (4-6) explicitly phase pre-tanh/MUFU/post-tanh for scheduling control. Scalar variants (0-3) define `HAS_GELU_APPROX`, enabling `BATCH_EPILOGUE` mode. `GELU_VECTOR_WIDTH` (8/16/32) controls the compute batch size within `BATCH_EPILOGUE=1`: 32=all GELU then all stores, 16=two batches, 8=per-group (same scheduling as non-batch). `STORE_TIMING` (0/1) controls TMA store placement: 0=inline per `INTERLEAVE_STRATEGY`, 1=all stores deferred to end of Phase 1 (single fence, eliminates inline syncwarp+fence overhead). `EPILOGUE_LOOP` (0/1) switches between unrolled and `#pragma unroll 1` epilogue loop body (forces `PHASE1_UNROLL=1`, requires `STORE_TIMING=1`). `STS_WIDTH` (16/32) switches between 1x and 2x `st.shared.v4` per call via `cvt_sts_v8` (requires `BATCH_EPILOGUE=1`, FC1/FC2 only). `EPI_SYNC` (0/1) adds `bar.sync 1` across epi warps before epilogue entry (makes `STAGGER_CYCLES` redundant). `NUM_PASSES_PARAM` (0/4) controls FC2 TMA_RESIDUAL pass count: 0=auto (128 cols/pass), 4=64 cols/pass (requires `TMA_RESIDUAL>0`).
+All kernels share `kernel_common.cuh` (pipeline, TMEM, TMA, mbarriers, tuning params) and `kernel_body.cuh` (epilogue_store template, persistent_gemm template). Each `.cu` file `#define N_DIM` and `K_DIM`, defines its epilogue macro, then includes both headers.
 
 ```
 edit kernel_common.cuh / kernel_body.cuh / patch_embed.cu / fc1_gelu.cu / fc2.cu -> make -> ./patch_embed (or ./fc1_gelu, ./fc2)
 ```
+
+### Compile-time tuning params
+
+Key params (controlled via `-D` flags, swept by grid_search.py):
+
+| Param | Values | Effect |
+|-------|--------|--------|
+| `N_STAGES` | 3,4,5 | Pipeline depth. FC1 needs 5. FC2 tests both 4 and 5. |
+| `K_LOOP_UNROLL` | 1,2,4,6,8 | K-loop unroll factor |
+| `PHASE1_UNROLL` | 1,2,4 | Epilogue unroll. PH1U=4 critical for FC1, neutral for PE. |
+| `INTERLEAVE_STRATEGY` | 0,1,2,3 | TMA store interleaving. IS=0 wins FC1, IS=2 wins PE. |
+| `GELU_VARIANT` | 0,4,5 | FC1 only. V4 (batched asm) is best. |
+| `TMA_RESIDUAL` | 0,1,2 | FC2 only. TMAR=1 (TMA coalesced) is key. |
+| `STORE_TIMING` | 0,1 | 0=inline stores, 1=all deferred after Phase 1. |
+| `BATCH_EPILOGUE` | 0,1 | 1=separate compute/store phases (FC1/FC2 only). |
+
+See grid_search.py `RANGES` dict for full parameter list and valid values.
 
 ## Code style
 
@@ -100,30 +145,29 @@ CLAUDE.md               # This file
 TASKS.md                # B200 session playbook — automated benchmarking workflow
 
 tools/                  # Analysis & sweep scripts
-  sass_analysis.py      # SASS scheduling analyzer (decodes control words, dep graphs, slack)
-  grid_search.py        # Compile-time parameter sweep (per-kernel tiered default, cross-tier interactions, CSV output)
-  simulate_lhs.py       # Bootstrap convergence simulation (no GPU)
-  balanced_eta.py       # Balanced-subset eta-squared from sweep CSVs (controls for tiered confounds)
+  grid_search.py        # Per-kernel tiered parameter sweep (top-lock, interactions, CSV output)
+  b200_session.sh       # Automated B200 session (grid search, benchmark, ncu, SASS, autocommit)
+  compare_all.py        # Benchmark: CUTLASS vs ours (--no-cutlass default in sessions)
+  analyze_session.py    # Summarize session output for Claude Code interpretation
+  analyze_sweep.py      # Grid search analysis: eta-squared, balanced subsets, RF importance
+  balanced_eta.py       # Standalone balanced-subset eta-squared tool
+  sass_analysis.py      # SASS scheduling analyzer (control words, dep graphs, slack)
   analyze_timing.py     # clock64 timing → equilibrium analysis
   analyze_source_counters.py  # ncu SourceCounters CSV → stall breakdown
-  compare_all.py        # Unified benchmark: CUTLASS vs ours + ANOVA
-  analyze_sweep.py      # Grid search analysis: eta-squared, balanced subsets, RF importance
+  simulate_lhs.py       # Bootstrap convergence simulation (no GPU)
+  analyze_gelu_variants.py  # Static GELU variant scheduling analysis (no GPU)
   remote.py             # Remote B200 provisioning + sweep runner
   ncu_diff.py           # ncu CSV diff tool
   compare_sass.py       # SASS dump diff tool
-  cutlass_sweep.sh      # Build + run all CUTLASS bench variants (max/standard)
-  b200_session.sh       # Automated B200 rental session (builds, benchmarks, profiles, SASS)
-  analyze_session.py    # Summarize session output for Claude Code interpretation
-  analyze_gelu_variants.py  # Static GELU variant scheduling analysis (runs locally, no GPU)
+  cutlass_sweep.sh      # Build + run all CUTLASS bench variants
 
 bench/                  # Benchmark & calibration kernels
   cutlass_bench.cu      # CUTLASS tile/policy sweep (compile-time N/K/epilogue via -D flags)
   siglip_periodic_add.hpp # Custom EVT visitor (Sm100PeriodicAddNode)
-  cublas_bench.cu       # cuBLAS baseline benchmark (compile-time N/K/epilogue via -D flags)
+  cublas_bench.cu       # cuBLAS baseline benchmark
   calibration.cu        # SASS latency microbenchmarks (K1-K26)
   common.h              # Shared PTX helpers (mbarrier, TMA, tcgen05)
   profiler.h            # globaltimer-based kernel profiler
-  CALIBRATION_LACKING   # Calibration status audit (measured/pending/unfixable)
 
 data/                   # Sweep results, ncu profiles, session outputs (data/session_*/)
 docs/                   # Experiments (F1-F40), proposals, grid search, SASS notes, ncu analysis
@@ -133,109 +177,42 @@ docs/                   # Experiments (F1-F40), proposals, grid search, SASS not
 
 ```bash
 make                    # compile patch_embed.cu -> patch_embed
-./patch_embed         # run on B200, prints timing + TFLOPS + checksum
+./patch_embed           # run on B200, prints timing + TFLOPS + checksum
 make fc1-gelu           # compile fc1_gelu.cu -> fc1-gelu
 ./fc1-gelu              # run FC1+GELU kernel
 make fc2                # compile fc2.cu -> fc2
 ./fc2                   # run FC2 kernel
-make timing && ./patch_embed_timing | tee data/clock64_timing.txt | python3 tools/analyze_timing.py
-ncu --set source --csv ./patch_embed > data/source_counters_raw.csv && python3 tools/analyze_source_counters.py data/source_counters_raw.csv
-
-# CUTLASS tile/policy sweep (compile-time N/K/epilogue via -D flags, one binary per epilogue)
-make cutlass-bench          # patch embed: N=768 K=768 PERIODIC_ADD (default)
-make cutlass-bench-fc1      # FC1: N=3072 K=768 GELU_BIAS
-make cutlass-bench-fc2      # FC2: N=768 K=3072 BIAS_RESIDUAL
-./cutlass-bench [imgs_per_sm]  # default 32 → M=928256
-
-# CUTLASS extended sweep (more tile/cluster configs)
-make cutlass-bench-max          # extended patch embed
-make cutlass-bench-fc1-max      # extended FC1
-make cutlass-bench-fc2-max      # extended FC2
-
-# Full CUTLASS sweep across all three layers (builds + runs)
-./tools/cutlass_sweep.sh              # max mode, 32 imgs/SM
-./tools/cutlass_sweep.sh 1            # quick test (1 img/SM = 148*196 rows)
-./tools/cutlass_sweep.sh 32 standard  # standard tile list only
 
 # Parameter grid search — per-kernel tiered (default)
-python3 tools/grid_search.py                                    # per-kernel tiered, ~60 configs (default)
-python3 tools/grid_search.py --kernel fc1_gelu                  # FC1 per-kernel tiers (GV+ST first)
-python3 tools/grid_search.py --kernel fc2                       # FC2 per-kernel tiers (NS+KLU first)
-python3 tools/grid_search.py --tier all --no-interact           # tiers only, skip interaction sweeps
+python3 tools/grid_search.py                                    # per-kernel tiered (default)
+python3 tools/grid_search.py --kernel fc1_gelu                  # FC1 tiers
+python3 tools/grid_search.py --kernel fc2                       # FC2 tiers
+python3 tools/grid_search.py --tier all --no-interact           # tiers only, skip interactions
 python3 tools/grid_search.py --full-cross                       # all parameters crossed
-python3 tools/grid_search.py --kernel fc1_gelu --tier 5         # FC1 generic tier 5 only
-python3 tools/grid_search.py --only K_LOOP_UNROLL W0_LOOP_UNROLL SUB_MMA_UNROLL  # sweep specific params
-python3 tools/grid_search.py --interact epilogue --kernel fc1_gelu   # cross-tier interaction sweep
-python3 tools/grid_search.py --interact all --kernel fc2             # all applicable interactions for FC2
-python3 tools/grid_search.py --only BATCH_EPILOGUE INTERLEAVE_STRATEGY --base MBAR_EARLY=1  # --base sets baseline
+python3 tools/grid_search.py --only K_LOOP_UNROLL TMA_RESIDUAL  # sweep specific params
+python3 tools/grid_search.py --interact epilogue --kernel fc2   # single interaction group
+python3 tools/grid_search.py --only BATCH_EPILOGUE --base MBAR_EARLY=1  # --base sets baseline
 
-# Search convergence simulation (no GPU needed)
-python3 tools/simulate_lhs.py data/session_*/sweep_fc1_gelu.csv    # bootstrap comparison
+# CUTLASS comparison
+make cutlass-bench-max && ./cutlass-bench-max         # PE
+make cutlass-bench-fc1-max && ./cutlass-bench-fc1-max # FC1
+make cutlass-bench-fc2-max && ./cutlass-bench-fc2-max # FC2
+python3 tools/compare_all.py --runs 20 --csv data/compare.csv   # full ANOVA comparison
 
-# Balanced-η² analysis (controls for tiered search confounds)
-python3 tools/balanced_eta.py data/session_*/sweep_fc1_gelu.csv    # FC1 param importance
-python3 tools/balanced_eta.py data/session_*/sweep_fc2.csv          # FC2 param importance
-
-# GELU variant static analysis (runs locally on Mac, no GPU needed)
-python3 tools/analyze_gelu_variants.py                     # comparison table (all 7 variants)
-python3 tools/analyze_gelu_variants.py --variant 3         # single variant detail
-python3 tools/analyze_gelu_variants.py --verbose            # instruction-by-instruction schedule
-
-# Grid search analysis (eta-squared, balanced subsets, random forest)
-python3 tools/analyze_sweep.py data/sweep_results_run4.csv             # balanced PE data
-python3 tools/analyze_sweep.py data/session_*/sweep_*.csv              # all layers from session
-
-# SASS scheduling analysis
-cuobjdump --dump-sass patch_embed > sass_dump.txt
-python3 tools/sass_analysis.py sass_dump.txt                          # annotated listing
-python3 tools/sass_analysis.py sass_dump.txt --section 0x1300 0x1a70  # address range (e.g., epilogue)
-python3 tools/sass_analysis.py sass_dump.txt --deps                   # dependency + slack analysis
-python3 tools/sass_analysis.py --cubin patch_embed                  # runs cuobjdump internally
-
-# Calibration: verify SASS control word decoder on B200
-make calibration          # compile bench/calibration.cu
-./calibration > cal_output.txt
-cuobjdump --dump-sass calibration > cal_sass.txt
-python3 tools/sass_analysis.py cal_sass.txt --calibrate-compare                          # SASS-only
-python3 tools/sass_analysis.py cal_sass.txt --calibrate-compare --runtime cal_output.txt # compare vs runtime
-
-# Unified comparison (CUTLASS vs ours, ANOVA statistical analysis)
-make compare                                              # all layers, 10 runs, CSV output
-python3 tools/compare_all.py --runs 20 --csv data/compare.csv   # more runs for tighter CI
-python3 tools/compare_all.py --layer patch_embed --runs 5        # single layer, quick
-python3 tools/compare_all.py --grid-search                      # run grid search first
+# Analysis (all run locally, no GPU)
+python3 tools/analyze_sweep.py data/session_*/sweep_*.csv       # param importance rankings
+python3 tools/balanced_eta.py data/session_*/sweep_fc2.csv      # balanced η² for FC2
+python3 tools/sass_analysis.py --cubin patch_embed --deps       # SASS dependency analysis
 ```
-
-### Bench details
-
-Both `cutlass_bench.cu` and `cublas_bench.cu` are compile-time parameterized via `-D` flags: `BENCH_N`, `BENCH_K`, `BENCH_EPILOGUE` (`1`=PERIODIC_ADD, `2`=GELU_BIAS, `3`=BIAS_RESIDUAL, `0`=NONE). CUTLASS adds `CUTLASS_EXTENDED_SWEEP=1` for more tile/cluster configs. Configs exceeding SMEM capacity return sentinel `-3.0f`. cuBLAS tests both MXFP8 and per-tensor FP8 with up to 128 algo heuristics.
 
 ## Key constraints
 
 - Target: `sm_100a` (B200, 148 SMs)
 - `cta_group::2` with `__cluster_dims__(2,1,1)` — 74 clusters of 2 CTAs
-- TMEM: 512 cols/SM total, single alloc of TN*2 for double buffering (learned from matmul_v7: two separate allocs deadlock, single alloc works)
-- SMEM: 228 KB/SM — current usage ~192 KB (4-stage pipeline + unified SWIZZLE_128B epilogue staging, ~36 KB free)
+- TMEM: 512 cols/SM total, single alloc for double buffering (two separate allocs deadlock)
+- SMEM: 228 KB/SM — current usage ~192-225 KB depending on N_STAGES
 - All inline PTX — no CUTLASS dependency for the kernels themselves
-- Kernels are hand-edited directly; shared infrastructure lives in `kernel_common.cuh`
-- Validation: non-uniform B (alternating FP8 rows: 1.5/1.0 → distinct even/odd col accumulators), non-uniform bias/pos_embed, 1024 strided checksum + 32 CPU reference spot checks (valid=1 in @@RESULT)
-- **OFF_STAGING must be 1024-byte aligned** for SWIZZLE_128B correctness — TMA swizzle operates on absolute SMEM address bits `addr[6:4] ^= addr[9:7]`; misalignment causes systematic 8-col (16-byte) group swaps in output. Swizzle period = 8 rows x 128 bytes = 1024 bytes.
-- **`fence.proxy.async.shared::cta` required** before every TMA store that reads from SMEM written by `st.shared` — bridges sync→async memory proxies. Without it, TMA may read stale data (sporadic corruption).
-- ml_phase init must account for odd tile_start (start_buf-dependent)
-
-## Grid search findings
-
-Sweep data analyzed via `python3 tools/analyze_sweep.py` using eta-squared (ANOVA), balanced-subset eta-squared (controls for tiered search confounds), and random forest permutation importance. Tiered search data is heavily imbalanced (pinned params get 90%+ of configs) — only balanced η² and the run4 balanced sweep (145 configs) give trustworthy importance rankings.
-
-**Patch embed** (run4, 145 balanced configs): parameter search exhausted — all top configs within 0.001 ms. Best: `MBAR_EARLY=1 STAGGER_CYCLES=160` → 0.519 ms / 2108 TFLOPS. Defaults → 0.524 ms / 2090 TFLOPS.
-
-**Cross-kernel universal defaults**: `SNAKE_ORDER=1`, `PHASE1_UNROLL=2`, `K_LOOP_UNROLL=4`, `W0_LOOP_UNROLL=0`, `TMEM_LOAD_WIDTH=32`, `PRELOAD_MODE=1`, `PREFETCH_BEFORE_STORE=0`, `GELU_VARIANT=0`, `BATCH_EPILOGUE=0`.
-**Per-kernel tuning**: `INTERLEAVE_STRATEGY=2` (PE, FC2) vs `=1` (FC1) — N=3072 changes epilogue pattern.
-**Catastrophic values**: `PHASE1_UNROLL=4` (+2.4 ms on FC1), `SNAKE_ORDER=0` (+49 us on PE).
-**Per-kernel epilogue warps**: `NUM_EPI_WARPS=4` (all kernels). EPI=5 disabled — split warp creates 2 extra template instantiations (9227 vs ~5000 SASS lines), bloating icache and register allocation.
-**Epilogue scheduling** (tier 4): `PRELOAD_MODE` (0/1/2) × `PREFETCH_BEFORE_STORE` (0/1) × `BATCH_EPILOGUE` (0/1) × `TMA_RESIDUAL` (0/1/2) × `STORE_TIMING` (0/1) × `EPILOGUE_LOOP` (0/1) × `STS_WIDTH` (16/32) × `EPI_SYNC` (0/1) × `NUM_PASSES_PARAM` (0/4). PRELOAD_MODE=2 preloads all side-data before TMEM_WAIT (BIAS_ADD: 8 uint4; BIAS_GELU: 8 float4 = all 32 bias). PREFETCH_BEFORE_STORE=1 adds ~14 regs on PE (205→219); FC2 stays at 254 (allocator at ceiling). `BATCH_EPILOGUE=1` separates compute and store phases (all 32 GELU/residual results computed, then batch 4x `cvt_sts_v4`); only for FC1 (GELU_VARIANT 0-3) and FC2. `TMA_RESIDUAL=2` preloads first-pass residual before mainloop wait (FC2 only). `STORE_TIMING=1` defers all TMA stores to after Phase 1 (single fence, eliminates inline syncwarp+fence overhead); pruned when `INTERLEAVE_STRATEGY=0` (IS=0 already does all-at-end, redundant with ST=1). IS is dead code when ST=1 (inline stores suppressed), so IS variants with ST=1 are deduped via `make_dflags`. `EPILOGUE_LOOP=1` uses `#pragma unroll 1` on the epilogue loop body, reducing SASS instruction count at the cost of loop overhead; forces `PHASE1_UNROLL=1`, requires `STORE_TIMING=1`, incompatible with `BATCH_EPILOGUE`. `STS_WIDTH=32` uses `cvt_sts_v8` (16 CVTs batched before 2x `st.shared.v4`) instead of separate `cvt_sts_v4` calls; requires `BATCH_EPILOGUE=1`, FC1/FC2 only, incompatible with `GELU_VECTOR_WIDTH=8`. `EPI_SYNC=1` adds `bar.sync 1` across epi warps before epilogue, ensuring coordinated entry (like CUTLASS); makes `STAGGER_CYCLES` redundant (pruned when `STAGGER_CYCLES>0`). `NUM_PASSES_PARAM=4` splits FC2 TMA_RESIDUAL into 4 passes of 64 cols (1 region per pass, 1 TMA load per pass); FC2 only, requires `TMA_RESIDUAL>0`.
-**GELU variants** (tier 5, fc1_gelu only): `GELU_VARIANT` (0-6) × `GELU_VECTOR_WIDTH` (8/16/32). Scalar: 0=asm tanh (default), 1=tanhf(), 2=tanhf()+half_x reorder, 3=__fmaf_rn (7 ops/elem vs 8). Batched: 4=batch8-asm, 5=batch4+4-asm, 6=batch8-tanhf. `GELU_VECTOR_WIDTH` controls batch size within `BATCH_EPILOGUE=1`: 32=all GELU then all stores, 16=two batches, 8=per-group. VW!=32 requires `BATCH_EPILOGUE=1` + `GELU_VARIANT` 0-3. Static analysis predicts V3 (-7% scheduled cycles, fewest instructions) and V4/V6 (-8%, tightest MUFU gaps) as best candidates; register pressure is the risk for batched variants at FC1's ~242 baseline.
-**Cross-tier interactions**: `--tier all` automatically runs interaction sweeps after tier 5 (skippable with `--no-interact`). Thirteen named groups: `epilogue` (`BATCH_EPILOGUE × INTERLEAVE_STRATEGY × PRELOAD_MODE`, FC1/FC2 — ~24 configs), `gelu` (`BATCH_EPILOGUE × GELU_VARIANT`, FC1 only — 4 valid configs, V4/V5 pruned), `residual` (`TMA_RESIDUAL × PRELOAD_MODE × INTERLEAVE_STRATEGY`, FC2 only — 36 configs), `reg_pressure` (`TMEM_LOAD_WIDTH × BATCH_EPILOGUE`, FC1/FC2 — 2-4 configs), `unroll_batch` (`PHASE1_UNROLL × BATCH_EPILOGUE`, FC1/FC2 — 6 configs), `gelu_interleave` (`GELU_VARIANT × INTERLEAVE_STRATEGY`, FC1 only — 12 configs), `gelu_width` (`GELU_VECTOR_WIDTH × GELU_VARIANT × BATCH_EPILOGUE`, FC1 only — ~8 valid configs), `store_batch` (`STORE_TIMING × BATCH_EPILOGUE`, FC1/FC2 — 4 configs), `prefetch_store` (`PREFETCH_BEFORE_STORE × STORE_TIMING`, FC1/FC2 — 3-4 configs), `loop_store` (`EPILOGUE_LOOP × STORE_TIMING`, all kernels — 3 valid configs), `sts_batch` (`STS_WIDTH × BATCH_EPILOGUE`, FC1/FC2 — 3 valid configs), `sync_stagger` (`EPI_SYNC × STAGGER_CYCLES`, all kernels), `passes_residual` (`NUM_PASSES_PARAM × TMA_RESIDUAL`, FC2 only). Interactions run across all top-k branches with dedup. Standalone: `--interact epilogue --kernel fc2`. Baseline: `--base` > most recent sweep CSV > DEFAULTS.
-**Dynamic k**: `--tier all` reduces branching when the gap between #1 and #2 is clear (>2% → k=1, >0.5% → k≤2). Saves compile time on FC1 where EPI=5 wins by 13%.
-**Inline η²**: Each tier/interaction prints per-parameter eta-squared immediately after the sweep completes.
-
+- Validation: non-uniform B, non-uniform bias/pos_embed, 1024 strided checksum + 32 CPU reference spot checks
+- **OFF_STAGING must be 1024-byte aligned** for SWIZZLE_128B correctness
+- **`fence.proxy.async.shared::cta` required** before every TMA store that reads from SMEM written by `st.shared`
+- FC2 at 255 regs — allocator ceiling. Any change that adds regs is dead on arrival.

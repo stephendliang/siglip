@@ -3,13 +3,14 @@
 #
 # Phases:
 #   1. Machine snapshot                          (~5 sec)
-#   2. Build + grid search + benchmark + ANOVA   (~15-30 min, CUTLASS deferred after grid search)
+#   2. Build + grid search + benchmark           (~15-30 min)
 #   3. ncu profiling (source counters + full)     (~5 min)
-#   4. SASS dumps (our kernels + CUTLASS)           (~1 min)
+#   4. SASS dumps (our kernels)                    (~1 min)
 #
 # Usage:
 #   tmux new -s b200
-#   ./tools/b200_session.sh                    # full session
+#   ./tools/b200_session.sh                    # grid search only (no CUTLASS)
+#   ./tools/b200_session.sh --cutlass          # include CUTLASS build + comparison
 #   ./tools/b200_session.sh --phase 2          # single phase
 #
 # Monitor from another pane:
@@ -21,12 +22,18 @@ cd "$(dirname "$0")/.."
 
 PHASE_ONLY=0
 COMPARE_ARGS=""
+WITH_CUTLASS=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --phase) PHASE_ONLY="$2"; shift 2 ;;
+        --cutlass) WITH_CUTLASS=1; shift ;;
         *) COMPARE_ARGS="$COMPARE_ARGS $1"; shift ;;
     esac
 done
+
+if [ "$WITH_CUTLASS" = "0" ]; then
+    COMPARE_ARGS="--no-cutlass $COMPARE_ARGS"
+fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTDIR="data/session_${TIMESTAMP}"
@@ -70,11 +77,16 @@ if should_run 1; then
     log "Machine info saved to machine_info.txt"
 fi
 
-# ── Phase 2/4: Build + grid search + benchmark (~30-90 min) ──
+# ── Phase 2/4: Build + grid search + benchmark (~15-90 min) ──
 if should_run 2; then
     log ""
     log "==== PHASE 2/4: BUILD + GRID SEARCH + BENCHMARK ===="
-    log "This is the long phase. Grid search: ~60 configs/layer (per-kernel tiered)."
+    log "Grid search: ~60-200 configs/layer (per-kernel tiered + top-lock)."
+    if [ "$WITH_CUTLASS" = "1" ]; then
+        log "CUTLASS comparison enabled."
+    else
+        log "CUTLASS skipped (pass --cutlass to enable)."
+    fi
     log "Monitor: tail -f $OUTDIR/compare.txt"
     log "Grid search logs: tail -f $OUTDIR/grid_search_*.log"
     python3 tools/compare_all.py \
@@ -128,18 +140,20 @@ if should_run 4; then
             log "FAIL cuobjdump $bin"
         fi
     done
-    for bin in cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2; do
-        if [ ! -x "./$bin" ]; then
-            log "SKIP SASS $bin: binary not found"
-            continue
-        fi
-        if cuobjdump --dump-sass "./$bin" > "$OUTDIR/sass_${bin}.txt" 2>&1; then
-            lines=$(wc -l < "$OUTDIR/sass_${bin}.txt")
-            log "SASS dumped: $bin ($lines lines)"
-        else
-            log "FAIL cuobjdump $bin"
-        fi
-    done
+    if [ "$WITH_CUTLASS" = "1" ]; then
+        for bin in cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2; do
+            if [ ! -x "./$bin" ]; then
+                log "SKIP SASS $bin: binary not found"
+                continue
+            fi
+            if cuobjdump --dump-sass "./$bin" > "$OUTDIR/sass_${bin}.txt" 2>&1; then
+                lines=$(wc -l < "$OUTDIR/sass_${bin}.txt")
+                log "SASS dumped: $bin ($lines lines)"
+            else
+                log "FAIL cuobjdump $bin"
+            fi
+        done
+    fi
     log "Phase 4 complete"
 fi
 
@@ -152,3 +166,27 @@ log "========================================"
 ls -lh "$OUTDIR/" | tee -a "$OUTDIR/session.log"
 echo ""
 echo "Analyze: python3 tools/analyze_session.py $OUTDIR"
+
+# ── Autocommit session data ──
+# Extract grid search winners for commit message
+WINNERS=""
+for f in "$OUTDIR"/grid_search_*.log; do
+    [ -f "$f" ] || continue
+    kernel=$(basename "$f" .log | sed 's/grid_search_//')
+    winner_line=$(grep '@@GRID_WINNER' "$f" | tail -1)
+    if [ -n "$winner_line" ]; then
+        ms=$(grep "^Best:" "$f" | tail -1 | grep -oP '[\d.]+(?= ms)' || true)
+        WINNERS="$WINNERS  $kernel: ${ms:-?} ms\n"
+    fi
+done
+
+log "Autocommitting session data..."
+git add "$OUTDIR/"
+git commit -m "$(cat <<EOF
+Add B200 session $TIMESTAMP
+
+$(printf "$WINNERS")
+Session: ${ELAPSED}s ($(( ELAPSED / 60 )) min), $(ls "$OUTDIR"/*.csv 2>/dev/null | wc -l) sweep CSVs
+EOF
+)" || log "WARN: git commit failed (nothing to commit?)"
+log "Committed $OUTDIR"
