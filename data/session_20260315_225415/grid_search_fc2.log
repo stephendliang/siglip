@@ -1,0 +1,290 @@
+Kernel: fc2 (fc2.cu)
+Per-kernel tiers for fc2: skipping GELU_VARIANT, GELU_VECTOR_WIDTH
+Pinned at winner values: INTERLEAVE_STRATEGY=1 PRELOAD_MODE=0 STAGGER_CYCLES=100
+
+=== Tier 1: N_STAGES, K_LOOP_UNROLL ===
+Sweep: 15 total, 15 valid, 0 pruned
+Estimated time: ~1 min (15 configs × ~5s each)
+
+[1/15] -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=1 -DN_STAGES=3 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 2.059 ms / 2128 TFLOPS  (206 regs, 1.6s)
+[2/15] -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=1 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 2.088 ms / 2098 TFLOPS  (212 regs, 1.6s)
+[3/15] -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 2.415 ms / 1814 TFLOPS  (216 regs, 1.6s)
+[4/15] -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=2 -DN_STAGES=3 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 2.048 ms / 2139 TFLOPS  (206 regs, 1.6s)
+[5/15] -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=2 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 2.068 ms / 2118 TFLOPS  (212 regs, 1.6s)
+[6/15] -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=2 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 2.420 ms / 1810 TFLOPS  (216 regs, 1.6s)
+[7/15] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=3 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 1.977 ms / 2216 TFLOPS  (240 regs, 1.6s)
+[8/15] -DINTERLEAVE_STRATEGY=1 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 1.660 ms / 2638 TFLOPS  (254 regs, 1.6s)
+[9/15] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 1.522 ms / 2878 TFLOPS  (255 regs, 1.6s)
+[10/15] -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=6 -DN_STAGES=3 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 1.974 ms / 2219 TFLOPS  (240 regs, 1.6s)
+[11/15] -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=6 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 2.034 ms / 2154 TFLOPS  (212 regs, 1.6s)
+[12/15] -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=6 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 2.386 ms / 1836 TFLOPS  (216 regs, 1.6s)
+[13/15] -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=8 -DN_STAGES=3 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 2.049 ms / 2138 TFLOPS  (206 regs, 1.7s)
+[14/15] -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=8 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 1.652 ms / 2652 TFLOPS  (254 regs, 1.6s)
+[15/15] -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=8 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 2.401 ms / 1824 TFLOPS  (216 regs, 1.7s)
+  η²: N_STAGES=0.249, K_LOOP_UNROLL=0.508
+
+  Gap: 8.54% → k_eff=1 (from 3)
+
+Tier 1 winner (top-3): -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 → 1.522 ms / 2878 TFLOPS
+  #2: -DINTERLEAVE_STRATEGY=1 -DK_LOOP_UNROLL=8 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 → 1.652 ms / 2652 TFLOPS
+  #3: -DINTERLEAVE_STRATEGY=1 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 → 1.660 ms / 2638 TFLOPS
+
+=== Tier 2: W0_LOOP_UNROLL ===
+Sweep: 3 total, 3 valid, 0 pruned
+Estimated time: ~0 min (3 configs × ~5s each)
+
+[1/3] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 1.525 ms / 2872 TFLOPS  (255 regs, 1.6s)
+[2/3] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DW0_LOOP_UNROLL=1 ... 2.361 ms / 1855 TFLOPS  (254 regs, 1.6s)
+[3/3] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DW0_LOOP_UNROLL=4 ... 2.300 ms / 1905 TFLOPS  (254 regs, 1.6s)
+  η²: W0_LOOP_UNROLL=1.000
+
+  Gap: 50.82% → k_eff=1 (from 3)
+
+Tier 2 winner (top-3): -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 → 1.525 ms / 2872 TFLOPS
+  #2: -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DW0_LOOP_UNROLL=4 → 2.300 ms / 1905 TFLOPS
+  #3: -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DW0_LOOP_UNROLL=1 → 2.361 ms / 1855 TFLOPS
+
+=== Tier 3: STORE_TIMING, BATCH_EPILOGUE, TMA_RESIDUAL, STS_WIDTH, EPILOGUE_LOOP, EPI_SYNC, NUM_PASSES_PARAM ===
+Sweep: 192 total, 35 valid, 157 pruned
+Estimated time: ~3 min (35 configs × ~5s each)
+
+[1/35] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 1.525 ms / 2873 TFLOPS  (255 regs, 1.6s)
+[2/35] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.473 ms / 2974 TFLOPS  (255 regs, 1.7s)
+[3/35] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=2 ... 1.483 ms / 2954 TFLOPS  (255 regs, 1.7s)
+[4/35] -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 ... 1.530 ms / 2862 TFLOPS  (255 regs, 1.6s)
+[5/35] -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=1 ... 1.494 ms / 2932 TFLOPS  (255 regs, 1.7s)
+[6/35] -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=2 ... 1.512 ms / 2896 TFLOPS  (255 regs, 1.7s)
+[7/35] -DINTERLEAVE_STRATEGY=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.507 ms / 2906 TFLOPS  (255 regs, 1.7s)
+[8/35] -DINTERLEAVE_STRATEGY=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=2 ... 1.506 ms / 2908 TFLOPS  (255 regs, 1.7s)
+[9/35] -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=1 ... 1.509 ms / 2902 TFLOPS  (255 regs, 1.7s)
+[10/35] -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=2 ... 1.503 ms / 2914 TFLOPS  (255 regs, 1.7s)
+[11/35] -DEPILOGUE_LOOP=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 ... 1.535 ms / 2854 TFLOPS  (232 regs, 1.6s)
+[12/35] -DEPILOGUE_LOOP=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=1 ... 1.498 ms / 2925 TFLOPS  (224 regs, 1.6s)
+[13/35] -DEPILOGUE_LOOP=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=2 ... 1.511 ms / 2898 TFLOPS  (226 regs, 1.6s)
+[14/35] -DEPILOGUE_LOOP=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=1 ... 1.516 ms / 2889 TFLOPS  (225 regs, 1.7s)
+[15/35] -DEPILOGUE_LOOP=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=2 ... 1.511 ms / 2900 TFLOPS  (227 regs, 1.7s)
+[16/35] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 1.521 ms / 2879 TFLOPS  (254 regs, 1.6s)
+[17/35] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.473 ms / 2974 TFLOPS  (255 regs, 1.7s)
+[18/35] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=2 ... 1.482 ms / 2955 TFLOPS  (255 regs, 1.7s)
+[19/35] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 ... 1.521 ms / 2879 TFLOPS  (254 regs, 1.6s)
+[20/35] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 ... 1.471 ms / 2977 TFLOPS  (255 regs, 1.7s)
+[21/35] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=2 ... 1.481 ms / 2957 TFLOPS  (255 regs, 1.7s)
+[22/35] -DBATCH_EPILOGUE=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 ... 1.524 ms / 2874 TFLOPS  (254 regs, 1.6s)
+[23/35] -DBATCH_EPILOGUE=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=1 ... 1.494 ms / 2931 TFLOPS  (255 regs, 1.7s)
+[24/35] -DBATCH_EPILOGUE=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=2 ... 1.512 ms / 2898 TFLOPS  (255 regs, 1.7s)
+[25/35] -DBATCH_EPILOGUE=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DSTS_WIDTH=32 ... 1.522 ms / 2878 TFLOPS  (254 regs, 1.6s)
+[26/35] -DBATCH_EPILOGUE=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 ... 1.496 ms / 2928 TFLOPS  (255 regs, 1.7s)
+[27/35] -DBATCH_EPILOGUE=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DSTS_WIDTH=32 -DTMA_RESIDUAL=2 ... 1.514 ms / 2893 TFLOPS  (255 regs, 1.7s)
+[28/35] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.509 ms / 2903 TFLOPS  (255 regs, 1.7s)
+[29/35] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=2 ... 1.506 ms / 2909 TFLOPS  (255 regs, 1.7s)
+[30/35] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 ... 1.510 ms / 2900 TFLOPS  (255 regs, 1.7s)
+[31/35] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=2 ... 1.505 ms / 2911 TFLOPS  (255 regs, 1.7s)
+[32/35] -DBATCH_EPILOGUE=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=1 ... 1.508 ms / 2904 TFLOPS  (255 regs, 1.7s)
+[33/35] -DBATCH_EPILOGUE=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=2 ... 1.503 ms / 2914 TFLOPS  (255 regs, 1.7s)
+[34/35] -DBATCH_EPILOGUE=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 ... 1.508 ms / 2905 TFLOPS  (255 regs, 1.7s)
+[35/35] -DBATCH_EPILOGUE=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DSTS_WIDTH=32 -DTMA_RESIDUAL=2 ... 1.504 ms / 2912 TFLOPS  (255 regs, 1.7s)
+  η²: STORE_TIMING=0.142, BATCH_EPILOGUE=0.018, TMA_RESIDUAL=0.435, STS_WIDTH=0.006, EPILOGUE_LOOP=0.056, NUM_PASSES_PARAM=0.016
+
+Tier 3 winner (top-3): -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 → 1.471 ms / 2977 TFLOPS
+  #2: -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 → 1.473 ms / 2974 TFLOPS
+  #3: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 → 1.473 ms / 2974 TFLOPS
+
+=== Interaction: epilogue — skipped (noise params: INTERLEAVE_STRATEGY, PRELOAD_MODE) ===
+
+=== Interaction: residual — skipped (noise params: PRELOAD_MODE, INTERLEAVE_STRATEGY) ===
+
+=== Interaction: reg_pressure — skipped (noise params: TMEM_LOAD_WIDTH) ===
+
+=== Interaction: unroll_batch — skipped (noise params: PHASE1_UNROLL) ===
+
+=== Interaction: store_batch (STORE_TIMING, BATCH_EPILOGUE) ===
+  Branch 1/3: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1
+Sweep: 4 total, 2 valid, 2 pruned
+Estimated time: ~0 min (2 configs × ~5s each)
+
+[1/2] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 ... 1.474 ms / 2972 TFLOPS  (255 regs, 1.7s)
+[2/2] -DBATCH_EPILOGUE=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 ... 1.493 ms / 2933 TFLOPS  (255 regs, 1.7s)
+  Branch 2/3: -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1
+Sweep: 4 total, 4 valid, 0 pruned
+Estimated time: ~0 min (4 configs × ~5s each)
+
+[1/4] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.474 ms / 2972 TFLOPS  (255 regs, 1.7s)
+[2/4] -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=1 ... 1.496 ms / 2928 TFLOPS  (255 regs, 1.7s)
+[3/4] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.475 ms / 2969 TFLOPS  (255 regs, 1.7s)
+[4/4] -DBATCH_EPILOGUE=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=1 ... 1.495 ms / 2929 TFLOPS  (255 regs, 1.7s)
+  Branch 3/3: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1
+Sweep: 4 total, 0 valid, 0 pruned, 4 deduped
+No valid configs!
+  η²: STORE_TIMING=0.991, BATCH_EPILOGUE=0.001
+  Best: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 → 1.474 ms / 2972 TFLOPS
+
+=== Interaction: prefetch_store — skipped (noise params: PREFETCH_BEFORE_STORE) ===
+
+=== Interaction: loop_store (EPILOGUE_LOOP, STORE_TIMING) ===
+  Branch 1/3: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1
+Sweep: 4 total, 2 valid, 2 pruned
+Estimated time: ~0 min (2 configs × ~5s each)
+
+[1/2] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 ... 1.474 ms / 2972 TFLOPS  (255 regs, 1.7s)
+[2/2] -DBATCH_EPILOGUE=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 ... 1.494 ms / 2931 TFLOPS  (255 regs, 1.7s)
+  Branch 2/3: -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1
+Sweep: 4 total, 3 valid, 1 pruned
+Estimated time: ~0 min (3 configs × ~5s each)
+
+[1/3] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.474 ms / 2971 TFLOPS  (255 regs, 1.7s)
+[2/3] -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=1 ... 1.493 ms / 2934 TFLOPS  (255 regs, 1.7s)
+[3/3] -DEPILOGUE_LOOP=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=1 ... 1.498 ms / 2924 TFLOPS  (224 regs, 1.6s)
+  Branch 3/3: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1
+Sweep: 4 total, 2 valid, 2 pruned
+Estimated time: ~0 min (2 configs × ~5s each)
+
+[1/2] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.474 ms / 2971 TFLOPS  (255 regs, 1.7s)
+[2/2] -DBATCH_EPILOGUE=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTORE_TIMING=1 -DTMA_RESIDUAL=1 ... 1.494 ms / 2932 TFLOPS  (255 regs, 1.7s)
+  η²: EPILOGUE_LOOP=0.228, STORE_TIMING=0.980
+  Best: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 → 1.474 ms / 2972 TFLOPS
+
+=== Interaction: sts_batch (STS_WIDTH, BATCH_EPILOGUE) ===
+  Branch 1/3: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1
+Sweep: 4 total, 3 valid, 1 pruned
+Estimated time: ~0 min (3 configs × ~5s each)
+
+[1/3] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.474 ms / 2971 TFLOPS  (255 regs, 1.7s)
+[2/3] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.474 ms / 2971 TFLOPS  (255 regs, 1.7s)
+[3/3] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 ... 1.474 ms / 2971 TFLOPS  (255 regs, 1.7s)
+  Branch 2/3: -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1
+Sweep: 4 total, 0 valid, 1 pruned, 3 deduped
+No valid configs!
+  Branch 3/3: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1
+Sweep: 4 total, 0 valid, 1 pruned, 3 deduped
+No valid configs!
+  η²: STS_WIDTH=0.000, BATCH_EPILOGUE=0.000
+  Best: -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 → 1.474 ms / 2971 TFLOPS
+
+=== Interaction: sync_stagger — skipped (noise params: STAGGER_CYCLES) ===
+
+=== Interaction: passes_residual (NUM_PASSES_PARAM, TMA_RESIDUAL) ===
+  Branch 1/3: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1
+Sweep: 6 total, 5 valid, 1 pruned
+Estimated time: ~0 min (5 configs × ~5s each)
+
+[1/5] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 ... 1.522 ms / 2877 TFLOPS  (254 regs, 1.6s)
+[2/5] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 ... 1.473 ms / 2974 TFLOPS  (255 regs, 1.7s)
+[3/5] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=2 ... 1.480 ms / 2960 TFLOPS  (255 regs, 1.7s)
+[4/5] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 ... 1.510 ms / 2901 TFLOPS  (255 regs, 1.7s)
+[5/5] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=2 ... 1.502 ms / 2916 TFLOPS  (255 regs, 1.7s)
+  Branch 2/3: -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1
+Sweep: 6 total, 5 valid, 1 pruned
+Estimated time: ~0 min (5 configs × ~5s each)
+
+[1/5] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 1.521 ms / 2881 TFLOPS  (255 regs, 1.6s)
+[2/5] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.474 ms / 2972 TFLOPS  (255 regs, 1.7s)
+[3/5] -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=2 ... 1.481 ms / 2957 TFLOPS  (255 regs, 1.7s)
+[4/5] -DINTERLEAVE_STRATEGY=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.511 ms / 2899 TFLOPS  (255 regs, 1.7s)
+[5/5] -DINTERLEAVE_STRATEGY=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=2 ... 1.504 ms / 2912 TFLOPS  (255 regs, 1.7s)
+  Branch 3/3: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1
+Sweep: 6 total, 5 valid, 1 pruned
+Estimated time: ~0 min (5 configs × ~5s each)
+
+[1/5] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 ... 1.522 ms / 2877 TFLOPS  (254 regs, 1.6s)
+[2/5] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.472 ms / 2975 TFLOPS  (255 regs, 1.7s)
+[3/5] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=2 ... 1.480 ms / 2959 TFLOPS  (255 regs, 1.7s)
+[4/5] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 ... 1.507 ms / 2906 TFLOPS  (255 regs, 1.7s)
+[5/5] -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DNUM_PASSES_PARAM=4 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=2 ... 1.506 ms / 2909 TFLOPS  (255 regs, 1.7s)
+  η²: NUM_PASSES_PARAM=0.162, TMA_RESIDUAL=0.432
+  Best: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DTMA_RESIDUAL=1 → 1.472 ms / 2975 TFLOPS
+
+@@GRID_WINNER -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1
+
+================================================================================
+RESULTS (sorted by ms)
+================================================================================
+  #  STG  EPI  INTER  MBAR  TMEM  STAG  PH1U  SNAKE  FUSE  KLU  W0U  SMU  PRLD  PFBS  GELU  TMAR  BTCH  GVW  STIM  ELOP  STSW  ESYN  NPP  REGS     SMEM       MS   TFLOPS  STATUS
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  1    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    32     0    0   255   225.0K    1.471     2977  BEST
+  2    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    16     0    0   255   225.0K    1.472     2975  OK
+  3    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     0     0    16     0    0   255   225.0K    1.473     2974  OK
+  4    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    16     0    0   255   225.0K    1.473     2974  OK
+  5    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    32     0    0   255   225.0K    1.473     2974  OK
+  6    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    32     0    0   255   225.0K    1.474     2972  OK
+  7    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     0     0    16     0    0   255   225.0K    1.474     2972  OK
+  8    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    32     0    0   255   225.0K    1.474     2972  OK
+  9    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     0     0    16     0    0   255   225.0K    1.474     2971  OK
+ 10    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    16     0    0   255   225.0K    1.474     2971  OK
+ 11    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     0     0    16     0    0   255   225.0K    1.474     2971  OK
+ 12    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    16     0    0   255   225.0K    1.474     2971  OK
+ 13    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    32     0    0   255   225.0K    1.474     2971  OK
+ 14    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     0     0    16     0    0   255   225.0K    1.474     2972  OK
+ 15    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    16     0    0   255   225.0K    1.475     2969  OK
+ 16    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     1   32     0     0    32     0    0   255   225.0K    1.480     2960  OK
+ 17    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     1   32     0     0    16     0    0   255   225.0K    1.480     2959  OK
+ 18    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     1   32     0     0    32     0    0   255   225.0K    1.481     2957  OK
+ 19    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     0   32     0     0    16     0    0   255   225.0K    1.481     2957  OK
+ 20    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     1   32     0     0    16     0    0   255   225.0K    1.482     2955  OK
+ 21    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     0   32     0     0    16     0    0   255   225.0K    1.483     2954  OK
+ 22    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     1     0    32     0    0   255   225.0K    1.493     2933  OK
+ 23    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     1     0    16     0    0   255   225.0K    1.493     2934  OK
+ 24    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     1     0    16     0    0   255   225.0K    1.494     2932  OK
+ 25    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     1     0    16     0    0   255   225.0K    1.494     2931  OK
+ 26    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     1     0    32     0    0   255   225.0K    1.494     2931  OK
+ 27    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     1     0    16     0    0   255   225.0K    1.494     2932  OK
+ 28    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     1     0    16     0    0   255   225.0K    1.495     2929  OK
+ 29    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     1     0    32     0    0   255   225.0K    1.496     2928  OK
+ 30    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     1     0    16     0    0   255   225.0K    1.496     2928  OK
+ 31    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     1     1    16     0    0   224   225.0K    1.498     2925  OK
+ 32    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     1     1    16     0    0   224   225.0K    1.498     2924  OK
+ 33    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     1   32     0     0    32     0    4   255   225.0K    1.502     2916  OK
+ 34    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     0   32     1     0    16     0    4   255   225.0K    1.503     2914  OK
+ 35    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     1   32     1     0    16     0    4   255   225.0K    1.503     2914  OK
+ 36    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     1   32     1     0    32     0    4   255   225.0K    1.504     2912  OK
+ 37    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     0   32     0     0    16     0    4   255   225.0K    1.504     2912  OK
+ 38    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     1   32     0     0    32     0    4   255   225.0K    1.505     2911  OK
+ 39    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     0   32     0     0    16     0    4   255   225.0K    1.506     2908  OK
+ 40    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     1   32     0     0    16     0    4   255   225.0K    1.506     2909  OK
+ 41    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     1   32     0     0    16     0    4   255   225.0K    1.506     2909  OK
+ 42    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     0     0    16     0    4   255   225.0K    1.507     2906  OK
+ 43    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    16     0    4   255   225.0K    1.507     2906  OK
+ 44    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     1     0    16     0    4   255   225.0K    1.508     2904  OK
+ 45    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     1     0    32     0    4   255   225.0K    1.508     2905  OK
+ 46    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     1     0    16     0    4   255   225.0K    1.509     2902  OK
+ 47    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    16     0    4   255   225.0K    1.509     2903  OK
+ 48    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    32     0    4   255   225.0K    1.510     2900  OK
+ 49    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     1   32     0     0    32     0    4   255   225.0K    1.510     2901  OK
+ 50    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     0   32     1     1    16     0    0   226   225.0K    1.511     2898  OK
+ 51    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     0   32     1     1    16     0    4   227   225.0K    1.511     2900  OK
+ 52    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     0     0    16     0    4   255   225.0K    1.511     2899  OK
+ 53    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     0   32     1     0    16     0    0   255   225.0K    1.512     2896  OK
+ 54    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     1   32     1     0    16     0    0   255   225.0K    1.512     2898  OK
+ 55    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     2     1   32     1     0    32     0    0   255   225.0K    1.514     2893  OK
+ 56    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     1     0   32     1     1    16     0    4   225   225.0K    1.516     2889  OK
+ 57    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     0     1   32     0     0    16     0    0   254   225.0K    1.521     2879  OK
+ 58    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     0     1   32     0     0    32     0    0   254   225.0K    1.521     2879  OK
+ 59    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     0     0   32     0     0    16     0    0   255   225.0K    1.521     2881  OK
+ 60    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     0     0   32     0     0    16     0    0   255   225.0K    1.522     2878  OK
+ 61    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     0     1   32     1     0    32     0    0   254   225.0K    1.522     2878  OK
+ 62    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     0     1   32     0     0    32     0    0   254   225.0K    1.522     2877  OK
+ 63    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     0     1   32     0     0    16     0    0   254   225.0K    1.522     2877  OK
+ 64    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     0     1   32     1     0    16     0    0   254   225.0K    1.524     2874  OK
+ 65    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     0     0   32     0     0    16     0    0   255   225.0K    1.525     2872  OK
+ 66    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     0     0   32     0     0    16     0    0   255   225.0K    1.525     2873  OK
+ 67    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     0     0   32     1     0    16     0    0   255   225.0K    1.530     2862  OK
+ 68    5    4      1     0    32   100     2      1     1    5    0    0     0     0     0     0     0   32     1     1    16     0    0   232   225.0K    1.535     2854  OK
+ 69    4    4      1     0    32   100     2      1     1    8    0    0     0     0     0     0     0   32     0     0    16     0    0   254   193.0K    1.652     2652  OK
+ 70    4    4      1     0    32   100     2      1     1    4    0    0     0     0     0     0     0   32     0     0    16     0    0   254   193.0K    1.660     2638  OK
+ 71    3    4      1     0    32   100     2      1     1    6    0    0     0     0     0     0     0   32     0     0    16     0    0   240   161.0K    1.974     2219  OK
+ 72    3    4      1     0    32   100     2      1     1    3    0    0     0     0     0     0     0   32     0     0    16     0    0   240   161.0K    1.977     2216  OK
+ 73    4    4      1     0    32   100     2      1     1    6    0    0     0     0     0     0     0   32     0     0    16     0    0   212   193.0K    2.034     2154  OK
+ 74    3    4      1     0    32   100     2      1     1    2    0    0     0     0     0     0     0   32     0     0    16     0    0   206   161.0K    2.048     2139  OK
+ 75    3    4      1     0    32   100     2      1     1    8    0    0     0     0     0     0     0   32     0     0    16     0    0   206   161.0K    2.049     2138  OK
+ 76    3    4      1     0    32   100     2      1     1    1    0    0     0     0     0     0     0   32     0     0    16     0    0   206   161.0K    2.059     2128  OK
+ 77    4    4      1     0    32   100     2      1     1    2    0    0     0     0     0     0     0   32     0     0    16     0    0   212   193.0K    2.068     2118  OK
+ 78    4    4      1     0    32   100     2      1     1    1    0    0     0     0     0     0     0   32     0     0    16     0    0   212   193.0K    2.088     2098  OK
+ 79    5    4      1     0    32   100     2      1     1    5    4    0     0     0     0     0     0   32     0     0    16     0    0   254   225.0K    2.300     1905  OK
+ 80    5    4      1     0    32   100     2      1     1    5    1    0     0     0     0     0     0   32     0     0    16     0    0   254   225.0K    2.361     1855  OK
+ 81    5    4      1     0    32   100     2      1     1    6    0    0     0     0     0     0     0   32     0     0    16     0    0   216   225.0K    2.386     1836  OK
+ 82    5    4      1     0    32   100     2      1     1    8    0    0     0     0     0     0     0   32     0     0    16     0    0   216   225.0K    2.401     1824  OK
+ 83    5    4      1     0    32   100     2      1     1    1    0    0     0     0     0     0     0   32     0     0    16     0    0   216   225.0K    2.415     1814  OK
+ 84    5    4      1     0    32   100     2      1     1    2    0    0     0     0     0     0     0   32     0     0    16     0    0   216   225.0K    2.420     1810  OK
+
+CSV written to /root/siglip/data/session_20260315_225415/sweep_fc2.csv
+
+Best: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 → 1.471 ms / 2977 TFLOPS (255 regs)

@@ -1,0 +1,14 @@
+[22:54:15] ========================================
+[22:54:15]   B200 SESSION 20260315_225415
+[22:54:15]   Output: data/session_20260315_225415
+[22:54:15]   Phase:  0
+[22:54:15] ========================================
+[22:54:15] Preflight OK
+[22:54:15] 
+[22:54:15] ==== PHASE 1/4: MACHINE SNAPSHOT ====
+[22:54:15] Machine info saved to machine_info.txt
+[22:54:15] 
+[22:54:15] ==== PHASE 2/4: BUILD + GRID SEARCH + BENCHMARK ====
+[22:54:15] This is the long phase. Grid search: ~60 configs/layer (per-kernel tiered).
+[22:54:15] Monitor: tail -f data/session_20260315_225415/compare.txt
+[22:54:15] Grid search logs: tail -f data/session_20260315_225415/grid_search_*.log
