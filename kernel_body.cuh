@@ -50,7 +50,7 @@ Epilogue: TMEM → transform → CVT → swizzle SMEM regions → TMA tensor sto
 Transform selected by Op: BIAS_ADD (combined table), BIAS_GELU (bias+GELU), BIAS_RESIDUAL (bias+residual)
 */
 
-template<int NC_START, int NC_END, EpilogueOp Op>
+template<int NC_START, int NC_END, EpilogueOp Op, bool FIRST_PASS_PRELOADED = false>
 static __device__ __forceinline__
 void epilogue_store(
     uint32_t tmem_addr,
@@ -127,13 +127,16 @@ void epilogue_store(
 
             /* Issue residual TMA first — flies while we wait for prior stores.
                Residual targets regions 2-3 (mbarrier-tracked), output stores
-               target regions 0-1 (commit_group-tracked): no SMEM conflict. */
-            if (lane == 0) {
-                mbar_arrive_expect_tx(res_mbar_addr, 2 * STAGING_REGION_BYTES);
-                tma_load_2d_cta(res_staging_saddr, tma_res_desc,
-                                n_start + pnc_s, gm_base, res_mbar_addr);
-                tma_load_2d_cta(res_staging_saddr + STAGING_REGION_BYTES, tma_res_desc,
-                                n_start + pnc_s + 64, gm_base, res_mbar_addr);
+               target regions 0-1 (commit_group-tracked): no SMEM conflict.
+               Skip pass 0 when caller already preloaded (TMA_RESIDUAL=2). */
+            if (!(FIRST_PASS_PRELOADED && pass == 0)) {
+                if (lane == 0) {
+                    mbar_arrive_expect_tx(res_mbar_addr, 2 * STAGING_REGION_BYTES);
+                    tma_load_2d_cta(res_staging_saddr, tma_res_desc,
+                                    n_start + pnc_s, gm_base, res_mbar_addr);
+                    tma_load_2d_cta(res_staging_saddr + STAGING_REGION_BYTES, tma_res_desc,
+                                    n_start + pnc_s + 64, gm_base, res_mbar_addr);
+                }
             }
 
             /* Between passes: wait for previous pass's output TMA stores */
@@ -219,6 +222,7 @@ void epilogue_store(
 #endif
 
                 /* Interleaved TMA stores within 128-col pass (2 output regions) */
+#if !STORE_TIMING
                 if (INTERLEAVE_STRATEGY == 1 && ((nc - pnc_s) & 63) == 32) {
                     int ri = (nc - pnc_s) >> 6;
                     __syncwarp();
@@ -248,6 +252,7 @@ void epilogue_store(
                                "r"(gm_base), "r"(src1) : "memory");
                     }
                 }
+#endif /* !STORE_TIMING */
 
 #if !PREFETCH_BEFORE_STORE
                 if (nc + 32 < pnc_e) {
@@ -259,7 +264,7 @@ void epilogue_store(
             }
 
             /* Commit this pass's TMA output stores */
-            if (INTERLEAVE_STRATEGY == 0) {
+            if (STORE_TIMING || INTERLEAVE_STRATEGY == 0) {
                 __syncwarp();
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 if (lane == 0) {
@@ -472,6 +477,7 @@ void epilogue_store(
 #endif
 
         // Interleaved TMA store(s) — fence.proxy.async bridges sync→async proxy
+#if !STORE_TIMING
         if (INTERLEAVE_STRATEGY == 1) {
             __syncwarp();
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -505,6 +511,7 @@ void epilogue_store(
                 }
             }
         }
+#endif /* !STORE_TIMING */
 
 #if !PREFETCH_BEFORE_STORE
         if (nc + 64 < NC_END) {
@@ -624,10 +631,108 @@ void epilogue_store(
             CVT_ADD_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, craw1.x,craw1.y,craw1.z,craw1.w, srow + ((byte_base + 48) ^ xor_val));
 #endif
         } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
-#if PRELOAD_MODE == 2
-            /* All 32 bias values already loaded before TMEM_WAIT —
-               no interleaved LDG between GELU calls. Compiler sees all
-               4 GELU blocks without intervening memory ops. */
+#if BATCH_EPILOGUE && defined(HAS_GELU_APPROX)
+            /*
+            Batched epilogue: compute GELU_VECTOR_WIDTH elements, then store.
+            Width 32: all 32 GELU → 4x store. Width 16: 2 × (16 GELU → 2x store).
+            Width 8: 4 × (8 GELU → 1x store). Compiler pipelines MUFU within batch.
+            Requires GELU_VARIANT 0-3 (standalone gelu_approx function).
+            */
+#if GELU_VECTOR_WIDTH == 32
+#if PRELOAD_MODE < 2
+            float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
+            float4 bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
+            float4 bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
+            float4 bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
+            float4 bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
+            float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
+#endif
+            a0  = gelu_approx(a0,  bv0.x); a1  = gelu_approx(a1,  bv0.y);
+            a2  = gelu_approx(a2,  bv0.z); a3  = gelu_approx(a3,  bv0.w);
+            a4  = gelu_approx(a4,  bv1.x); a5  = gelu_approx(a5,  bv1.y);
+            a6  = gelu_approx(a6,  bv1.z); a7  = gelu_approx(a7,  bv1.w);
+            a8  = gelu_approx(a8,  bv2.x); a9  = gelu_approx(a9,  bv2.y);
+            a10 = gelu_approx(a10, bv2.z); a11 = gelu_approx(a11, bv2.w);
+            a12 = gelu_approx(a12, bv3.x); a13 = gelu_approx(a13, bv3.y);
+            a14 = gelu_approx(a14, bv3.z); a15 = gelu_approx(a15, bv3.w);
+            a16 = gelu_approx(a16, bv4.x); a17 = gelu_approx(a17, bv4.y);
+            a18 = gelu_approx(a18, bv4.z); a19 = gelu_approx(a19, bv4.w);
+            a20 = gelu_approx(a20, bv5.x); a21 = gelu_approx(a21, bv5.y);
+            a22 = gelu_approx(a22, bv5.z); a23 = gelu_approx(a23, bv5.w);
+            a24 = gelu_approx(a24, bv6.x); a25 = gelu_approx(a25, bv6.y);
+            a26 = gelu_approx(a26, bv6.z); a27 = gelu_approx(a27, bv6.w);
+            a28 = gelu_approx(a28, bv7.x); a29 = gelu_approx(a29, bv7.y);
+            a30 = gelu_approx(a30, bv7.z); a31 = gelu_approx(a31, bv7.w);
+            cvt_sts_v4(a0,a1,a2,a3,a4,a5,a6,a7, srow + (byte_base ^ xor_val));
+            cvt_sts_v4(a8,a9,a10,a11,a12,a13,a14,a15, srow + ((byte_base + 16) ^ xor_val));
+            cvt_sts_v4(a16,a17,a18,a19,a20,a21,a22,a23, srow + ((byte_base + 32) ^ xor_val));
+            cvt_sts_v4(a24,a25,a26,a27,a28,a29,a30,a31, srow + ((byte_base + 48) ^ xor_val));
+#elif GELU_VECTOR_WIDTH == 16
+#if PRELOAD_MODE < 2
+            float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
+            float4 bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
+#endif
+            a0  = gelu_approx(a0,  bv0.x); a1  = gelu_approx(a1,  bv0.y);
+            a2  = gelu_approx(a2,  bv0.z); a3  = gelu_approx(a3,  bv0.w);
+            a4  = gelu_approx(a4,  bv1.x); a5  = gelu_approx(a5,  bv1.y);
+            a6  = gelu_approx(a6,  bv1.z); a7  = gelu_approx(a7,  bv1.w);
+            a8  = gelu_approx(a8,  bv2.x); a9  = gelu_approx(a9,  bv2.y);
+            a10 = gelu_approx(a10, bv2.z); a11 = gelu_approx(a11, bv2.w);
+            a12 = gelu_approx(a12, bv3.x); a13 = gelu_approx(a13, bv3.y);
+            a14 = gelu_approx(a14, bv3.z); a15 = gelu_approx(a15, bv3.w);
+            cvt_sts_v4(a0,a1,a2,a3,a4,a5,a6,a7, srow + (byte_base ^ xor_val));
+            cvt_sts_v4(a8,a9,a10,a11,a12,a13,a14,a15, srow + ((byte_base + 16) ^ xor_val));
+#if PRELOAD_MODE < 2
+            float4 bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
+            float4 bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
+            float4 bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
+            float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
+#endif
+            a16 = gelu_approx(a16, bv4.x); a17 = gelu_approx(a17, bv4.y);
+            a18 = gelu_approx(a18, bv4.z); a19 = gelu_approx(a19, bv4.w);
+            a20 = gelu_approx(a20, bv5.x); a21 = gelu_approx(a21, bv5.y);
+            a22 = gelu_approx(a22, bv5.z); a23 = gelu_approx(a23, bv5.w);
+            a24 = gelu_approx(a24, bv6.x); a25 = gelu_approx(a25, bv6.y);
+            a26 = gelu_approx(a26, bv6.z); a27 = gelu_approx(a27, bv6.w);
+            a28 = gelu_approx(a28, bv7.x); a29 = gelu_approx(a29, bv7.y);
+            a30 = gelu_approx(a30, bv7.z); a31 = gelu_approx(a31, bv7.w);
+            cvt_sts_v4(a16,a17,a18,a19,a20,a21,a22,a23, srow + ((byte_base + 32) ^ xor_val));
+            cvt_sts_v4(a24,a25,a26,a27,a28,a29,a30,a31, srow + ((byte_base + 48) ^ xor_val));
+#else /* GELU_VECTOR_WIDTH == 8 */
+            a0  = gelu_approx(a0,  bv0.x); a1  = gelu_approx(a1,  bv0.y);
+            a2  = gelu_approx(a2,  bv0.z); a3  = gelu_approx(a3,  bv0.w);
+            a4  = gelu_approx(a4,  bv1.x); a5  = gelu_approx(a5,  bv1.y);
+            a6  = gelu_approx(a6,  bv1.z); a7  = gelu_approx(a7,  bv1.w);
+            cvt_sts_v4(a0,a1,a2,a3,a4,a5,a6,a7, srow + (byte_base ^ xor_val));
+#if PRELOAD_MODE < 2
+            float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
+            float4 bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
+#endif
+            a8  = gelu_approx(a8,  bv2.x); a9  = gelu_approx(a9,  bv2.y);
+            a10 = gelu_approx(a10, bv2.z); a11 = gelu_approx(a11, bv2.w);
+            a12 = gelu_approx(a12, bv3.x); a13 = gelu_approx(a13, bv3.y);
+            a14 = gelu_approx(a14, bv3.z); a15 = gelu_approx(a15, bv3.w);
+            cvt_sts_v4(a8,a9,a10,a11,a12,a13,a14,a15, srow + ((byte_base + 16) ^ xor_val));
+#if PRELOAD_MODE < 2
+            float4 bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
+            float4 bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
+#endif
+            a16 = gelu_approx(a16, bv4.x); a17 = gelu_approx(a17, bv4.y);
+            a18 = gelu_approx(a18, bv4.z); a19 = gelu_approx(a19, bv4.w);
+            a20 = gelu_approx(a20, bv5.x); a21 = gelu_approx(a21, bv5.y);
+            a22 = gelu_approx(a22, bv5.z); a23 = gelu_approx(a23, bv5.w);
+            cvt_sts_v4(a16,a17,a18,a19,a20,a21,a22,a23, srow + ((byte_base + 32) ^ xor_val));
+#if PRELOAD_MODE < 2
+            float4 bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
+            float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
+#endif
+            a24 = gelu_approx(a24, bv6.x); a25 = gelu_approx(a25, bv6.y);
+            a26 = gelu_approx(a26, bv6.z); a27 = gelu_approx(a27, bv6.w);
+            a28 = gelu_approx(a28, bv7.x); a29 = gelu_approx(a29, bv7.y);
+            a30 = gelu_approx(a30, bv7.z); a31 = gelu_approx(a31, bv7.w);
+            cvt_sts_v4(a24,a25,a26,a27,a28,a29,a30,a31, srow + ((byte_base + 48) ^ xor_val));
+#endif /* GELU_VECTOR_WIDTH */
+#elif PRELOAD_MODE == 2
             GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, srow + (byte_base ^ xor_val));
             GELU_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, bv2.x,bv2.y,bv2.z,bv2.w,bv3.x,bv3.y,bv3.z,bv3.w, srow + ((byte_base + 16) ^ xor_val));
             GELU_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, bv4.x,bv4.y,bv4.z,bv4.w,bv5.x,bv5.y,bv5.z,bv5.w, srow + ((byte_base + 32) ^ xor_val));
@@ -646,8 +751,49 @@ void epilogue_store(
             GELU_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, srow + ((byte_base + 48) ^ xor_val));
 #endif
         } else if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
-#if PRELOAD_MODE == 2
-            /* All bias + residual preloaded before TMEM_WAIT — no interleaved LDG */
+#if BATCH_EPILOGUE
+            /*
+            Batched epilogue: load all side-data, compute all 32 bias+residual adds
+            as C++ (non-volatile BF16 unpack — compiler can reorder freely),
+            then batch 4x cvt_sts_v4. Eliminates 4 compute→STS serialization points.
+            */
+            {
+#if PRELOAD_MODE < 2
+                float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
+                float4 bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
+                float4 bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
+                float4 bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
+                float4 bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
+                float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
+                uint4 rv1 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 8));
+                uint4 rv2 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 16));
+                uint4 rv3 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 24));
+#endif
+                /* Compute phase: unpack BF16 residual (non-volatile) + bias add for all 32 */
+                float rf0, rf1;
+                BF16X2_TO_F32_NV(rv0.x, rf0, rf1); a0  = a0  + bv0.x + rf0; a1  = a1  + bv0.y + rf1;
+                BF16X2_TO_F32_NV(rv0.y, rf0, rf1); a2  = a2  + bv0.z + rf0; a3  = a3  + bv0.w + rf1;
+                BF16X2_TO_F32_NV(rv0.z, rf0, rf1); a4  = a4  + bv1.x + rf0; a5  = a5  + bv1.y + rf1;
+                BF16X2_TO_F32_NV(rv0.w, rf0, rf1); a6  = a6  + bv1.z + rf0; a7  = a7  + bv1.w + rf1;
+                BF16X2_TO_F32_NV(rv1.x, rf0, rf1); a8  = a8  + bv2.x + rf0; a9  = a9  + bv2.y + rf1;
+                BF16X2_TO_F32_NV(rv1.y, rf0, rf1); a10 = a10 + bv2.z + rf0; a11 = a11 + bv2.w + rf1;
+                BF16X2_TO_F32_NV(rv1.z, rf0, rf1); a12 = a12 + bv3.x + rf0; a13 = a13 + bv3.y + rf1;
+                BF16X2_TO_F32_NV(rv1.w, rf0, rf1); a14 = a14 + bv3.z + rf0; a15 = a15 + bv3.w + rf1;
+                BF16X2_TO_F32_NV(rv2.x, rf0, rf1); a16 = a16 + bv4.x + rf0; a17 = a17 + bv4.y + rf1;
+                BF16X2_TO_F32_NV(rv2.y, rf0, rf1); a18 = a18 + bv4.z + rf0; a19 = a19 + bv4.w + rf1;
+                BF16X2_TO_F32_NV(rv2.z, rf0, rf1); a20 = a20 + bv5.x + rf0; a21 = a21 + bv5.y + rf1;
+                BF16X2_TO_F32_NV(rv2.w, rf0, rf1); a22 = a22 + bv5.z + rf0; a23 = a23 + bv5.w + rf1;
+                BF16X2_TO_F32_NV(rv3.x, rf0, rf1); a24 = a24 + bv6.x + rf0; a25 = a25 + bv6.y + rf1;
+                BF16X2_TO_F32_NV(rv3.y, rf0, rf1); a26 = a26 + bv6.z + rf0; a27 = a27 + bv6.w + rf1;
+                BF16X2_TO_F32_NV(rv3.z, rf0, rf1); a28 = a28 + bv7.x + rf0; a29 = a29 + bv7.y + rf1;
+                BF16X2_TO_F32_NV(rv3.w, rf0, rf1); a30 = a30 + bv7.z + rf0; a31 = a31 + bv7.w + rf1;
+            }
+            /* Store phase: 4x cvt_sts_v4 */
+            cvt_sts_v4(a0,a1,a2,a3,a4,a5,a6,a7, srow + (byte_base ^ xor_val));
+            cvt_sts_v4(a8,a9,a10,a11,a12,a13,a14,a15, srow + ((byte_base + 16) ^ xor_val));
+            cvt_sts_v4(a16,a17,a18,a19,a20,a21,a22,a23, srow + ((byte_base + 32) ^ xor_val));
+            cvt_sts_v4(a24,a25,a26,a27,a28,a29,a30,a31, srow + ((byte_base + 48) ^ xor_val));
+#elif PRELOAD_MODE == 2
             BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, rv0.x,rv0.y,rv0.z,rv0.w, srow + (byte_base ^ xor_val));
             BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, bv2.x,bv2.y,bv2.z,bv2.w,bv3.x,bv3.y,bv3.z,bv3.w, rv1.x,rv1.y,rv1.z,rv1.w, srow + ((byte_base + 16) ^ xor_val));
             BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, bv4.x,bv4.y,bv4.z,bv4.w,bv5.x,bv5.y,bv5.z,bv5.w, rv2.x,rv2.y,rv2.z,rv2.w, srow + ((byte_base + 32) ^ xor_val));
@@ -679,6 +825,7 @@ void epilogue_store(
 #endif
 
         // Interleaved TMA store(s) — region completes every 2 x32 iterations
+#if !STORE_TIMING
         if (INTERLEAVE_STRATEGY == 1 && ((nc - NC_START) & 63) == 32) {
             int region_idx = (nc - NC_START) >> 6;
             __syncwarp();
@@ -712,6 +859,7 @@ void epilogue_store(
                 }
             }
         }
+#endif /* !STORE_TIMING */
 
 #if !PREFETCH_BEFORE_STORE
         if (nc + 32 < NC_END) {
@@ -727,8 +875,8 @@ void epilogue_store(
     t_phase1_end = clock64();
 #endif
 
-#if INTERLEAVE_STRATEGY == 0
-    // Strategy 0 (all-at-end): all TMA stores in Phase 2
+#if STORE_TIMING || INTERLEAVE_STRATEGY == 0
+    // All-at-end: single fence + all TMA stores (STORE_TIMING=1 or strategy 0)
     __syncwarp();
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
@@ -767,6 +915,12 @@ void epilogue_store(
     }
 #endif
 }
+
+#if TMA_RESIDUAL >= 2
+#define EPI_PRELOADED true
+#else
+#define EPI_PRELOADED false
+#endif
 
 /*
 Persistent GEMM — warp-specialized tcgen05 (cta_group::2)
@@ -973,11 +1127,44 @@ persistent_gemm(
             // OVERLAPPED EPILOGUE (W2+)
             const int ew = warp - 2;
             const int row_group = ew % 4;
+#if NUM_EPI_WARPS > 4
             const int is_split = (row_group < (NUM_EPI_WARPS - 4)) ? 1 : 0;
             const int col_rank = ew / 4;
+#endif
             const uint32_t staging_saddr = smem_to_uint(smem + OFF_STAGING + ew * STAGING_WARP_BYTES);
 
             const int prev_buf = buf ^ 1;
+
+            /* Hoist prev-tile coords above mainloop wait (pure arithmetic) */
+            int prev_n = 0;
+            int gm_base = 0;
+            if (tile_idx > tile_start) {
+                const int prev_idx = tile_idx - 1;
+                const int ptm = prev_idx / TILES_N;
+                int ptn = prev_idx % TILES_N;
+                if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
+                const int prev_m = ptm * TM * 2 + cta_rank * TM;
+                prev_n = ptn * TN;
+                gm_base = prev_m + row_group * 32;
+            }
+
+#if TMA_RESIDUAL >= 2
+            /* Preload first-pass residual before mainloop wait — TMA flies during idle */
+            if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+                if (tile_idx > tile_start && lane == 0) {
+                    const uint32_t res_mbar = smem_to_uint(smem + OFF_RES_MBAR + ew * 8);
+                    const uint32_t res_stg = staging_saddr + RES_STAGING_OFFSET;
+#if NUM_EPI_WARPS > 4
+                    const int nc0 = is_split ? (col_rank * (TN/2)) : 0;
+#else
+                    const int nc0 = 0;
+#endif
+                    mbar_arrive_expect_tx(res_mbar, 2 * STAGING_REGION_BYTES);
+                    tma_load_2d_cta(res_stg, &tma_res, prev_n + nc0, gm_base, res_mbar);
+                    tma_load_2d_cta(res_stg + STAGING_REGION_BYTES, &tma_res, prev_n + nc0 + 64, gm_base, res_mbar);
+                }
+            }
+#endif
 
 #ifdef TIMING
             if (ew == 1 && lane == 0 && cta_rank == 0)
@@ -997,18 +1184,11 @@ persistent_gemm(
 #endif
 
             if (tile_idx > tile_start) {
-                const int prev_idx = tile_idx - 1;
-                const int ptm = prev_idx / TILES_N;
-                int ptn = prev_idx % TILES_N;
-                if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
-                const int prev_m = ptm * TM * 2 + cta_rank * TM;
-                const int prev_n = ptn * TN;
-
-                const int gm_base = prev_m + row_group * 32;
                 const uint32_t epi_mbar_masked = (epilogue_mbar_addr + prev_buf * 8) & 0xFEFFFFFF;
+#if NUM_EPI_WARPS > 4
                 if (is_split) {
                     if (col_rank == 0)
-                        epilogue_store<0, TN/2, Op>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
+                        epilogue_store<0, TN/2, Op, EPI_PRELOADED>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #if TMA_RESIDUAL
                             , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
@@ -1017,7 +1197,7 @@ persistent_gemm(
 #endif
                         );
                     else
-                        epilogue_store<TN/2, TN, Op>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
+                        epilogue_store<TN/2, TN, Op, EPI_PRELOADED>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #if TMA_RESIDUAL
                             , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
@@ -1025,8 +1205,10 @@ persistent_gemm(
                             , epi_t1
 #endif
                         );
-                } else {
-                    epilogue_store<0, TN, Op>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
+                } else
+#endif
+                {
+                    epilogue_store<0, TN, Op, EPI_PRELOADED>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #if TMA_RESIDUAL
                         , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
@@ -1096,11 +1278,40 @@ persistent_gemm(
     if (warp >= 2) {
         const int ew = warp - 2;
         const int row_group = ew % 4;
+#if NUM_EPI_WARPS > 4
         const int is_split = (row_group < (NUM_EPI_WARPS - 4)) ? 1 : 0;
         const int col_rank = ew / 4;
+#endif
         const uint32_t staging_saddr = smem_to_uint(smem + OFF_STAGING + ew * STAGING_WARP_BYTES);
 
         const int last_buf = (tile_end - 1) & 1;
+
+        /* Hoist drain coords above mainloop wait (pure arithmetic) */
+        const int last_idx = tile_end - 1;
+        const int ltm = last_idx / TILES_N;
+        int ltn = last_idx % TILES_N;
+        if (SNAKE_ORDER && (ltm & 1)) ltn = TILES_N - 1 - ltn;
+        const int last_m = ltm * TM * 2 + cta_rank * TM;
+        const int last_n = ltn * TN;
+        const int gm_base = last_m + row_group * 32;
+
+#if TMA_RESIDUAL >= 2
+        /* Preload first-pass residual before mainloop wait — TMA flies during idle */
+        if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+            if (lane == 0) {
+                const uint32_t res_mbar = smem_to_uint(smem + OFF_RES_MBAR + ew * 8);
+                const uint32_t res_stg = staging_saddr + RES_STAGING_OFFSET;
+#if NUM_EPI_WARPS > 4
+                const int nc0 = is_split ? (col_rank * (TN/2)) : 0;
+#else
+                const int nc0 = 0;
+#endif
+                mbar_arrive_expect_tx(res_mbar, 2 * STAGING_REGION_BYTES);
+                tma_load_2d_cta(res_stg, &tma_res, last_n + nc0, gm_base, res_mbar);
+                tma_load_2d_cta(res_stg + STAGING_REGION_BYTES, &tma_res, last_n + nc0 + 64, gm_base, res_mbar);
+            }
+        }
+#endif
 
         mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
@@ -1110,19 +1321,13 @@ persistent_gemm(
         }
         __syncwarp();
 
-        const int last_idx = tile_end - 1;
-        const int ltm = last_idx / TILES_N;
-        int ltn = last_idx % TILES_N;
-        if (SNAKE_ORDER && (ltm & 1)) ltn = TILES_N - 1 - ltn;
-        const int last_m = ltm * TM * 2 + cta_rank * TM;
-        const int last_n = ltn * TN;
-        const int gm_base = last_m + row_group * 32;
 #ifdef TIMING
         long long drain_t1 = 0;
 #endif
+#if NUM_EPI_WARPS > 4
         if (is_split) {
             if (col_rank == 0)
-                epilogue_store<0, TN/2, Op>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
+                epilogue_store<0, TN/2, Op, EPI_PRELOADED>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #if TMA_RESIDUAL
                     , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
@@ -1131,7 +1336,7 @@ persistent_gemm(
 #endif
                 );
             else
-                epilogue_store<TN/2, TN, Op>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
+                epilogue_store<TN/2, TN, Op, EPI_PRELOADED>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #if TMA_RESIDUAL
                     , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
@@ -1139,8 +1344,10 @@ persistent_gemm(
                     , drain_t1
 #endif
                 );
-        } else {
-            epilogue_store<0, TN, Op>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
+        } else
+#endif
+        {
+            epilogue_store<0, TN, Op, EPI_PRELOADED>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #if TMA_RESIDUAL
                 , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif

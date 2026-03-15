@@ -11,15 +11,19 @@ Usage:
     python3 grid_search.py --tier 1          # structure: N_STAGES x NUM_EPI_WARPS (~5 configs)
     python3 grid_search.py --tier 2          # epilogue: INTER x MBAR x STAG x TMEM (~128 configs)
     python3 grid_search.py --tier 3          # tuning: PHASE1_UNROLL x SNAKE_ORDER (~6 configs)
-    python3 grid_search.py --tier 4          # scheduling: PRELOAD_MODE x PREFETCH_BEFORE_STORE (6 configs)
-    python3 grid_search.py --tier all        # sequential 1->2->3->4, pinning winners
+    python3 grid_search.py --tier 4          # scheduling: PRELOAD_MODE x PREFETCH_BEFORE_STORE x STORE_TIMING
+    python3 grid_search.py --tier all        # sequential 1->2->3->4->5 + interactions, dynamic k, η²
     python3 grid_search.py --full-cross      # all parameters crossed (~3000 configs)
     python3 grid_search.py --only N_STAGES STAGGER_CYCLES --fix MBAR_EARLY=1
     python3 grid_search.py --kernel fc2 --tier all   # sweep FC2 kernel
+    python3 grid_search.py --interact epilogue --kernel fc1_gelu   # cross-tier interaction sweep
+    python3 grid_search.py --interact all --kernel fc2             # all applicable interactions
+    python3 grid_search.py --only BATCH_EPILOGUE INTERLEAVE_STRATEGY --base MBAR_EARLY=1 STAGGER_CYCLES=160
 """
 
 import argparse
 import csv
+import glob as glob_mod
 import itertools
 import os
 import re
@@ -49,6 +53,9 @@ DEFAULTS = {
     'PREFETCH_BEFORE_STORE': 0,
     'GELU_VARIANT': 0,
     'TMA_RESIDUAL': 0,
+    'BATCH_EPILOGUE': 0,
+    'GELU_VECTOR_WIDTH': 32,
+    'STORE_TIMING': 0,
 }
 
 # ── Parameter ranges ──
@@ -68,7 +75,10 @@ RANGES = {
     'PRELOAD_MODE': [0, 1, 2],
     'PREFETCH_BEFORE_STORE': [0, 1],
     'GELU_VARIANT': [0, 4, 5],  # V1,2,3,6 use software tanhf() → 9.1ms catastrophic (4x slower)
-    'TMA_RESIDUAL': [0, 1],
+    'TMA_RESIDUAL': [0, 1, 2],
+    'BATCH_EPILOGUE': [0, 1],
+    'GELU_VECTOR_WIDTH': [8, 16, 32],
+    'STORE_TIMING': [0, 1],
 }
 
 # ── Tier definitions ──
@@ -77,8 +87,8 @@ TIER_PARAMS = {
     2: ['INTERLEAVE_STRATEGY', 'MBAR_EARLY', 'STAGGER_CYCLES', 'TMEM_LOAD_WIDTH'],
     3: ['PHASE1_UNROLL', 'SNAKE_ORDER', 'CVT_ADD_FUSED', 'K_LOOP_UNROLL',
         'W0_LOOP_UNROLL', 'SUB_MMA_UNROLL'],
-    4: ['PRELOAD_MODE', 'PREFETCH_BEFORE_STORE'],
-    5: ['GELU_VARIANT'],
+    4: ['PRELOAD_MODE', 'PREFETCH_BEFORE_STORE', 'BATCH_EPILOGUE', 'TMA_RESIDUAL', 'STORE_TIMING'],
+    5: ['GELU_VARIANT', 'GELU_VECTOR_WIDTH'],
 }
 
 # ── Kernel source files ──
@@ -86,6 +96,46 @@ KERNELS = {
     'patch_embed': 'patch_embed.cu',
     'fc1_gelu': 'fc1_gelu.cu',
     'fc2': 'fc2.cu',
+}
+
+# ── Cross-tier interaction groups ──
+INTERACTIONS = {
+    'epilogue': {
+        'params': ['BATCH_EPILOGUE', 'INTERLEAVE_STRATEGY', 'PRELOAD_MODE'],
+        'kernels': ['fc1_gelu', 'fc2'],
+    },
+    'gelu': {
+        'params': ['BATCH_EPILOGUE', 'GELU_VARIANT'],
+        'kernels': ['fc1_gelu'],
+    },
+    'residual': {
+        'params': ['TMA_RESIDUAL', 'PRELOAD_MODE', 'INTERLEAVE_STRATEGY'],
+        'kernels': ['fc2'],
+    },
+    'reg_pressure': {
+        'params': ['TMEM_LOAD_WIDTH', 'BATCH_EPILOGUE'],
+        'kernels': ['fc1_gelu', 'fc2'],
+    },
+    'unroll_batch': {
+        'params': ['PHASE1_UNROLL', 'BATCH_EPILOGUE'],
+        'kernels': ['fc1_gelu', 'fc2'],
+    },
+    'gelu_interleave': {
+        'params': ['GELU_VARIANT', 'INTERLEAVE_STRATEGY'],
+        'kernels': ['fc1_gelu'],
+    },
+    'gelu_width': {
+        'params': ['GELU_VECTOR_WIDTH', 'GELU_VARIANT', 'BATCH_EPILOGUE'],
+        'kernels': ['fc1_gelu'],
+    },
+    'store_batch': {
+        'params': ['STORE_TIMING', 'BATCH_EPILOGUE'],
+        'kernels': ['fc1_gelu', 'fc2'],
+    },
+    'prefetch_store': {
+        'params': ['PREFETCH_BEFORE_STORE', 'STORE_TIMING'],
+        'kernels': ['fc1_gelu', 'fc2'],
+    },
 }
 
 # ── Build config ──
@@ -144,13 +194,38 @@ def is_valid(cfg, kernel='patch_embed'):
     if cfg.get('CVT_ADD_FUSED', 1) != 1 and kernel != 'patch_embed':
         return False, 'CVT_ADD_FUSED only for patch_embed'
 
-    # NUM_EPI_WARPS=5 only benefits FC1 (PE: tie, FC2: -14%)
-    if num_epi == 5 and kernel not in ('fc1_gelu',):
-        return False, 'NUM_EPI_WARPS=5 only for fc1_gelu'
+    # NUM_EPI_WARPS=5 disabled — split warp creates 2 extra template instantiations
+    # that double FC1 SASS (9227 vs ~5000 lines), hurting icache and register allocation.
+    # EPI=4 eliminates split-warp paths entirely (1 instantiation vs 3).
+    if num_epi == 5:
+        return False, 'NUM_EPI_WARPS=5 disabled (template bloat)'
 
-    # NUM_EPI_WARPS=4 is 13% worse than 5 on FC1 — skip to save time
-    if num_epi == 4 and kernel == 'fc1_gelu':
-        return False, 'NUM_EPI_WARPS=4 worse than 5 on FC1'
+    # BATCH_EPILOGUE only meaningful for fc1_gelu and fc2 (BIAS_ADD unaffected)
+    if cfg.get('BATCH_EPILOGUE', 0) != 0 and kernel == 'patch_embed':
+        return False, 'BATCH_EPILOGUE only for fc1_gelu/fc2'
+
+    # BATCH_EPILOGUE with GELU_VARIANT >= 4 not supported (no standalone gelu_approx)
+    if cfg.get('BATCH_EPILOGUE', 0) != 0 and kernel == 'fc1_gelu' and cfg.get('GELU_VARIANT', 0) >= 4:
+        return False, 'BATCH_EPILOGUE requires GELU_VARIANT <= 3'
+
+    # TMEM_LOAD_WIDTH=64 causes COMPILE_FAIL on FC1 (register pressure)
+    if cfg.get('TMEM_LOAD_WIDTH', 32) == 64 and kernel == 'fc1_gelu':
+        return False, 'TMEM_LOAD_WIDTH=64 COMPILE_FAIL on fc1_gelu'
+
+    # GELU_VECTOR_WIDTH only meaningful for fc1_gelu with BATCH_EPILOGUE=1
+    gvw = cfg.get('GELU_VECTOR_WIDTH', 32)
+    if gvw != 32:
+        if kernel != 'fc1_gelu':
+            return False, 'GELU_VECTOR_WIDTH only for fc1_gelu'
+        if cfg.get('BATCH_EPILOGUE', 0) != 1:
+            return False, 'GELU_VECTOR_WIDTH requires BATCH_EPILOGUE=1'
+        if cfg.get('GELU_VARIANT', 0) >= 4:
+            return False, 'GELU_VECTOR_WIDTH requires GELU_VARIANT <= 3'
+
+    # STORE_TIMING=1 with INTERLEAVE_STRATEGY=0 is redundant
+    # (IS=0 already puts all stores at end, same as STORE_TIMING=1)
+    if cfg.get('STORE_TIMING', 0) == 1 and cfg.get('INTERLEAVE_STRATEGY', 2) == 0:
+        return False, 'STORE_TIMING=1 redundant with INTERLEAVE_STRATEGY=0'
 
     return True, 'ok'
 
@@ -207,14 +282,10 @@ def make_dflags(cfg):
     parts = []
     for k, v in sorted(cfg.items()):
         if k in DEFAULTS and v != DEFAULTS[k]:
+            # STORE_TIMING=1 suppresses inline stores, making IS dead code
+            if k == 'INTERLEAVE_STRATEGY' and cfg.get('STORE_TIMING', 0) == 1:
+                continue
             parts.append(f'-D{k}={v}')
-    # When N_STAGES differs from default, K_LOOP_UNROLL defaults to N_STAGES
-    # in the kernel but to 4 in DEFAULTS — force-emit it so CSV matches binary
-    if cfg.get('N_STAGES', DEFAULTS['N_STAGES']) != DEFAULTS['N_STAGES']:
-        klu = cfg.get('K_LOOP_UNROLL', DEFAULTS['K_LOOP_UNROLL'])
-        flag = f'-DK_LOOP_UNROLL={klu}'
-        if flag not in parts:
-            parts.append(flag)
     return ' '.join(parts)
 
 
@@ -225,6 +296,14 @@ def run_config(cfg, binary_path, src_path, repeat=1):
 
     result = {**cfg, 'status': 'UNKNOWN', 'ms': float('inf'), 'tflops': 0.0,
               'regs': 0, 'spills': 0, 'smem_kb': smem_kb(cfg), 'dflags': dflags}
+
+    # K_LOOP_UNROLL defaults to N_STAGES in the kernel (#define K_LOOP_UNROLL N_STAGES).
+    # When N_STAGES differs from default but K_LOOP_UNROLL wasn't explicitly varied,
+    # the result dict should reflect the actual binary value (N_STAGES, not 4).
+    n_stages = result.get('N_STAGES', DEFAULTS['N_STAGES'])
+    klu = result.get('K_LOOP_UNROLL', DEFAULTS['K_LOOP_UNROLL'])
+    if klu == DEFAULTS['K_LOOP_UNROLL'] and n_stages != DEFAULTS['N_STAGES']:
+        result['K_LOOP_UNROLL'] = n_stages
 
     # Compile
     try:
@@ -328,7 +407,7 @@ def print_table(results, file=sys.stdout):
     header = (f'{"#":>3}  {"STG":>3}  {"EPI":>3}  {"INTER":>5}  {"MBAR":>4}  {"TMEM":>4}  '
               f'{"STAG":>4}  {"PH1U":>4}  {"SNAKE":>5}  {"FUSE":>4}  {"KLU":>3}  '
               f'{"W0U":>3}  {"SMU":>3}  {"PRLD":>4}  {"PFBS":>4}  {"GELU":>4}  '
-              f'{"TMAR":>4}  '
+              f'{"TMAR":>4}  {"BTCH":>4}  {"GVW":>3}  {"STIM":>4}  '
               f'{"REGS":>4}  {"SMEM":>7}  '
               f'{"MS":>7}  {"TFLOPS":>7}  {"STATUS"}')
     print(header, file=file)
@@ -351,6 +430,9 @@ def print_table(results, file=sys.stdout):
               f'{r["PRELOAD_MODE"]:>4}  {r["PREFETCH_BEFORE_STORE"]:>4}  '
               f'{r["GELU_VARIANT"]:>4}  '
               f'{r.get("TMA_RESIDUAL", 0):>4}  '
+              f'{r.get("BATCH_EPILOGUE", 0):>4}  '
+              f'{r.get("GELU_VECTOR_WIDTH", 32):>3}  '
+              f'{r.get("STORE_TIMING", 0):>4}  '
               f'{r["regs"]:>4}  {r["smem_kb"]:>6.1f}K  '
               f'{ms_str:>7}  {tflops_str:>7}  {status}',
               file=file)
@@ -367,6 +449,7 @@ def write_csv(results, path):
               'TMEM_LOAD_WIDTH', 'STAGGER_CYCLES', 'PHASE1_UNROLL', 'SNAKE_ORDER',
               'CVT_ADD_FUSED', 'K_LOOP_UNROLL', 'W0_LOOP_UNROLL', 'SUB_MMA_UNROLL',
               'PRELOAD_MODE', 'PREFETCH_BEFORE_STORE', 'GELU_VARIANT', 'TMA_RESIDUAL',
+              'BATCH_EPILOGUE', 'GELU_VECTOR_WIDTH', 'STORE_TIMING',
               'regs', 'spills', 'smem_kb', 'ms', 'tflops', 'status', 'dflags']
 
     with open(path, 'w', newline='') as f:
@@ -469,26 +552,89 @@ def get_top_k(results, tier_params, k=3):
     return top
 
 
+def compute_eta_sq_inline(results, param):
+    """One-way ANOVA eta-squared from result dicts. No scipy needed."""
+    ok = [r for r in results if r['status'] == 'OK']
+    if len(ok) < 3:
+        return None
+    ms_vals = [r['ms'] for r in ok]
+    grand_mean = sum(ms_vals) / len(ms_vals)
+    ss_total = sum((m - grand_mean) ** 2 for m in ms_vals)
+    if ss_total == 0:
+        return 0.0
+    levels = {}
+    for r in ok:
+        levels.setdefault(r[param], []).append(r['ms'])
+    if len(levels) < 2:
+        return None
+    ss_between = sum(len(v) * (sum(v)/len(v) - grand_mean)**2 for v in levels.values())
+    return ss_between / ss_total
+
+
+def print_eta_summary(results, params):
+    """Print inline eta-squared for each swept param."""
+    parts = []
+    for p in params:
+        eta = compute_eta_sq_inline(results, p)
+        if eta is not None:
+            parts.append(f'{p}={eta:.3f}')
+    if parts:
+        print(f'  η²: {", ".join(parts)}')
+
+
+def load_best_from_csv(kernel):
+    """Load the best config from the most recent sweep CSV for this kernel."""
+    csv_dir = os.path.join(ROOT_DIR, 'data')
+    pattern = os.path.join(csv_dir, f'sweep_{kernel}*.csv')
+    files = sorted(glob_mod.glob(pattern), key=os.path.getmtime, reverse=True)
+    if not files:
+        return None
+    with open(files[0]) as f:
+        reader = csv.DictReader(f)
+        best_ms = float('inf')
+        best_cfg = None
+        for row in reader:
+            if row.get('status') != 'OK':
+                continue
+            ms = float(row['ms'])
+            if ms < best_ms:
+                best_ms = ms
+                best_cfg = {k: int(row[k]) for k in DEFAULTS if k in row}
+    if best_cfg:
+        print(f'Loaded baseline from {os.path.basename(files[0])} ({best_ms:.3f} ms)')
+    return best_cfg
+
+
 def main():
     parser = argparse.ArgumentParser(description='Grid search for SigLIP kernel parameters')
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--tier', choices=['1', '2', '3', '4', '5', 'all'],
                       help='Tiered search (1=structure, 2=epilogue, 3=tuning, 4=scheduling, 5=GELU variant, all=sequential)')
     mode.add_argument('--full-cross', action='store_true',
                       help='Full cross-product of all parameters')
+    mode.add_argument('--interact', choices=list(INTERACTIONS.keys()) + ['all'],
+                      help='Cross-tier interaction sweep (named group or all)')
     parser.add_argument('--kernel', choices=list(KERNELS.keys()), default='patch_embed',
                         help='Kernel to sweep (default: patch_embed)')
     parser.add_argument('--fix', nargs='*', default=[], metavar='PARAM=VAL',
                         help='Pin specific parameters (e.g. --fix MBAR_EARLY=1 N_STAGES=4)')
+    parser.add_argument('--base', nargs='*', default=[], metavar='PARAM=VAL',
+                        help='Base config to inherit from (e.g. from @@GRID_WINNER output)')
     parser.add_argument('--only', nargs='*', default=[], metavar='PARAM',
-                        help='Sweep only these parameters, pin rest at defaults')
+                        help='Sweep only these parameters, pin rest at best-known config')
     parser.add_argument('--repeat', type=int, default=1,
                         help='Run each config N times, report best (default: 1)')
     parser.add_argument('--top-k', type=int, default=3, dest='top_k',
                         help='Carry top-k branches between tiers (default: 3, 1=greedy)')
+    parser.add_argument('--no-interact', action='store_true', dest='no_interact',
+                        help='Skip interaction sweeps after --tier all')
     parser.add_argument('--csv', default=None,
                         help='Output CSV path (default: data/sweep_<kernel>.csv)')
     args = parser.parse_args()
+
+    # Validate: need at least one mode
+    if not args.only and not args.tier and not args.full_cross and not args.interact:
+        parser.error('one of --tier, --full-cross, --interact, or --only is required')
 
     src_path = os.path.join(ROOT_DIR, KERNELS[args.kernel])
     if args.csv is None:
@@ -507,6 +653,18 @@ def main():
             sys.exit(1)
         fixed_overrides[k] = int(v)
 
+    # Parse --base
+    base_overrides = {}
+    for b in args.base:
+        if '=' not in b:
+            print(f'Error: --base arg must be PARAM=VAL, got: {b}', file=sys.stderr)
+            sys.exit(1)
+        k, v = b.split('=', 1)
+        if k not in DEFAULTS:
+            print(f'Error: unknown parameter: {k}', file=sys.stderr)
+            sys.exit(1)
+        base_overrides[k] = int(v)
+
     # Validate --only
     for p in args.only:
         if p not in RANGES:
@@ -517,8 +675,14 @@ def main():
 
     if args.only:
         # Custom sweep: only specified params
+        # Baseline: --base > CSV best > DEFAULTS
         sweep_params = {p: RANGES[p] for p in args.only}
-        fixed = dict(DEFAULTS)
+        if base_overrides:
+            fixed = dict(DEFAULTS)
+            fixed.update(base_overrides)
+        else:
+            csv_best = load_best_from_csv(args.kernel)
+            fixed = csv_best if csv_best else dict(DEFAULTS)
         fixed.update(fixed_overrides)
         for p in args.only:
             fixed.pop(p, None)
@@ -526,6 +690,7 @@ def main():
         print(f'=== Custom sweep: {", ".join(args.only)} ===')
         results = run_sweep(sweep_params, fixed, src_path, repeat=args.repeat, kernel=args.kernel)
         all_results.extend(results)
+        print_eta_summary(results, list(sweep_params.keys()))
 
     elif args.full_cross:
         # Full cross-product
@@ -538,6 +703,50 @@ def main():
         print('=== Full cross-product sweep ===')
         results = run_sweep(sweep_params, fixed, src_path, repeat=args.repeat, kernel=args.kernel)
         all_results.extend(results)
+
+    elif args.interact:
+        # Cross-tier interaction sweep
+        groups_to_run = []
+        if args.interact == 'all':
+            for name, group in INTERACTIONS.items():
+                if args.kernel in group['kernels']:
+                    groups_to_run.append((name, group))
+        else:
+            group = INTERACTIONS[args.interact]
+            if args.kernel not in group['kernels']:
+                print(f'Error: interaction {args.interact!r} not applicable to {args.kernel}',
+                      file=sys.stderr)
+                sys.exit(1)
+            groups_to_run.append((args.interact, group))
+
+        if not groups_to_run:
+            print(f'No applicable interactions for {args.kernel}')
+            sys.exit(0)
+
+        # Baseline: --base > CSV best > DEFAULTS
+        if base_overrides:
+            baseline = dict(DEFAULTS)
+            baseline.update(base_overrides)
+        else:
+            csv_best = load_best_from_csv(args.kernel)
+            baseline = csv_best if csv_best else dict(DEFAULTS)
+        baseline.update(fixed_overrides)
+
+        for name, group in groups_to_run:
+            sweep_params = {p: RANGES[p] for p in group['params']}
+            fixed = dict(baseline)
+            for p in sweep_params:
+                fixed.pop(p, None)
+
+            print(f'\n=== Interaction: {name} ({", ".join(sweep_params.keys())}) ===')
+            results = run_sweep(sweep_params, fixed, src_path, repeat=args.repeat, kernel=args.kernel)
+            all_results.extend(results)
+            print_eta_summary(results, group['params'])
+
+            int_best = get_best(results)
+            if int_best:
+                print(f'  Best: {make_dflags(int_best) or "(defaults)"} '
+                      f'→ {int_best["ms"]:.3f} ms / {int_best["tflops"]:.0f} TFLOPS')
 
     elif args.tier == 'all':
         # Sequential tiers, top-k pinning (explores k branches per tier)
@@ -567,12 +776,24 @@ def main():
                 tier_results.extend(results)
 
             all_results.extend(tier_results)
+            print_eta_summary(tier_results, list(sweep_params.keys()))
 
             top = get_top_k(tier_results, tier_params, k=k)
             if top:
+                # Dynamic k: reduce branching when winner is clear
+                k_eff = len(top)
+                if len(top) >= 2:
+                    gap_pct = (top[1]['ms'] - top[0]['ms']) / top[0]['ms'] * 100
+                    if gap_pct > 2.0:
+                        k_eff = 1
+                    elif gap_pct > 0.5:
+                        k_eff = min(k_eff, 2)
+                    if k_eff < len(top):
+                        print(f'\n  Gap: {gap_pct:.2f}% → k_eff={k_eff} (from {len(top)})')
+
                 # Build new branches from top-k winners
                 new_branches = []
-                for i, t in enumerate(top):
+                for i, t in enumerate(top[:k_eff]):
                     b = dict(branches[0])  # start from current best branch
                     for p in tier_params:
                         b[p] = t[p]
@@ -600,6 +821,48 @@ def main():
             else:
                 print(f'\nTier {tier_num}: no valid results!')
 
+        # Run applicable cross-tier interaction groups
+        if not args.no_interact:
+            best_so_far = get_best(all_results)
+            any_interaction = False
+            for name, group in INTERACTIONS.items():
+                if args.kernel not in group['kernels']:
+                    continue
+                any_interaction = True
+                sweep_params = {p: RANGES[p] for p in group['params']}
+
+                print(f'\n=== Interaction: {name} ({", ".join(sweep_params.keys())}) ===')
+
+                group_results = []
+                seen_cfgs = set()
+                for bi, branch in enumerate(branches):
+                    fixed = dict(branch)
+                    for p in sweep_params:
+                        fixed.pop(p, None)
+                    if len(branches) > 1:
+                        print(f'  Branch {bi+1}/{len(branches)}: '
+                              f'{make_dflags(branch) or "(defaults)"}')
+                    results = run_sweep(sweep_params, fixed, src_path,
+                                        repeat=args.repeat, kernel=args.kernel,
+                                        seen_cfgs=seen_cfgs)
+                    group_results.extend(results)
+
+                all_results.extend(group_results)
+                print_eta_summary(group_results, group['params'])
+
+                int_best = get_best(group_results)
+                if int_best:
+                    print(f'  Best: {make_dflags(int_best) or "(defaults)"} '
+                          f'→ {int_best["ms"]:.3f} ms / {int_best["tflops"]:.0f} TFLOPS')
+                    if best_so_far is None or int_best['ms'] < best_so_far['ms']:
+                        for p in group['params']:
+                            branches[0][p] = int_best[p]
+                        best_so_far = int_best
+                        print(f'  ** New overall best from interaction {name!r} **')
+
+            if not any_interaction:
+                print(f'\nNo applicable interactions for {args.kernel}')
+
         # Print the composite pinned winner (best branch)
         composite_dflags = make_dflags(branches[0])
         print(f'\n@@GRID_WINNER {composite_dflags or "(defaults)"}')
@@ -617,6 +880,7 @@ def main():
         print(f'=== Tier {tier_num}: {", ".join(sweep_params.keys())} ===')
         results = run_sweep(sweep_params, fixed, src_path, repeat=args.repeat, kernel=args.kernel)
         all_results.extend(results)
+        print_eta_summary(results, list(sweep_params.keys()))
 
     # Summary
     if all_results:

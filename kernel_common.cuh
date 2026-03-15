@@ -61,7 +61,16 @@ Usage: #define N_DIM and K_DIM before including this header.
 #define GELU_VARIANT 0           // 0=asm tanh, 1=tanhf, 2=tanhf+half_x, 3=fmaf, 4=batch8-asm, 5=batch4+4-asm, 6=batch8-tanhf
 #endif
 #ifndef TMA_RESIDUAL
-#define TMA_RESIDUAL 0           // 0=__ldg residual (default), 1=TMA residual via SMEM staging
+#define TMA_RESIDUAL 0           // 0=__ldg residual (default), 1=TMA residual via SMEM staging, 2=TMA preloaded before mainloop wait
+#endif
+#ifndef BATCH_EPILOGUE
+#define BATCH_EPILOGUE 0         // 0=fused compute+CVT+STS per 8 elems, 1=compute all 32 then batch CVT+STS
+#endif
+#ifndef GELU_VECTOR_WIDTH
+#define GELU_VECTOR_WIDTH 32     // BATCH_EPILOGUE GELU batch size: 8=per-group, 16=two-batch, 32=full-batch
+#endif
+#ifndef STORE_TIMING
+#define STORE_TIMING 0           // 0=inline TMA stores per INTERLEAVE_STRATEGY, 1=all stores after Phase 1
 #endif
 
 // nvcc doesn't expand macros in #pragma unroll — use _Pragma instead
@@ -354,6 +363,30 @@ S is the stage index (0..N_STAGES-1); works with runtime values but best with co
         "cvt.rn.f32.bf16 %0, lo;\n\t" \
         "cvt.rn.f32.bf16 %1, hi;\n\t" \
         "}" : "=f"(flo), "=f"(fhi) : "r"(reg))
+
+/* Non-volatile BF16x2 unpack — compiler can reorder freely */
+#define BF16X2_TO_F32_NV(reg, flo, fhi) \
+    asm("{\n\t" \
+        ".reg .b16 lo, hi;\n\t" \
+        "mov.b32 {lo, hi}, %2;\n\t" \
+        "cvt.rn.f32.bf16 %0, lo;\n\t" \
+        "cvt.rn.f32.bf16 %1, hi;\n\t" \
+        "}" : "=f"(flo), "=f"(fhi) : "r"(reg))
+
+/* 8-float CVT+STS: pack 8 FP32 → 4 BF16x2 → 1x st.shared.v4 (16 bytes) */
+static __device__ __forceinline__ void cvt_sts_v4(
+    float g0, float g1, float g2, float g3,
+    float g4, float g5, float g6, float g7,
+    uint32_t saddr
+) {
+    uint32_t o0, o1, o2, o3;
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o0) : "f"(g0), "f"(g1));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o1) : "f"(g2), "f"(g3));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o2) : "f"(g4), "f"(g5));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o3) : "f"(g6), "f"(g7));
+    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+        :: "r"(saddr), "r"(o0), "r"(o1), "r"(o2), "r"(o3) : "memory");
+}
 
 #define CVT_STS(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15, SADDR) \
     asm volatile( \

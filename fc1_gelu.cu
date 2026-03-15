@@ -22,24 +22,6 @@ static __host__ __forceinline__ float gelu_fwd(float x) {
     return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
 }
 
-/*
-BF16x2 pack + SMEM store for 8 values — shared by all GELU variants.
-CVT and STS stay in asm (hardware-specific, no C++ equivalent).
-*/
-static __device__ __forceinline__ void cvt_sts_v4(
-    float g0, float g1, float g2, float g3,
-    float g4, float g5, float g6, float g7,
-    uint32_t saddr
-) {
-    uint32_t o0, o1, o2, o3;
-    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o0) : "f"(g0), "f"(g1));
-    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o1) : "f"(g2), "f"(g3));
-    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o2) : "f"(g4), "f"(g5));
-    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o3) : "f"(g6), "f"(g7));
-    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-        :: "r"(saddr), "r"(o0), "r"(o1), "r"(o2), "r"(o3) : "memory");
-}
-
 /* ── GELU variants (selected by GELU_VARIANT compile-time flag) ── */
 
 #if GELU_VARIANT == 0
@@ -98,6 +80,7 @@ static __device__ __forceinline__ float gelu_approx(float acc, float bias) {
 #endif
 
 #if GELU_VARIANT <= 3
+#define HAS_GELU_APPROX 1
 /* Scalar variants: call gelu_approx per element */
 #define GELU_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3,b4,b5,b6,b7, SADDR) \
     cvt_sts_v4( \

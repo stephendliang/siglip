@@ -25,12 +25,12 @@ The kernel is **epilogue-bound** in a balanced producer-consumer equilibrium. F3
 - Phase 1 TMEM readback = binding constraint. Interleaved TMA stores (strategy 2, half-batch) fill TMEM stall windows.
 - K-loop: 4,059 cycles. Precomputed descriptors, unroll controlled by `K_LOOP_UNROLL` (default `N_STAGES`).
 - TMA multicast not applicable (B is N-split across CTAs).
-- ~161-254 regs/thread (varies with `K_LOOP_UNROLL`, `W0_LOOP_UNROLL`, `SUB_MMA_UNROLL`, `CVT_ADD_FUSED`, `PHASE1_UNROLL`, `MBAR_EARLY`, `PREFETCH_BEFORE_STORE`, `GELU_VARIANT`, `TMA_RESIDUAL`; defaults: PE=205, FC1=~242, FC2=254), 0 spills. Limits occupancy to 1 CTA/SM.
+- ~161-254 regs/thread (varies with `K_LOOP_UNROLL`, `W0_LOOP_UNROLL`, `SUB_MMA_UNROLL`, `CVT_ADD_FUSED`, `PHASE1_UNROLL`, `MBAR_EARLY`, `PREFETCH_BEFORE_STORE`, `GELU_VARIANT`, `TMA_RESIDUAL`, `BATCH_EPILOGUE`, `GELU_VECTOR_WIDTH`, `STORE_TIMING`; defaults: PE=205, FC1=~242, FC2=254), 0 spills. Limits occupancy to 1 CTA/SM.
 - Timing build uses ~245 regs (distorts cycles vs production). Wall clock is ground truth.
 
 Run `python3 tools/analyze_timing.py data/clock64_timing.txt` for full equilibrium analysis and what-if projections.
 Run `python3 tools/analyze_source_counters.py data/source_counters_raw.csv` for per-instruction stall breakdown.
-See `docs/EXPERIMENTS.md` for experiments (F1-F40) with hypotheses, results, and analysis. See `docs/FUTURE_PROPOSALS.md` for optimization roadmap.
+See `docs/EXPERIMENTS.md` for experiments (F1-F40) with hypotheses, results, and analysis.
 
 ## Kernel structure
 
@@ -38,11 +38,11 @@ Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1
 
 - **W0**: TMA async bulk loads (A + B tiles, both CTAs load independently)
 - **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
-- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols through 4 SWIZZLE_128B regions: x32 `tcgen05.ld` → epilogue op → CVT → `st.shared`, with **interleaved TMA stores** every 2 regions hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1. The epilogue op is kernel-specific: bias+pos_embed add (patch_embed), bias+GELU (fc1_gelu), or bias+residual (fc2). Side-data LDG placement controlled by `PRELOAD_MODE` (0=after TMEM_WAIT, 1=partial preload before, 2=full preload before TMEM_WAIT — all three epilogue types). Next-tile TMEM prefetch timing controlled by `PREFETCH_BEFORE_STORE` (0=after TMA stores, 1=before). FC2 residual loading controlled by `TMA_RESIDUAL` (0=scattered `__ldg`, 1=TMA coalesced via SMEM staging with two-pass 128-col structure).
+- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols through 4 SWIZZLE_128B regions: x32 `tcgen05.ld` → epilogue op → CVT → `st.shared`, with **interleaved TMA stores** every 2 regions hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1. The epilogue op is kernel-specific: bias+pos_embed add (patch_embed), bias+GELU (fc1_gelu), or bias+residual (fc2). Side-data LDG placement controlled by `PRELOAD_MODE` (0=after TMEM_WAIT, 1=partial preload before, 2=full preload before TMEM_WAIT — all three epilogue types). Next-tile TMEM prefetch timing controlled by `PREFETCH_BEFORE_STORE` (0=after TMA stores, 1=before). FC2 residual loading controlled by `TMA_RESIDUAL` (0=scattered `__ldg`, 1=TMA coalesced via SMEM staging with two-pass 128-col structure, 2=TMA preloaded before mainloop wait — first-pass residual TMA flies during idle, `epilogue_store` skips pass 0 load via `FIRST_PASS_PRELOADED` template param). Epilogue compute/store phasing controlled by `BATCH_EPILOGUE` (0=fused compute+CVT+STS per 8 elems, 1=compute all then batch `cvt_sts_v4` — eliminates MUFU drain/refill cycles for GELU, eliminates compute→STS serialization for RESIDUAL; requires `GELU_VARIANT` 0-3 for FC1 via `HAS_GELU_APPROX`). GELU batch size within `BATCH_EPILOGUE=1` controlled by `GELU_VECTOR_WIDTH` (8=per-group, 16=two-batch, 32=full-batch; FC1 only). TMA store placement controlled by `STORE_TIMING` (0=inline per `INTERLEAVE_STRATEGY`, 1=all stores batched after Phase 1 with single fence — overrides inline stores).
 
-TM=128 rows / 32 rows per warp = 4 row groups. With 4 epi warps (default), each warp owns a full row group (256 cols, `is_split=0`). With 5 epi warps, warp 4 shares row_group 0 via `ew % 4`, creating split warps (`is_split=1`) that each handle 128 cols (2 regions). `epilogue_store` is templated on `<NC_START, NC_END>` so the compiler sees constant loop bounds and `N_REGIONS = (NC_END - NC_START) / 64` is constexpr; unroll depth controlled by `PHASE1_UNROLL` (default 2).
+TM=128 rows / 32 rows per warp = 4 row groups. With 4 epi warps (default), each warp owns a full row group (256 cols, `is_split=0`). With 5 epi warps, warp 4 shares row_group 0 via `ew % 4`, creating split warps (`is_split=1`) that each handle 128 cols (2 regions). `epilogue_store` is templated on `<NC_START, NC_END, Op, FIRST_PASS_PRELOADED>` so the compiler sees constant loop bounds and `N_REGIONS = (NC_END - NC_START) / 64` is constexpr; unroll depth controlled by `PHASE1_UNROLL` (default 2). `is_split`/`col_rank` are compiled out with `#if NUM_EPI_WARPS > 4` guards when not needed.
 
-The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile N (double-buffered TMEM, mbarrier-protected). After the tile loop, W2-5 run a drain epilogue for the last tile.
+The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile N (double-buffered TMEM, mbarrier-protected). Prev-tile coordinates are hoisted above the mainloop wait (pure arithmetic). After the tile loop, W2-5 run a drain epilogue for the last tile (same coord-hoisting pattern).
 
 ### Tile config
 - Tile: 256x256x128 (M=2x128 from cta_group::2, N=256, K=128)
@@ -65,7 +65,7 @@ Phases: machine snapshot → `compare_all.py --runs 20 --grid-search` (ANOVA) �
 
 ## Development workflow
 
-All kernels share `kernel_common.cuh` (pipeline, TMEM loads, TMA helpers, mbarrier ops, tuning parameters) and `kernel_body.cuh` (epilogue_store template, persistent_gemm kernel template). Each `.cu` file `#define N_DIM` and `K_DIM`, defines its epilogue macro (e.g., `CVT_ADD_STS_V4`), then includes both headers — tile counts and K-iter constants are derived automatically. FC1's GELU epilogue has 7 variants (0-6) selected by `GELU_VARIANT`: scalar (0-3) vary algebra/intrinsics, batched (4-6) explicitly phase pre-tanh/MUFU/post-tanh for scheduling control.
+All kernels share `kernel_common.cuh` (pipeline, TMEM loads, TMA helpers, mbarrier ops, tuning parameters, `cvt_sts_v4` helper, `BF16X2_TO_F32_NV` non-volatile unpack macro) and `kernel_body.cuh` (epilogue_store template, persistent_gemm kernel template). Each `.cu` file `#define N_DIM` and `K_DIM`, defines its epilogue macro (e.g., `CVT_ADD_STS_V4`), then includes both headers — tile counts and K-iter constants are derived automatically. FC1's GELU epilogue has 7 variants (0-6) selected by `GELU_VARIANT`: scalar (0-3) vary algebra/intrinsics, batched (4-6) explicitly phase pre-tanh/MUFU/post-tanh for scheduling control. Scalar variants (0-3) define `HAS_GELU_APPROX`, enabling `BATCH_EPILOGUE` mode. `GELU_VECTOR_WIDTH` (8/16/32) controls the compute batch size within `BATCH_EPILOGUE=1`: 32=all GELU then all stores, 16=two batches, 8=per-group (same scheduling as non-batch). `STORE_TIMING` (0/1) controls TMA store placement: 0=inline per `INTERLEAVE_STRATEGY`, 1=all stores deferred to end of Phase 1 (single fence, eliminates inline syncwarp+fence overhead).
 
 ```
 edit kernel_common.cuh / kernel_body.cuh / patch_embed.cu / fc1_gelu.cu / fc2.cu -> make -> ./patch_embed (or ./fc1_gelu, ./fc2)
@@ -101,7 +101,7 @@ TASKS.md                # B200 session playbook — automated benchmarking workf
 
 tools/                  # Analysis & sweep scripts
   sass_analysis.py      # SASS scheduling analyzer (decodes control words, dep graphs, slack)
-  grid_search.py        # Compile-time parameter sweep (tiered search, CSV output)
+  grid_search.py        # Compile-time parameter sweep (tiered search, cross-tier interactions, CSV output)
   analyze_timing.py     # clock64 timing → equilibrium analysis
   analyze_source_counters.py  # ncu SourceCounters CSV → stall breakdown
   compare_all.py        # Unified benchmark: CUTLASS vs ours + ANOVA
@@ -155,13 +155,17 @@ make cutlass-bench-fc2-max      # extended FC2
 ./tools/cutlass_sweep.sh 1            # quick test (1 img/SM = 148*196 rows)
 ./tools/cutlass_sweep.sh 32 standard  # standard tile list only
 
-# Parameter grid search (any kernel)
-python3 tools/grid_search.py --tier all                    # sequential 1→2→3→4→5, pinning winners
+# Parameter grid search (any kernel) — prints inline η² per param after each sweep
+python3 tools/grid_search.py --tier all                    # sequential 1→2→3→4→5 + interactions, dynamic k, η²
+python3 tools/grid_search.py --tier all --no-interact      # tiers only, skip interaction sweeps
 python3 tools/grid_search.py --full-cross                  # all parameters crossed
-python3 tools/grid_search.py --kernel fc2 --tier all       # FC2 sweep
+python3 tools/grid_search.py --kernel fc2 --tier all       # FC2 sweep (includes residual + epilogue interactions)
 python3 tools/grid_search.py --kernel fc1_gelu --tier 5    # FC1 GELU variant sweep only
 python3 tools/grid_search.py --kernel fc1_gelu --tier 3    # FC1 tier 3 only
 python3 tools/grid_search.py --only K_LOOP_UNROLL W0_LOOP_UNROLL SUB_MMA_UNROLL  # sweep specific params
+python3 tools/grid_search.py --interact epilogue --kernel fc1_gelu   # cross-tier interaction sweep
+python3 tools/grid_search.py --interact all --kernel fc2             # all applicable interactions for FC2
+python3 tools/grid_search.py --only BATCH_EPILOGUE INTERLEAVE_STRATEGY --base MBAR_EARLY=1  # --base sets baseline
 
 # GELU variant static analysis (runs locally on Mac, no GPU needed)
 python3 tools/analyze_gelu_variants.py                     # comparison table (all 7 variants)
@@ -216,10 +220,13 @@ Sweep data analyzed via `python3 tools/analyze_sweep.py` using eta-squared (ANOV
 
 **Patch embed** (run4, 145 balanced configs): parameter search exhausted — all top configs within 0.001 ms. Best: `MBAR_EARLY=1 STAGGER_CYCLES=160` → 0.519 ms / 2108 TFLOPS. Defaults → 0.524 ms / 2090 TFLOPS.
 
-**Cross-kernel universal defaults**: `SNAKE_ORDER=1`, `PHASE1_UNROLL=2`, `K_LOOP_UNROLL=4`, `W0_LOOP_UNROLL=0`, `TMEM_LOAD_WIDTH=32`, `PRELOAD_MODE=1`, `PREFETCH_BEFORE_STORE=0`, `GELU_VARIANT=0`.
+**Cross-kernel universal defaults**: `SNAKE_ORDER=1`, `PHASE1_UNROLL=2`, `K_LOOP_UNROLL=4`, `W0_LOOP_UNROLL=0`, `TMEM_LOAD_WIDTH=32`, `PRELOAD_MODE=1`, `PREFETCH_BEFORE_STORE=0`, `GELU_VARIANT=0`, `BATCH_EPILOGUE=0`.
 **Per-kernel tuning**: `INTERLEAVE_STRATEGY=2` (PE, FC2) vs `=1` (FC1) — N=3072 changes epilogue pattern.
 **Catastrophic values**: `PHASE1_UNROLL=4` (+2.4 ms on FC1), `SNAKE_ORDER=0` (+49 us on PE).
-**Per-kernel epilogue warps**: `NUM_EPI_WARPS=4` (PE, FC2) vs `=5` (FC1 winner, 13% faster than EPI=4 at 2.676 ms vs 3.080 ms).
-**Epilogue scheduling** (tier 4): `PRELOAD_MODE` (0/1/2) × `PREFETCH_BEFORE_STORE` (0/1) = 6 configs. PRELOAD_MODE=2 preloads all side-data before TMEM_WAIT (BIAS_ADD: 8 uint4; BIAS_GELU: 8 float4 = all 32 bias). RESIDUAL still falls back to mode 1. PREFETCH_BEFORE_STORE=1 adds ~14 regs on PE (205→219); FC2 stays at 254 (allocator at ceiling).
-**GELU variants** (tier 5, fc1_gelu only): `GELU_VARIANT` (0-6) = 7 configs. Scalar: 0=asm tanh (default), 1=tanhf(), 2=tanhf()+half_x reorder, 3=__fmaf_rn (7 ops/elem vs 8). Batched: 4=batch8-asm, 5=batch4+4-asm, 6=batch8-tanhf. Static analysis predicts V3 (-7% scheduled cycles, fewest instructions) and V4/V6 (-8%, tightest MUFU gaps) as best candidates; register pressure is the risk for batched variants at FC1's ~242 baseline.
+**Per-kernel epilogue warps**: `NUM_EPI_WARPS=4` (all kernels). EPI=5 disabled — split warp creates 2 extra template instantiations (9227 vs ~5000 SASS lines), bloating icache and register allocation.
+**Epilogue scheduling** (tier 4): `PRELOAD_MODE` (0/1/2) × `PREFETCH_BEFORE_STORE` (0/1) × `BATCH_EPILOGUE` (0/1) × `TMA_RESIDUAL` (0/1/2) × `STORE_TIMING` (0/1). PRELOAD_MODE=2 preloads all side-data before TMEM_WAIT (BIAS_ADD: 8 uint4; BIAS_GELU: 8 float4 = all 32 bias). PREFETCH_BEFORE_STORE=1 adds ~14 regs on PE (205→219); FC2 stays at 254 (allocator at ceiling). `BATCH_EPILOGUE=1` separates compute and store phases (all 32 GELU/residual results computed, then batch 4x `cvt_sts_v4`); only for FC1 (GELU_VARIANT 0-3) and FC2. `TMA_RESIDUAL=2` preloads first-pass residual before mainloop wait (FC2 only). `STORE_TIMING=1` defers all TMA stores to after Phase 1 (single fence, eliminates inline syncwarp+fence overhead); pruned when `INTERLEAVE_STRATEGY=0` (IS=0 already does all-at-end, redundant with ST=1). IS is dead code when ST=1 (inline stores suppressed), so IS variants with ST=1 are deduped via `make_dflags`.
+**GELU variants** (tier 5, fc1_gelu only): `GELU_VARIANT` (0-6) × `GELU_VECTOR_WIDTH` (8/16/32). Scalar: 0=asm tanh (default), 1=tanhf(), 2=tanhf()+half_x reorder, 3=__fmaf_rn (7 ops/elem vs 8). Batched: 4=batch8-asm, 5=batch4+4-asm, 6=batch8-tanhf. `GELU_VECTOR_WIDTH` controls batch size within `BATCH_EPILOGUE=1`: 32=all GELU then all stores, 16=two batches, 8=per-group. VW!=32 requires `BATCH_EPILOGUE=1` + `GELU_VARIANT` 0-3. Static analysis predicts V3 (-7% scheduled cycles, fewest instructions) and V4/V6 (-8%, tightest MUFU gaps) as best candidates; register pressure is the risk for batched variants at FC1's ~242 baseline.
+**Cross-tier interactions**: `--tier all` automatically runs interaction sweeps after tier 5 (skippable with `--no-interact`). Nine named groups: `epilogue` (`BATCH_EPILOGUE × INTERLEAVE_STRATEGY × PRELOAD_MODE`, FC1/FC2 — ~24 configs), `gelu` (`BATCH_EPILOGUE × GELU_VARIANT`, FC1 only — 4 valid configs, V4/V5 pruned), `residual` (`TMA_RESIDUAL × PRELOAD_MODE × INTERLEAVE_STRATEGY`, FC2 only — 36 configs), `reg_pressure` (`TMEM_LOAD_WIDTH × BATCH_EPILOGUE`, FC1/FC2 — 2-4 configs), `unroll_batch` (`PHASE1_UNROLL × BATCH_EPILOGUE`, FC1/FC2 — 6 configs), `gelu_interleave` (`GELU_VARIANT × INTERLEAVE_STRATEGY`, FC1 only — 12 configs), `gelu_width` (`GELU_VECTOR_WIDTH × GELU_VARIANT × BATCH_EPILOGUE`, FC1 only — ~8 valid configs), `store_batch` (`STORE_TIMING × BATCH_EPILOGUE`, FC1/FC2 — 4 configs), `prefetch_store` (`PREFETCH_BEFORE_STORE × STORE_TIMING`, FC1/FC2 — 3-4 configs). Interactions run across all top-k branches with dedup. Standalone: `--interact epilogue --kernel fc2`. Baseline: `--base` > most recent sweep CSV > DEFAULTS.
+**Dynamic k**: `--tier all` reduces branching when the gap between #1 and #2 is clear (>2% → k=1, >0.5% → k≤2). Saves compile time on FC1 where EPI=5 wins by 13%.
+**Inline η²**: Each tier/interaction prints per-parameter eta-squared immediately after the sweep completes.
 
