@@ -4,7 +4,7 @@
 Three methods, each addressing different weaknesses:
   1. eta-squared (one-way ANOVA) — simple, but confounded by tiered search imbalance
   2. Balanced-subset eta-squared — filters to subsets where only one param varies
-  3. Random forest permutation importance — handles interactions and imbalance
+  3. Random forest permutation importance — diagnostic only (confounded on tiered data)
 
 Usage:
     python3 tools/analyze_sweep.py data/sweep_results_run4.csv
@@ -196,8 +196,11 @@ def analyze_file(path):
     def sort_key(p):
         bal = bal_results.get(p, {}).get('eta_sq', 0)
         raw = raw_results.get(p, {}).get('eta_sq', 0)
-        rf = rf_results[p][0] if rf_results and p in rf_results else 0
-        return max(bal, raw, rf)
+        n_bal = bal_results.get(p, {}).get('n', 0)
+        # Use balanced η² when we have enough balanced pairs, raw as fallback
+        if n_bal >= 10:
+            return bal
+        return raw
 
     for param in sorted(params, key=sort_key, reverse=True):
         raw = raw_results.get(param, {})

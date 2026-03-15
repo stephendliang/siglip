@@ -8,11 +8,11 @@ into a sorted table + CSV.
 Supports all three kernels: patch_embed (default), fc1_gelu, fc2.
 
 Usage:
+    python3 grid_search.py                   # per-kernel tiered search (default)
+    python3 grid_search.py --kernel fc1_gelu # FC1 per-kernel tiers (GV+ST first)
+    python3 grid_search.py --kernel fc2      # FC2 per-kernel tiers (NS+KLU first)
     python3 grid_search.py --tier 1          # structure: N_STAGES x NUM_EPI_WARPS (~5 configs)
-    python3 grid_search.py --tier 2          # epilogue: INTER x MBAR x STAG x TMEM (~128 configs)
-    python3 grid_search.py --tier 3          # tuning: PHASE1_UNROLL x SNAKE_ORDER (~6 configs)
-    python3 grid_search.py --tier 4          # scheduling: PRELOAD_MODE x PREFETCH_BEFORE_STORE x STORE_TIMING
-    python3 grid_search.py --tier all        # sequential 1->2->3->4->5 + interactions, dynamic k, η²
+    python3 grid_search.py --tier all        # per-kernel tiered + interactions, dynamic k, η²
     python3 grid_search.py --full-cross      # all parameters crossed (~3000 configs)
     python3 grid_search.py --only N_STAGES STAGGER_CYCLES --fix MBAR_EARLY=1
     python3 grid_search.py --kernel fc2 --tier all   # sweep FC2 kernel
@@ -56,6 +56,10 @@ DEFAULTS = {
     'BATCH_EPILOGUE': 0,
     'GELU_VECTOR_WIDTH': 32,
     'STORE_TIMING': 0,
+    'EPILOGUE_LOOP': 0,
+    'STS_WIDTH': 16,
+    'EPI_SYNC': 0,
+    'NUM_PASSES_PARAM': 0,
 }
 
 # ── Parameter ranges ──
@@ -79,16 +83,73 @@ RANGES = {
     'BATCH_EPILOGUE': [0, 1],
     'GELU_VECTOR_WIDTH': [8, 16, 32],
     'STORE_TIMING': [0, 1],
+    'EPILOGUE_LOOP': [0, 1],
+    'STS_WIDTH': [16, 32],
+    'EPI_SYNC': [0, 1],
+    'NUM_PASSES_PARAM': [0, 4],
 }
 
-# ── Tier definitions ──
+# ── Tier definitions (generic, used by --tier 1/2/3/4/5) ──
 TIER_PARAMS = {
     1: ['N_STAGES', 'NUM_EPI_WARPS'],
     2: ['INTERLEAVE_STRATEGY', 'MBAR_EARLY', 'STAGGER_CYCLES', 'TMEM_LOAD_WIDTH'],
     3: ['PHASE1_UNROLL', 'SNAKE_ORDER', 'CVT_ADD_FUSED', 'K_LOOP_UNROLL',
         'W0_LOOP_UNROLL', 'SUB_MMA_UNROLL'],
-    4: ['PRELOAD_MODE', 'PREFETCH_BEFORE_STORE', 'BATCH_EPILOGUE', 'TMA_RESIDUAL', 'STORE_TIMING'],
+    4: ['PRELOAD_MODE', 'PREFETCH_BEFORE_STORE', 'BATCH_EPILOGUE', 'TMA_RESIDUAL', 'STORE_TIMING',
+        'EPILOGUE_LOOP', 'STS_WIDTH', 'EPI_SYNC', 'NUM_PASSES_PARAM'],
     5: ['GELU_VARIANT', 'GELU_VECTOR_WIDTH'],
+}
+
+# ── Per-kernel tiers (used by --tier all) ──
+# Ordered by balanced-η² from existing sweep data. Noise params (η²<0.01 with
+# adequate N_bal) are omitted — pinned at KERNEL_BASES values and never swept.
+# Tier 1: known dominant. Tier 2: known secondary. Tier 3: untested, need data.
+# Source: session_20260315 (FC1), session_20260314 (FC2, PE). See docs/SEARCH_ANALYSIS.md.
+# Invalidate after structural kernel changes (new epilogue ops, tile config changes).
+KERNEL_TIERS = {
+    'fc1_gelu': {
+        1: ['GELU_VARIANT', 'STORE_TIMING', 'INTERLEAVE_STRATEGY'],
+        2: ['PHASE1_UNROLL', 'SNAKE_ORDER', 'PRELOAD_MODE', 'BATCH_EPILOGUE'],
+        3: ['EPILOGUE_LOOP', 'STS_WIDTH', 'EPI_SYNC', 'GELU_VECTOR_WIDTH'],
+    },
+    'fc2': {
+        1: ['N_STAGES', 'K_LOOP_UNROLL'],
+        2: ['W0_LOOP_UNROLL'],
+        3: ['STORE_TIMING', 'BATCH_EPILOGUE', 'TMA_RESIDUAL', 'STS_WIDTH',
+            'EPILOGUE_LOOP', 'EPI_SYNC', 'NUM_PASSES_PARAM'],
+    },
+    'patch_embed': {
+        1: ['N_STAGES', 'K_LOOP_UNROLL', 'W0_LOOP_UNROLL'],
+        2: ['PHASE1_UNROLL', 'SNAKE_ORDER'],
+        3: ['EPILOGUE_LOOP', 'EPI_SYNC', 'STORE_TIMING'],
+    },
+}
+
+# Best-known configs per kernel (pin non-swept params here).
+# Derived from sweep winners — noise params locked at their winning values.
+# FC1: 2.247ms winner from session_20260315. FC2: 1.651ms from session_20260314.
+# PE: 0.525ms from session_20260314 (effectively exhausted).
+KERNEL_BASES = {
+    'fc1_gelu': {
+        'N_STAGES': 5, 'K_LOOP_UNROLL': 5, 'MBAR_EARLY': 1,
+        'STAGGER_CYCLES': 0, 'W0_LOOP_UNROLL': 0, 'SUB_MMA_UNROLL': 3,
+        'PREFETCH_BEFORE_STORE': 0, 'TMEM_LOAD_WIDTH': 32,
+        'CVT_ADD_FUSED': 1, 'NUM_EPI_WARPS': 4,
+    },
+    'fc2': {
+        'N_STAGES': 4, 'INTERLEAVE_STRATEGY': 1, 'MBAR_EARLY': 0,
+        'STAGGER_CYCLES': 100, 'SNAKE_ORDER': 1, 'PHASE1_UNROLL': 2,
+        'SUB_MMA_UNROLL': 0, 'PREFETCH_BEFORE_STORE': 0,
+        'PRELOAD_MODE': 0, 'TMEM_LOAD_WIDTH': 32,
+        'CVT_ADD_FUSED': 1, 'NUM_EPI_WARPS': 4,
+    },
+    'patch_embed': {
+        'MBAR_EARLY': 1, 'STAGGER_CYCLES': 160,
+        'INTERLEAVE_STRATEGY': 2, 'PRELOAD_MODE': 1,
+        'PREFETCH_BEFORE_STORE': 0, 'SUB_MMA_UNROLL': 0,
+        'TMEM_LOAD_WIDTH': 32, 'CVT_ADD_FUSED': 1,
+        'NUM_EPI_WARPS': 4,
+    },
 }
 
 # ── Kernel source files ──
@@ -135,6 +196,22 @@ INTERACTIONS = {
     'prefetch_store': {
         'params': ['PREFETCH_BEFORE_STORE', 'STORE_TIMING'],
         'kernels': ['fc1_gelu', 'fc2'],
+    },
+    'loop_store': {
+        'params': ['EPILOGUE_LOOP', 'STORE_TIMING'],
+        'kernels': ['fc1_gelu', 'fc2', 'patch_embed'],
+    },
+    'sts_batch': {
+        'params': ['STS_WIDTH', 'BATCH_EPILOGUE'],
+        'kernels': ['fc1_gelu', 'fc2'],
+    },
+    'sync_stagger': {
+        'params': ['EPI_SYNC', 'STAGGER_CYCLES'],
+        'kernels': ['fc1_gelu', 'fc2', 'patch_embed'],
+    },
+    'passes_residual': {
+        'params': ['NUM_PASSES_PARAM', 'TMA_RESIDUAL'],
+        'kernels': ['fc2'],
     },
 }
 
@@ -227,6 +304,38 @@ def is_valid(cfg, kernel='patch_embed'):
     if cfg.get('STORE_TIMING', 0) == 1 and cfg.get('INTERLEAVE_STRATEGY', 2) == 0:
         return False, 'STORE_TIMING=1 redundant with INTERLEAVE_STRATEGY=0'
 
+    # EPILOGUE_LOOP constraints
+    if cfg.get('EPILOGUE_LOOP', 0) == 1:
+        if cfg.get('STORE_TIMING', 0) != 1:
+            return False, 'EPILOGUE_LOOP=1 requires STORE_TIMING=1'
+        if cfg.get('BATCH_EPILOGUE', 0) != 0:
+            return False, 'EPILOGUE_LOOP=1 incompatible with BATCH_EPILOGUE'
+        if cfg.get('PRELOAD_MODE', 1) > 1:
+            return False, 'EPILOGUE_LOOP=1 requires PRELOAD_MODE<=1'
+        if cfg.get('GELU_VECTOR_WIDTH', 32) != 32:
+            return False, 'EPILOGUE_LOOP=1 requires GELU_VECTOR_WIDTH=32'
+
+    # STS_WIDTH constraints
+    if cfg.get('STS_WIDTH', 16) == 32:
+        if kernel == 'patch_embed':
+            return False, 'STS_WIDTH=32 not for patch_embed'
+        if cfg.get('BATCH_EPILOGUE', 0) != 1:
+            return False, 'STS_WIDTH=32 requires BATCH_EPILOGUE=1'
+        if kernel == 'fc1_gelu' and cfg.get('GELU_VECTOR_WIDTH', 32) == 8:
+            return False, 'STS_WIDTH=32 incompatible with GELU_VECTOR_WIDTH=8'
+
+    # EPI_SYNC + STAGGER prune
+    if cfg.get('EPI_SYNC', 0) == 1 and cfg.get('STAGGER_CYCLES', 80) > 0:
+        return False, 'EPI_SYNC=1 makes STAGGER_CYCLES redundant'
+
+    # NUM_PASSES_PARAM constraints
+    npp = cfg.get('NUM_PASSES_PARAM', 0)
+    if npp != 0:
+        if kernel != 'fc2':
+            return False, 'NUM_PASSES_PARAM only for fc2'
+        if cfg.get('TMA_RESIDUAL', 0) == 0:
+            return False, 'NUM_PASSES_PARAM requires TMA_RESIDUAL>0'
+
     return True, 'ok'
 
 
@@ -284,6 +393,12 @@ def make_dflags(cfg):
         if k in DEFAULTS and v != DEFAULTS[k]:
             # STORE_TIMING=1 suppresses inline stores, making IS dead code
             if k == 'INTERLEAVE_STRATEGY' and cfg.get('STORE_TIMING', 0) == 1:
+                continue
+            # K_LOOP_UNROLL = N_STAGES is the kernel default; don't emit redundantly
+            if k == 'K_LOOP_UNROLL' and v == cfg.get('N_STAGES', DEFAULTS['N_STAGES']):
+                continue
+            # EPILOGUE_LOOP=1 forces PHASE1_UNROLL=1 in kernel_common.cuh
+            if k == 'PHASE1_UNROLL' and cfg.get('EPILOGUE_LOOP', 0) == 1:
                 continue
             parts.append(f'-D{k}={v}')
     return ' '.join(parts)
@@ -408,6 +523,7 @@ def print_table(results, file=sys.stdout):
               f'{"STAG":>4}  {"PH1U":>4}  {"SNAKE":>5}  {"FUSE":>4}  {"KLU":>3}  '
               f'{"W0U":>3}  {"SMU":>3}  {"PRLD":>4}  {"PFBS":>4}  {"GELU":>4}  '
               f'{"TMAR":>4}  {"BTCH":>4}  {"GVW":>3}  {"STIM":>4}  '
+              f'{"ELOP":>4}  {"STSW":>4}  {"ESYN":>4}  {"NPP":>3}  '
               f'{"REGS":>4}  {"SMEM":>7}  '
               f'{"MS":>7}  {"TFLOPS":>7}  {"STATUS"}')
     print(header, file=file)
@@ -433,6 +549,10 @@ def print_table(results, file=sys.stdout):
               f'{r.get("BATCH_EPILOGUE", 0):>4}  '
               f'{r.get("GELU_VECTOR_WIDTH", 32):>3}  '
               f'{r.get("STORE_TIMING", 0):>4}  '
+              f'{r.get("EPILOGUE_LOOP", 0):>4}  '
+              f'{r.get("STS_WIDTH", 16):>4}  '
+              f'{r.get("EPI_SYNC", 0):>4}  '
+              f'{r.get("NUM_PASSES_PARAM", 0):>3}  '
               f'{r["regs"]:>4}  {r["smem_kb"]:>6.1f}K  '
               f'{ms_str:>7}  {tflops_str:>7}  {status}',
               file=file)
@@ -450,6 +570,7 @@ def write_csv(results, path):
               'CVT_ADD_FUSED', 'K_LOOP_UNROLL', 'W0_LOOP_UNROLL', 'SUB_MMA_UNROLL',
               'PRELOAD_MODE', 'PREFETCH_BEFORE_STORE', 'GELU_VARIANT', 'TMA_RESIDUAL',
               'BATCH_EPILOGUE', 'GELU_VECTOR_WIDTH', 'STORE_TIMING',
+              'EPILOGUE_LOOP', 'STS_WIDTH', 'EPI_SYNC', 'NUM_PASSES_PARAM',
               'regs', 'spills', 'smem_kb', 'ms', 'tflops', 'status', 'dflags']
 
     with open(path, 'w', newline='') as f:
@@ -632,9 +753,9 @@ def main():
                         help='Output CSV path (default: data/sweep_<kernel>.csv)')
     args = parser.parse_args()
 
-    # Validate: need at least one mode
+    # Default mode: per-kernel tiered search when no explicit mode given
     if not args.only and not args.tier and not args.full_cross and not args.interact:
-        parser.error('one of --tier, --full-cross, --interact, or --only is required')
+        args.tier = 'all'
 
     src_path = os.path.join(ROOT_DIR, KERNELS[args.kernel])
     if args.csv is None:
@@ -750,13 +871,36 @@ def main():
 
     elif args.tier == 'all':
         # Sequential tiers, top-k pinning (explores k branches per tier)
+        # Uses per-kernel tiers + bases when available (balanced-η² ordering).
         k = args.top_k
-        # Each branch is a dict of pinned param values
-        branches = [dict(DEFAULTS)]
+        use_kernel_tiers = args.kernel in KERNEL_TIERS
+        if use_kernel_tiers:
+            ktiers = KERNEL_TIERS[args.kernel]
+            tier_nums = sorted(ktiers.keys())
+            base = dict(DEFAULTS)
+            base.update(KERNEL_BASES.get(args.kernel, {}))
+            swept_params = set()
+            for tn in tier_nums:
+                swept_params.update(ktiers[tn])
+            skipped = [p for p in RANGES if p not in swept_params
+                       and p not in KERNEL_BASES.get(args.kernel, {})]
+            if skipped:
+                print(f'Per-kernel tiers for {args.kernel}: skipping {", ".join(skipped)}')
+            pinned = {p: base[p] for p in DEFAULTS if p not in swept_params and p in base}
+            if pinned:
+                pinned_str = ' '.join(f'{p}={v}' for p, v in sorted(pinned.items()) if v != DEFAULTS[p])
+                if pinned_str:
+                    print(f'Pinned at winner values: {pinned_str}')
+        else:
+            ktiers = TIER_PARAMS
+            tier_nums = [1, 2, 3, 4, 5]
+            base = dict(DEFAULTS)
+
+        branches = [dict(base)]
         branches[0].update(fixed_overrides)
 
-        for tier_num in [1, 2, 3, 4, 5]:
-            tier_params = TIER_PARAMS[tier_num]
+        for tier_num in tier_nums:
+            tier_params = ktiers[tier_num]
             sweep_params = {p: RANGES[p] for p in tier_params if p not in fixed_overrides}
             if not sweep_params:
                 print(f'\n=== Tier {tier_num}: all params pinned by --fix, skipping ===')
@@ -773,6 +917,8 @@ def main():
                     print(f'  Branch {bi+1}/{len(branches)}: {make_dflags(branch) or "(defaults)"}')
                 results = run_sweep(sweep_params, fixed, src_path, repeat=args.repeat, kernel=args.kernel,
                                     seen_cfgs=seen_cfgs)
+                for r in results:
+                    r['_branch_idx'] = bi
                 tier_results.extend(results)
 
             all_results.extend(tier_results)
@@ -794,18 +940,10 @@ def main():
                 # Build new branches from top-k winners
                 new_branches = []
                 for i, t in enumerate(top[:k_eff]):
-                    b = dict(branches[0])  # start from current best branch
+                    parent_idx = t.get('_branch_idx', 0)
+                    b = dict(branches[parent_idx])
                     for p in tier_params:
                         b[p] = t[p]
-                    # Also inherit any non-tier params from the branch that produced this result
-                    for br in branches:
-                        fixed_sig = tuple(br.get(p) for p in tier_params)
-                        result_sig = tuple(t[p] for p in tier_params)
-                        if fixed_sig == result_sig:
-                            b.update(br)
-                            for p in tier_params:
-                                b[p] = t[p]
-                            break
                     new_branches.append(b)
 
                 branches = new_branches
@@ -828,6 +966,12 @@ def main():
             for name, group in INTERACTIONS.items():
                 if args.kernel not in group['kernels']:
                     continue
+                # Skip interactions involving params not in any tier (noise params)
+                if use_kernel_tiers:
+                    if not all(p in swept_params for p in group['params']):
+                        skipped_in = [p for p in group['params'] if p not in swept_params]
+                        print(f'\n=== Interaction: {name} — skipped (noise params: {", ".join(skipped_in)}) ===')
+                        continue
                 any_interaction = True
                 sweep_params = {p: RANGES[p] for p in group['params']}
 

@@ -3,7 +3,7 @@
 #
 # Phases:
 #   1. Machine snapshot                          (~5 sec)
-#   2. Build + grid search + benchmark + ANOVA   (~30-90 min with grid search)
+#   2. Build + grid search + benchmark + ANOVA   (~15-30 min, CUTLASS deferred after grid search)
 #   3. ncu profiling (source counters + full)     (~5 min)
 #   4. SASS dumps (our kernels + CUTLASS)           (~1 min)
 #
@@ -74,7 +74,7 @@ fi
 if should_run 2; then
     log ""
     log "==== PHASE 2/4: BUILD + GRID SEARCH + BENCHMARK ===="
-    log "This is the long phase. Grid search: ~673 configs/layer."
+    log "This is the long phase. Grid search: ~60 configs/layer (per-kernel tiered)."
     log "Monitor: tail -f $OUTDIR/compare.txt"
     log "Grid search logs: tail -f $OUTDIR/grid_search_*.log"
     python3 tools/compare_all.py \

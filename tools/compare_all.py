@@ -330,12 +330,13 @@ def run_grid_search(kernel, tier='all', csv_dir=None, top_k=3):
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, f'grid_search_{kernel}.log')
 
-    print(f"\n  Running grid search for {kernel} (tier={tier}, top-k={top_k})")
-    print(f"  Log: {log_path}")
     cmd = [sys.executable, '-u',  # unbuffered python output
            os.path.join(SCRIPT_DIR, 'grid_search.py'),
-           '--kernel', kernel, '--tier', tier,
-           '--top-k', str(top_k)]
+           '--kernel', kernel, '--tier', tier, '--top-k', str(top_k)]
+    mode_str = f'tier={tier}, top-k={top_k}'
+
+    print(f"\n  Running grid search for {kernel} ({mode_str})")
+    print(f"  Log: {log_path}")
     if csv_dir:
         cmd.extend(['--csv', os.path.join(csv_dir, f'sweep_{kernel}.csv')])
 
@@ -392,7 +393,7 @@ def main():
     parser.add_argument('--grid-search', action='store_true',
                         help='Run grid search before repeated measurements')
     parser.add_argument('--grid-tier', default='all',
-                        help='Grid search tier (default: all)')
+                        help='Grid search tier (default: all = per-kernel tiered)')
     parser.add_argument('--top-k', type=int, default=3,
                         help='Top-k branches for grid search (default: 3, 1=greedy)')
     parser.add_argument('--cutlass-mode', choices=['standard', 'max'], default='max',
@@ -413,7 +414,7 @@ def main():
 
     n_layers = len(args.layer)
     n_targets = n_layers * 2  # our + cutlass per layer
-    grid_configs = 673  # approx valid configs per kernel in --tier all
+    grid_configs = 60  # approx valid configs per kernel with per-kernel tiers
 
     print("=" * 72)
     print("  Unified Benchmark: CUTLASS vs Our Kernel")
@@ -421,42 +422,36 @@ def main():
     print(f"  Runs per approach: {args.runs}")
     print(f"  CUTLASS mode: {args.cutlass_mode}")
     if args.grid_search:
-        print(f"  Grid search: {grid_configs} configs/layer x {n_layers} layers (~{grid_configs * n_layers * 5 // 60} min)")
+        print(f"  Grid search: ~{grid_configs} configs/layer x {n_layers} layers (~{grid_configs * n_layers * 5 // 60} min) [tier={args.grid_tier}]")
     print("=" * 72)
 
-    # ── Phase 1/4: Build ──
+    # ── Phase 1/5: Build our kernels (needed for grid search) ──
     t_start = time.time()
     if not args.skip_build:
-        print(f"\n[Phase 1/4] BUILD ({n_targets} targets)")
-        targets = set()
+        our_targets = set()
         for layer_name in args.layer:
-            layer = LAYERS[layer_name]
-            targets.add(layer['our_target'])
-            if args.cutlass_mode == 'max':
-                targets.add(layer['cutlass_target_max'])
-            else:
-                targets.add(layer['cutlass_target'])
-
-        if not build_targets(sorted(targets), verbose=True):
+            our_targets.add(LAYERS[layer_name]['our_target'])
+        print(f"\n[Phase 1/5] BUILD OUR KERNELS ({len(our_targets)} targets)")
+        if not build_targets(sorted(our_targets), verbose=True):
             print("\nBuild failed. Aborting.")
             sys.exit(1)
-        print(f"  Build done in {time.time() - t_start:.0f}s")
+        print(f"  Our kernels built in {time.time() - t_start:.0f}s")
     else:
-        print(f"\n[Phase 1/4] BUILD — skipped (--skip-build)")
+        print(f"\n[Phase 1/5] BUILD — skipped (--skip-build)")
 
-    # ── Phase 2/4: Grid search ──
+    # ── Phase 2/5: Grid search ──
     grid_dflags = {}  # layer_name -> best dflags string
     # Route grid search CSV output to same dir as --csv if provided
     grid_csv_dir = os.path.dirname(os.path.join(ROOT_DIR, args.csv)) if args.csv else None
     if args.grid_search:
         t_grid = time.time()
-        print(f"\n[Phase 2/4] GRID SEARCH (~{grid_configs * n_layers * 5 // 60} min, "
-              f"{grid_configs} configs/layer x {n_layers} layers)")
+        print(f"\n[Phase 2/5] GRID SEARCH (~{grid_configs * n_layers * 5 // 60} min, "
+              f"~{grid_configs} configs/layer x {n_layers} layers)")
         print(f"  Each config: compile + run + validate. Progress in log files.")
         for layer_name in args.layer:
             kernel_name = layer_name if layer_name != 'fc1' else 'fc1_gelu'
-            best = run_grid_search(kernel_name, args.grid_tier, csv_dir=grid_csv_dir,
-                                       top_k=args.top_k)
+            best = run_grid_search(kernel_name, tier=args.grid_tier,
+                                       csv_dir=grid_csv_dir, top_k=args.top_k)
             if best:
                 grid_dflags[layer_name] = best
 
@@ -472,11 +467,27 @@ def main():
                     sys.exit(1)
         print(f"  Grid search done in {time.time() - t_grid:.0f}s")
     else:
-        print(f"\n[Phase 2/4] GRID SEARCH — skipped (no --grid-search)")
+        print(f"\n[Phase 2/5] GRID SEARCH — skipped (no --grid-search)")
 
-    # ── Phase 3/4: Benchmark ──
+    # ── Phase 3/5: Build CUTLASS (deferred to avoid blocking grid search) ──
+    if not args.skip_build:
+        cutlass_targets = set()
+        for layer_name in args.layer:
+            layer = LAYERS[layer_name]
+            if args.cutlass_mode == 'max':
+                cutlass_targets.add(layer['cutlass_target_max'])
+            else:
+                cutlass_targets.add(layer['cutlass_target'])
+        t_cutlass = time.time()
+        print(f"\n[Phase 3/5] BUILD CUTLASS ({len(cutlass_targets)} targets)")
+        if not build_targets(sorted(cutlass_targets), verbose=True):
+            print("\nCUTLASS build failed. Benchmark will skip CUTLASS comparisons.")
+        else:
+            print(f"  CUTLASS built in {time.time() - t_cutlass:.0f}s")
+
+    # ── Phase 4/5: Benchmark ──
     t_bench = time.time()
-    print(f"\n[Phase 3/4] BENCHMARK ({args.runs} runs x {n_layers} layers x 2 implementations)")
+    print(f"\n[Phase 4/5] BENCHMARK ({args.runs} runs x {n_layers} layers x 2 implementations)")
     all_raw = []  # for CSV: (layer, approach, run_idx, ms)
     layer_results = {}  # layer -> {approach: [ms, ...]}
 
@@ -520,8 +531,8 @@ def main():
 
     print(f"  Benchmark done in {time.time() - t_bench:.0f}s")
 
-    # ── Phase 4/4: Analysis ──
-    print(f"\n[Phase 4/4] STATISTICAL ANALYSIS")
+    # ── Phase 5/5: Analysis ──
+    print(f"\n[Phase 5/5] STATISTICAL ANALYSIS")
 
     print(f"\n{'#' * 72}")
     print(f"{'#':>2}  RESULTS & STATISTICAL ANALYSIS")

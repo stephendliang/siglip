@@ -72,6 +72,23 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef STORE_TIMING
 #define STORE_TIMING 0           // 0=inline TMA stores per INTERLEAVE_STRATEGY, 1=all stores after Phase 1
 #endif
+#ifndef EPILOGUE_LOOP
+#define EPILOGUE_LOOP 0          // 0=unrolled epilogue, 1=#pragma unroll 1 loop body
+#endif
+#ifndef STS_WIDTH
+#define STS_WIDTH 16             // 16=1x st.shared.v4 per call, 32=2x st.shared.v4 per call
+#endif
+#ifndef EPI_SYNC
+#define EPI_SYNC 0               // 0=independent warp poll, 1=bar.sync before epilogue
+#endif
+#ifndef NUM_PASSES_PARAM
+#define NUM_PASSES_PARAM 0       // 0=auto (128 cols/pass), 4=4-pass (64 cols/pass), FC2 TMA_RESIDUAL only
+#endif
+
+#if EPILOGUE_LOOP
+#undef PHASE1_UNROLL
+#define PHASE1_UNROLL 1
+#endif
 
 // nvcc doesn't expand macros in #pragma unroll — use _Pragma instead
 #define _UNROLL_STR2(x) #x
@@ -386,6 +403,32 @@ static __device__ __forceinline__ void cvt_sts_v4(
     asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o3) : "f"(g6), "f"(g7));
     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
         :: "r"(saddr), "r"(o0), "r"(o1), "r"(o2), "r"(o3) : "memory");
+}
+
+/* 16-float CVT+STS: pack 16 FP32 → 8 BF16x2 → 2x st.shared.v4 (32 bytes).
+   Two addresses needed because SWIZZLE_128B makes addr and addr+16 non-contiguous. */
+static __device__ __forceinline__ void cvt_sts_v8(
+    float g0, float g1, float g2, float g3,
+    float g4, float g5, float g6, float g7,
+    float g8, float g9, float g10, float g11,
+    float g12, float g13, float g14, float g15,
+    uint32_t saddr0, uint32_t saddr1
+) {
+    uint32_t o0, o1, o2, o3, o4, o5, o6, o7;
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o0) : "f"(g0), "f"(g1));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o1) : "f"(g2), "f"(g3));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o2) : "f"(g4), "f"(g5));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o3) : "f"(g6), "f"(g7));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o4) : "f"(g8), "f"(g9));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o5) : "f"(g10), "f"(g11));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o6) : "f"(g12), "f"(g13));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o7) : "f"(g14), "f"(g15));
+    asm volatile(
+        "st.shared.v4.b32 [%0], {%2,%3,%4,%5};\n\t"
+        "st.shared.v4.b32 [%1], {%6,%7,%8,%9};"
+        :: "r"(saddr0), "r"(saddr1),
+           "r"(o0),"r"(o1),"r"(o2),"r"(o3),
+           "r"(o4),"r"(o5),"r"(o6),"r"(o7) : "memory");
 }
 
 #define CVT_STS(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15, SADDR) \

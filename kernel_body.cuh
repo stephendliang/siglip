@@ -113,15 +113,21 @@ void epilogue_store(
     (2 passes) so mbarrier phase is consistent across calls.
     */
     if constexpr (Op == EpilogueOp::BIAS_RESIDUAL && (NC_END - NC_START) >= 256) {
+#if NUM_PASSES_PARAM == 0
         constexpr int PASS_COLS = 128;
-        constexpr int NUM_PASSES = (NC_END - NC_START) / PASS_COLS;
+        constexpr int LOCAL_PASSES = (NC_END - NC_START) / PASS_COLS;
+#else
+        constexpr int LOCAL_PASSES = NUM_PASSES_PARAM;
+        constexpr int PASS_COLS = (NC_END - NC_START) / LOCAL_PASSES;
+#endif
+        constexpr int PASS_REGIONS = PASS_COLS / 64;
         const int taddr_base = tmem_addr + ((cta_rank * 128 + row_group * 32) << 16);
         int res_phase = 0;
 
         float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
         float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
 
-        for (int pass = 0; pass < NUM_PASSES; pass++) {
+        for (int pass = 0; pass < LOCAL_PASSES; pass++) {
             const int pnc_s = NC_START + pass * PASS_COLS;
             const int pnc_e = pnc_s + PASS_COLS;
 
@@ -131,11 +137,13 @@ void epilogue_store(
                Skip pass 0 when caller already preloaded (TMA_RESIDUAL=2). */
             if (!(FIRST_PASS_PRELOADED && pass == 0)) {
                 if (lane == 0) {
-                    mbar_arrive_expect_tx(res_mbar_addr, 2 * STAGING_REGION_BYTES);
+                    mbar_arrive_expect_tx(res_mbar_addr, PASS_REGIONS * STAGING_REGION_BYTES);
                     tma_load_2d_cta(res_staging_saddr, tma_res_desc,
                                     n_start + pnc_s, gm_base, res_mbar_addr);
-                    tma_load_2d_cta(res_staging_saddr + STAGING_REGION_BYTES, tma_res_desc,
-                                    n_start + pnc_s + 64, gm_base, res_mbar_addr);
+                    if constexpr (PASS_REGIONS >= 2) {
+                        tma_load_2d_cta(res_staging_saddr + STAGING_REGION_BYTES, tma_res_desc,
+                                        n_start + pnc_s + 64, gm_base, res_mbar_addr);
+                    }
                 }
             }
 
@@ -157,7 +165,11 @@ void epilogue_store(
             res_phase ^= 1;
 
             /* Process 4 × 32-col chunks within this pass */
+#if EPILOGUE_LOOP
+#pragma unroll 1
+#else
             PRAGMA_UNROLL(PHASE1_UNROLL)
+#endif
             for (int nc = pnc_s; nc < pnc_e; nc += 32) {
                 /* Preload all 32 bias floats (L1-hot, fills TMEM stall window) */
                 const float* bp = side_data + n_start + nc;
@@ -191,7 +203,7 @@ void epilogue_store(
 
                 TMEM_WAIT();
 
-                if (MBAR_EARLY && pass == NUM_PASSES - 1 && nc + 32 >= pnc_e) {
+                if (MBAR_EARLY && pass == LOCAL_PASSES - 1 && nc + 32 >= pnc_e) {
                     if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
                 }
 
@@ -264,11 +276,12 @@ void epilogue_store(
             }
 
             /* Commit this pass's TMA output stores */
-            if (STORE_TIMING || INTERLEAVE_STRATEGY == 0) {
+            if (STORE_TIMING || INTERLEAVE_STRATEGY == 0
+                || (INTERLEAVE_STRATEGY >= 2 && PASS_REGIONS < 2)) {
                 __syncwarp();
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 if (lane == 0) {
-                    for (int r = 0; r < 2; r++) {
+                    for (int r = 0; r < PASS_REGIONS; r++) {
                         uint32_t src = staging_saddr + r * STAGING_REGION_BYTES;
                         asm volatile(
                             "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
@@ -305,7 +318,11 @@ void epilogue_store(
                   a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
                   taddr_base + NC_START);
 
+#if EPILOGUE_LOOP
+#pragma unroll 1
+#else
     PRAGMA_UNROLL(PHASE1_UNROLL)
+#endif
     for (int nc = NC_START; nc < NC_END; nc += 64) {
         const uint32_t srow = srow_base + ((nc - NC_START) >> 6) * STAGING_REGION_BYTES;
 
@@ -532,7 +549,11 @@ void epilogue_store(
                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                  taddr_base + NC_START);
 
+#if EPILOGUE_LOOP
+#pragma unroll 1
+#else
     PRAGMA_UNROLL(PHASE1_UNROLL)
+#endif
     for (int nc = NC_START; nc < NC_END; nc += 32) {
         // Side-data variables
         uint4 craw0 = {}, craw1 = {};
@@ -663,10 +684,17 @@ void epilogue_store(
             a26 = gelu_approx(a26, bv6.z); a27 = gelu_approx(a27, bv6.w);
             a28 = gelu_approx(a28, bv7.x); a29 = gelu_approx(a29, bv7.y);
             a30 = gelu_approx(a30, bv7.z); a31 = gelu_approx(a31, bv7.w);
+#if STS_WIDTH == 32
+            cvt_sts_v8(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                       srow + (byte_base ^ xor_val), srow + ((byte_base + 16) ^ xor_val));
+            cvt_sts_v8(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                       srow + ((byte_base + 32) ^ xor_val), srow + ((byte_base + 48) ^ xor_val));
+#else
             cvt_sts_v4(a0,a1,a2,a3,a4,a5,a6,a7, srow + (byte_base ^ xor_val));
             cvt_sts_v4(a8,a9,a10,a11,a12,a13,a14,a15, srow + ((byte_base + 16) ^ xor_val));
             cvt_sts_v4(a16,a17,a18,a19,a20,a21,a22,a23, srow + ((byte_base + 32) ^ xor_val));
             cvt_sts_v4(a24,a25,a26,a27,a28,a29,a30,a31, srow + ((byte_base + 48) ^ xor_val));
+#endif
 #elif GELU_VECTOR_WIDTH == 16
 #if PRELOAD_MODE < 2
             float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
@@ -680,8 +708,13 @@ void epilogue_store(
             a10 = gelu_approx(a10, bv2.z); a11 = gelu_approx(a11, bv2.w);
             a12 = gelu_approx(a12, bv3.x); a13 = gelu_approx(a13, bv3.y);
             a14 = gelu_approx(a14, bv3.z); a15 = gelu_approx(a15, bv3.w);
+#if STS_WIDTH == 32
+            cvt_sts_v8(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                       srow + (byte_base ^ xor_val), srow + ((byte_base + 16) ^ xor_val));
+#else
             cvt_sts_v4(a0,a1,a2,a3,a4,a5,a6,a7, srow + (byte_base ^ xor_val));
             cvt_sts_v4(a8,a9,a10,a11,a12,a13,a14,a15, srow + ((byte_base + 16) ^ xor_val));
+#endif
 #if PRELOAD_MODE < 2
             float4 bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
             float4 bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
@@ -696,8 +729,13 @@ void epilogue_store(
             a26 = gelu_approx(a26, bv6.z); a27 = gelu_approx(a27, bv6.w);
             a28 = gelu_approx(a28, bv7.x); a29 = gelu_approx(a29, bv7.y);
             a30 = gelu_approx(a30, bv7.z); a31 = gelu_approx(a31, bv7.w);
+#if STS_WIDTH == 32
+            cvt_sts_v8(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                       srow + ((byte_base + 32) ^ xor_val), srow + ((byte_base + 48) ^ xor_val));
+#else
             cvt_sts_v4(a16,a17,a18,a19,a20,a21,a22,a23, srow + ((byte_base + 32) ^ xor_val));
             cvt_sts_v4(a24,a25,a26,a27,a28,a29,a30,a31, srow + ((byte_base + 48) ^ xor_val));
+#endif
 #else /* GELU_VECTOR_WIDTH == 8 */
             a0  = gelu_approx(a0,  bv0.x); a1  = gelu_approx(a1,  bv0.y);
             a2  = gelu_approx(a2,  bv0.z); a3  = gelu_approx(a3,  bv0.w);
@@ -788,11 +826,18 @@ void epilogue_store(
                 BF16X2_TO_F32_NV(rv3.z, rf0, rf1); a28 = a28 + bv7.x + rf0; a29 = a29 + bv7.y + rf1;
                 BF16X2_TO_F32_NV(rv3.w, rf0, rf1); a30 = a30 + bv7.z + rf0; a31 = a31 + bv7.w + rf1;
             }
-            /* Store phase: 4x cvt_sts_v4 */
+            /* Store phase */
+#if STS_WIDTH == 32
+            cvt_sts_v8(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                       srow + (byte_base ^ xor_val), srow + ((byte_base + 16) ^ xor_val));
+            cvt_sts_v8(a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                       srow + ((byte_base + 32) ^ xor_val), srow + ((byte_base + 48) ^ xor_val));
+#else
             cvt_sts_v4(a0,a1,a2,a3,a4,a5,a6,a7, srow + (byte_base ^ xor_val));
             cvt_sts_v4(a8,a9,a10,a11,a12,a13,a14,a15, srow + ((byte_base + 16) ^ xor_val));
             cvt_sts_v4(a16,a17,a18,a19,a20,a21,a22,a23, srow + ((byte_base + 32) ^ xor_val));
             cvt_sts_v4(a24,a25,a26,a27,a28,a29,a30,a31, srow + ((byte_base + 48) ^ xor_val));
+#endif
 #elif PRELOAD_MODE == 2
             BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, rv0.x,rv0.y,rv0.z,rv0.w, srow + (byte_base ^ xor_val));
             BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, bv2.x,bv2.y,bv2.z,bv2.w,bv3.x,bv3.y,bv3.z,bv3.w, rv1.x,rv1.y,rv1.z,rv1.w, srow + ((byte_base + 16) ^ xor_val));
@@ -1159,9 +1204,14 @@ persistent_gemm(
 #else
                     const int nc0 = 0;
 #endif
+#if NUM_PASSES_PARAM == 4
+                    mbar_arrive_expect_tx(res_mbar, STAGING_REGION_BYTES);
+                    tma_load_2d_cta(res_stg, &tma_res, prev_n + nc0, gm_base, res_mbar);
+#else
                     mbar_arrive_expect_tx(res_mbar, 2 * STAGING_REGION_BYTES);
                     tma_load_2d_cta(res_stg, &tma_res, prev_n + nc0, gm_base, res_mbar);
                     tma_load_2d_cta(res_stg + STAGING_REGION_BYTES, &tma_res, prev_n + nc0 + 64, gm_base, res_mbar);
+#endif
                 }
             }
 #endif
@@ -1172,6 +1222,9 @@ persistent_gemm(
 #endif
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+#if EPI_SYNC
+            asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
+#endif
             ml_phase[prev_buf] ^= 1;
             if (STAGGER_CYCLES > 0 && ew > 0 && lane == 0) {
                 long long __stagger_end = clock64() + ew * STAGGER_CYCLES;
@@ -1306,15 +1359,23 @@ persistent_gemm(
 #else
                 const int nc0 = 0;
 #endif
+#if NUM_PASSES_PARAM == 4
+                mbar_arrive_expect_tx(res_mbar, STAGING_REGION_BYTES);
+                tma_load_2d_cta(res_stg, &tma_res, last_n + nc0, gm_base, res_mbar);
+#else
                 mbar_arrive_expect_tx(res_mbar, 2 * STAGING_REGION_BYTES);
                 tma_load_2d_cta(res_stg, &tma_res, last_n + nc0, gm_base, res_mbar);
                 tma_load_2d_cta(res_stg + STAGING_REGION_BYTES, &tma_res, last_n + nc0 + 64, gm_base, res_mbar);
+#endif
             }
         }
 #endif
 
         mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+#if EPI_SYNC
+        asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
+#endif
         if (STAGGER_CYCLES > 0 && ew > 0 && lane == 0) {
             long long __stagger_end = clock64() + ew * STAGGER_CYCLES;
             while (clock64() < __stagger_end) {}
