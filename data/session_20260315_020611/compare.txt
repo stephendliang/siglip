@@ -1,0 +1,93 @@
+========================================================================
+  Unified Benchmark: CUTLASS vs Our Kernel
+  Layers: fc1
+  Runs per approach: 10
+  CUTLASS mode: max
+  Grid search: 673 configs/layer x 1 layers (~56 min)
+========================================================================
+
+[Phase 1/4] BUILD (2 targets)
+  Building cutlass-bench-fc1-max ... ok
+  Building fc1-gelu ... ok
+  Build done in 384s
+
+[Phase 2/4] GRID SEARCH (~56 min, 673 configs/layer x 1 layers)
+  Each config: compile + run + validate. Progress in log files.
+
+  Running grid search for fc1_gelu (tier=all, top-k=3)
+  Log: /root/siglip/data/session_20260315_020611/grid_search_fc1_gelu.log
+  Winner dflags: -DGELU_VARIANT=4 -DK_LOOP_UNROLL=5 -DMBAR_EARLY=1 -DN_STAGES=5 -DPHASE1_UNROLL=4 -DSTAGGER_CYCLES=0 -DSTORE_TIMING=1 -DSUB_MMA_UNROLL=3
+
+  Rebuilding with grid search winners:
+  Rebuilding ./fc1-gelu with: -DGELU_VARIANT=4 -DK_LOOP_UNROLL=5 -DMBAR_EARLY=1 -DN_STAGES=5 -DPHASE1_UNROLL=4 -DSTAGGER_CYCLES=0 -DSTORE_TIMING=1 -DSUB_MMA_UNROLL=3 ... ok
+  Grid search done in 6112s
+
+[Phase 3/4] BENCHMARK (10 runs x 1 layers x 2 implementations)
+
+========================================================================
+  FC1+GELU (768x3072)
+========================================================================
+
+  Our kernel (./fc1-gelu):
+    our kernel run 1/10: 2.281 ms / 1920 TFLOPS
+    our kernel run 2/10: 2.283 ms / 1919 TFLOPS
+    our kernel run 3/10: 2.344 ms / 1868 TFLOPS
+    our kernel run 4/10: 2.275 ms / 1925 TFLOPS
+    our kernel run 5/10: 2.275 ms / 1925 TFLOPS
+    our kernel run 6/10: 2.405 ms / 1821 TFLOPS
+    our kernel run 7/10: 2.249 ms / 1948 TFLOPS
+    our kernel run 8/10: 2.271 ms / 1928 TFLOPS
+    our kernel run 9/10: 2.393 ms / 1831 TFLOPS
+    our kernel run 10/10: 2.311 ms / 1895 TFLOPS
+
+  CUTLASS (./cutlass-bench-fc1-max):
+    CUTLASS run 1/10: 2.318 ms (GEMM-only: 1.611 ms)
+    CUTLASS run 2/10: 2.319 ms (GEMM-only: 1.609 ms)
+    CUTLASS run 3/10: 2.319 ms (GEMM-only: 1.610 ms)
+    CUTLASS run 4/10: 2.319 ms (GEMM-only: 1.610 ms)
+    CUTLASS run 5/10: 2.320 ms (GEMM-only: 1.611 ms)
+    CUTLASS run 6/10: 2.323 ms (GEMM-only: 1.613 ms)
+    CUTLASS run 7/10: 2.319 ms (GEMM-only: 1.610 ms)
+    CUTLASS run 8/10: 2.319 ms (GEMM-only: 1.610 ms)
+    CUTLASS run 9/10: 2.323 ms (GEMM-only: 1.612 ms)
+    CUTLASS run 10/10: 2.324 ms (GEMM-only: 1.611 ms)
+  Benchmark done in 226s
+
+[Phase 4/4] STATISTICAL ANALYSIS
+
+########################################################################
+ #  RESULTS & STATISTICAL ANALYSIS
+########################################################################
+
+========================================================================
+  FC1+GELU (768x3072)
+========================================================================
+
+                           Summary Statistics                           
+========================================================================
+  Our kernel            n=10  mean=2.3087  std=0.0541  min=2.2490  max=2.4050  median=2.2820  IQR=0.0608
+  CUTLASS fused         n=10  mean=2.3203  std=0.0022  min=2.3180  max=2.3240  median=2.3190  IQR=0.0032
+
+  Ranking (fastest first):
+    #1: Our kernel            2.3087 ms (best)
+    #2: CUTLASS fused         2.3203 ms (+11.6 us vs best)
+
+                             One-way ANOVA                              
+========================================================================
+  F(1, 18) = 0.459,  p = 5.06e-01  (not significant)
+
+                        Pairwise Welchs t-tests                         
+========================================================================
+  Comparison                              t-stat     p-value        d   Sig       Delta
+  --------------------------------------------------------------------------------
+         Our kernel vs CUTLASS fused       -0.678    5.15e-01   -0.303    ns     -11.6 us
+
+  n = 10-10 runs, alpha = 0.05
+  ns = not significant, * p<0.05, ** p<0.01, *** p<0.001
+
+  GEMM-only reference (not fused):
+    CUTLASS GEMM-only     mean=1.6107 ms  std=0.0012
+
+Raw samples saved to: /root/siglip/data/session_20260315_020611/compare.csv
+
+Done. 10 runs x 1 layers in 6723s (112.0 min).

@@ -1,0 +1,52 @@
+[02:06:11] ========================================
+[02:06:11]   B200 SESSION 20260315_020611
+[02:06:11]   Output: data/session_20260315_020611
+[02:06:11]   Phase:  0
+[02:06:11] ========================================
+[02:06:12] Preflight OK
+[02:06:12] 
+[02:06:12] ==== PHASE 1/4: MACHINE SNAPSHOT ====
+[02:06:12] Machine info saved to machine_info.txt
+[02:06:12] 
+[02:06:12] ==== PHASE 2/4: BUILD + GRID SEARCH + BENCHMARK ====
+[02:06:12] This is the long phase. Grid search: ~673 configs/layer.
+[02:06:12] Monitor: tail -f data/session_20260315_020611/compare.txt
+[02:06:12] Grid search logs: tail -f data/session_20260315_020611/grid_search_*.log
+[03:58:16] Phase 2 complete
+[03:58:16] 
+[03:58:16] ==== PHASE 3/4: NCU PROFILING ====
+[03:58:16] WARN ncu patch_embed: binary predates this session — may be stale
+[03:58:16] ncu source counters: patch_embed
+[03:58:20] ncu source counters: fc1-gelu
+[03:58:26] WARN ncu fc2: binary predates this session — may be stale
+[03:58:26] ncu source counters: fc2
+[03:58:28] ncu full profile: patch_embed
+[03:59:27] Phase 3 complete
+[03:59:27] 
+[03:59:27] ==== PHASE 4/4: SASS DUMPS ====
+[03:59:27] SASS dumped: patch_embed (4816 lines)
+[03:59:28] SASS dumped: fc1-gelu (7499 lines)
+[03:59:29] SASS dumped: fc2 (10592 lines)
+[03:59:29] SKIP SASS cutlass-bench: binary not found
+[03:59:29] SKIP SASS cutlass-bench-fc1: binary not found
+[03:59:29] SKIP SASS cutlass-bench-fc2: binary not found
+[03:59:29] Phase 4 complete
+[03:59:29] 
+[03:59:29] ========================================
+[03:59:29]   SESSION COMPLETE: 6798s (113 min)
+[03:59:29]   Output: data/session_20260315_020611
+[03:59:29] ========================================
+total 35M
+-rw-r--r-- 1 root root   788 Mar 15 03:58 compare.csv
+-rw-r--r-- 1 root root  4.1K Mar 15 03:58 compare.txt
+-rw-r--r-- 1 root root  327K Mar 15 03:54 grid_search_fc1_gelu.log
+-rw-r--r-- 1 root root  4.1K Mar 15 02:06 machine_info.txt
+-rw-r--r-- 1 root root 1023K Mar 15 03:59 sass_fc1-gelu.txt
+-rw-r--r-- 1 root root  1.5M Mar 15 03:59 sass_fc2.txt
+-rw-r--r-- 1 root root  655K Mar 15 03:59 sass_patch_embed.txt
+-rw-r--r-- 1 root root  1.7K Mar 15 03:59 session.log
+-rw-r--r-- 1 root root   32M Mar 15 03:59 siglip_full.ncu-rep
+-rw-r--r-- 1 root root   864 Mar 15 03:58 source_counters_fc1-gelu.csv
+-rw-r--r-- 1 root root   861 Mar 15 03:58 source_counters_fc2.csv
+-rw-r--r-- 1 root root  1.3K Mar 15 03:58 source_counters_patch_embed.csv
+-rw-r--r-- 1 root root  185K Mar 15 03:54 sweep_fc1_gelu.csv
