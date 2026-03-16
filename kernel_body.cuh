@@ -70,6 +70,9 @@ void epilogue_store(
     , uint32_t res_mbar_addr
     , uint32_t res_staging_saddr
 #endif
+#if W0_RES_PREFETCH
+    , uint32_t res_consumed_mbar_addr
+#endif
 #ifdef TIMING
     , long long& t_phase1_end
 #endif
@@ -296,6 +299,11 @@ void epilogue_store(
                 }
             }
         }
+
+#if W0_RES_PREFETCH
+        if (res_consumed_mbar_addr && lane == 0)
+            mbar_arrive(res_consumed_mbar_addr);
+#endif
 
 #ifdef TIMING
         t_phase1_end = clock64();
@@ -961,7 +969,7 @@ void epilogue_store(
 #endif
 }
 
-#if TMA_RESIDUAL >= 2
+#if TMA_RESIDUAL >= 2 || W0_RES_PREFETCH
 #define EPI_PRELOADED true
 #else
 #define EPI_PRELOADED false
@@ -1014,6 +1022,9 @@ persistent_gemm(
 #if TMA_RESIDUAL
         for (int w = 0; w < NUM_EPI_WARPS; w++)
             mbar_init(smem_to_uint(smem + OFF_RES_MBAR + w * 8), 1);
+#if W0_RES_PREFETCH
+        mbar_init(smem_to_uint(smem + OFF_RES_CONSUMED_MBAR), NUM_EPI_WARPS);
+#endif
 #endif
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -1052,6 +1063,9 @@ persistent_gemm(
     const int start_buf = tile_start & 1;
     int epi_phase[2] = {1, 1};
     int ml_phase[2]  = {start_buf, 1 - start_buf};
+#if W0_RES_PREFETCH
+    int res_consumed_phase = 0;
+#endif
 
 #ifdef TIMING
     long long t_tile_start = 0, t_after_epi = 0, t_after_tma0 = 0, t_kloop_end = 0;
@@ -1095,6 +1109,31 @@ persistent_gemm(
                     tma_load_2d(smem_b[s], &tma_b, k_start, n_start + cta_rank * (TN/2), tma_mbar_masked);
                     mbar_arrive_expect_tx(tma_mbar_masked, TMA_BYTES);
                 }
+#if W0_RES_PREFETCH
+                if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+                    /* Wait for prev tile's epilogue to finish reading residual */
+                    if (tile_idx > tile_start) {
+                        mbar_wait(smem_to_uint(smem + OFF_RES_CONSUMED_MBAR), res_consumed_phase);
+                        res_consumed_phase ^= 1;
+                    }
+                    /* Prefetch pass-0 residual for ALL epilogue warps */
+                    for (int ew = 0; ew < NUM_EPI_WARPS; ew++) {
+                        const int gm = m_start + ew * 32;
+                        const uint32_t rmbar = smem_to_uint(smem + OFF_RES_MBAR + ew * 8);
+                        const uint32_t rstg = smem_to_uint(smem + OFF_STAGING
+                            + ew * STAGING_WARP_BYTES + RES_STAGING_OFFSET);
+#if NUM_PASSES_PARAM == 4
+                        mbar_arrive_expect_tx(rmbar, STAGING_REGION_BYTES);
+                        tma_load_2d_cta(rstg, &tma_res, n_start, gm, rmbar);
+#else
+                        mbar_arrive_expect_tx(rmbar, 2 * STAGING_REGION_BYTES);
+                        tma_load_2d_cta(rstg, &tma_res, n_start, gm, rmbar);
+                        tma_load_2d_cta(rstg + STAGING_REGION_BYTES,
+                                        &tma_res, n_start + 64, gm, rmbar);
+#endif
+                    }
+                }
+#endif
             }
         } else if (warp == 1) {
             // MMA WARP (W1)
@@ -1193,7 +1232,7 @@ persistent_gemm(
                 gm_base = prev_m + row_group * 32;
             }
 
-#if TMA_RESIDUAL >= 2
+#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH
             /* Preload first-pass residual before mainloop wait — TMA flies during idle */
             if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                 if (tile_idx > tile_start && lane == 0) {
@@ -1245,6 +1284,9 @@ persistent_gemm(
 #if TMA_RESIDUAL
                             , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
+#if W0_RES_PREFETCH
+                            , smem_to_uint(smem + OFF_RES_CONSUMED_MBAR)
+#endif
 #ifdef TIMING
                             , epi_t1
 #endif
@@ -1253,6 +1295,9 @@ persistent_gemm(
                         epilogue_store<TN/2, TN, Op, EPI_PRELOADED>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #if TMA_RESIDUAL
                             , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
+#if W0_RES_PREFETCH
+                            , smem_to_uint(smem + OFF_RES_CONSUMED_MBAR)
 #endif
 #ifdef TIMING
                             , epi_t1
@@ -1264,6 +1309,9 @@ persistent_gemm(
                     epilogue_store<0, TN, Op, EPI_PRELOADED>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #if TMA_RESIDUAL
                         , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
+#if W0_RES_PREFETCH
+                        , smem_to_uint(smem + OFF_RES_CONSUMED_MBAR)
 #endif
 #ifdef TIMING
                         , epi_t1
@@ -1348,7 +1396,7 @@ persistent_gemm(
         const int last_n = ltn * TN;
         const int gm_base = last_m + row_group * 32;
 
-#if TMA_RESIDUAL >= 2
+#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH
         /* Preload first-pass residual before mainloop wait — TMA flies during idle */
         if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
             if (lane == 0) {
@@ -1392,6 +1440,9 @@ persistent_gemm(
 #if TMA_RESIDUAL
                     , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
+#if W0_RES_PREFETCH
+                    , 0
+#endif
 #ifdef TIMING
                     , drain_t1
 #endif
@@ -1400,6 +1451,9 @@ persistent_gemm(
                 epilogue_store<TN/2, TN, Op, EPI_PRELOADED>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #if TMA_RESIDUAL
                     , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
+#if W0_RES_PREFETCH
+                    , 0
 #endif
 #ifdef TIMING
                     , drain_t1
@@ -1411,6 +1465,9 @@ persistent_gemm(
             epilogue_store<0, TN, Op, EPI_PRELOADED>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #if TMA_RESIDUAL
                 , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
+#if W0_RES_PREFETCH
+                , 0
 #endif
 #ifdef TIMING
                 , drain_t1

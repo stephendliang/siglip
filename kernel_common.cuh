@@ -48,6 +48,12 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef W0_LOOP_UNROLL
 #define W0_LOOP_UNROLL  0    // W0 load K-iter loop: 0=no pragma, 1=no unroll, N=unroll by N
 #endif
+#ifndef W0_RES_PREFETCH
+#define W0_RES_PREFETCH 0    // 0=off, 1=W0 prefetches residual after K-loop (fc2 only)
+#endif
+#if W0_RES_PREFETCH && !TMA_RESIDUAL
+#error "W0_RES_PREFETCH requires TMA_RESIDUAL >= 1"
+#endif
 #ifndef SUB_MMA_UNROLL
 #define SUB_MMA_UNROLL  0    // Sub-MMA inner loop: 0=no pragma, 1=no unroll, N=unroll by N
 #endif
@@ -143,7 +149,12 @@ Problem dimensions — N_DIM must be defined before including this header
 #define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
 #if TMA_RESIDUAL
 #define OFF_RES_MBAR       (OFF_EPILOGUE_MBAR + 16)
+#if W0_RES_PREFETCH
+#define OFF_RES_CONSUMED_MBAR  (OFF_RES_MBAR + NUM_EPI_WARPS * 8)
+#define OFF_STAGING        ((OFF_RES_CONSUMED_MBAR + 8 + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
+#else
 #define OFF_STAGING        ((OFF_RES_MBAR + NUM_EPI_WARPS * 8 + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
+#endif
 #define RES_STAGING_OFFSET (2 * STAGING_REGION_BYTES)   // residual regions start after 2 output regions per warp
 #else
 #define OFF_STAGING        ((OFF_EPILOGUE_MBAR + 16 + 1023) & ~1023)  // 1024-align for SWIZZLE_128B (addr[6:4] ^= addr[9:7])

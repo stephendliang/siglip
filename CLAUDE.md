@@ -111,6 +111,7 @@ Key params (controlled via `-D` flags, swept by grid_search.py):
 | `INTERLEAVE_STRATEGY` | 0,1,2,3 | TMA store interleaving. IS=0 wins FC1, IS=2 wins PE. |
 | `GELU_VARIANT` | 0,4,5 | FC1 only. V4 (batched asm) is best. |
 | `TMA_RESIDUAL` | 0,1,2 | FC2 only. TMAR=1 (TMA coalesced) is key. |
+| `W0_RES_PREFETCH` | 0,1 | FC2 only. W0 prefetches residual after K-loop. Requires TMA_RESIDUAL≥1. |
 | `STORE_TIMING` | 0,1 | 0=inline stores, 1=all deferred after Phase 1. |
 | `BATCH_EPILOGUE` | 0,1 | 1=separate compute/store phases (FC1/FC2 only). |
 

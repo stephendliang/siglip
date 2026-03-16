@@ -53,6 +53,7 @@ DEFAULTS = {
     'PREFETCH_BEFORE_STORE': 0,
     'GELU_VARIANT': 0,
     'TMA_RESIDUAL': 0,
+    'W0_RES_PREFETCH': 0,
     'BATCH_EPILOGUE': 0,
     'GELU_VECTOR_WIDTH': 32,
     'STORE_TIMING': 0,
@@ -80,6 +81,7 @@ RANGES = {
     'PREFETCH_BEFORE_STORE': [0, 1],
     'GELU_VARIANT': [0, 4, 5],  # V1,2,3,6 use software tanhf() → 9.1ms catastrophic (4x slower)
     'TMA_RESIDUAL': [0, 1, 2],
+    'W0_RES_PREFETCH': [0, 1],
     'BATCH_EPILOGUE': [0, 1],
     'GELU_VECTOR_WIDTH': [8, 16, 32],
     'STORE_TIMING': [0, 1],
@@ -108,12 +110,12 @@ TIER_PARAMS = {
 # Invalidate after structural kernel changes (new epilogue ops, tile config changes).
 KERNEL_TIERS = {
     'fc1_gelu': {
-        1: ['GELU_VARIANT', 'STORE_TIMING', 'INTERLEAVE_STRATEGY'],
-        2: ['PHASE1_UNROLL', 'PRELOAD_MODE', 'BATCH_EPILOGUE'],
+        1: ['GELU_VARIANT', 'INTERLEAVE_STRATEGY'],
+        2: ['PHASE1_UNROLL', 'STORE_TIMING', 'PRELOAD_MODE', 'BATCH_EPILOGUE'],
         3: ['EPILOGUE_LOOP', 'STS_WIDTH', 'EPI_SYNC', 'GELU_VECTOR_WIDTH'],
     },
     'fc2': {
-        1: ['N_STAGES', 'K_LOOP_UNROLL', 'TMA_RESIDUAL'],
+        1: ['N_STAGES', 'K_LOOP_UNROLL', 'TMA_RESIDUAL', 'W0_RES_PREFETCH'],
         2: ['INTERLEAVE_STRATEGY', 'PHASE1_UNROLL'],
         3: ['BATCH_EPILOGUE', 'STORE_TIMING', 'STS_WIDTH', 'PRELOAD_MODE'],
         4: ['EPILOGUE_LOOP', 'EPI_SYNC', 'NUM_PASSES_PARAM'],
@@ -219,6 +221,10 @@ INTERACTIONS = {
         'params': ['NUM_PASSES_PARAM', 'TMA_RESIDUAL'],
         'kernels': ['fc2'],
     },
+    'w0_prefetch': {
+        'params': ['W0_RES_PREFETCH', 'TMA_RESIDUAL', 'N_STAGES'],
+        'kernels': ['fc2'],
+    },
 }
 
 # ── Build config ──
@@ -255,9 +261,14 @@ def is_valid(cfg, kernel='patch_embed'):
     off_mainloop_mbar = off_mma_mbar + n_stages * 8
     off_epilogue_mbar = off_mainloop_mbar + 16
     tma_res = cfg.get('TMA_RESIDUAL', 0)
+    w0_res_pf = cfg.get('W0_RES_PREFETCH', 0)
     if tma_res:
         off_res_mbar = off_epilogue_mbar + 16
-        off_staging = (off_res_mbar + num_epi * 8 + 1023) & ~1023
+        if w0_res_pf:
+            off_res_consumed_mbar = off_res_mbar + num_epi * 8
+            off_staging = (off_res_consumed_mbar + 8 + 1023) & ~1023
+        else:
+            off_staging = (off_res_mbar + num_epi * 8 + 1023) & ~1023
     else:
         off_staging = (off_epilogue_mbar + 16 + 1023) & ~1023
     staging_warp_bytes = 4 * 32 * 128  # 16384
@@ -272,6 +283,13 @@ def is_valid(cfg, kernel='patch_embed'):
     # TMA_RESIDUAL only meaningful for fc2
     if cfg.get('TMA_RESIDUAL', 0) != 0 and kernel != 'fc2':
         return False, 'TMA_RESIDUAL only for fc2'
+
+    # W0_RES_PREFETCH only for fc2, requires TMA_RESIDUAL>=1
+    if cfg.get('W0_RES_PREFETCH', 0) == 1:
+        if kernel != 'fc2':
+            return False, 'W0_RES_PREFETCH only for fc2'
+        if cfg.get('TMA_RESIDUAL', 0) < 1:
+            return False, 'W0_RES_PREFETCH requires TMA_RESIDUAL>=1'
 
     # CVT_ADD_FUSED only meaningful for patch_embed (dead code on fc1/fc2)
     if cfg.get('CVT_ADD_FUSED', 1) != 1 and kernel != 'patch_embed':
@@ -356,9 +374,14 @@ def smem_kb(cfg):
     off_mainloop_mbar = off_mma_mbar + n_stages * 8
     off_epilogue_mbar = off_mainloop_mbar + 16
     tma_res = cfg.get('TMA_RESIDUAL', 0)
+    w0_res_pf = cfg.get('W0_RES_PREFETCH', 0)
     if tma_res:
         off_res_mbar = off_epilogue_mbar + 16
-        off_staging = (off_res_mbar + num_epi * 8 + 1023) & ~1023
+        if w0_res_pf:
+            off_res_consumed_mbar = off_res_mbar + num_epi * 8
+            off_staging = (off_res_consumed_mbar + 8 + 1023) & ~1023
+        else:
+            off_staging = (off_res_mbar + num_epi * 8 + 1023) & ~1023
     else:
         off_staging = (off_epilogue_mbar + 16 + 1023) & ~1023
     staging_warp_bytes = 4 * 32 * 128
@@ -974,12 +997,14 @@ def main():
             top = get_top_k(tier_results, tier_params, k=k)
             if top:
                 # Dynamic k: reduce branching when winner is clear
+                # Conservative: never drop below 2 branches — interactions
+                # may flip rankings when combined with later-tier params
                 k_eff = len(top)
                 if len(top) >= 2:
                     gap_pct = (top[1]['ms'] - top[0]['ms']) / top[0]['ms'] * 100
-                    if gap_pct > 2.0:
-                        k_eff = 1
-                    elif gap_pct > 0.5:
+                    if gap_pct > 5.0:
+                        k_eff = 2
+                    elif gap_pct > 2.0:
                         k_eff = min(k_eff, 2)
 
                 # Structural params: ensure each distinct value survives
