@@ -1,0 +1,199 @@
+Kernel: patch_embed (patch_embed.cu)
+Per-kernel tiers for patch_embed: skipping SNAKE_ORDER, GELU_VARIANT, TMA_RESIDUAL, BATCH_EPILOGUE, GELU_VECTOR_WIDTH, STS_WIDTH, NUM_PASSES_PARAM
+Pinned at winner values: MBAR_EARLY=1 STAGGER_CYCLES=160
+
+=== Tier 1: N_STAGES, K_LOOP_UNROLL, W0_LOOP_UNROLL ===
+Sweep: 45 total, 45 valid, 0 pruned
+Estimated time: ~4 min (45 configs × ~5s each)
+
+[1/45] -DK_LOOP_UNROLL=1 -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 ... 0.567 ms / 1933 TFLOPS  (157 regs, 2.0s)
+[2/45] -DK_LOOP_UNROLL=1 -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.582 ms / 1882 TFLOPS  (143 regs, 1.5s)
+[3/45] -DK_LOOP_UNROLL=1 -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.582 ms / 1880 TFLOPS  (143 regs, 1.5s)
+[4/45] -DK_LOOP_UNROLL=1 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 ... 0.668 ms / 1640 TFLOPS  (163 regs, 1.5s)
+[5/45] -DK_LOOP_UNROLL=1 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.760 ms / 1440 TFLOPS  (145 regs, 1.6s)
+[6/45] -DK_LOOP_UNROLL=1 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.663 ms / 1650 TFLOPS  (163 regs, 1.6s)
+[7/45] -DK_LOOP_UNROLL=1 -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 ... 0.868 ms / 1261 TFLOPS  (167 regs, 1.6s)
+[8/45] -DK_LOOP_UNROLL=1 -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.900 ms / 1217 TFLOPS  (143 regs, 1.6s)
+[9/45] -DK_LOOP_UNROLL=1 -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.877 ms / 1249 TFLOPS  (143 regs, 1.6s)
+[10/45] -DK_LOOP_UNROLL=2 -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 ... 0.569 ms / 1925 TFLOPS  (157 regs, 1.6s)
+[11/45] -DK_LOOP_UNROLL=2 -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.586 ms / 1869 TFLOPS  (143 regs, 1.6s)
+[12/45] -DK_LOOP_UNROLL=2 -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.583 ms / 1877 TFLOPS  (143 regs, 1.6s)
+[13/45] -DK_LOOP_UNROLL=2 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 ... 0.664 ms / 1650 TFLOPS  (163 regs, 1.6s)
+[14/45] -DK_LOOP_UNROLL=2 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.762 ms / 1436 TFLOPS  (145 regs, 1.6s)
+[15/45] -DK_LOOP_UNROLL=2 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.671 ms / 1631 TFLOPS  (163 regs, 1.5s)
+[16/45] -DK_LOOP_UNROLL=2 -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 ... 0.868 ms / 1262 TFLOPS  (167 regs, 1.6s)
+[17/45] -DK_LOOP_UNROLL=2 -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.898 ms / 1220 TFLOPS  (143 regs, 1.6s)
+[18/45] -DK_LOOP_UNROLL=2 -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.878 ms / 1248 TFLOPS  (143 regs, 1.6s)
+[19/45] -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 ... 0.570 ms / 1922 TFLOPS  (157 regs, 1.6s)
+[20/45] -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.582 ms / 1882 TFLOPS  (143 regs, 1.6s)
+[21/45] -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.581 ms / 1884 TFLOPS  (143 regs, 1.6s)
+[22/45] -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 ... 0.526 ms / 2083 TFLOPS  (210 regs, 1.6s)
+[23/45] -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.681 ms / 1608 TFLOPS  (196 regs, 1.6s)
+[24/45] -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.528 ms / 2075 TFLOPS  (210 regs, 1.6s)
+[25/45] -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 ... 0.535 ms / 2047 TFLOPS  (234 regs, 1.6s)
+[26/45] -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.859 ms / 1275 TFLOPS  (212 regs, 1.6s)
+[27/45] -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.829 ms / 1321 TFLOPS  (212 regs, 1.6s)
+[28/45] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 ... 0.558 ms / 1961 TFLOPS  (169 regs, 1.6s)
+[29/45] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.573 ms / 1911 TFLOPS  (155 regs, 1.6s)
+[30/45] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.567 ms / 1930 TFLOPS  (155 regs, 1.6s)
+[31/45] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 ... 0.526 ms / 2083 TFLOPS  (178 regs, 1.6s)
+[32/45] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.678 ms / 1615 TFLOPS  (159 regs, 1.6s)
+[33/45] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.524 ms / 2088 TFLOPS  (174 regs, 1.6s)
+[34/45] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 ... 0.537 ms / 2039 TFLOPS  (186 regs, 1.6s)
+[35/45] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.864 ms / 1268 TFLOPS  (163 regs, 1.6s)
+[36/45] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.832 ms / 1317 TFLOPS  (163 regs, 1.6s)
+[37/45] -DK_LOOP_UNROLL=8 -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 ... 0.556 ms / 1970 TFLOPS  (169 regs, 1.6s)
+[38/45] -DK_LOOP_UNROLL=8 -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.571 ms / 1917 TFLOPS  (155 regs, 1.6s)
+[39/45] -DK_LOOP_UNROLL=8 -DMBAR_EARLY=1 -DN_STAGES=3 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.569 ms / 1923 TFLOPS  (155 regs, 1.6s)
+[40/45] -DK_LOOP_UNROLL=8 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 ... 0.526 ms / 2082 TFLOPS  (214 regs, 1.6s)
+[41/45] -DK_LOOP_UNROLL=8 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.679 ms / 1613 TFLOPS  (196 regs, 1.6s)
+[42/45] -DK_LOOP_UNROLL=8 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.526 ms / 2081 TFLOPS  (210 regs, 1.6s)
+[43/45] -DK_LOOP_UNROLL=8 -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 ... 0.536 ms / 2042 TFLOPS  (186 regs, 1.6s)
+[44/45] -DK_LOOP_UNROLL=8 -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=1 ... 0.864 ms / 1268 TFLOPS  (163 regs, 1.6s)
+[45/45] -DK_LOOP_UNROLL=8 -DMBAR_EARLY=1 -DN_STAGES=5 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.828 ms / 1322 TFLOPS  (163 regs, 1.6s)
+  η²: N_STAGES=0.525, K_LOOP_UNROLL=0.176, W0_LOOP_UNROLL=0.131
+  top-lock: N_STAGES=4(top5,33%)
+
+Tier 1 winner (top-3): -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 → 0.524 ms / 2088 TFLOPS
+  #2: -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 → 0.526 ms / 2083 TFLOPS
+  #3: -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 → 0.526 ms / 2083 TFLOPS
+
+=== Tier 2: PHASE1_UNROLL ===
+  Branch 1/3: -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4
+Sweep: 3 total, 3 valid, 0 pruned
+Estimated time: ~0 min (3 configs × ~5s each)
+
+[1/3] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DPHASE1_UNROLL=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.635 ms / 1723 TFLOPS  (142 regs, 1.6s)
+[2/3] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.525 ms / 2086 TFLOPS  (174 regs, 1.6s)
+[3/3] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DPHASE1_UNROLL=4 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.529 ms / 2071 TFLOPS  (222 regs, 1.6s)
+  Branch 2/3: -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160
+Sweep: 3 total, 3 valid, 0 pruned
+Estimated time: ~0 min (3 configs × ~5s each)
+
+[1/3] -DMBAR_EARLY=1 -DPHASE1_UNROLL=1 -DSTAGGER_CYCLES=160 ... 0.629 ms / 1740 TFLOPS  (177 regs, 1.6s)
+[2/3] -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 ... 0.526 ms / 2082 TFLOPS  (210 regs, 1.6s)
+[3/3] -DMBAR_EARLY=1 -DPHASE1_UNROLL=4 -DSTAGGER_CYCLES=160 ... 0.529 ms / 2069 TFLOPS  (255 regs, 1.6s)
+  Branch 3/3: -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160
+Sweep: 3 total, 3 valid, 0 pruned
+Estimated time: ~0 min (3 configs × ~5s each)
+
+[1/3] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DPHASE1_UNROLL=1 -DSTAGGER_CYCLES=160 ... 0.633 ms / 1730 TFLOPS  (145 regs, 1.6s)
+[2/3] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 ... 0.527 ms / 2079 TFLOPS  (178 regs, 1.6s)
+[3/3] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DPHASE1_UNROLL=4 -DSTAGGER_CYCLES=160 ... 0.529 ms / 2071 TFLOPS  (222 regs, 1.6s)
+  η²: PHASE1_UNROLL=0.999
+
+  Gap: 0.76% → k_eff=2 (from 3)
+
+Tier 2 winner (top-3): -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 → 0.525 ms / 2086 TFLOPS
+  #2: -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DPHASE1_UNROLL=4 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 → 0.529 ms / 2071 TFLOPS
+  #3: -DMBAR_EARLY=1 -DPHASE1_UNROLL=1 -DSTAGGER_CYCLES=160 → 0.629 ms / 1740 TFLOPS
+
+=== Tier 3: EPILOGUE_LOOP, EPI_SYNC, STORE_TIMING ===
+  Branch 1/2: -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4
+Sweep: 8 total, 3 valid, 5 pruned
+Estimated time: ~0 min (3 configs × ~5s each)
+
+[1/3] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.525 ms / 2084 TFLOPS  (174 regs, 1.6s)
+[2/3] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DSTORE_TIMING=1 -DW0_LOOP_UNROLL=4 ... 0.553 ms / 1979 TFLOPS  (172 regs, 1.6s)
+[3/3] -DEPILOGUE_LOOP=1 -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DSTORE_TIMING=1 -DW0_LOOP_UNROLL=4 ... 0.572 ms / 1913 TFLOPS  (142 regs, 1.6s)
+  Branch 2/2: -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DPHASE1_UNROLL=4 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4
+Sweep: 8 total, 2 valid, 5 pruned, 1 deduped
+Estimated time: ~0 min (2 configs × ~5s each)
+
+[1/2] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DPHASE1_UNROLL=4 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.530 ms / 2067 TFLOPS  (222 regs, 1.6s)
+[2/2] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DPHASE1_UNROLL=4 -DSTAGGER_CYCLES=160 -DSTORE_TIMING=1 -DW0_LOOP_UNROLL=4 ... 0.552 ms / 1985 TFLOPS  (222 regs, 1.6s)
+  η²: EPILOGUE_LOOP=0.562, STORE_TIMING=0.817
+
+  Gap: 5.14% → k_eff=1 (from 3)
+
+Tier 3 winner (top-3): -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 → 0.525 ms / 2084 TFLOPS
+  #2: -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DPHASE1_UNROLL=4 -DSTAGGER_CYCLES=160 -DSTORE_TIMING=1 -DW0_LOOP_UNROLL=4 → 0.552 ms / 1985 TFLOPS
+  #3: -DEPILOGUE_LOOP=1 -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DSTORE_TIMING=1 -DW0_LOOP_UNROLL=4 → 0.572 ms / 1913 TFLOPS
+
+=== Interaction: loop_store (EPILOGUE_LOOP, STORE_TIMING) ===
+Sweep: 4 total, 3 valid, 1 pruned
+Estimated time: ~0 min (3 configs × ~5s each)
+
+[1/3] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... 0.526 ms / 2083 TFLOPS  (174 regs, 1.6s)
+[2/3] -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DSTORE_TIMING=1 -DW0_LOOP_UNROLL=4 ... 0.554 ms / 1976 TFLOPS  (172 regs, 1.6s)
+[3/3] -DEPILOGUE_LOOP=1 -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DSTORE_TIMING=1 -DW0_LOOP_UNROLL=4 ... 0.564 ms / 1941 TFLOPS  (142 regs, 1.6s)
+  η²: EPILOGUE_LOOP=0.495, STORE_TIMING=0.936
+  Best: -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 → 0.526 ms / 2083 TFLOPS
+
+=== Interaction: sync_stagger — skipped (noise params: STAGGER_CYCLES) ===
+
+Top-locked params: N_STAGES=4
+
+@@GRID_WINNER -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4
+
+================================================================================
+RESULTS (sorted by ms)
+================================================================================
+  #  STG  EPI  INTER  MBAR  TMEM  STAG  PH1U  SNAKE  FUSE  KLU  W0U  SMU  PRLD  PFBS  GELU  TMAR  BTCH  GVW  STIM  ELOP  STSW  ESYN  NPP  REGS     SMEM       MS   TFLOPS  STATUS
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  1    4    4      2     1    32   160     2      1     1    6    4    0     1     0     0     0     0   32     0     0    16     0    0   174   193.0K    0.524     2088  BEST
+  2    4    4      2     1    32   160     2      1     1    6    4    0     1     0     0     0     0   32     0     0    16     0    0   174   193.0K    0.525     2086  OK
+  3    4    4      2     1    32   160     2      1     1    6    4    0     1     0     0     0     0   32     0     0    16     0    0   174   193.0K    0.525     2084  OK
+  4    4    4      2     1    32   160     2      1     1    4    0    0     1     0     0     0     0   32     0     0    16     0    0   210   193.0K    0.526     2083  OK
+  5    4    4      2     1    32   160     2      1     1    6    0    0     1     0     0     0     0   32     0     0    16     0    0   178   193.0K    0.526     2083  OK
+  6    4    4      2     1    32   160     2      1     1    8    0    0     1     0     0     0     0   32     0     0    16     0    0   214   193.0K    0.526     2082  OK
+  7    4    4      2     1    32   160     2      1     1    8    4    0     1     0     0     0     0   32     0     0    16     0    0   210   193.0K    0.526     2081  OK
+  8    4    4      2     1    32   160     2      1     1    4    0    0     1     0     0     0     0   32     0     0    16     0    0   210   193.0K    0.526     2082  OK
+  9    4    4      2     1    32   160     2      1     1    6    4    0     1     0     0     0     0   32     0     0    16     0    0   174   193.0K    0.526     2083  OK
+ 10    4    4      2     1    32   160     2      1     1    6    0    0     1     0     0     0     0   32     0     0    16     0    0   178   193.0K    0.527     2079  OK
+ 11    4    4      2     1    32   160     2      1     1    4    4    0     1     0     0     0     0   32     0     0    16     0    0   210   193.0K    0.528     2075  OK
+ 12    4    4      2     1    32   160     4      1     1    6    4    0     1     0     0     0     0   32     0     0    16     0    0   222   193.0K    0.529     2071  OK
+ 13    4    4      2     1    32   160     4      1     1    4    0    0     1     0     0     0     0   32     0     0    16     0    0   255   193.0K    0.529     2069  OK
+ 14    4    4      2     1    32   160     4      1     1    6    0    0     1     0     0     0     0   32     0     0    16     0    0   222   193.0K    0.529     2071  OK
+ 15    4    4      2     1    32   160     4      1     1    6    4    0     1     0     0     0     0   32     0     0    16     0    0   222   193.0K    0.530     2067  OK
+ 16    5    4      2     1    32   160     2      1     1    5    0    0     1     0     0     0     0   32     0     0    16     0    0   234   225.0K    0.535     2047  OK
+ 17    5    4      2     1    32   160     2      1     1    8    0    0     1     0     0     0     0   32     0     0    16     0    0   186   225.0K    0.536     2042  OK
+ 18    5    4      2     1    32   160     2      1     1    6    0    0     1     0     0     0     0   32     0     0    16     0    0   186   225.0K    0.537     2039  OK
+ 19    4    4      2     1    32   160     4      1     1    6    4    0     1     0     0     0     0   32     1     0    16     0    0   222   193.0K    0.552     1985  OK
+ 20    4    4      2     1    32   160     2      1     1    6    4    0     1     0     0     0     0   32     1     0    16     0    0   172   193.0K    0.553     1979  OK
+ 21    4    4      2     1    32   160     2      1     1    6    4    0     1     0     0     0     0   32     1     0    16     0    0   172   193.0K    0.554     1976  OK
+ 22    3    4      2     1    32   160     2      1     1    8    0    0     1     0     0     0     0   32     0     0    16     0    0   169   161.0K    0.556     1970  OK
+ 23    3    4      2     1    32   160     2      1     1    6    0    0     1     0     0     0     0   32     0     0    16     0    0   169   161.0K    0.558     1961  OK
+ 24    4    4      2     1    32   160     2      1     1    6    4    0     1     0     0     0     0   32     1     1    16     0    0   142   193.0K    0.564     1941  OK
+ 25    3    4      2     1    32   160     2      1     1    1    0    0     1     0     0     0     0   32     0     0    16     0    0   157   161.0K    0.567     1933  OK
+ 26    3    4      2     1    32   160     2      1     1    6    4    0     1     0     0     0     0   32     0     0    16     0    0   155   161.0K    0.567     1930  OK
+ 27    3    4      2     1    32   160     2      1     1    2    0    0     1     0     0     0     0   32     0     0    16     0    0   157   161.0K    0.569     1925  OK
+ 28    3    4      2     1    32   160     2      1     1    8    4    0     1     0     0     0     0   32     0     0    16     0    0   155   161.0K    0.569     1923  OK
+ 29    3    4      2     1    32   160     2      1     1    3    0    0     1     0     0     0     0   32     0     0    16     0    0   157   161.0K    0.570     1922  OK
+ 30    3    4      2     1    32   160     2      1     1    8    1    0     1     0     0     0     0   32     0     0    16     0    0   155   161.0K    0.571     1917  OK
+ 31    4    4      2     1    32   160     2      1     1    6    4    0     1     0     0     0     0   32     1     1    16     0    0   142   193.0K    0.572     1913  OK
+ 32    3    4      2     1    32   160     2      1     1    6    1    0     1     0     0     0     0   32     0     0    16     0    0   155   161.0K    0.573     1911  OK
+ 33    3    4      2     1    32   160     2      1     1    3    4    0     1     0     0     0     0   32     0     0    16     0    0   143   161.0K    0.581     1884  OK
+ 34    3    4      2     1    32   160     2      1     1    1    1    0     1     0     0     0     0   32     0     0    16     0    0   143   161.0K    0.582     1882  OK
+ 35    3    4      2     1    32   160     2      1     1    1    4    0     1     0     0     0     0   32     0     0    16     0    0   143   161.0K    0.582     1880  OK
+ 36    3    4      2     1    32   160     2      1     1    3    1    0     1     0     0     0     0   32     0     0    16     0    0   143   161.0K    0.582     1882  OK
+ 37    3    4      2     1    32   160     2      1     1    2    4    0     1     0     0     0     0   32     0     0    16     0    0   143   161.0K    0.583     1877  OK
+ 38    3    4      2     1    32   160     2      1     1    2    1    0     1     0     0     0     0   32     0     0    16     0    0   143   161.0K    0.586     1869  OK
+ 39    4    4      2     1    32   160     1      1     1    4    0    0     1     0     0     0     0   32     0     0    16     0    0   177   193.0K    0.629     1740  OK
+ 40    4    4      2     1    32   160     1      1     1    6    0    0     1     0     0     0     0   32     0     0    16     0    0   145   193.0K    0.633     1730  OK
+ 41    4    4      2     1    32   160     1      1     1    6    4    0     1     0     0     0     0   32     0     0    16     0    0   142   193.0K    0.635     1723  OK
+ 42    4    4      2     1    32   160     2      1     1    1    4    0     1     0     0     0     0   32     0     0    16     0    0   163   193.0K    0.663     1650  OK
+ 43    4    4      2     1    32   160     2      1     1    2    0    0     1     0     0     0     0   32     0     0    16     0    0   163   193.0K    0.664     1650  OK
+ 44    4    4      2     1    32   160     2      1     1    1    0    0     1     0     0     0     0   32     0     0    16     0    0   163   193.0K    0.668     1640  OK
+ 45    4    4      2     1    32   160     2      1     1    2    4    0     1     0     0     0     0   32     0     0    16     0    0   163   193.0K    0.671     1631  OK
+ 46    4    4      2     1    32   160     2      1     1    6    1    0     1     0     0     0     0   32     0     0    16     0    0   159   193.0K    0.678     1615  OK
+ 47    4    4      2     1    32   160     2      1     1    8    1    0     1     0     0     0     0   32     0     0    16     0    0   196   193.0K    0.679     1613  OK
+ 48    4    4      2     1    32   160     2      1     1    4    1    0     1     0     0     0     0   32     0     0    16     0    0   196   193.0K    0.681     1608  OK
+ 49    4    4      2     1    32   160     2      1     1    1    1    0     1     0     0     0     0   32     0     0    16     0    0   145   193.0K    0.760     1440  OK
+ 50    4    4      2     1    32   160     2      1     1    2    1    0     1     0     0     0     0   32     0     0    16     0    0   145   193.0K    0.762     1436  OK
+ 51    5    4      2     1    32   160     2      1     1    8    4    0     1     0     0     0     0   32     0     0    16     0    0   163   225.0K    0.828     1322  OK
+ 52    5    4      2     1    32   160     2      1     1    5    4    0     1     0     0     0     0   32     0     0    16     0    0   212   225.0K    0.829     1321  OK
+ 53    5    4      2     1    32   160     2      1     1    6    4    0     1     0     0     0     0   32     0     0    16     0    0   163   225.0K    0.832     1317  OK
+ 54    5    4      2     1    32   160     2      1     1    5    1    0     1     0     0     0     0   32     0     0    16     0    0   212   225.0K    0.859     1275  OK
+ 55    5    4      2     1    32   160     2      1     1    6    1    0     1     0     0     0     0   32     0     0    16     0    0   163   225.0K    0.864     1268  OK
+ 56    5    4      2     1    32   160     2      1     1    8    1    0     1     0     0     0     0   32     0     0    16     0    0   163   225.0K    0.864     1268  OK
+ 57    5    4      2     1    32   160     2      1     1    1    0    0     1     0     0     0     0   32     0     0    16     0    0   167   225.0K    0.868     1261  OK
+ 58    5    4      2     1    32   160     2      1     1    2    0    0     1     0     0     0     0   32     0     0    16     0    0   167   225.0K    0.868     1262  OK
+ 59    5    4      2     1    32   160     2      1     1    1    4    0     1     0     0     0     0   32     0     0    16     0    0   143   225.0K    0.877     1249  OK
+ 60    5    4      2     1    32   160     2      1     1    2    4    0     1     0     0     0     0   32     0     0    16     0    0   143   225.0K    0.878     1248  OK
+ 61    5    4      2     1    32   160     2      1     1    2    1    0     1     0     0     0     0   32     0     0    16     0    0   143   225.0K    0.898     1220  OK
+ 62    5    4      2     1    32   160     2      1     1    1    1    0     1     0     0     0     0   32     0     0    16     0    0   143   225.0K    0.900     1217  OK
+
+CSV written to /root/siglip/data/session_20260316_215523/sweep_patch_embed.csv
+
+Best: -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 → 0.524 ms / 2088 TFLOPS (174 regs)

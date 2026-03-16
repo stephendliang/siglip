@@ -1,0 +1,121 @@
+========================================================================
+  Grid Search + Benchmark (our kernels only)
+  Layers: patch_embed, fc1, fc2
+  Runs per approach: 10
+  Grid search: ~60 configs/layer x 3 layers (~15 min) [tier=all]
+========================================================================
+
+[Phase 1/5] BUILD OUR KERNELS (3 targets)
+  Building fc1-gelu ... ok
+  Building fc2 ... ok
+  Building patch_embed ... ok
+  Our kernels built in 2s
+
+[Phase 2/5] GRID SEARCH (~15 min, ~60 configs/layer x 3 layers)
+  Each config: compile + run + validate. Progress in log files.
+
+  Running grid search for patch_embed (tier=all, top-k=3)
+  Log: /root/siglip/data/session_20260316_215523/grid_search_patch_embed.log
+  Winner dflags: -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4
+
+  Running grid search for fc1_gelu (tier=all, top-k=3)
+  Log: /root/siglip/data/session_20260316_215523/grid_search_fc1_gelu.log
+  Winner dflags: -DGELU_VARIANT=4 -DINTERLEAVE_STRATEGY=0 -DMBAR_EARLY=1 -DN_STAGES=5 -DPHASE1_UNROLL=4 -DSTAGGER_CYCLES=0 -DSUB_MMA_UNROLL=3
+
+  Running grid search for fc2 (tier=all, top-k=3)
+  Log: /root/siglip/data/session_20260316_215523/grid_search_fc2.log
+  Winner dflags: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPHASE1_UNROLL=4 -DPRELOAD_MODE=2 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1
+
+  Rebuilding with grid search winners:
+  Rebuilding ./patch_embed with: -DK_LOOP_UNROLL=6 -DMBAR_EARLY=1 -DSTAGGER_CYCLES=160 -DW0_LOOP_UNROLL=4 ... ok
+  Rebuilding ./fc1-gelu with: -DGELU_VARIANT=4 -DINTERLEAVE_STRATEGY=0 -DMBAR_EARLY=1 -DN_STAGES=5 -DPHASE1_UNROLL=4 -DSTAGGER_CYCLES=0 -DSUB_MMA_UNROLL=3 ... ok
+  Rebuilding ./fc2 with: -DBATCH_EPILOGUE=1 -DINTERLEAVE_STRATEGY=1 -DN_STAGES=5 -DPHASE1_UNROLL=4 -DPRELOAD_MODE=2 -DSTAGGER_CYCLES=100 -DSTS_WIDTH=32 -DTMA_RESIDUAL=1 ... ok
+  Grid search done in 911s
+
+[Phase 3/5] BUILD CUTLASS — skipped (--no-cutlass)
+
+[Phase 4/5] BENCHMARK (10 runs x 3 layers x 2 implementations)
+
+========================================================================
+  Patch Embed (768x768)
+========================================================================
+
+  Our kernel (./patch_embed):
+    our kernel run 1/10: 0.528 ms / 2076 TFLOPS
+    our kernel run 2/10: 0.528 ms / 2073 TFLOPS
+    our kernel run 3/10: 0.527 ms / 2077 TFLOPS
+    our kernel run 4/10: 0.527 ms / 2078 TFLOPS
+    our kernel run 5/10: 0.527 ms / 2077 TFLOPS
+    our kernel run 6/10: 0.527 ms / 2078 TFLOPS
+    our kernel run 7/10: 0.526 ms / 2082 TFLOPS
+    our kernel run 8/10: 0.528 ms / 2076 TFLOPS
+    our kernel run 9/10: 0.527 ms / 2079 TFLOPS
+    our kernel run 10/10: 0.527 ms / 2078 TFLOPS
+
+========================================================================
+  FC1+GELU (768x3072)
+========================================================================
+
+  Our kernel (./fc1-gelu):
+    our kernel run 1/10: 2.334 ms / 1877 TFLOPS
+    our kernel run 2/10: 2.264 ms / 1935 TFLOPS
+    our kernel run 3/10: 2.297 ms / 1907 TFLOPS
+    our kernel run 4/10: 2.373 ms / 1846 TFLOPS
+    our kernel run 5/10: 2.302 ms / 1903 TFLOPS
+    our kernel run 6/10: 2.317 ms / 1890 TFLOPS
+    our kernel run 7/10: 2.291 ms / 1912 TFLOPS
+    our kernel run 8/10: 2.394 ms / 1830 TFLOPS
+    our kernel run 9/10: 2.272 ms / 1928 TFLOPS
+    our kernel run 10/10: 2.333 ms / 1877 TFLOPS
+
+========================================================================
+  FC2+Bias (3072x768)
+========================================================================
+
+  Our kernel (./fc2):
+    our kernel run 1/10: 1.473 ms / 2975 TFLOPS
+    our kernel run 2/10: 1.472 ms / 2975 TFLOPS
+    our kernel run 3/10: 1.475 ms / 2970 TFLOPS
+    our kernel run 4/10: 1.473 ms / 2974 TFLOPS
+    our kernel run 5/10: 1.476 ms / 2968 TFLOPS
+    our kernel run 6/10: 1.473 ms / 2974 TFLOPS
+    our kernel run 7/10: 1.475 ms / 2969 TFLOPS
+    our kernel run 8/10: 1.473 ms / 2973 TFLOPS
+    our kernel run 9/10: 1.473 ms / 2974 TFLOPS
+    our kernel run 10/10: 1.473 ms / 2974 TFLOPS
+  Benchmark done in 35s
+
+[Phase 5/5] STATISTICAL ANALYSIS
+
+########################################################################
+ #  RESULTS & STATISTICAL ANALYSIS
+########################################################################
+
+========================================================================
+  Patch Embed (768x768)
+========================================================================
+  Not enough data for ANOVA (need >= 2 groups with >= 2 samples)
+
+========================================================================
+  FC1+GELU (768x3072)
+========================================================================
+  Not enough data for ANOVA (need >= 2 groups with >= 2 samples)
+
+========================================================================
+  FC2+Bias (3072x768)
+========================================================================
+  Not enough data for ANOVA (need >= 2 groups with >= 2 samples)
+
+
+========================================================================
+  CROSS-LAYER SUMMARY (mean ms, fused)
+========================================================================
+  Layer                   Our kernel       CUTLASS          Best
+  --------------------------------------------------------
+  Patch Embed (768x768)        0.5272           n/a  Our kernel
+  FC1+GELU (768x3072)         2.3177           n/a  Our kernel
+  FC2+Bias (3072x768)         1.4736           n/a  Our kernel
+
+Raw samples saved to: /root/siglip/data/session_20260316_215523/compare.csv
+
+Done. 10 runs x 3 layers in 948s (15.8 min).
