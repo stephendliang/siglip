@@ -491,11 +491,21 @@ def run_config(cfg, binary_path, src_path, repeat=1):
 
     for rep in range(repeat):
         try:
-            run = subprocess.run([binary_path], capture_output=True, text=True,
-                                 timeout=RUN_TIMEOUT)
+            proc = subprocess.Popen([binary_path], stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            stdout, stderr = proc.communicate(timeout=RUN_TIMEOUT)
         except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
             result['status'] = 'HANG'
             return result
+
+        class _Run:
+            pass
+        run = _Run()
+        run.returncode = proc.returncode
+        run.stdout = stdout
+        run.stderr = stderr
 
         if run.returncode != 0:
             result['status'] = 'RUNTIME_ERROR'
