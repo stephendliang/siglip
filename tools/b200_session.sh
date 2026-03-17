@@ -99,7 +99,7 @@ if should_run 2; then
     log "Phase 2 complete"
 fi
 
-# ── Phase 3/4: ncu profiling (~5 min) ──
+# ── Phase 3/4: ncu profiling (~10 min) ──
 if should_run 3; then
     log ""
     log "==== PHASE 3/4: NCU PROFILING ===="
@@ -113,13 +113,26 @@ if should_run 3; then
         if [ -n "$bin_mtime" ] && [ "$bin_mtime" -lt "$SESSION_START" ]; then
             log "WARN ncu $name: binary predates this session — may be stale"
         fi
+        # Source counters: save ncu-rep first, then export clean CSV (no kernel stdout)
         log "ncu source counters: $name"
-        ncu --set source --csv "$bin" > "$OUTDIR/source_counters_${name}.csv" 2>&1 || \
-            log "FAIL ncu $name (may need root or --mode=launch)"
+        if ncu --set source -o "$OUTDIR/source_${name}" "$bin" >> "$OUTDIR/session.log" 2>&1; then
+            ncu --import "$OUTDIR/source_${name}.ncu-rep" --csv \
+                > "$OUTDIR/source_counters_${name}.csv" 2>/dev/null
+            rm -f "$OUTDIR/source_${name}.ncu-rep"
+            lines=$(wc -l < "$OUTDIR/source_counters_${name}.csv")
+            log "  source counters: $name ($lines CSV lines)"
+        else
+            log "FAIL ncu source $name (may need root or --mode=launch)"
+        fi
     done
-    log "ncu full profile: patch_embed"
-    ncu --set full -o "$OUTDIR/siglip_full" ./patch_embed 2>&1 || \
-        log "FAIL ncu full (may need root or --mode=launch)"
+    # Full profile for all kernels (not just patch_embed)
+    for bin in ./patch_embed ./fc1-gelu ./fc2; do
+        name=$(basename "$bin")
+        [ -x "$bin" ] || continue
+        log "ncu full profile: $name"
+        ncu --set full -o "$OUTDIR/full_${name}" "$bin" >> "$OUTDIR/session.log" 2>&1 || \
+            log "FAIL ncu full $name"
+    done
     log "Phase 3 complete"
 fi
 

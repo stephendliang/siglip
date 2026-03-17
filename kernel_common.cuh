@@ -51,8 +51,17 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef W0_RES_PREFETCH
 #define W0_RES_PREFETCH 0    // 0=off, 1=W0 prefetches residual after K-loop (fc2 only)
 #endif
+#ifndef W0_RES_FULL
+#define W0_RES_FULL 0        // 0=off, 1=W0 loads ALL residual (both passes) after K-loop (fc2 only)
+#endif
 #if W0_RES_PREFETCH && !TMA_RESIDUAL
 #error "W0_RES_PREFETCH requires TMA_RESIDUAL >= 1"
+#endif
+#if W0_RES_FULL && !TMA_RESIDUAL
+#error "W0_RES_FULL requires TMA_RESIDUAL >= 1"
+#endif
+#if W0_RES_FULL && W0_RES_PREFETCH
+#error "W0_RES_FULL and W0_RES_PREFETCH are mutually exclusive"
 #endif
 #ifndef SUB_MMA_UNROLL
 #define SUB_MMA_UNROLL  0    // Sub-MMA inner loop: 0=no pragma, 1=no unroll, N=unroll by N
@@ -157,7 +166,11 @@ Problem dimensions — N_DIM must be defined before including this header
 #endif
 #if TMA_RESIDUAL
 #define OFF_RES_MBAR       (OFF_EPILOGUE_MBAR + 16)
-#if W0_RES_PREFETCH
+#if W0_RES_FULL
+#define OFF_RES_CONSUMED_MBAR  (OFF_RES_MBAR + NUM_EPI_WARPS * 8)
+#define OFF_RES_PASS_MBAR      (OFF_RES_CONSUMED_MBAR + 8)
+#define _MBAR_END              (OFF_RES_PASS_MBAR + 8)
+#elif W0_RES_PREFETCH
 #define OFF_RES_CONSUMED_MBAR  (OFF_RES_MBAR + NUM_EPI_WARPS * 8)
 #define _MBAR_END          (OFF_RES_CONSUMED_MBAR + 8)
 #else
@@ -213,10 +226,13 @@ Problem dimensions — N_DIM must be defined before including this header
 
 static __device__ __forceinline__
 uint32_t smem_to_uint(const void* p) {
-    uint32_t r;
-    asm volatile("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }"
-        : "=r"(r) : "l"(p));
-    return r;
+    return static_cast<uint32_t>(
+        reinterpret_cast<uintptr_t>(__cvta_generic_to_shared(p)));
+}
+
+template<typename T>
+static __device__ __forceinline__ T warp_uniform(T x) {
+    return __shfl_sync(0xFFFFFFFF, x, 0);
 }
 
 static __device__ __forceinline__

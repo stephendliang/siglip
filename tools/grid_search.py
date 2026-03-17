@@ -54,6 +54,7 @@ DEFAULTS = {
     'GELU_VARIANT': 0,
     'TMA_RESIDUAL': 0,
     'W0_RES_PREFETCH': 0,
+    'W0_RES_FULL': 0,
     'BATCH_EPILOGUE': 0,
     'GELU_VECTOR_WIDTH': 32,
     'STORE_TIMING': 0,
@@ -83,6 +84,7 @@ RANGES = {
     'GELU_VARIANT': [0, 4, 5],  # V1,2,3,6 use software tanhf() → 9.1ms catastrophic (4x slower)
     'TMA_RESIDUAL': [0, 1, 2],
     'W0_RES_PREFETCH': [0, 1],
+    'W0_RES_FULL': [0, 1],
     'BATCH_EPILOGUE': [0, 1],
     'GELU_VECTOR_WIDTH': [8, 16, 32],
     'STORE_TIMING': [0, 1],
@@ -117,7 +119,7 @@ KERNEL_TIERS = {
         3: ['EPILOGUE_LOOP', 'STS_WIDTH', 'EPI_SYNC', 'GELU_VECTOR_WIDTH'],
     },
     'fc2': {
-        1: ['N_STAGES', 'K_LOOP_UNROLL', 'TMA_RESIDUAL', 'W0_RES_PREFETCH'],
+        1: ['N_STAGES', 'K_LOOP_UNROLL', 'TMA_RESIDUAL', 'W0_RES_PREFETCH', 'W0_RES_FULL'],
         2: ['INTERLEAVE_STRATEGY', 'PHASE1_UNROLL', 'BIAS_SMEM', 'TMEM_LOAD_WIDTH'],
         3: ['BATCH_EPILOGUE', 'STORE_TIMING', 'STS_WIDTH', 'PRELOAD_MODE'],
         4: ['EPILOGUE_LOOP', 'EPI_SYNC', 'NUM_PASSES_PARAM'],
@@ -224,7 +226,7 @@ INTERACTIONS = {
         'kernels': ['fc2'],
     },
     'w0_prefetch': {
-        'params': ['W0_RES_PREFETCH', 'TMA_RESIDUAL', 'N_STAGES'],
+        'params': ['W0_RES_PREFETCH', 'W0_RES_FULL', 'TMA_RESIDUAL', 'N_STAGES'],
         'kernels': ['fc2'],
     },
 }
@@ -232,7 +234,7 @@ INTERACTIONS = {
 # ── Build config ──
 NVCC = 'nvcc'
 ARCH = 'sm_100a'
-CFLAGS = f'-gencode arch=compute_100a,code={ARCH} -O3 -std=c++17 --ptxas-options=-v'
+CFLAGS = f'-gencode arch=compute_100a,code={ARCH} -O3 -std=c++17 -lineinfo --ptxas-options=-v'
 LDFLAGS = '-lcurand -lcuda'
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -264,9 +266,14 @@ def is_valid(cfg, kernel='patch_embed'):
     off_epilogue_mbar = off_mainloop_mbar + 16
     tma_res = cfg.get('TMA_RESIDUAL', 0)
     w0_res_pf = cfg.get('W0_RES_PREFETCH', 0)
+    w0_res_full = cfg.get('W0_RES_FULL', 0)
     if tma_res:
         off_res_mbar = off_epilogue_mbar + 16
-        if w0_res_pf:
+        if w0_res_full:
+            off_res_consumed_mbar = off_res_mbar + num_epi * 8
+            off_res_pass_mbar = off_res_consumed_mbar + 8
+            mbar_end = off_res_pass_mbar + 8
+        elif w0_res_pf:
             off_res_consumed_mbar = off_res_mbar + num_epi * 8
             mbar_end = off_res_consumed_mbar + 8
         else:
@@ -294,6 +301,15 @@ def is_valid(cfg, kernel='patch_embed'):
             return False, 'W0_RES_PREFETCH only for fc2'
         if cfg.get('TMA_RESIDUAL', 0) < 1:
             return False, 'W0_RES_PREFETCH requires TMA_RESIDUAL>=1'
+
+    # W0_RES_FULL only for fc2, requires TMA_RESIDUAL>=1, mutually exclusive with W0_RES_PREFETCH
+    if cfg.get('W0_RES_FULL', 0) == 1:
+        if kernel != 'fc2':
+            return False, 'W0_RES_FULL only for fc2'
+        if cfg.get('TMA_RESIDUAL', 0) < 1:
+            return False, 'W0_RES_FULL requires TMA_RESIDUAL>=1'
+        if cfg.get('W0_RES_PREFETCH', 0) == 1:
+            return False, 'W0_RES_FULL and W0_RES_PREFETCH are mutually exclusive'
 
     # CVT_ADD_FUSED only meaningful for patch_embed (dead code on fc1/fc2)
     if cfg.get('CVT_ADD_FUSED', 1) != 1 and kernel != 'patch_embed':
@@ -383,9 +399,14 @@ def smem_kb(cfg):
     off_epilogue_mbar = off_mainloop_mbar + 16
     tma_res = cfg.get('TMA_RESIDUAL', 0)
     w0_res_pf = cfg.get('W0_RES_PREFETCH', 0)
+    w0_res_full = cfg.get('W0_RES_FULL', 0)
     if tma_res:
         off_res_mbar = off_epilogue_mbar + 16
-        if w0_res_pf:
+        if w0_res_full:
+            off_res_consumed_mbar = off_res_mbar + num_epi * 8
+            off_res_pass_mbar = off_res_consumed_mbar + 8
+            mbar_end = off_res_pass_mbar + 8
+        elif w0_res_pf:
             off_res_consumed_mbar = off_res_mbar + num_epi * 8
             mbar_end = off_res_consumed_mbar + 8
         else:

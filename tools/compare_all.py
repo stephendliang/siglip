@@ -154,7 +154,7 @@ def rebuild_with_dflags(source, binary, dflags):
     """Rebuild a kernel binary with custom -D flags from grid search."""
     nvcc = 'nvcc'
     arch = 'sm_100a'
-    cflags = f'-gencode arch=compute_100a,code={arch} -O3 -std=c++17 --ptxas-options=-v'
+    cflags = f'-gencode arch=compute_100a,code={arch} -O3 -std=c++17 -lineinfo --ptxas-options=-v'
     ldflags = '-lcurand -lcuda'
     cmd = f'{nvcc} {cflags} {dflags} {source} -o {binary} {ldflags}'
     print(f"  Rebuilding {binary} with: {dflags} ...", end=' ', flush=True)

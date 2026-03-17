@@ -1,6 +1,6 @@
 NVCC     = nvcc
 ARCH     = sm_100a
-CFLAGS   = -gencode arch=compute_100a,code=$(ARCH) -O3 -std=c++17 --ptxas-options=-v
+CFLAGS   = -gencode arch=compute_100a,code=$(ARCH) -O3 -std=c++17 -lineinfo --ptxas-options=-v
 LDFLAGS  = -lcurand -lcuda
 TARGET   = patch_embed
 CU       = patch_embed.cu

@@ -70,8 +70,11 @@ void epilogue_store(
     , uint32_t res_mbar_addr
     , uint32_t res_staging_saddr
 #endif
-#if W0_RES_PREFETCH
+#if W0_RES_PREFETCH || W0_RES_FULL
     , uint32_t res_consumed_mbar_addr
+#endif
+#if W0_RES_FULL
+    , uint32_t res_pass_mbar_addr
 #endif
 #ifdef TIMING
     , long long& t_phase1_end
@@ -157,6 +160,7 @@ void epilogue_store(
             const int pnc_s = NC_START + pass * PASS_COLS;
             const int pnc_e = pnc_s + PASS_COLS;
 
+#if !W0_RES_FULL
             if (!(FIRST_PASS_PRELOADED && pass == 0)) {
                 if (lane == 0) {
                     mbar_arrive_expect_tx(res_mbar_addr, PASS_REGIONS * STAGING_REGION_BYTES);
@@ -168,6 +172,7 @@ void epilogue_store(
                     }
                 }
             }
+#endif
 
             if (pass > 0) {
                 if (lane == 0) {
@@ -352,6 +357,12 @@ void epilogue_store(
                     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                 }
             }
+#if W0_RES_FULL
+            /* Signal pass consumed so W0 can load next pass (or tile done) */
+            if (pass < LOCAL_PASSES - 1) {
+                if (res_pass_mbar_addr && lane == 0) mbar_arrive(res_pass_mbar_addr);
+            }
+#endif
         }
 #else  /* TMEM_LOAD_WIDTH != 64 — x32 path */
         float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
@@ -361,6 +372,7 @@ void epilogue_store(
             const int pnc_s = NC_START + pass * PASS_COLS;
             const int pnc_e = pnc_s + PASS_COLS;
 
+#if !W0_RES_FULL
             if (!(FIRST_PASS_PRELOADED && pass == 0)) {
                 if (lane == 0) {
                     mbar_arrive_expect_tx(res_mbar_addr, PASS_REGIONS * STAGING_REGION_BYTES);
@@ -372,6 +384,7 @@ void epilogue_store(
                     }
                 }
             }
+#endif
 
             if (pass > 0) {
                 if (lane == 0) {
@@ -522,10 +535,16 @@ void epilogue_store(
                     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                 }
             }
+#if W0_RES_FULL
+            /* Signal pass consumed so W0 can load next pass (or tile done) */
+            if (pass < LOCAL_PASSES - 1) {
+                if (res_pass_mbar_addr && lane == 0) mbar_arrive(res_pass_mbar_addr);
+            }
+#endif
         }
 #endif  /* TMEM_LOAD_WIDTH == 64 */
 
-#if W0_RES_PREFETCH
+#if W0_RES_PREFETCH || W0_RES_FULL
         if (res_consumed_mbar_addr && lane == 0)
             mbar_arrive(res_consumed_mbar_addr);
 #endif
@@ -1194,7 +1213,7 @@ void epilogue_store(
 #endif
 }
 
-#if TMA_RESIDUAL >= 2 || W0_RES_PREFETCH
+#if TMA_RESIDUAL >= 2 || W0_RES_PREFETCH || W0_RES_FULL
 #define EPI_PRELOADED true
 #else
 #define EPI_PRELOADED false
@@ -1229,8 +1248,9 @@ persistent_gemm(
     const int warp  = tid / 32;
     const int lane  = tid % 32;
 
-    int cta_rank;
-    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+    /* cluster_dims(2,1,1): CTA rank = position within 2-CTA cluster.
+       Derived from blockIdx.x to avoid asm → keeps uniform chain for UR allocation. */
+    const int cta_rank = sm_id & 1;
     const int cluster_id = sm_id / 2;
     const int num_clusters = SM_COUNT / 2;
 
@@ -1247,7 +1267,10 @@ persistent_gemm(
 #if TMA_RESIDUAL
         for (int w = 0; w < NUM_EPI_WARPS; w++)
             mbar_init(smem_to_uint(smem + OFF_RES_MBAR + w * 8), 1);
-#if W0_RES_PREFETCH
+#if W0_RES_FULL
+        mbar_init(smem_to_uint(smem + OFF_RES_CONSUMED_MBAR), NUM_EPI_WARPS);
+        mbar_init(smem_to_uint(smem + OFF_RES_PASS_MBAR), NUM_EPI_WARPS);
+#elif W0_RES_PREFETCH
         mbar_init(smem_to_uint(smem + OFF_RES_CONSUMED_MBAR), NUM_EPI_WARPS);
 #endif
 #endif
@@ -1288,7 +1311,10 @@ persistent_gemm(
     const int start_buf = tile_start & 1;
     int epi_phase[2] = {1, 1};
     int ml_phase[2]  = {start_buf, 1 - start_buf};
-#if W0_RES_PREFETCH
+#if W0_RES_FULL
+    int res_consumed_phase = 0;
+    int res_pass_phase = 0;
+#elif W0_RES_PREFETCH
     int res_consumed_phase = 0;
 #endif
 
@@ -1317,49 +1343,121 @@ persistent_gemm(
         const int n_start = tn * TN;
 
         if (warp == 0) {
-            // LOAD WARP (W0)
-            if (lane == 0) {
-                MAYBE_UNROLL_W0
-                for (int ki = 0; ki < K_ITERS; ki++) {
-                    const int s = ki % N_STAGES;
-                    const int k_start = ki * TK;
+            /*
+            LOAD WARP (W0) — R2UR fix: all threads compute addresses as
+            integer offsets from smem_base (uniform), eliminating array lookups
+            that break the compiler's uniformity tracking. Only lane 0 issues TMA.
+            */
+            const uint32_t smem_base = warp_uniform(smem_to_uint(smem));
+            MAYBE_UNROLL_W0
+            for (int ki = 0; ki < K_ITERS; ki++) {
+                const int s = ki % N_STAGES;
+                const int k_start = ki * TK;
+                const uint32_t mma_mbar_s = smem_base + OFF_MMA_MBAR + s * 8;
+                const uint32_t tma_mbar_s = (smem_base + OFF_TMA_MBAR + s * 8) & 0xFEFFFFFF;
 
-                    if (tile_idx > tile_start || ki >= N_STAGES) {
-                        mbar_wait(mma_mbar[s], mma_phase[s]);
-                        mma_phase[s] ^= 1;
-                    }
-
-                    const uint32_t tma_mbar_masked = tma_mbar[s] & 0xFEFFFFFF;
-                    tma_load_2d(smem_a[s], &tma_a, k_start, m_start, tma_mbar_masked);
-                    tma_load_2d(smem_b[s], &tma_b, k_start, n_start + cta_rank * (TN/2), tma_mbar_masked);
-                    mbar_arrive_expect_tx(tma_mbar_masked, TMA_BYTES);
+                if (tile_idx > tile_start || ki >= N_STAGES) {
+                    mbar_wait(mma_mbar_s, mma_phase[s]);
+                    mma_phase[s] ^= 1;
                 }
-#if W0_RES_PREFETCH
+
+                if (lane == 0) {
+                    const uint32_t a_dst = smem_base + s * STAGE_BYTES;
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                        ".mbarrier::complete_tx::bytes.cta_group::2"
+                        " [%0], [%1, {%2, %3}], [%4];\n\t"
+                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                        ".mbarrier::complete_tx::bytes.cta_group::2"
+                        " [%5], [%6, {%2, %7}], [%4];\n\t"
+                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %8;"
+                        :: "r"(a_dst), "l"(&tma_a), "r"(k_start), "r"(m_start),
+                           "r"(tma_mbar_s), "r"(a_dst + 16384), "l"(&tma_b),
+                           "r"(n_start + cta_rank * (TN/2)), "r"(TMA_BYTES)
+                        : "memory");
+                }
+            }
+#if W0_RES_FULL
+            if (lane == 0) {
                 if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                     /* Wait for prev tile's epilogue to finish reading residual */
                     if (tile_idx > tile_start) {
-                        mbar_wait(smem_to_uint(smem + OFF_RES_CONSUMED_MBAR), res_consumed_phase);
+                        mbar_wait(smem_base + OFF_RES_CONSUMED_MBAR, res_consumed_phase);
+                        res_consumed_phase ^= 1;
+                    }
+                    /* Load ALL residual for all epilogue warps, both passes */
+                    for (int pass = 0; pass < 2; pass++) {
+                        if (pass > 0) {
+                            mbar_wait(smem_base + OFF_RES_PASS_MBAR, res_pass_phase);
+                            res_pass_phase ^= 1;
+                        }
+                        for (int ew = 0; ew < NUM_EPI_WARPS; ew++) {
+                            const int gm = m_start + ew * 32;
+                            const uint32_t rmbar = smem_base + OFF_RES_MBAR + ew * 8;
+                            const uint32_t rstg = smem_base + OFF_STAGING
+                                + ew * STAGING_WARP_BYTES + RES_STAGING_OFFSET;
+#if NUM_PASSES_PARAM == 4
+                            asm volatile(
+                                "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;\n\t"
+                                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                                " [%2], [%3, {%4, %5}], [%0];"
+                                :: "r"(rmbar), "r"(STAGING_REGION_BYTES),
+                                   "r"(rstg), "l"(&tma_res), "r"(n_start + pass * 64), "r"(gm)
+                                : "memory");
+#else
+                            asm volatile(
+                                "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;\n\t"
+                                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                                " [%2], [%3, {%4, %5}], [%0];\n\t"
+                                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                                " [%6], [%3, {%7, %5}], [%0];"
+                                :: "r"(rmbar), "r"(2 * STAGING_REGION_BYTES),
+                                   "r"(rstg), "l"(&tma_res), "r"(n_start + pass * 128), "r"(gm),
+                                   "r"(rstg + STAGING_REGION_BYTES), "r"(n_start + pass * 128 + 64)
+                                : "memory");
+#endif
+                        }
+                    }
+                }
+            }
+#elif W0_RES_PREFETCH
+            if (lane == 0) {
+                if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+                    /* Wait for prev tile's epilogue to finish reading residual */
+                    if (tile_idx > tile_start) {
+                        mbar_wait(smem_base + OFF_RES_CONSUMED_MBAR, res_consumed_phase);
                         res_consumed_phase ^= 1;
                     }
                     /* Prefetch pass-0 residual for ALL epilogue warps */
                     for (int ew = 0; ew < NUM_EPI_WARPS; ew++) {
                         const int gm = m_start + ew * 32;
-                        const uint32_t rmbar = smem_to_uint(smem + OFF_RES_MBAR + ew * 8);
-                        const uint32_t rstg = smem_to_uint(smem + OFF_STAGING
-                            + ew * STAGING_WARP_BYTES + RES_STAGING_OFFSET);
+                        const uint32_t rmbar = smem_base + OFF_RES_MBAR + ew * 8;
+                        const uint32_t rstg = smem_base + OFF_STAGING
+                            + ew * STAGING_WARP_BYTES + RES_STAGING_OFFSET;
 #if NUM_PASSES_PARAM == 4
-                        mbar_arrive_expect_tx(rmbar, STAGING_REGION_BYTES);
-                        tma_load_2d_cta(rstg, &tma_res, n_start, gm, rmbar);
+                        asm volatile(
+                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;\n\t"
+                            "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                            " [%2], [%3, {%4, %5}], [%0];"
+                            :: "r"(rmbar), "r"(STAGING_REGION_BYTES),
+                               "r"(rstg), "l"(&tma_res), "r"(n_start), "r"(gm)
+                            : "memory");
 #else
-                        mbar_arrive_expect_tx(rmbar, 2 * STAGING_REGION_BYTES);
-                        tma_load_2d_cta(rstg, &tma_res, n_start, gm, rmbar);
-                        tma_load_2d_cta(rstg + STAGING_REGION_BYTES,
-                                        &tma_res, n_start + 64, gm, rmbar);
+                        asm volatile(
+                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;\n\t"
+                            "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                            " [%2], [%3, {%4, %5}], [%0];\n\t"
+                            "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                            " [%6], [%3, {%7, %5}], [%0];"
+                            :: "r"(rmbar), "r"(2 * STAGING_REGION_BYTES),
+                               "r"(rstg), "l"(&tma_res), "r"(n_start), "r"(gm),
+                               "r"(rstg + STAGING_REGION_BYTES), "r"(n_start + 64)
+                            : "memory");
 #endif
                     }
                 }
-#endif
             }
+#endif
         } else if (warp == 1) {
             // MMA WARP (W1)
             if (lane == 0 && cta_rank == 0) {
@@ -1457,7 +1555,7 @@ persistent_gemm(
                 gm_base = prev_m + row_group * 32;
             }
 
-#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH
+#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH && !W0_RES_FULL
             /* Preload first-pass residual before mainloop wait — TMA flies during idle */
             if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                 if (tile_idx > tile_start && lane == 0) {
@@ -1509,8 +1607,11 @@ persistent_gemm(
 #if TMA_RESIDUAL
                             , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
-#if W0_RES_PREFETCH
+#if W0_RES_FULL || W0_RES_PREFETCH
                             , smem_to_uint(smem + OFF_RES_CONSUMED_MBAR)
+#endif
+#if W0_RES_FULL
+                            , smem_to_uint(smem + OFF_RES_PASS_MBAR)
 #endif
 #ifdef TIMING
                             , epi_t1
@@ -1521,8 +1622,11 @@ persistent_gemm(
 #if TMA_RESIDUAL
                             , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
-#if W0_RES_PREFETCH
+#if W0_RES_FULL || W0_RES_PREFETCH
                             , smem_to_uint(smem + OFF_RES_CONSUMED_MBAR)
+#endif
+#if W0_RES_FULL
+                            , smem_to_uint(smem + OFF_RES_PASS_MBAR)
 #endif
 #ifdef TIMING
                             , epi_t1
@@ -1535,8 +1639,11 @@ persistent_gemm(
 #if TMA_RESIDUAL
                         , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
-#if W0_RES_PREFETCH
+#if W0_RES_FULL || W0_RES_PREFETCH
                         , smem_to_uint(smem + OFF_RES_CONSUMED_MBAR)
+#endif
+#if W0_RES_FULL
+                        , smem_to_uint(smem + OFF_RES_PASS_MBAR)
 #endif
 #ifdef TIMING
                         , epi_t1
@@ -1621,7 +1728,7 @@ persistent_gemm(
         const int last_n = ltn * TN;
         const int gm_base = last_m + row_group * 32;
 
-#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH
+#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH && !W0_RES_FULL
         /* Preload first-pass residual before mainloop wait — TMA flies during idle */
         if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
             if (lane == 0) {
@@ -1665,7 +1772,10 @@ persistent_gemm(
 #if TMA_RESIDUAL
                     , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
-#if W0_RES_PREFETCH
+#if W0_RES_FULL
+                    , 0
+                    , smem_to_uint(smem + OFF_RES_PASS_MBAR)
+#elif W0_RES_PREFETCH
                     , 0
 #endif
 #ifdef TIMING
@@ -1677,7 +1787,10 @@ persistent_gemm(
 #if TMA_RESIDUAL
                     , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
-#if W0_RES_PREFETCH
+#if W0_RES_FULL
+                    , 0
+                    , smem_to_uint(smem + OFF_RES_PASS_MBAR)
+#elif W0_RES_PREFETCH
                     , 0
 #endif
 #ifdef TIMING
@@ -1691,7 +1804,10 @@ persistent_gemm(
 #if TMA_RESIDUAL
                 , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
-#if W0_RES_PREFETCH
+#if W0_RES_FULL
+                , 0
+                , smem_to_uint(smem + OFF_RES_PASS_MBAR)
+#elif W0_RES_PREFETCH
                 , 0
 #endif
 #ifdef TIMING
