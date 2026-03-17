@@ -77,6 +77,9 @@ void epilogue_store(
     , long long& t_phase1_end
 #endif
 ) {
+#if BIAS_SMEM
+    extern __shared__ __align__(128) char smem[];
+#endif
     const int taddr_base = tmem_addr + ((cta_rank * 128 + row_group * 32) << 16);
 
     // BIAS_ADD: precompute combined table base pointer (pos_row computed here)
@@ -127,17 +130,33 @@ void epilogue_store(
         const int taddr_base = tmem_addr + ((cta_rank * 128 + row_group * 32) << 16);
         int res_phase = 0;
 
+#if BIAS_SMEM
+        /* Load tile's 256 bias floats into SMEM once. All warps write same values
+           (idempotent — no cross-warp sync needed). 2 float4 LDG per lane = 64 LDG. */
+        {
+            float* bias_smem = reinterpret_cast<float*>(smem + OFF_BIAS_SMEM);
+            const float* bias_src = side_data + n_start;
+            reinterpret_cast<float4*>(bias_smem)[lane * 2]     = __ldg(reinterpret_cast<const float4*>(bias_src) + lane * 2);
+            reinterpret_cast<float4*>(bias_smem)[lane * 2 + 1] = __ldg(reinterpret_cast<const float4*>(bias_src) + lane * 2 + 1);
+        }
+        __syncwarp();
+        const uint32_t bias_smem_base = smem_to_uint(smem + OFF_BIAS_SMEM);
+#endif
+
+        /* Precomputed swizzle offsets — 8 groups of 16 bytes within a 128-byte region row */
+        const uint32_t sw0 = 0 ^ xor_val, sw1 = 16 ^ xor_val, sw2 = 32 ^ xor_val, sw3 = 48 ^ xor_val;
+        const uint32_t sw4 = 64 ^ xor_val, sw5 = 80 ^ xor_val, sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
+
+#if TMEM_LOAD_WIDTH == 64
         float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
         float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
+        float a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47;
+        float a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63;
 
         for (int pass = 0; pass < LOCAL_PASSES; pass++) {
             const int pnc_s = NC_START + pass * PASS_COLS;
             const int pnc_e = pnc_s + PASS_COLS;
 
-            /* Issue residual TMA first — flies while we wait for prior stores.
-               Residual targets regions 2-3 (mbarrier-tracked), output stores
-               target regions 0-1 (commit_group-tracked): no SMEM conflict.
-               Skip pass 0 when caller already preloaded (TMA_RESIDUAL=2). */
             if (!(FIRST_PASS_PRELOADED && pass == 0)) {
                 if (lane == 0) {
                     mbar_arrive_expect_tx(res_mbar_addr, PASS_REGIONS * STAGING_REGION_BYTES);
@@ -150,7 +169,6 @@ void epilogue_store(
                 }
             }
 
-            /* Between passes: wait for previous pass's output TMA stores */
             if (pass > 0) {
                 if (lane == 0) {
                     asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
@@ -158,23 +176,49 @@ void epilogue_store(
                 __syncwarp();
             }
 
-            /* Start TMEM readback — overlaps with TMA residual in-flight */
-            LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-                         a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                         taddr_base + pnc_s);
+            /* x64: load 64 cols at a time, 1 region per iteration */
+            TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                          a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47,
+                          a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
+                          taddr_base + pnc_s);
 
-            /* Wait for residual TMA */
             mbar_wait(res_mbar_addr, res_phase);
             res_phase ^= 1;
 
-            /* Process 4 × 32-col chunks within this pass */
 #if EPILOGUE_LOOP
 #pragma unroll 1
 #else
             PRAGMA_UNROLL(PHASE1_UNROLL)
 #endif
-            for (int nc = pnc_s; nc < pnc_e; nc += 32) {
-                /* Preload all 32 bias floats (L1-hot, fills TMEM stall window) */
+            for (int nc = pnc_s; nc < pnc_e; nc += 64) {
+                const int ri = (nc - pnc_s) >> 6;
+                const uint32_t srow = srow_base + ri * STAGING_REGION_BYTES;
+                const uint32_t rs = res_staging_saddr + ri * STAGING_REGION_BYTES
+                    + lane * STAGING_REGION_ROW_BYTES;
+
+#if BIAS_SMEM
+                /* Load 64 bias floats from SMEM (linear, no swizzle) */
+                const uint32_t bs = bias_smem_base + nc * 4;
+                float4 bv0, bv1, bv2, bv3, bv4, bv5, bv6, bv7;
+                float4 bv8, bv9, bv10, bv11, bv12, bv13, bv14, bv15;
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv0.x),"=f"(bv0.y),"=f"(bv0.z),"=f"(bv0.w) : "r"(bs));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv1.x),"=f"(bv1.y),"=f"(bv1.z),"=f"(bv1.w) : "r"(bs + 16));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv2.x),"=f"(bv2.y),"=f"(bv2.z),"=f"(bv2.w) : "r"(bs + 32));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv3.x),"=f"(bv3.y),"=f"(bv3.z),"=f"(bv3.w) : "r"(bs + 48));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv4.x),"=f"(bv4.y),"=f"(bv4.z),"=f"(bv4.w) : "r"(bs + 64));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv5.x),"=f"(bv5.y),"=f"(bv5.z),"=f"(bv5.w) : "r"(bs + 80));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv6.x),"=f"(bv6.y),"=f"(bv6.z),"=f"(bv6.w) : "r"(bs + 96));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv7.x),"=f"(bv7.y),"=f"(bv7.z),"=f"(bv7.w) : "r"(bs + 112));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv8.x),"=f"(bv8.y),"=f"(bv8.z),"=f"(bv8.w) : "r"(bs + 128));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv9.x),"=f"(bv9.y),"=f"(bv9.z),"=f"(bv9.w) : "r"(bs + 144));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv10.x),"=f"(bv10.y),"=f"(bv10.z),"=f"(bv10.w) : "r"(bs + 160));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv11.x),"=f"(bv11.y),"=f"(bv11.z),"=f"(bv11.w) : "r"(bs + 176));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv12.x),"=f"(bv12.y),"=f"(bv12.z),"=f"(bv12.w) : "r"(bs + 192));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv13.x),"=f"(bv13.y),"=f"(bv13.z),"=f"(bv13.w) : "r"(bs + 208));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv14.x),"=f"(bv14.y),"=f"(bv14.z),"=f"(bv14.w) : "r"(bs + 224));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv15.x),"=f"(bv15.y),"=f"(bv15.z),"=f"(bv15.w) : "r"(bs + 240));
+#else
                 const float* bp = side_data + n_start + nc;
                 float4 bv0 = __ldg(reinterpret_cast<const float4*>(bp));
                 float4 bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
@@ -184,25 +228,210 @@ void epilogue_store(
                 float4 bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
                 float4 bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
                 float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
+                float4 bv8 = __ldg(reinterpret_cast<const float4*>(bp + 32));
+                float4 bv9 = __ldg(reinterpret_cast<const float4*>(bp + 36));
+                float4 bv10 = __ldg(reinterpret_cast<const float4*>(bp + 40));
+                float4 bv11 = __ldg(reinterpret_cast<const float4*>(bp + 44));
+                float4 bv12 = __ldg(reinterpret_cast<const float4*>(bp + 48));
+                float4 bv13 = __ldg(reinterpret_cast<const float4*>(bp + 52));
+                float4 bv14 = __ldg(reinterpret_cast<const float4*>(bp + 56));
+                float4 bv15 = __ldg(reinterpret_cast<const float4*>(bp + 60));
+#endif
 
-                /* Load residual from SMEM (TMA-loaded, coalesced) with swizzle */
-                const int res_ri = (nc - pnc_s) >> 6;
-                const int res_bb = ((nc - pnc_s) & 63) * 2;
+                /* Load 64 cols of residual from SMEM (swizzled) */
+                uint4 rv0, rv1, rv2, rv3, rv4, rv5, rv6, rv7;
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(rs + sw0));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv1.x),"=r"(rv1.y),"=r"(rv1.z),"=r"(rv1.w) : "r"(rs + sw1));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w) : "r"(rs + sw2));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w) : "r"(rs + sw3));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv4.x),"=r"(rv4.y),"=r"(rv4.z),"=r"(rv4.w) : "r"(rs + sw4));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv5.x),"=r"(rv5.y),"=r"(rv5.z),"=r"(rv5.w) : "r"(rs + sw5));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv6.x),"=r"(rv6.y),"=r"(rv6.z),"=r"(rv6.w) : "r"(rs + sw6));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv7.x),"=r"(rv7.y),"=r"(rv7.z),"=r"(rv7.w) : "r"(rs + sw7));
+
+                TMEM_WAIT();
+
+                if (MBAR_EARLY && pass == LOCAL_PASSES - 1 && nc + 64 >= pnc_e) {
+                    if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
+                }
+
+                /* 8× BIAS_RES_CVT_STS_V4 — one full 64-col region */
+                BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                    bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w,
+                    rv0.x,rv0.y,rv0.z,rv0.w, srow + sw0);
+                BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                    bv2.x,bv2.y,bv2.z,bv2.w,bv3.x,bv3.y,bv3.z,bv3.w,
+                    rv1.x,rv1.y,rv1.z,rv1.w, srow + sw1);
+                BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                    bv4.x,bv4.y,bv4.z,bv4.w,bv5.x,bv5.y,bv5.z,bv5.w,
+                    rv2.x,rv2.y,rv2.z,rv2.w, srow + sw2);
+                BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                    bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w,
+                    rv3.x,rv3.y,rv3.z,rv3.w, srow + sw3);
+                BIAS_RES_CVT_STS_V4(a32,a33,a34,a35,a36,a37,a38,a39,
+                    bv8.x,bv8.y,bv8.z,bv8.w,bv9.x,bv9.y,bv9.z,bv9.w,
+                    rv4.x,rv4.y,rv4.z,rv4.w, srow + sw4);
+                BIAS_RES_CVT_STS_V4(a40,a41,a42,a43,a44,a45,a46,a47,
+                    bv10.x,bv10.y,bv10.z,bv10.w,bv11.x,bv11.y,bv11.z,bv11.w,
+                    rv5.x,rv5.y,rv5.z,rv5.w, srow + sw5);
+                BIAS_RES_CVT_STS_V4(a48,a49,a50,a51,a52,a53,a54,a55,
+                    bv12.x,bv12.y,bv12.z,bv12.w,bv13.x,bv13.y,bv13.z,bv13.w,
+                    rv6.x,rv6.y,rv6.z,rv6.w, srow + sw6);
+                BIAS_RES_CVT_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63,
+                    bv14.x,bv14.y,bv14.z,bv14.w,bv15.x,bv15.y,bv15.z,bv15.w,
+                    rv7.x,rv7.y,rv7.z,rv7.w, srow + sw7);
+
+#if PREFETCH_BEFORE_STORE
+                if (nc + 64 < pnc_e) {
+                    TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                                  a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47,
+                                  a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
+                                  taddr_base + nc + 64);
+                }
+#endif
+
+                /* Interleaved TMA stores — x64 completes one region per iteration */
+#if !STORE_TIMING
+                if (INTERLEAVE_STRATEGY == 1) {
+                    __syncwarp();
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    if (lane == 0) {
+                        uint32_t src = staging_saddr + ri * STAGING_REGION_BYTES;
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                            :: "l"(tma_c_desc), "r"(n_start + nc),
+                               "r"(gm_base), "r"(src) : "memory");
+                    }
+                } else if (INTERLEAVE_STRATEGY >= 2 && (ri & 1) == 1) {
+                    __syncwarp();
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    if (lane == 0) {
+                        uint32_t src0 = staging_saddr + (ri - 1) * STAGING_REGION_BYTES;
+                        uint32_t src1 = staging_saddr + ri * STAGING_REGION_BYTES;
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                            :: "l"(tma_c_desc), "r"(n_start + nc - 64),
+                               "r"(gm_base), "r"(src0) : "memory");
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                            :: "l"(tma_c_desc), "r"(n_start + nc),
+                               "r"(gm_base), "r"(src1) : "memory");
+                    }
+                }
+#endif /* !STORE_TIMING */
+
+#if !PREFETCH_BEFORE_STORE
+                if (nc + 64 < pnc_e) {
+                    TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                                  a32,a33,a34,a35,a36,a37,a38,a39,a40,a41,a42,a43,a44,a45,a46,a47,
+                                  a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
+                                  taddr_base + nc + 64);
+                }
+#endif
+            }
+
+            /* Commit this pass's TMA output stores */
+            if (STORE_TIMING || INTERLEAVE_STRATEGY == 0
+                || (INTERLEAVE_STRATEGY >= 2 && PASS_REGIONS < 2)) {
+                __syncwarp();
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                if (lane == 0) {
+                    for (int r = 0; r < PASS_REGIONS; r++) {
+                        uint32_t src = staging_saddr + r * STAGING_REGION_BYTES;
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                            :: "l"(tma_c_desc), "r"(n_start + pnc_s + r * 64),
+                               "r"(gm_base), "r"(src) : "memory");
+                    }
+                    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+                }
+            } else {
+                if (lane == 0) {
+                    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+                }
+            }
+        }
+#else  /* TMEM_LOAD_WIDTH != 64 — x32 path */
+        float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
+        float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
+
+        for (int pass = 0; pass < LOCAL_PASSES; pass++) {
+            const int pnc_s = NC_START + pass * PASS_COLS;
+            const int pnc_e = pnc_s + PASS_COLS;
+
+            if (!(FIRST_PASS_PRELOADED && pass == 0)) {
+                if (lane == 0) {
+                    mbar_arrive_expect_tx(res_mbar_addr, PASS_REGIONS * STAGING_REGION_BYTES);
+                    tma_load_2d_cta(res_staging_saddr, tma_res_desc,
+                                    n_start + pnc_s, gm_base, res_mbar_addr);
+                    if constexpr (PASS_REGIONS >= 2) {
+                        tma_load_2d_cta(res_staging_saddr + STAGING_REGION_BYTES, tma_res_desc,
+                                        n_start + pnc_s + 64, gm_base, res_mbar_addr);
+                    }
+                }
+            }
+
+            if (pass > 0) {
+                if (lane == 0) {
+                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                }
+                __syncwarp();
+            }
+
+            LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                         a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                         taddr_base + pnc_s);
+
+            mbar_wait(res_mbar_addr, res_phase);
+            res_phase ^= 1;
+
+#if EPILOGUE_LOOP
+#pragma unroll 1
+#else
+            PRAGMA_UNROLL(PHASE1_UNROLL)
+#endif
+            for (int nc = pnc_s; nc < pnc_e; nc += 32) {
+                const int chunk_in_pass = nc - pnc_s;
+                const int res_ri = chunk_in_pass >> 6;
+                const int half = (chunk_in_pass >> 5) & 1;  /* 0=first 32 cols, 1=second 32 cols */
+
+#if BIAS_SMEM
+                const uint32_t bs = bias_smem_base + nc * 4;
+                float4 bv0, bv1, bv2, bv3, bv4, bv5, bv6, bv7;
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv0.x),"=f"(bv0.y),"=f"(bv0.z),"=f"(bv0.w) : "r"(bs));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv1.x),"=f"(bv1.y),"=f"(bv1.z),"=f"(bv1.w) : "r"(bs + 16));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv2.x),"=f"(bv2.y),"=f"(bv2.z),"=f"(bv2.w) : "r"(bs + 32));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv3.x),"=f"(bv3.y),"=f"(bv3.z),"=f"(bv3.w) : "r"(bs + 48));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv4.x),"=f"(bv4.y),"=f"(bv4.z),"=f"(bv4.w) : "r"(bs + 64));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv5.x),"=f"(bv5.y),"=f"(bv5.z),"=f"(bv5.w) : "r"(bs + 80));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv6.x),"=f"(bv6.y),"=f"(bv6.z),"=f"(bv6.w) : "r"(bs + 96));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=f"(bv7.x),"=f"(bv7.y),"=f"(bv7.z),"=f"(bv7.w) : "r"(bs + 112));
+#else
+                const float* bp = side_data + n_start + nc;
+                float4 bv0 = __ldg(reinterpret_cast<const float4*>(bp));
+                float4 bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
+                float4 bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
+                float4 bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
+                float4 bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
+                float4 bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
+                float4 bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
+                float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
+#endif
+
+                /* Residual from SMEM — use precomputed swizzle offsets */
                 const uint32_t rs = res_staging_saddr
                     + res_ri * STAGING_REGION_BYTES + lane * STAGING_REGION_ROW_BYTES;
+                const uint32_t rsw0 = half ? sw4 : sw0;
+                const uint32_t rsw1 = half ? sw5 : sw1;
+                const uint32_t rsw2 = half ? sw6 : sw2;
+                const uint32_t rsw3 = half ? sw7 : sw3;
                 uint4 rv0, rv1, rv2, rv3;
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w)
-                    : "r"(rs + (res_bb ^ xor_val)));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(rv1.x),"=r"(rv1.y),"=r"(rv1.z),"=r"(rv1.w)
-                    : "r"(rs + ((res_bb + 16) ^ xor_val)));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w)
-                    : "r"(rs + ((res_bb + 32) ^ xor_val)));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w)
-                    : "r"(rs + ((res_bb + 48) ^ xor_val)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(rs + rsw0));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv1.x),"=r"(rv1.y),"=r"(rv1.z),"=r"(rv1.w) : "r"(rs + rsw1));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w) : "r"(rs + rsw2));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w) : "r"(rs + rsw3));
 
                 TMEM_WAIT();
 
@@ -210,23 +439,21 @@ void epilogue_store(
                     if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
                 }
 
-                /* Transform: acc + bias + residual → BF16 → output SMEM regions 0-1 */
-                const uint32_t srow = srow_base
-                    + ((nc - pnc_s) >> 6) * STAGING_REGION_BYTES;
-                const int byte_base = ((nc - pnc_s) & 63) * 2;
+                /* Output staging — use precomputed swizzle offsets */
+                const uint32_t srow = srow_base + res_ri * STAGING_REGION_BYTES;
 
                 BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                     bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w,
-                    rv0.x,rv0.y,rv0.z,rv0.w, srow + (byte_base ^ xor_val));
+                    rv0.x,rv0.y,rv0.z,rv0.w, srow + rsw0);
                 BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
                     bv2.x,bv2.y,bv2.z,bv2.w,bv3.x,bv3.y,bv3.z,bv3.w,
-                    rv1.x,rv1.y,rv1.z,rv1.w, srow + ((byte_base + 16) ^ xor_val));
+                    rv1.x,rv1.y,rv1.z,rv1.w, srow + rsw1);
                 BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
                     bv4.x,bv4.y,bv4.z,bv4.w,bv5.x,bv5.y,bv5.z,bv5.w,
-                    rv2.x,rv2.y,rv2.z,rv2.w, srow + ((byte_base + 32) ^ xor_val));
+                    rv2.x,rv2.y,rv2.z,rv2.w, srow + rsw2);
                 BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
                     bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w,
-                    rv3.x,rv3.y,rv3.z,rv3.w, srow + ((byte_base + 48) ^ xor_val));
+                    rv3.x,rv3.y,rv3.z,rv3.w, srow + rsw3);
 
 #if PREFETCH_BEFORE_STORE
                 if (nc + 32 < pnc_e) {
@@ -238,20 +465,17 @@ void epilogue_store(
 
                 /* Interleaved TMA stores within 128-col pass (2 output regions) */
 #if !STORE_TIMING
-                if (INTERLEAVE_STRATEGY == 1 && ((nc - pnc_s) & 63) == 32) {
-                    int ri = (nc - pnc_s) >> 6;
+                if (INTERLEAVE_STRATEGY == 1 && half == 1) {
                     __syncwarp();
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     if (lane == 0) {
-                        uint32_t src = staging_saddr + ri * STAGING_REGION_BYTES;
+                        uint32_t src = staging_saddr + res_ri * STAGING_REGION_BYTES;
                         asm volatile(
                             "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
-                            :: "l"(tma_c_desc), "r"(n_start + pnc_s + ri * 64),
+                            :: "l"(tma_c_desc), "r"(n_start + pnc_s + res_ri * 64),
                                "r"(gm_base), "r"(src) : "memory");
                     }
-                } else if (INTERLEAVE_STRATEGY >= 2
-                           && ((nc - pnc_s) & 63) == 32
-                           && (((nc - pnc_s) >> 6) & 1) == 1) {
+                } else if (INTERLEAVE_STRATEGY >= 2 && half == 1 && (res_ri & 1) == 1) {
                     __syncwarp();
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     if (lane == 0) {
@@ -299,6 +523,7 @@ void epilogue_store(
                 }
             }
         }
+#endif  /* TMEM_LOAD_WIDTH == 64 */
 
 #if W0_RES_PREFETCH
         if (res_consumed_mbar_addr && lane == 0)

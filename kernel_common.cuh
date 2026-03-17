@@ -90,6 +90,9 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef NUM_PASSES_PARAM
 #define NUM_PASSES_PARAM 0       // 0=auto (128 cols/pass), 4=4-pass (64 cols/pass), FC2 TMA_RESIDUAL only
 #endif
+#ifndef BIAS_SMEM
+#define BIAS_SMEM 0              // 0=LDG bias per-chunk, 1=load bias to SMEM once per tile (fc2/fc1 only)
+#endif
 
 #if EPILOGUE_LOOP
 #undef PHASE1_UNROLL
@@ -147,17 +150,28 @@ Problem dimensions — N_DIM must be defined before including this header
 #define OFF_MMA_MBAR       (OFF_TMA_MBAR + N_STAGES * 8)
 #define OFF_MAINLOOP_MBAR  (OFF_MMA_MBAR + N_STAGES * 8)
 #define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
+#if BIAS_SMEM
+#define BIAS_SMEM_BYTES    (TN * 4)          /* 256 floats = 1024 bytes */
+#else
+#define BIAS_SMEM_BYTES    0
+#endif
 #if TMA_RESIDUAL
 #define OFF_RES_MBAR       (OFF_EPILOGUE_MBAR + 16)
 #if W0_RES_PREFETCH
 #define OFF_RES_CONSUMED_MBAR  (OFF_RES_MBAR + NUM_EPI_WARPS * 8)
-#define OFF_STAGING        ((OFF_RES_CONSUMED_MBAR + 8 + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
+#define _MBAR_END          (OFF_RES_CONSUMED_MBAR + 8)
 #else
-#define OFF_STAGING        ((OFF_RES_MBAR + NUM_EPI_WARPS * 8 + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
+#define _MBAR_END          (OFF_RES_MBAR + NUM_EPI_WARPS * 8)
 #endif
 #define RES_STAGING_OFFSET (2 * STAGING_REGION_BYTES)   // residual regions start after 2 output regions per warp
 #else
-#define OFF_STAGING        ((OFF_EPILOGUE_MBAR + 16 + 1023) & ~1023)  // 1024-align for SWIZZLE_128B (addr[6:4] ^= addr[9:7])
+#define _MBAR_END          (OFF_EPILOGUE_MBAR + 16)
+#endif
+#if BIAS_SMEM
+#define OFF_BIAS_SMEM      _MBAR_END
+#define OFF_STAGING        ((_MBAR_END + BIAS_SMEM_BYTES + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
+#else
+#define OFF_STAGING        ((_MBAR_END + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
 #endif
 #define STAGING_REGION_ROW_BYTES  128                                               // 64 BF16 cols = 128 bytes (SWIZZLE_128B)
 #define STAGING_REGION_BYTES      (32 * STAGING_REGION_ROW_BYTES)                   // 4096 bytes per region (32 rows x 128B)

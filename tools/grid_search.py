@@ -61,6 +61,7 @@ DEFAULTS = {
     'STS_WIDTH': 16,
     'EPI_SYNC': 0,
     'NUM_PASSES_PARAM': 0,
+    'BIAS_SMEM': 0,
 }
 
 # ── Parameter ranges ──
@@ -89,6 +90,7 @@ RANGES = {
     'STS_WIDTH': [16, 32],
     'EPI_SYNC': [0, 1],
     'NUM_PASSES_PARAM': [0, 4],
+    'BIAS_SMEM': [0, 1],
 }
 
 # ── Tier definitions (generic, used by --tier 1/2/3/4/5) ──
@@ -116,7 +118,7 @@ KERNEL_TIERS = {
     },
     'fc2': {
         1: ['N_STAGES', 'K_LOOP_UNROLL', 'TMA_RESIDUAL', 'W0_RES_PREFETCH'],
-        2: ['INTERLEAVE_STRATEGY', 'PHASE1_UNROLL'],
+        2: ['INTERLEAVE_STRATEGY', 'PHASE1_UNROLL', 'BIAS_SMEM', 'TMEM_LOAD_WIDTH'],
         3: ['BATCH_EPILOGUE', 'STORE_TIMING', 'STS_WIDTH', 'PRELOAD_MODE'],
         4: ['EPILOGUE_LOOP', 'EPI_SYNC', 'NUM_PASSES_PARAM'],
     },
@@ -178,11 +180,11 @@ INTERACTIONS = {
         'kernels': ['fc1_gelu'],
     },
     'residual': {
-        'params': ['TMA_RESIDUAL', 'PRELOAD_MODE', 'INTERLEAVE_STRATEGY'],
+        'params': ['TMA_RESIDUAL', 'PRELOAD_MODE', 'INTERLEAVE_STRATEGY', 'BIAS_SMEM'],
         'kernels': ['fc2'],
     },
     'reg_pressure': {
-        'params': ['TMEM_LOAD_WIDTH', 'BATCH_EPILOGUE'],
+        'params': ['TMEM_LOAD_WIDTH', 'BATCH_EPILOGUE', 'BIAS_SMEM'],
         'kernels': ['fc1_gelu', 'fc2'],
     },
     'unroll_batch': {
@@ -266,11 +268,13 @@ def is_valid(cfg, kernel='patch_embed'):
         off_res_mbar = off_epilogue_mbar + 16
         if w0_res_pf:
             off_res_consumed_mbar = off_res_mbar + num_epi * 8
-            off_staging = (off_res_consumed_mbar + 8 + 1023) & ~1023
+            mbar_end = off_res_consumed_mbar + 8
         else:
-            off_staging = (off_res_mbar + num_epi * 8 + 1023) & ~1023
+            mbar_end = off_res_mbar + num_epi * 8
     else:
-        off_staging = (off_epilogue_mbar + 16 + 1023) & ~1023
+        mbar_end = off_epilogue_mbar + 16
+    bias_smem_bytes = 256 * 4 if cfg.get('BIAS_SMEM', 0) else 0
+    off_staging = (mbar_end + bias_smem_bytes + 1023) & ~1023
     staging_warp_bytes = 4 * 32 * 128  # 16384
     smem_total = (off_staging + num_epi * staging_warp_bytes + 127) & ~127
     if smem_total > SMEM_LIMIT:
@@ -360,6 +364,10 @@ def is_valid(cfg, kernel='patch_embed'):
         if cfg.get('TMA_RESIDUAL', 0) == 0:
             return False, 'NUM_PASSES_PARAM requires TMA_RESIDUAL>0'
 
+    # BIAS_SMEM only meaningful for fc1_gelu and fc2 (BIAS_ADD has combined table, not bias vector)
+    if cfg.get('BIAS_SMEM', 0) != 0 and kernel == 'patch_embed':
+        return False, 'BIAS_SMEM only for fc1_gelu/fc2'
+
     return True, 'ok'
 
 
@@ -379,11 +387,13 @@ def smem_kb(cfg):
         off_res_mbar = off_epilogue_mbar + 16
         if w0_res_pf:
             off_res_consumed_mbar = off_res_mbar + num_epi * 8
-            off_staging = (off_res_consumed_mbar + 8 + 1023) & ~1023
+            mbar_end = off_res_consumed_mbar + 8
         else:
-            off_staging = (off_res_mbar + num_epi * 8 + 1023) & ~1023
+            mbar_end = off_res_mbar + num_epi * 8
     else:
-        off_staging = (off_epilogue_mbar + 16 + 1023) & ~1023
+        mbar_end = off_epilogue_mbar + 16
+    bias_smem_bytes = 256 * 4 if cfg.get('BIAS_SMEM', 0) else 0
+    off_staging = (mbar_end + bias_smem_bytes + 1023) & ~1023
     staging_warp_bytes = 4 * 32 * 128
     smem_total = (off_staging + num_epi * staging_warp_bytes + 127) & ~127
     return smem_total / 1024
