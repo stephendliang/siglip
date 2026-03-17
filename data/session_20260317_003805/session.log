@@ -1,0 +1,53 @@
+[00:38:05] ========================================
+[00:38:05]   B200 SESSION 20260317_003805
+[00:38:05]   Output: data/session_20260317_003805
+[00:38:05]   Phase:  0
+[00:38:05] ========================================
+[00:38:05] Preflight OK
+[00:38:05] 
+[00:38:05] ==== PHASE 1/4: MACHINE SNAPSHOT ====
+[00:38:05] Machine info saved to machine_info.txt
+[00:38:05] 
+[00:38:05] ==== PHASE 2/4: BUILD + GRID SEARCH + BENCHMARK ====
+[00:38:05] Grid search: ~60-200 configs/layer (per-kernel tiered + top-lock).
+[00:38:05] CUTLASS skipped (pass --cutlass to enable).
+[00:38:05] Monitor: tail -f data/session_20260317_003805/compare.txt
+[00:38:05] Grid search logs: tail -f data/session_20260317_003805/grid_search_*.log
+[01:01:12] Phase 2 complete
+[01:01:12] 
+[01:01:12] ==== PHASE 3/4: NCU PROFILING ====
+[01:01:12] ncu source counters: patch_embed
+[01:01:14] ncu source counters: fc1-gelu
+[01:01:16] ncu source counters: fc2
+[01:01:18] ncu full profile: patch_embed
+[01:02:10] Phase 3 complete
+[01:02:10] 
+[01:02:10] ==== PHASE 4/4: SASS DUMPS ====
+[01:02:10] SASS dumped: patch_embed (3792 lines)
+[01:02:11] SASS dumped: fc1-gelu (7499 lines)
+[01:02:11] SASS dumped: fc2 (6832 lines)
+[01:02:11] Phase 4 complete
+[01:02:11] 
+[01:02:11] ========================================
+[01:02:11]   SESSION COMPLETE: 1446s (24 min)
+[01:02:11]   Output: data/session_20260317_003805
+[01:02:11] ========================================
+total 32M
+-rw-r--r-- 1 root root   820 Mar 17 01:01 compare.csv
+-rw-r--r-- 1 root root  5.5K Mar 17 01:01 compare.txt
+-rw-r--r-- 1 root root   57K Mar 17 00:46 grid_search_fc1_gelu.log
+-rw-r--r-- 1 root root  189K Mar 17 01:00 grid_search_fc2.log
+-rw-r--r-- 1 root root   24K Mar 17 00:39 grid_search_patch_embed.log
+-rw-r--r-- 1 root root  4.3K Mar 17 00:38 machine_info.txt
+-rw-r--r-- 1 root root 1023K Mar 17 01:02 sass_fc1-gelu.txt
+-rw-r--r-- 1 root root  931K Mar 17 01:02 sass_fc2.txt
+-rw-r--r-- 1 root root  515K Mar 17 01:02 sass_patch_embed.txt
+-rw-r--r-- 1 root root  1.4K Mar 17 01:02 session.log
+-rw-r--r-- 1 root root   29M Mar 17 01:02 siglip_full.ncu-rep
+-rw-r--r-- 1 root root   866 Mar 17 01:01 source_counters_fc1-gelu.csv
+-rw-r--r-- 1 root root   863 Mar 17 01:01 source_counters_fc2.csv
+-rw-r--r-- 1 root root  1.3K Mar 17 01:01 source_counters_patch_embed.csv
+-rw-r--r-- 1 root root   27K Mar 17 00:46 sweep_fc1_gelu.csv
+-rw-r--r-- 1 root root  104K Mar 17 01:00 sweep_fc2.csv
+-rw-r--r-- 1 root root   11K Mar 17 00:39 sweep_patch_embed.csv
+[01:02:11] Autocommitting session data...
