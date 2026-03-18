@@ -174,12 +174,14 @@ void epilogue_store(
             }
 #endif
 
+#if !DEFERRED_WAIT
             if (pass > 0) {
                 if (lane == 0) {
                     asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
                 }
                 __syncwarp();
             }
+#endif
 
             /* x64: load 64 cols at a time, 1 region per iteration */
             TMEM_LOAD_X64(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
@@ -190,6 +192,15 @@ void epilogue_store(
 
             mbar_wait(res_mbar_addr, res_phase);
             res_phase ^= 1;
+
+#if DEFERRED_WAIT
+            if (pass > 0) {
+                if (lane == 0) {
+                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                }
+                __syncwarp();
+            }
+#endif
 
 #if EPILOGUE_LOOP
 #pragma unroll 1
@@ -386,12 +397,14 @@ void epilogue_store(
             }
 #endif
 
+#if !DEFERRED_WAIT
             if (pass > 0) {
                 if (lane == 0) {
                     asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
                 }
                 __syncwarp();
             }
+#endif
 
             LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
@@ -399,6 +412,15 @@ void epilogue_store(
 
             mbar_wait(res_mbar_addr, res_phase);
             res_phase ^= 1;
+
+#if DEFERRED_WAIT
+            if (pass > 0) {
+                if (lane == 0) {
+                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                }
+                __syncwarp();
+            }
+#endif
 
 #if EPILOGUE_LOOP
 #pragma unroll 1
@@ -1380,42 +1402,59 @@ persistent_gemm(
 #if W0_RES_FULL
             if (lane == 0) {
                 if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
-                    /* Wait for prev tile's epilogue to finish reading residual */
+                    /*
+                    Load residual for the PREVIOUS tile — the one the epilogue is
+                    processing concurrently in this iteration. Handshake:
+                      W0 loads pass 0 → epilogue consumes → signals res_pass_mbar →
+                      W0 loads pass 1 → epilogue consumes → signals res_consumed_mbar.
+                    Previous code loaded for the CURRENT tile and deadlocked because
+                    the current tile's epilogue runs in the NEXT iteration.
+                    */
                     if (tile_idx > tile_start) {
-                        mbar_wait(smem_base + OFF_RES_CONSUMED_MBAR, res_consumed_phase);
-                        res_consumed_phase ^= 1;
-                    }
-                    /* Load ALL residual for all epilogue warps, both passes */
-                    for (int pass = 0; pass < 2; pass++) {
-                        if (pass > 0) {
-                            mbar_wait(smem_base + OFF_RES_PASS_MBAR, res_pass_phase);
-                            res_pass_phase ^= 1;
+                        /* Wait for tile before previous to finish reading residual */
+                        if (tile_idx > tile_start + 1) {
+                            mbar_wait(smem_base + OFF_RES_CONSUMED_MBAR, res_consumed_phase);
+                            res_consumed_phase ^= 1;
                         }
-                        for (int ew = 0; ew < NUM_EPI_WARPS; ew++) {
-                            const int gm = m_start + ew * 32;
-                            const uint32_t rmbar = smem_base + OFF_RES_MBAR + ew * 8;
-                            const uint32_t rstg = smem_base + OFF_STAGING
-                                + ew * STAGING_WARP_BYTES + RES_STAGING_OFFSET;
+                        /* Compute previous tile's coordinates */
+                        const int prev_idx = tile_idx - 1;
+                        const int ptm = prev_idx / TILES_N;
+                        int ptn = prev_idx % TILES_N;
+                        if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
+                        const int prev_m = ptm * TM * 2 + cta_rank * TM;
+                        const int prev_n = ptn * TN;
+
+                        for (int pass = 0; pass < 2; pass++) {
+                            if (pass > 0) {
+                                mbar_wait(smem_base + OFF_RES_PASS_MBAR, res_pass_phase);
+                                res_pass_phase ^= 1;
+                            }
+                            for (int ew = 0; ew < NUM_EPI_WARPS; ew++) {
+                                const int gm = prev_m + ew * 32;
+                                const uint32_t rmbar = smem_base + OFF_RES_MBAR + ew * 8;
+                                const uint32_t rstg = smem_base + OFF_STAGING
+                                    + ew * STAGING_WARP_BYTES + RES_STAGING_OFFSET;
 #if NUM_PASSES_PARAM == 4
-                            asm volatile(
-                                "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;\n\t"
-                                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
-                                " [%2], [%3, {%4, %5}], [%0];"
-                                :: "r"(rmbar), "r"(STAGING_REGION_BYTES),
-                                   "r"(rstg), "l"(&tma_res), "r"(n_start + pass * 64), "r"(gm)
-                                : "memory");
+                                asm volatile(
+                                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;\n\t"
+                                    "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                                    " [%2], [%3, {%4, %5}], [%0];"
+                                    :: "r"(rmbar), "r"(STAGING_REGION_BYTES),
+                                       "r"(rstg), "l"(&tma_res), "r"(prev_n + pass * 64), "r"(gm)
+                                    : "memory");
 #else
-                            asm volatile(
-                                "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;\n\t"
-                                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
-                                " [%2], [%3, {%4, %5}], [%0];\n\t"
-                                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
-                                " [%6], [%3, {%7, %5}], [%0];"
-                                :: "r"(rmbar), "r"(2 * STAGING_REGION_BYTES),
-                                   "r"(rstg), "l"(&tma_res), "r"(n_start + pass * 128), "r"(gm),
-                                   "r"(rstg + STAGING_REGION_BYTES), "r"(n_start + pass * 128 + 64)
-                                : "memory");
+                                asm volatile(
+                                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;\n\t"
+                                    "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                                    " [%2], [%3, {%4, %5}], [%0];\n\t"
+                                    "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                                    " [%6], [%3, {%7, %5}], [%0];"
+                                    :: "r"(rmbar), "r"(2 * STAGING_REGION_BYTES),
+                                       "r"(rstg), "l"(&tma_res), "r"(prev_n + pass * 128), "r"(gm),
+                                       "r"(rstg + STAGING_REGION_BYTES), "r"(prev_n + pass * 128 + 64)
+                                    : "memory");
 #endif
+                            }
                         }
                     }
                 }
@@ -1704,6 +1743,60 @@ persistent_gemm(
         out[3] = epi_sum_ml;
         out[4] = epi_min_ml;
         out[5] = epi_max_ml;
+    }
+#endif
+
+#if W0_RES_FULL
+    /*
+    W0 drain: load residual for the last tile. Runs concurrently with
+    the drain epilogue (W2+). Same pass handshake as the tile loop.
+    */
+    if (warp == 0 && tile_end > tile_start && lane == 0) {
+        if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+            const uint32_t smem_base = smem_to_uint(smem);
+            /* Wait for previous tile's epilogue to finish with residual */
+            if (tile_end - tile_start > 1) {
+                mbar_wait(smem_base + OFF_RES_CONSUMED_MBAR, res_consumed_phase);
+            }
+            const int last_idx = tile_end - 1;
+            const int ltm = last_idx / TILES_N;
+            int ltn = last_idx % TILES_N;
+            if (SNAKE_ORDER && (ltm & 1)) ltn = TILES_N - 1 - ltn;
+            const int drain_m = ltm * TM * 2 + cta_rank * TM;
+            const int drain_n = ltn * TN;
+
+            for (int pass = 0; pass < 2; pass++) {
+                if (pass > 0) {
+                    mbar_wait(smem_base + OFF_RES_PASS_MBAR, res_pass_phase);
+                }
+                for (int ew = 0; ew < NUM_EPI_WARPS; ew++) {
+                    const int gm = drain_m + ew * 32;
+                    const uint32_t rmbar = smem_base + OFF_RES_MBAR + ew * 8;
+                    const uint32_t rstg = smem_base + OFF_STAGING
+                        + ew * STAGING_WARP_BYTES + RES_STAGING_OFFSET;
+#if NUM_PASSES_PARAM == 4
+                    asm volatile(
+                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;\n\t"
+                        "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                        " [%2], [%3, {%4, %5}], [%0];"
+                        :: "r"(rmbar), "r"(STAGING_REGION_BYTES),
+                           "r"(rstg), "l"(&tma_res), "r"(drain_n + pass * 64), "r"(gm)
+                        : "memory");
+#else
+                    asm volatile(
+                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;\n\t"
+                        "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                        " [%2], [%3, {%4, %5}], [%0];\n\t"
+                        "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                        " [%6], [%3, {%7, %5}], [%0];"
+                        :: "r"(rmbar), "r"(2 * STAGING_REGION_BYTES),
+                           "r"(rstg), "l"(&tma_res), "r"(drain_n + pass * 128), "r"(gm),
+                           "r"(rstg + STAGING_REGION_BYTES), "r"(drain_n + pass * 128 + 64)
+                        : "memory");
+#endif
+                }
+            }
+        }
     }
 #endif
 

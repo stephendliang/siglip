@@ -11,7 +11,7 @@ Three fused GEMM kernels for the vision encoder MLP:
 |--------|-------|----------|---------|--------|------|------------------|
 | **patch_embed** | [928256,768]×[768,768]^T | bias + pos_embed | 0.525 | 2085 | 174-214 | **2% faster** (0.536) |
 | **fc1_gelu** | [928256,768]×[768,3072]^T | bias + GELU | 2.267 | 1932 | 244 | **3% faster** (2.323) |
-| **fc2** | [928256,3072]×[3072,768]^T | bias + residual | 1.471 | 2977 | 255 | **20% slower** (1.224) |
+| **fc2** | [928256,3072]×[3072,768]^T | bias + residual | 1.466 | 2988 | 184-217 | **20% slower** (1.225) |
 
 Batch = 4736 images × 196 patches = 928256 rows. BF16 output, FP8 inputs.
 
@@ -19,7 +19,7 @@ The kernels' value is **fusion**: overlapped epilogues eliminate unfused overhea
 
 **PE is exhausted** — 145 balanced configs all within 0.001ms. No parameter moves the needle.
 **FC1** — won via interaction sweeps finding GV=4+IS=0+PH1U=4. Prior best 2.247ms (IS=1+ST=1).
-**FC2** — biggest opportunity. 20% gap to CUTLASS. New restructured tiers (IS/PH1U now swept, N_STAGES=4 preserved via BRANCH_PARAMS) haven't been tested yet.
+**FC2** — biggest opportunity. 20% gap to CUTLASS. W0 restructured (all threads compute addrs, lane 0 issues TMA), `W0_RES_FULL` added, `DEFERRED_WAIT` added. New params untested on B200.
 
 ## Grid search
 
@@ -38,15 +38,15 @@ The primary optimization tool. Per-kernel tiered parameter sweep with top-lock a
 Based on balanced-η² from session_20260315. Params not in any tier are pinned at `KERNEL_BASES` values.
 
 **FC1** (K=768, N=3072, 12 N-tiles):
-- Tier 1: `GELU_VARIANT`, `STORE_TIMING`, `INTERLEAVE_STRATEGY` — IS is dominant (η²=0.533)
-- Tier 2: `PHASE1_UNROLL`, `PRELOAD_MODE`, `BATCH_EPILOGUE` — PH1U=4 is critical (η²=0.842)
+- Tier 1: `GELU_VARIANT`, `INTERLEAVE_STRATEGY` — IS is dominant (η²=0.533)
+- Tier 2: `PHASE1_UNROLL`, `STORE_TIMING`, `PRELOAD_MODE`, `BATCH_EPILOGUE` — PH1U=4 is critical (η²=0.842)
 - Tier 3: `EPILOGUE_LOOP`, `STS_WIDTH`, `EPI_SYNC`, `GELU_VECTOR_WIDTH`
 - Pinned: N_STAGES=5 (mandatory, 23% slower at 4), KLU=5, SMU=3
 
 **FC2** (K=3072, N=768, 3 N-tiles, 24 K-iterations):
-- Tier 1: `N_STAGES`, `K_LOOP_UNROLL`, `TMA_RESIDUAL` — TMAR=1 is key (η²=0.435)
-- Tier 2: `INTERLEAVE_STRATEGY`, `PHASE1_UNROLL` — untested with TMAR=1 baseline
-- Tier 3: `BATCH_EPILOGUE`, `STORE_TIMING`, `STS_WIDTH`, `PRELOAD_MODE`
+- Tier 1: `N_STAGES`, `K_LOOP_UNROLL`, `TMA_RESIDUAL`, `W0_RES_PREFETCH`, `W0_RES_FULL` — TMAR=1 is key (η²=0.435)
+- Tier 2: `INTERLEAVE_STRATEGY`, `PHASE1_UNROLL`, `BIAS_SMEM`, `TMEM_LOAD_WIDTH`
+- Tier 3: `BATCH_EPILOGUE`, `STORE_TIMING`, `STS_WIDTH`, `PRELOAD_MODE`, `DEFERRED_WAIT`
 - Tier 4: `EPILOGUE_LOOP`, `EPI_SYNC`, `NUM_PASSES_PARAM`
 - N_STAGES is a `BRANCH_PARAM` — both 4 and 5 always survive dynamic-k
 
@@ -56,7 +56,7 @@ Based on balanced-η² from session_20260315. Params not in any tier are pinned 
 
 - **SNAKE_ORDER=1**: Mandatory (pinned). SNAKE=0 is catastrophic (+49μs PE, never wins anywhere).
 - **FC1 breakthrough**: GV=4+IS=0+PH1U=4 found via interaction sweeps, not tier search. IS=3 won tier 1 but IS=0 was the real winner.
-- **FC2 constraint**: 255 regs at N_STAGES=5 — allocator ceiling. N_STAGES=4 frees 1 reg (254) but was 8.5% slower without TMAR=1. Untested with full param sweep.
+- **FC2 regs**: 184-217 depending on config (down from 255 after W0 restructure). No longer at allocator ceiling.
 - **Top-lock vs η²**: η² catches params that create spread. Top-lock catches params required for peak. Complementary — η² says what to avoid, top-lock says what to pin.
 - **Tiered data is confounded**: Raw η², RF, Pearson/Spearman all give wrong rankings. Only balanced-subset η² works.
 
@@ -64,7 +64,7 @@ Based on balanced-η² from session_20260315. Params not in any tier are pinned 
 
 Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1)`:
 
-- **W0**: TMA async bulk loads (A + B tiles, both CTAs load independently)
+- **W0**: TMA async bulk loads (A + B tiles, all threads compute addrs, lane 0 issues TMA). FC2: optionally prefetches (`W0_RES_PREFETCH`) or fully loads (`W0_RES_FULL`) residual via TMA after K-loop.
 - **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
 - **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols through 4 SWIZZLE_128B regions: x32 `tcgen05.ld` → epilogue op → CVT → `st.shared`, with **interleaved TMA stores** hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1.
 
@@ -111,7 +111,10 @@ Key params (controlled via `-D` flags, swept by grid_search.py):
 | `INTERLEAVE_STRATEGY` | 0,1,2,3 | TMA store interleaving. IS=0 wins FC1, IS=2 wins PE. |
 | `GELU_VARIANT` | 0,4,5 | FC1 only. V4 (batched asm) is best. |
 | `TMA_RESIDUAL` | 0,1,2 | FC2 only. TMAR=1 (TMA coalesced) is key. |
-| `W0_RES_PREFETCH` | 0,1 | FC2 only. W0 prefetches residual after K-loop. Requires TMA_RESIDUAL≥1. |
+| `W0_RES_PREFETCH` | 0,1 | FC2 only. W0 prefetches pass-0 residual after K-loop. Requires TMA_RESIDUAL≥1. |
+| `W0_RES_FULL` | 0,1 | FC2 only. W0 loads ALL residual (both passes) with pass handshake. Requires TMA_RESIDUAL≥1, mutually exclusive with W0_RES_PREFETCH. |
+| `DEFERRED_WAIT` | 0,1 | FC2 only. Defers `wait_group 0` until after TMEM load + residual mbar_wait. Requires TMA_RESIDUAL≥1. |
+| `BIAS_SMEM` | 0,1 | FC1/FC2 only. Load bias vector into SMEM (vs global `__ldg`). |
 | `STORE_TIMING` | 0,1 | 0=inline stores, 1=all deferred after Phase 1. |
 | `BATCH_EPILOGUE` | 0,1 | 1=separate compute/store phases (FC1/FC2 only). |
 
@@ -216,4 +219,4 @@ python3 tools/sass_analysis.py --cubin patch_embed --deps       # SASS dependenc
 - Validation: non-uniform B, non-uniform bias/pos_embed, 1024 strided checksum + 32 CPU reference spot checks
 - **OFF_STAGING must be 1024-byte aligned** for SWIZZLE_128B correctness
 - **`fence.proxy.async.shared::cta` required** before every TMA store that reads from SMEM written by `st.shared`
-- FC2 at 255 regs — allocator ceiling. Any change that adds regs is dead on arrival.
+- FC2 regs: 184-217 depending on config (down from 255 after W0 restructure + `cta_rank` uniformity fix).

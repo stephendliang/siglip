@@ -78,6 +78,9 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef TMA_RESIDUAL
 #define TMA_RESIDUAL 0           // 0=__ldg residual (default), 1=TMA residual via SMEM staging, 2=TMA preloaded before mainloop wait
 #endif
+#ifndef DEFERRED_WAIT
+#define DEFERRED_WAIT 0          // 0=wait_group before TMEM load (default), 1=wait_group after TMEM load + residual mbar_wait
+#endif
 #ifndef BATCH_EPILOGUE
 #define BATCH_EPILOGUE 0         // 0=fused compute+CVT+STS per 8 elems, 1=compute all 32 then batch CVT+STS
 #endif

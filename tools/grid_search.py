@@ -93,6 +93,7 @@ RANGES = {
     'EPI_SYNC': [0, 1],
     'NUM_PASSES_PARAM': [0, 4],
     'BIAS_SMEM': [0, 1],
+    'DEFERRED_WAIT': [0, 1],
 }
 
 # ── Tier definitions (generic, used by --tier 1/2/3/4/5) ──
@@ -121,7 +122,7 @@ KERNEL_TIERS = {
     'fc2': {
         1: ['N_STAGES', 'K_LOOP_UNROLL', 'TMA_RESIDUAL', 'W0_RES_PREFETCH', 'W0_RES_FULL'],
         2: ['INTERLEAVE_STRATEGY', 'PHASE1_UNROLL', 'BIAS_SMEM', 'TMEM_LOAD_WIDTH'],
-        3: ['BATCH_EPILOGUE', 'STORE_TIMING', 'STS_WIDTH', 'PRELOAD_MODE'],
+        3: ['BATCH_EPILOGUE', 'STORE_TIMING', 'STS_WIDTH', 'PRELOAD_MODE', 'DEFERRED_WAIT'],
         4: ['EPILOGUE_LOOP', 'EPI_SYNC', 'NUM_PASSES_PARAM'],
     },
     'patch_embed': {
@@ -154,6 +155,7 @@ KERNEL_BASES = {
         'W0_LOOP_UNROLL': 0, 'SUB_MMA_UNROLL': 0,
         'PREFETCH_BEFORE_STORE': 0, 'TMEM_LOAD_WIDTH': 32,
         'CVT_ADD_FUSED': 1, 'NUM_EPI_WARPS': 4,
+        'DEFERRED_WAIT': 0,
     },
     'patch_embed': {
         'MBAR_EARLY': 1, 'STAGGER_CYCLES': 160,
@@ -182,7 +184,7 @@ INTERACTIONS = {
         'kernels': ['fc1_gelu'],
     },
     'residual': {
-        'params': ['TMA_RESIDUAL', 'PRELOAD_MODE', 'INTERLEAVE_STRATEGY', 'BIAS_SMEM'],
+        'params': ['TMA_RESIDUAL', 'PRELOAD_MODE', 'INTERLEAVE_STRATEGY', 'BIAS_SMEM', 'DEFERRED_WAIT'],
         'kernels': ['fc2'],
     },
     'reg_pressure': {
@@ -379,6 +381,13 @@ def is_valid(cfg, kernel='patch_embed'):
             return False, 'NUM_PASSES_PARAM only for fc2'
         if cfg.get('TMA_RESIDUAL', 0) == 0:
             return False, 'NUM_PASSES_PARAM requires TMA_RESIDUAL>0'
+
+    # DEFERRED_WAIT only for fc2, requires TMA_RESIDUAL>=1
+    if cfg.get('DEFERRED_WAIT', 0) == 1:
+        if kernel != 'fc2':
+            return False, 'DEFERRED_WAIT only for fc2'
+        if cfg.get('TMA_RESIDUAL', 0) < 1:
+            return False, 'DEFERRED_WAIT requires TMA_RESIDUAL>=1'
 
     # BIAS_SMEM only meaningful for fc1_gelu and fc2 (BIAS_ADD has combined table, not bias vector)
     if cfg.get('BIAS_SMEM', 0) != 0 and kernel == 'patch_embed':
