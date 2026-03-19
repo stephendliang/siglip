@@ -470,6 +470,8 @@ def is_valid(cfg, kernel='patch_embed'):
             return False, 'SINGLE_PRODUCER_RES incompatible with DIRECT_STG'
         if cfg.get('W0_RES_PREFETCH', 0) or cfg.get('W0_RES_FULL', 0):
             return False, 'SINGLE_PRODUCER_RES mutually exclusive with W0_RES_PREFETCH/W0_RES_FULL'
+        if six_warp:
+            return False, 'SINGLE_PRODUCER_RES incompatible with SIX_WARP_EPI'
 
     # FOLDED_RESIDUAL constraints
     fold_res = cfg.get('FOLDED_RESIDUAL', 0)

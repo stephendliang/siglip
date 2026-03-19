@@ -139,6 +139,9 @@ Usage: #define N_DIM and K_DIM before including this header.
 #if SINGLE_PRODUCER_RES && (W0_RES_PREFETCH || W0_RES_FULL)
 #error "SINGLE_PRODUCER_RES mutually exclusive with W0_RES_PREFETCH/W0_RES_FULL"
 #endif
+#if SINGLE_PRODUCER_RES && SIX_WARP_EPI
+#error "SINGLE_PRODUCER_RES incompatible with SIX_WARP_EPI (split-column warps need different residual columns)"
+#endif
 #if SINGLE_PRODUCER_RES && FOLDED_RESIDUAL
 #error "SINGLE_PRODUCER_RES and FOLDED_RESIDUAL are mutually exclusive"
 #endif
