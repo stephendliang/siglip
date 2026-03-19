@@ -108,6 +108,31 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef BIAS_BF16
 #define BIAS_BF16 0              // 0=FP32 bias, 1=BF16 bias with bf16x2 epilogue arithmetic (fc2 only)
 #endif
+#ifndef NON_OVERLAPPED
+#define NON_OVERLAPPED 0         // 0=overlapped epilogue (default), 1=barrier-separated K-loop + epilogue
+#endif
+#ifndef SIX_WARP_EPI
+#define SIX_WARP_EPI 0           // 0=W2+ epilogue (default), 1=all 6 warps do epilogue (requires NON_OVERLAPPED)
+#endif
+#ifndef DIRECT_STG
+#define DIRECT_STG 0             // 0=SMEM-staged TMA stores (default), 1=direct STG stores (no staging SMEM)
+#endif
+#ifndef SINGLE_PRODUCER_RES
+#define SINGLE_PRODUCER_RES 0    // 0=per-warp residual loads (default), 1=single producer loads all residual
+#endif
+#ifndef FOLDED_RESIDUAL
+#define FOLDED_RESIDUAL 0        // 0=separate residual (default), 1=fold residual into pipeline stages
+#endif
+
+#if SIX_WARP_EPI && !NON_OVERLAPPED
+#error "SIX_WARP_EPI requires NON_OVERLAPPED"
+#endif
+#if SINGLE_PRODUCER_RES && FOLDED_RESIDUAL
+#error "SINGLE_PRODUCER_RES and FOLDED_RESIDUAL are mutually exclusive"
+#endif
+#if FOLDED_RESIDUAL && !DIRECT_STG && N_STAGES > 3
+#error "FOLDED_RESIDUAL without DIRECT_STG requires N_STAGES <= 3 (SMEM budget)"
+#endif
 
 #if EPILOGUE_LOOP
 #undef PHASE1_UNROLL
@@ -198,8 +223,17 @@ Problem dimensions — N_DIM must be defined before including this header
 #endif
 #define STAGING_REGION_ROW_BYTES  128                                               // 64 BF16 cols = 128 bytes (SWIZZLE_128B)
 #define STAGING_REGION_BYTES      (32 * STAGING_REGION_ROW_BYTES)                   // 4096 bytes per region (32 rows x 128B)
+#if DIRECT_STG
+#define STAGING_WARP_BYTES        0
+#else
 #define STAGING_WARP_BYTES        (4 * STAGING_REGION_BYTES)                         // 16384 bytes per warp (4 regions x 4096)
-#define SMEM_BYTES                ((OFF_STAGING + NUM_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
+#endif
+#if SIX_WARP_EPI
+#define STAGING_EPI_WARPS         6
+#else
+#define STAGING_EPI_WARPS         NUM_EPI_WARPS
+#endif
+#define SMEM_BYTES                ((OFF_STAGING + STAGING_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
 
 // WGMMA / TMEM constants
 #define TMEM_COLS      512

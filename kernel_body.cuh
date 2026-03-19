@@ -110,6 +110,135 @@ void epilogue_store(
 
     constexpr int N_REGIONS = (NC_END - NC_START) / 64;
 
+#if DIRECT_STG
+    /*
+    DIRECT_STG path: TMEM → registers → compute → st.global.v4.b32 to HBM.
+    No SMEM staging, no TMA stores, no fence.proxy.async.
+    Residual loaded via __ldg (not TMA). Bias via __ldg or BIAS_SMEM.
+    Trade: each thread writes a different row → 32 cache lines per warp (scattered).
+    Hypothesis: eliminating STS (32 cyc each) + TMA store overhead compensates.
+    */
+    if constexpr (Op == EpilogueOp::BIAS_RESIDUAL && (NC_END - NC_START) >= 256) {
+        __nv_bfloat16* row_out = C + (long long)(gm_base + lane) * N_DIM + n_start;
+
+#if BIAS_SMEM
+        extern __shared__ __align__(128) char smem_stg[];
+#if BIAS_BF16
+        reinterpret_cast<uint4*>(smem_stg + OFF_BIAS_SMEM)[lane] =
+            __ldg(reinterpret_cast<const uint4*>(side_data + n_start) + lane);
+#else
+        {
+            float* bias_smem = reinterpret_cast<float*>(smem_stg + OFF_BIAS_SMEM);
+            const float* bias_src = side_data + n_start;
+            reinterpret_cast<float4*>(bias_smem)[lane * 2]     = __ldg(reinterpret_cast<const float4*>(bias_src) + lane * 2);
+            reinterpret_cast<float4*>(bias_smem)[lane * 2 + 1] = __ldg(reinterpret_cast<const float4*>(bias_src) + lane * 2 + 1);
+        }
+#endif
+        __syncwarp();
+        const uint32_t bias_smem_base = smem_to_uint(smem_stg + OFF_BIAS_SMEM);
+#endif
+
+        float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
+        float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
+
+        constexpr int TOTAL_REGIONS = (NC_END - NC_START) / 64;
+        PRAGMA_UNROLL(PHASE1_UNROLL)
+        for (int ri = 0; ri < TOTAL_REGIONS; ri++) {
+            const int nc = NC_START + ri * 64;
+
+            /* TMEM load x32: first 32-col half */
+            TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                          taddr_base + nc);
+
+#if BIAS_BF16 && BIAS_SMEM
+            const uint32_t bs = bias_smem_base + nc * 2;
+            uint4 bv0, bv1, bv2, bv3;
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv0.x),"=r"(bv0.y),"=r"(bv0.z),"=r"(bv0.w) : "r"(bs));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv1.x),"=r"(bv1.y),"=r"(bv1.z),"=r"(bv1.w) : "r"(bs + 16));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv2.x),"=r"(bv2.y),"=r"(bv2.z),"=r"(bv2.w) : "r"(bs + 32));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
+#elif BIAS_BF16
+            const uint4* bp = reinterpret_cast<const uint4*>(side_data + n_start + nc);
+            uint4 bv0 = __ldg(bp);     uint4 bv1 = __ldg(bp + 1);
+            uint4 bv2 = __ldg(bp + 2); uint4 bv3 = __ldg(bp + 3);
+#else
+#error "DIRECT_STG currently requires BIAS_BF16=1"
+#endif
+
+            /* Residual for cols 0-31 via __ldg (per-lane, scattered but L2 cached) */
+            uint4 rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
+            uint4 rv1 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 8));
+            uint4 rv2 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 16));
+            uint4 rv3 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 24));
+
+            TMEM_WAIT();
+
+            /* 4× CVT + bias + residual + STG — first 32-col half */
+            BIAS_RES_CVT_STG_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                bv0.x,bv0.y,bv0.z,bv0.w,
+                rv0.x,rv0.y,rv0.z,rv0.w, row_out + nc + 0);
+            BIAS_RES_CVT_STG_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                bv1.x,bv1.y,bv1.z,bv1.w,
+                rv1.x,rv1.y,rv1.z,rv1.w, row_out + nc + 8);
+            BIAS_RES_CVT_STG_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                bv2.x,bv2.y,bv2.z,bv2.w,
+                rv2.x,rv2.y,rv2.z,rv2.w, row_out + nc + 16);
+            BIAS_RES_CVT_STG_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                bv3.x,bv3.y,bv3.z,bv3.w,
+                rv3.x,rv3.y,rv3.z,rv3.w, row_out + nc + 24);
+
+            /* TMEM load x32: second 32-col half */
+            TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                          taddr_base + nc + 32);
+
+#if BIAS_BF16 && BIAS_SMEM
+            uint4 bv4, bv5, bv6, bv7;
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv4.x),"=r"(bv4.y),"=r"(bv4.z),"=r"(bv4.w) : "r"(bs + 64));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv5.x),"=r"(bv5.y),"=r"(bv5.z),"=r"(bv5.w) : "r"(bs + 80));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv6.x),"=r"(bv6.y),"=r"(bv6.z),"=r"(bv6.w) : "r"(bs + 96));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv7.x),"=r"(bv7.y),"=r"(bv7.z),"=r"(bv7.w) : "r"(bs + 112));
+#elif BIAS_BF16
+            uint4 bv4 = __ldg(bp + 4); uint4 bv5 = __ldg(bp + 5);
+            uint4 bv6 = __ldg(bp + 6); uint4 bv7 = __ldg(bp + 7);
+#endif
+
+            /* Residual for cols 32-63 */
+            uint4 rv4 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 32));
+            uint4 rv5 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 40));
+            uint4 rv6 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 48));
+            uint4 rv7 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 56));
+
+            TMEM_WAIT();
+
+            if (MBAR_EARLY && ri == TOTAL_REGIONS - 1) {
+                if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
+            }
+
+            /* 4× CVT + bias + residual + STG — second 32-col half */
+            BIAS_RES_CVT_STG_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                bv4.x,bv4.y,bv4.z,bv4.w,
+                rv4.x,rv4.y,rv4.z,rv4.w, row_out + nc + 32);
+            BIAS_RES_CVT_STG_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                bv5.x,bv5.y,bv5.z,bv5.w,
+                rv5.x,rv5.y,rv5.z,rv5.w, row_out + nc + 40);
+            BIAS_RES_CVT_STG_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                bv6.x,bv6.y,bv6.z,bv6.w,
+                rv6.x,rv6.y,rv6.z,rv6.w, row_out + nc + 48);
+            BIAS_RES_CVT_STG_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                bv7.x,bv7.y,bv7.z,bv7.w,
+                rv7.x,rv7.y,rv7.z,rv7.w, row_out + nc + 56);
+        }
+
+        if (!MBAR_EARLY && epi_mbar_addr) mbar_arrive(epi_mbar_addr);
+#ifdef TIMING
+        t_phase1_end = clock64();
+#endif
+        return;
+    }
+#endif /* DIRECT_STG */
+
     // Wait for previous tile's Phase 2 TMA stores before overwriting staging.
     if (lane == 0) {
         asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
@@ -1434,18 +1563,26 @@ persistent_gemm(
             mbar_init(smem_to_uint(smem + OFF_TMA_MBAR + s * 8), 2);
             mbar_init(smem_to_uint(smem + OFF_MMA_MBAR + s * 8), 1);
         }
+#if !NON_OVERLAPPED
         for (int i = 0; i < 2; i++) {
             mbar_init(smem_to_uint(smem + OFF_MAINLOOP_MBAR + i * 8), 1);
             mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR + i * 8), NUM_EPI_WARPS * 2 * 32);
         }
+#endif
 #if TMA_RESIDUAL
+#if SIX_WARP_EPI
+        for (int w = 0; w < 6; w++)
+#else
         for (int w = 0; w < NUM_EPI_WARPS; w++)
+#endif
             mbar_init(smem_to_uint(smem + OFF_RES_MBAR + w * 8), 1);
+#if !NON_OVERLAPPED
 #if W0_RES_FULL
         mbar_init(smem_to_uint(smem + OFF_RES_CONSUMED_MBAR), NUM_EPI_WARPS);
         mbar_init(smem_to_uint(smem + OFF_RES_PASS_MBAR), NUM_EPI_WARPS);
 #elif W0_RES_PREFETCH
         mbar_init(smem_to_uint(smem + OFF_RES_CONSUMED_MBAR), NUM_EPI_WARPS);
+#endif
 #endif
 #endif
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -1482,6 +1619,7 @@ persistent_gemm(
         desc_b_base[s] = make_smem_desc(smem_b[s]);
     }
 
+#if !NON_OVERLAPPED
     const int start_buf = tile_start & 1;
     int epi_phase[2] = {1, 1};
     int ml_phase[2]  = {start_buf, 1 - start_buf};
@@ -1490,6 +1628,7 @@ persistent_gemm(
     int res_pass_phase = 0;
 #elif W0_RES_PREFETCH
     int res_consumed_phase = 0;
+#endif
 #endif
 
 #ifdef TIMING
@@ -1509,6 +1648,143 @@ persistent_gemm(
 #endif
 
     for (int tile_idx = tile_start; tile_idx < tile_end; tile_idx++) {
+#if NON_OVERLAPPED
+        /* --- NON-OVERLAPPED TILE LOOP ---
+           Phase 1: W0 loads + W1 computes (W2+ idle)
+           bar.sync 2: all warps rendezvous
+           Phase 2: epilogue on CURRENT tile (W2+, or all 6 if SIX_WARP_EPI)
+           bar.sync 2: wait for epilogue + TMA drain before next tile
+        */
+        const int buf = 0;    /* no double-buffering — single TMEM buffer */
+        const int tm = tile_idx / TILES_N;
+        int tn = tile_idx % TILES_N;
+        if (SNAKE_ORDER && (tm & 1)) tn = TILES_N - 1 - tn;
+        const int m_start = tm * TM * 2 + cta_rank * TM;
+        const int n_start = tn * TN;
+
+        /* Phase 1: K-loop (W0 loads, W1 computes, W2+ idle) */
+        if (warp == 0) {
+            const uint32_t smem_base = warp_uniform(smem_to_uint(smem));
+            MAYBE_UNROLL_W0
+            for (int ki = 0; ki < K_ITERS; ki++) {
+                const int s = ki % N_STAGES;
+                const int k_start = ki * TK;
+                const uint32_t mma_mbar_s = smem_base + OFF_MMA_MBAR + s * 8;
+                const uint32_t tma_mbar_s = (smem_base + OFF_TMA_MBAR + s * 8) & 0xFEFFFFFF;
+
+                if (tile_idx > tile_start || ki >= N_STAGES) {
+                    mbar_wait(mma_mbar_s, mma_phase[s]);
+                    mma_phase[s] ^= 1;
+                }
+
+                if (lane == 0) {
+                    const uint32_t a_dst = smem_base + s * STAGE_BYTES;
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                        ".mbarrier::complete_tx::bytes.cta_group::2"
+                        " [%0], [%1, {%2, %3}], [%4];\n\t"
+                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                        ".mbarrier::complete_tx::bytes.cta_group::2"
+                        " [%5], [%6, {%2, %7}], [%4];\n\t"
+                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %8;"
+                        :: "r"(a_dst), "l"(&tma_a), "r"(k_start), "r"(m_start),
+                           "r"(tma_mbar_s), "r"(a_dst + 16384), "l"(&tma_b),
+                           "r"(n_start + cta_rank * (TN/2)), "r"(TMA_BYTES)
+                        : "memory");
+                }
+            }
+            /* No W0_RES_FULL/PREFETCH in NON_OVERLAPPED — residual handled by epilogue warps */
+        }
+
+        if (warp == 1) {
+            if (lane == 0 && cta_rank == 0) {
+                mbar_wait(tma_mbar[0], tma_phase[0]);
+                tma_phase[0] ^= 1;
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                /* First MMA: initialize accumulator (pred=false) — TMEM offset 0 */
+                {
+                    uint64_t desc_a = desc_a_base[0], desc_b = desc_b_base[0];
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p;\n\t"
+                        "setp.ne.b32 p, 0, 0;\n\t"
+                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                        "[%0], %1, %2, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t"
+                        "}"
+                        :
+                        : "r"(0), "l"(desc_a), "l"(desc_b), "r"(IDESC),
+                          "r"(0),"r"(0),"r"(0),"r"(0),
+                          "r"(0),"r"(0),"r"(0),"r"(0));
+                    MAYBE_UNROLL_SUB
+                    for (int sub = 1; sub < MMA_PER_KI; sub++) {
+                        desc_a += 2; desc_b += 2;
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .pred p;\n\t"
+                            "setp.ne.b32 p, 1, 0;\n\t"
+                            "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                            "[%0], %1, %2, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t"
+                            "}"
+                            :
+                            : "r"(0), "l"(desc_a), "l"(desc_b), "r"(IDESC),
+                              "r"(0),"r"(0),"r"(0),"r"(0),
+                              "r"(0),"r"(0),"r"(0),"r"(0));
+                    }
+                }
+                tcgen05_commit_mcast(mma_mbar[0], 0x3);
+                PRAGMA_UNROLL(K_LOOP_UNROLL)
+                for (int ki = 1; ki < K_ITERS; ki++) {
+                    K_ITER_ACCUM(ki % N_STAGES);
+                }
+                /* No mainloop_mbar signal — bar.sync below replaces it */
+            }
+        }
+
+        /* Barrier: K-loop complete, TMEM results ready for epilogue */
+        asm volatile("bar.sync 2, %0;" :: "r"(THREADS) : "memory");
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+
+        /* Phase 2: Epilogue on current tile */
+        {
+#if SIX_WARP_EPI
+            const int ew = warp;
+            const int num_epi = 6;
+            if (ew < 6) {
+#else
+            const int ew = warp - 2;
+            const int num_epi = NUM_EPI_WARPS;
+            (void)num_epi;
+            if (warp >= 2) {
+#endif
+                const int row_group = ew % 4;
+                const uint32_t staging_saddr = smem_to_uint(smem + OFF_STAGING + ew * STAGING_WARP_BYTES);
+                const int gm_base = m_start + row_group * 32;
+#ifdef TIMING
+                long long epi_t1_no = 0;
+#endif
+                epilogue_store<0, TN, Op, false>(0, row_group, lane, gm_base, n_start,
+                    side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
+#if TMA_RESIDUAL
+                    , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
+#ifdef TIMING
+                    , epi_t1_no
+#endif
+                );
+#if !DIRECT_STG
+                /* Wait for TMA stores to drain before next tile reuses staging SMEM */
+                if (lane == 0) {
+                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                }
+                __syncwarp();
+#endif
+            }
+        }
+
+        /* Barrier: epilogue complete, safe for next tile */
+        asm volatile("bar.sync 2, %0;" :: "r"(THREADS) : "memory");
+
+#else  /* !NON_OVERLAPPED — original overlapped tile loop */
         const int buf = tile_idx & 1;
         const int tm = tile_idx / TILES_N;
         int tn = tile_idx % TILES_N;
@@ -1865,6 +2141,7 @@ persistent_gemm(
 #endif
             }
         }
+#endif /* NON_OVERLAPPED */
     }  // tile loop
 
 #ifdef TIMING
@@ -1898,6 +2175,7 @@ persistent_gemm(
     }
 #endif
 
+#if !NON_OVERLAPPED
 #if W0_RES_FULL
     /*
     W0 drain: load residual for the last tile. Runs concurrently with
@@ -2066,6 +2344,7 @@ persistent_gemm(
         }
         __syncwarp();
     }
+#endif /* !NON_OVERLAPPED */
 
     // Cluster sync + TMEM dealloc
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");

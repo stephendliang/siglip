@@ -9,7 +9,7 @@ CUTLASS_DIR = third_party/cutlass
 CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUTLASS_FLAGS = -std=c++17 --expt-relaxed-constexpr
 
-.PHONY: all clean timing fc1-gelu fc2 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare
+.PHONY: all clean timing fc1-gelu fc2 fc2-timing cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare
 
 all: $(TARGET)
 
@@ -26,6 +26,9 @@ fc1-gelu: fc1_gelu.cu kernel_common.cuh kernel_body.cuh
 # ── FC2 kernel ──
 fc2: fc2.cu kernel_common.cuh kernel_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
+
+fc2-timing: fc2.cu kernel_common.cuh kernel_body.cuh
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTIMING $< -o $@ $(LDFLAGS)
 
 # ── CUTLASS benchmark (per-tensor FP8, grid search) ──
 cutlass-bench: bench/cutlass_bench.cu bench/siglip_periodic_add.hpp
