@@ -184,8 +184,8 @@ Problem dimensions — N_DIM must be defined before including this header
 #define _MBAR_END          (OFF_EPILOGUE_MBAR + 16)
 #endif
 #if BIAS_SMEM
-#define OFF_BIAS_SMEM      _MBAR_END
-#define OFF_STAGING        ((_MBAR_END + BIAS_SMEM_BYTES + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
+#define OFF_BIAS_SMEM      ((_MBAR_END + 15) & ~15)                       // 16-align for ld.shared.v4.b32
+#define OFF_STAGING        ((OFF_BIAS_SMEM + BIAS_SMEM_BYTES + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
 #else
 #define OFF_STAGING        ((_MBAR_END + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
 #endif

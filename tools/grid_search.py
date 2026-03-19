@@ -381,6 +381,8 @@ def is_valid(cfg, kernel='patch_embed'):
             return False, 'NUM_PASSES_PARAM only for fc2'
         if cfg.get('TMA_RESIDUAL', 0) == 0:
             return False, 'NUM_PASSES_PARAM requires TMA_RESIDUAL>0'
+        if npp == 4 and cfg.get('W0_RES_FULL', 0) == 1:
+            return False, 'W0_RES_FULL hardcodes 2 passes, deadlocks with NUM_PASSES_PARAM=4'
 
     # DEFERRED_WAIT only for fc2, requires TMA_RESIDUAL>=1
     if cfg.get('DEFERRED_WAIT', 0) == 1:
