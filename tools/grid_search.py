@@ -132,6 +132,24 @@ KERNEL_TIERS = {
     },
 }
 
+# Proven-meaningful params per kernel for --cross mode (full cross-product).
+# Tiers 1-2 only — high η² params that interact. Tier 3+ are noise, pinned at KERNEL_BASES.
+KERNEL_CROSS_PARAMS = {
+    'fc1_gelu': [
+        'GELU_VARIANT', 'INTERLEAVE_STRATEGY',                   # tier 1
+        'PHASE1_UNROLL', 'STORE_TIMING', 'PRELOAD_MODE', 'BATCH_EPILOGUE',  # tier 2
+    ],
+    'fc2': [
+        'N_STAGES', 'TMA_RESIDUAL', 'W0_RES_PREFETCH', 'W0_RES_FULL',          # tier 1 (drop KLU — η²<0.01)
+        'INTERLEAVE_STRATEGY', 'PHASE1_UNROLL', 'BIAS_SMEM', 'BATCH_EPILOGUE',  # tier 2
+        'STORE_TIMING', 'DEFERRED_WAIT',                                         # tier 3 (drop PRELOAD_MODE — noise with TMAR=1)
+    ],
+    'patch_embed': [
+        'N_STAGES', 'K_LOOP_UNROLL', 'W0_LOOP_UNROLL',          # tier 1
+        'PHASE1_UNROLL',                                          # tier 2
+    ],
+}
+
 # Structural params: always branch both values, never prune by dynamic-k.
 # These change pipeline depth or fundamental kernel structure — later tiers
 # may interact differently with each value, so both must survive.
@@ -847,6 +865,8 @@ def main():
                       help='Tiered search (1=structure, 2=epilogue, 3=tuning, 4=scheduling, 5=GELU variant, all=sequential)')
     mode.add_argument('--full-cross', action='store_true',
                       help='Full cross-product of all parameters')
+    mode.add_argument('--cross', action='store_true',
+                      help='Full cross-product of proven-meaningful params (KERNEL_CROSS_PARAMS), noise pinned at KERNEL_BASES')
     mode.add_argument('--interact', choices=list(INTERACTIONS.keys()) + ['all'],
                       help='Cross-tier interaction sweep (named group or all)')
     parser.add_argument('--kernel', choices=list(KERNELS.keys()), default='patch_embed',
@@ -867,9 +887,9 @@ def main():
                         help='Output CSV path (default: data/sweep_<kernel>.csv)')
     args = parser.parse_args()
 
-    # Default mode: per-kernel tiered search when no explicit mode given
-    if not args.only and not args.tier and not args.full_cross and not args.interact:
-        args.tier = 'all'
+    # Default mode: --cross when no explicit mode given
+    if not args.only and not args.tier and not args.full_cross and not args.cross and not args.interact:
+        args.cross = True
 
     src_path = os.path.join(ROOT_DIR, KERNELS[args.kernel])
     if args.csv is None:
@@ -927,11 +947,41 @@ def main():
         all_results.extend(results)
         print_eta_summary(results, list(sweep_params.keys()))
 
+    elif args.cross:
+        # Full cross-product of proven-meaningful params, noise pinned at KERNEL_BASES
+        if args.kernel not in KERNEL_CROSS_PARAMS:
+            print(f'Error: no KERNEL_CROSS_PARAMS for {args.kernel}', file=sys.stderr)
+            sys.exit(1)
+        cross_params = KERNEL_CROSS_PARAMS[args.kernel]
+        sweep_params = {p: RANGES[p] for p in cross_params if p not in fixed_overrides}
+        fixed = dict(DEFAULTS)
+        fixed.update(KERNEL_BASES.get(args.kernel, {}))
+        fixed.update(base_overrides)
+        fixed.update(fixed_overrides)
+        for p in sweep_params:
+            fixed.pop(p, None)
+
+        n_cross = 1
+        for v in sweep_params.values():
+            n_cross *= len(v)
+        pinned = {p: fixed[p] for p in sorted(fixed) if p in DEFAULTS and fixed[p] != DEFAULTS[p]
+                  and p not in sweep_params}
+        print(f'=== Cross-product: {", ".join(sweep_params.keys())} ({n_cross} raw configs) ===')
+        if pinned:
+            print(f'Pinned: {" ".join(f"{p}={v}" for p, v in sorted(pinned.items()))}')
+        results = run_sweep(sweep_params, fixed, src_path, repeat=args.repeat, kernel=args.kernel)
+        all_results.extend(results)
+        print_eta_summary(results, list(sweep_params.keys()))
+
+        best = get_best(results)
+        if best:
+            composite_dflags = make_dflags(best)
+            print(f'\n@@GRID_WINNER {composite_dflags or "(defaults)"}')
+
     elif args.full_cross:
-        # Full cross-product
+        # Full cross-product of ALL parameters (huge — use --cross instead)
         sweep_params = dict(RANGES)
         fixed = dict(fixed_overrides)
-        # Remove swept params from fixed
         for p in sweep_params:
             fixed.pop(p, None)
 
