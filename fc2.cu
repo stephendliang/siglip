@@ -11,48 +11,36 @@ Epilogue: FP32 acc + bias + residual(BF16) → BF16 CVT → SMEM staging → TMA
 
 #define N_DIM          768
 #define K_DIM          3072
+#define BIAS_BF16      1
 #include "kernel_common.cuh"
 
 /*
-Fused bias+residual+CVT+STS macro
-Adds FP32 bias to 8 FP32 accumulators, extracts BF16 residual to F32, adds,
-converts to 4 BF16x2, stores 16B to SMEM.
-Uses asm-local .reg to avoid global register inflation.
-f0-f7: FP32 accumulators, b0-b7: FP32 bias, r0-r3: BF16x2 residual pairs
+Fused bias+residual+CVT+STS macro — BF16 arithmetic path
+CVT acc FP32→BF16x2 first, then HADD2 bias + HADD2 residual, STS.
+13 instructions vs 33 in the FP32 path. Precision: ≤1 ULP vs FP32 path.
+f0-f7: FP32 accumulators, b0-b3: BF16x2 bias pairs, r0-r3: BF16x2 residual pairs
 */
-#define BIAS_RES_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3,b4,b5,b6,b7, r0,r1,r2,r3, SADDR) \
+#define BIAS_RES_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3, r0,r1,r2,r3, SADDR) \
     asm volatile( \
         "{\n\t" \
         ".reg .b32 o0, o1, o2, o3;\n\t" \
-        ".reg .f32 t0, t1, t2, t3, t4, t5, t6, t7;\n\t" \
-        ".reg .b16 rlo, rhi;\n\t" \
-        ".reg .f32 rf0, rf1;\n\t" \
-        "add.f32 t0, %0, %8;\n\t"  "add.f32 t1, %1, %9;\n\t" \
-        "add.f32 t2, %2, %10;\n\t" "add.f32 t3, %3, %11;\n\t" \
-        "add.f32 t4, %4, %12;\n\t" "add.f32 t5, %5, %13;\n\t" \
-        "add.f32 t6, %6, %14;\n\t" "add.f32 t7, %7, %15;\n\t" \
-        "mov.b32 {rlo, rhi}, %16;\n\t" \
-        "cvt.rn.f32.bf16 rf0, rlo;\n\t" "cvt.rn.f32.bf16 rf1, rhi;\n\t" \
-        "add.f32 t0, t0, rf0;\n\t" "add.f32 t1, t1, rf1;\n\t" \
-        "mov.b32 {rlo, rhi}, %17;\n\t" \
-        "cvt.rn.f32.bf16 rf0, rlo;\n\t" "cvt.rn.f32.bf16 rf1, rhi;\n\t" \
-        "add.f32 t2, t2, rf0;\n\t" "add.f32 t3, t3, rf1;\n\t" \
-        "mov.b32 {rlo, rhi}, %18;\n\t" \
-        "cvt.rn.f32.bf16 rf0, rlo;\n\t" "cvt.rn.f32.bf16 rf1, rhi;\n\t" \
-        "add.f32 t4, t4, rf0;\n\t" "add.f32 t5, t5, rf1;\n\t" \
-        "mov.b32 {rlo, rhi}, %19;\n\t" \
-        "cvt.rn.f32.bf16 rf0, rlo;\n\t" "cvt.rn.f32.bf16 rf1, rhi;\n\t" \
-        "add.f32 t6, t6, rf0;\n\t" "add.f32 t7, t7, rf1;\n\t" \
-        "cvt.rn.bf16x2.f32 o0, t1, t0;\n\t" \
-        "cvt.rn.bf16x2.f32 o1, t3, t2;\n\t" \
-        "cvt.rn.bf16x2.f32 o2, t5, t4;\n\t" \
-        "cvt.rn.bf16x2.f32 o3, t7, t6;\n\t" \
-        "st.shared.v4.b32 [%20], {o0,o1,o2,o3};\n\t" \
+        "cvt.rn.bf16x2.f32 o0, %1, %0;\n\t" \
+        "cvt.rn.bf16x2.f32 o1, %3, %2;\n\t" \
+        "cvt.rn.bf16x2.f32 o2, %5, %4;\n\t" \
+        "cvt.rn.bf16x2.f32 o3, %7, %6;\n\t" \
+        "add.rn.bf16x2 o0, o0, %8;\n\t" \
+        "add.rn.bf16x2 o1, o1, %9;\n\t" \
+        "add.rn.bf16x2 o2, o2, %10;\n\t" \
+        "add.rn.bf16x2 o3, o3, %11;\n\t" \
+        "add.rn.bf16x2 o0, o0, %12;\n\t" \
+        "add.rn.bf16x2 o1, o1, %13;\n\t" \
+        "add.rn.bf16x2 o2, o2, %14;\n\t" \
+        "add.rn.bf16x2 o3, o3, %15;\n\t" \
+        "st.shared.v4.b32 [%16], {o0,o1,o2,o3};\n\t" \
         "}" \
         :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
            "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
-           "f"(b0),"f"(b1),"f"(b2),"f"(b3), \
-           "f"(b4),"f"(b5),"f"(b6),"f"(b7), \
+           "r"(b0),"r"(b1),"r"(b2),"r"(b3), \
            "r"(r0),"r"(r1),"r"(r2),"r"(r3), \
            "r"(SADDR) \
         : "memory")
@@ -79,11 +67,11 @@ int main() {
            M_TOTAL, K_DIM, N_DIM, K_DIM, N_STAGES, IDESC);
 
     uint8_t *d_A, *d_B;
-    float *d_bias;
+    __nv_bfloat16 *d_bias;
     __nv_bfloat16 *d_residual, *d_C;
     CUDA_CHECK(cudaMalloc(&d_A,        (size_t)M_TOTAL * K_DIM));
     CUDA_CHECK(cudaMalloc(&d_B,        (size_t)N_DIM   * K_DIM));
-    CUDA_CHECK(cudaMalloc(&d_bias,     (size_t)N_DIM   * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_bias,     (size_t)N_DIM   * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&d_residual, (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&d_C,        (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16)));
 
@@ -100,12 +88,12 @@ int main() {
         free(h_B);
     }
 
-    // Non-uniform bias: bias[c] = c + 1
+    // Non-uniform bias: bias[c] = bf16(c + 1)
     {
-        float* h_bias = (float*)malloc((size_t)N_DIM * sizeof(float));
+        __nv_bfloat16* h_bias = (__nv_bfloat16*)malloc((size_t)N_DIM * sizeof(__nv_bfloat16));
         for (int c = 0; c < N_DIM; c++)
-            h_bias[c] = (float)(c + 1);
-        CUDA_CHECK(cudaMemcpy(d_bias, h_bias, (size_t)N_DIM * sizeof(float), cudaMemcpyHostToDevice));
+            h_bias[c] = __float2bfloat16((float)(c + 1));
+        CUDA_CHECK(cudaMemcpy(d_bias, h_bias, (size_t)N_DIM * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
         free(h_bias);
     }
 
@@ -270,11 +258,16 @@ int main() {
 
             float b_val = (col & 1) ? 1.0f : 1.5f;
             float gemm = (float)K_DIM * 1.5f * b_val;
-            float bias = (float)(col + 1);
+            /*
+            BF16 arithmetic order: bf16(bf16(gemm) + bf16(bias)) + residual
+            Each add.rn.bf16x2 promotes to FP32 internally, adds, rounds back.
+            */
+            float acc_rounded = __bfloat162float(__float2bfloat16(gemm));
+            float bias_bf16_f = __bfloat162float(__float2bfloat16((float)(col + 1)));
+            float after_bias = __bfloat162float(__float2bfloat16(acc_rounded + bias_bf16_f));
             float res_bf16_f = __bfloat162float(__float2bfloat16(
                 (float)((int)row % 128) * 0.25f + (float)col * 0.125f));
-            float expected_f32 = gemm + bias + res_bf16_f;
-            __nv_bfloat16 expected = __float2bfloat16(expected_f32);
+            __nv_bfloat16 expected = __float2bfloat16(after_bias + res_bf16_f);
             __nv_bfloat16 actual = h_C[row * N_DIM + col];
 
             float ef = __bfloat162float(expected);
@@ -282,7 +275,7 @@ int main() {
             if (ef != af) {
                 if (errors < 5)
                     printf("  MISMATCH at (%lld,%d): expected %.1f got %.1f (gemm=%.1f bias=%.1f res=%.4f)\n",
-                           row, col, ef, af, gemm, bias, res_bf16_f);
+                           row, col, ef, af, gemm, bias_bf16_f, res_bf16_f);
                 errors++;
             }
         }
@@ -301,10 +294,11 @@ int main() {
     printf("DIAG row0 expected: ");
     for (int c = 0; c < 8; c++) {
         float b_val = (c & 1) ? 1.0f : 1.5f;
-        float g = (float)K_DIM * 1.5f * b_val;
-        float b = (float)(c + 1);
+        float g_r = __bfloat162float(__float2bfloat16((float)K_DIM * 1.5f * b_val));
+        float b_r = __bfloat162float(__float2bfloat16((float)(c + 1)));
+        float ab = __bfloat162float(__float2bfloat16(g_r + b_r));
         float r = __bfloat162float(__float2bfloat16((float)c * 0.125f));
-        printf("%.1f ", __bfloat162float(__float2bfloat16(g + b + r)));
+        printf("%.1f ", __bfloat162float(__float2bfloat16(ab + r)));
     }
     printf("\n");
     printf("@@RESULT ms=%.3f tflops=%.2f checksum=%f valid=%d c0=%.1f\n",

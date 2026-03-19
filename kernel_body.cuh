@@ -12,7 +12,13 @@ enum class EpilogueOp : int { BIAS_ADD = 0, BIAS_GELU = 1, BIAS_RESIDUAL = 2 };
 template<EpilogueOp Op> struct EpilogueSideData;
 template<> struct EpilogueSideData<EpilogueOp::BIAS_ADD>      { using type = const __nv_bfloat16*; };
 template<> struct EpilogueSideData<EpilogueOp::BIAS_GELU>     { using type = const float*; };
-template<> struct EpilogueSideData<EpilogueOp::BIAS_RESIDUAL>  { using type = const float*; };
+template<> struct EpilogueSideData<EpilogueOp::BIAS_RESIDUAL>  {
+#if BIAS_BF16
+    using type = const __nv_bfloat16*;
+#else
+    using type = const float*;
+#endif
+};
 template<EpilogueOp Op> using SideDataPtr = typename EpilogueSideData<Op>::type;
 
 /*
@@ -134,6 +140,13 @@ void epilogue_store(
         int res_phase = 0;
 
 #if BIAS_SMEM
+#if BIAS_BF16
+        /* Load tile's 256 bias bf16 into SMEM once. 1 uint4 LDG per lane = 32 LDG. */
+        {
+            reinterpret_cast<uint4*>(smem + OFF_BIAS_SMEM)[lane] =
+                __ldg(reinterpret_cast<const uint4*>(side_data + n_start) + lane);
+        }
+#else
         /* Load tile's 256 bias floats into SMEM once. All warps write same values
            (idempotent — no cross-warp sync needed). 2 float4 LDG per lane = 64 LDG. */
         {
@@ -142,6 +155,7 @@ void epilogue_store(
             reinterpret_cast<float4*>(bias_smem)[lane * 2]     = __ldg(reinterpret_cast<const float4*>(bias_src) + lane * 2);
             reinterpret_cast<float4*>(bias_smem)[lane * 2 + 1] = __ldg(reinterpret_cast<const float4*>(bias_src) + lane * 2 + 1);
         }
+#endif
         __syncwarp();
         const uint32_t bias_smem_base = smem_to_uint(smem + OFF_BIAS_SMEM);
 #endif
@@ -213,6 +227,26 @@ void epilogue_store(
                 const uint32_t rs = res_staging_saddr + ri * STAGING_REGION_BYTES
                     + lane * STAGING_REGION_ROW_BYTES;
 
+#if BIAS_BF16
+#if BIAS_SMEM
+                const uint32_t bs = bias_smem_base + nc * 2;
+                uint4 bv0, bv1, bv2, bv3, bv4, bv5, bv6, bv7;
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv0.x),"=r"(bv0.y),"=r"(bv0.z),"=r"(bv0.w) : "r"(bs));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv1.x),"=r"(bv1.y),"=r"(bv1.z),"=r"(bv1.w) : "r"(bs + 16));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv2.x),"=r"(bv2.y),"=r"(bv2.z),"=r"(bv2.w) : "r"(bs + 32));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv4.x),"=r"(bv4.y),"=r"(bv4.z),"=r"(bv4.w) : "r"(bs + 64));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv5.x),"=r"(bv5.y),"=r"(bv5.z),"=r"(bv5.w) : "r"(bs + 80));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv6.x),"=r"(bv6.y),"=r"(bv6.z),"=r"(bv6.w) : "r"(bs + 96));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv7.x),"=r"(bv7.y),"=r"(bv7.z),"=r"(bv7.w) : "r"(bs + 112));
+#else
+                const uint4* bp = reinterpret_cast<const uint4*>(side_data + n_start + nc);
+                uint4 bv0 = __ldg(bp);     uint4 bv1 = __ldg(bp + 1);
+                uint4 bv2 = __ldg(bp + 2); uint4 bv3 = __ldg(bp + 3);
+                uint4 bv4 = __ldg(bp + 4); uint4 bv5 = __ldg(bp + 5);
+                uint4 bv6 = __ldg(bp + 6); uint4 bv7 = __ldg(bp + 7);
+#endif
+#else /* !BIAS_BF16 */
 #if BIAS_SMEM
                 /* Load 64 bias floats from SMEM (linear, no swizzle) */
                 const uint32_t bs = bias_smem_base + nc * 4;
@@ -253,6 +287,7 @@ void epilogue_store(
                 float4 bv14 = __ldg(reinterpret_cast<const float4*>(bp + 56));
                 float4 bv15 = __ldg(reinterpret_cast<const float4*>(bp + 60));
 #endif
+#endif /* BIAS_BF16 */
 
                 /* Load 64 cols of residual from SMEM (swizzled) */
                 uint4 rv0, rv1, rv2, rv3, rv4, rv5, rv6, rv7;
@@ -271,6 +306,32 @@ void epilogue_store(
                     if (epi_mbar_addr) mbar_arrive(epi_mbar_addr);
                 }
 
+#if BIAS_BF16
+                BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                    bv0.x,bv0.y,bv0.z,bv0.w,
+                    rv0.x,rv0.y,rv0.z,rv0.w, srow + sw0);
+                BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                    bv1.x,bv1.y,bv1.z,bv1.w,
+                    rv1.x,rv1.y,rv1.z,rv1.w, srow + sw1);
+                BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                    bv2.x,bv2.y,bv2.z,bv2.w,
+                    rv2.x,rv2.y,rv2.z,rv2.w, srow + sw2);
+                BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                    bv3.x,bv3.y,bv3.z,bv3.w,
+                    rv3.x,rv3.y,rv3.z,rv3.w, srow + sw3);
+                BIAS_RES_CVT_STS_V4(a32,a33,a34,a35,a36,a37,a38,a39,
+                    bv4.x,bv4.y,bv4.z,bv4.w,
+                    rv4.x,rv4.y,rv4.z,rv4.w, srow + sw4);
+                BIAS_RES_CVT_STS_V4(a40,a41,a42,a43,a44,a45,a46,a47,
+                    bv5.x,bv5.y,bv5.z,bv5.w,
+                    rv5.x,rv5.y,rv5.z,rv5.w, srow + sw5);
+                BIAS_RES_CVT_STS_V4(a48,a49,a50,a51,a52,a53,a54,a55,
+                    bv6.x,bv6.y,bv6.z,bv6.w,
+                    rv6.x,rv6.y,rv6.z,rv6.w, srow + sw6);
+                BIAS_RES_CVT_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63,
+                    bv7.x,bv7.y,bv7.z,bv7.w,
+                    rv7.x,rv7.y,rv7.z,rv7.w, srow + sw7);
+#else
                 /* 8× BIAS_RES_CVT_STS_V4 — one full 64-col region */
                 BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                     bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w,
@@ -296,6 +357,7 @@ void epilogue_store(
                 BIAS_RES_CVT_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63,
                     bv14.x,bv14.y,bv14.z,bv14.w,bv15.x,bv15.y,bv15.z,bv15.w,
                     rv7.x,rv7.y,rv7.z,rv7.w, srow + sw7);
+#endif
 
 #if PREFETCH_BEFORE_STORE
                 if (nc + 64 < pnc_e) {
@@ -432,6 +494,20 @@ void epilogue_store(
                 const int res_ri = chunk_in_pass >> 6;
                 const int half = (chunk_in_pass >> 5) & 1;  /* 0=first 32 cols, 1=second 32 cols */
 
+#if BIAS_BF16
+#if BIAS_SMEM
+                const uint32_t bs = bias_smem_base + nc * 2;
+                uint4 bv0, bv1, bv2, bv3;
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv0.x),"=r"(bv0.y),"=r"(bv0.z),"=r"(bv0.w) : "r"(bs));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv1.x),"=r"(bv1.y),"=r"(bv1.z),"=r"(bv1.w) : "r"(bs + 16));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv2.x),"=r"(bv2.y),"=r"(bv2.z),"=r"(bv2.w) : "r"(bs + 32));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
+#else
+                const uint4* bp = reinterpret_cast<const uint4*>(side_data + n_start + nc);
+                uint4 bv0 = __ldg(bp);     uint4 bv1 = __ldg(bp + 1);
+                uint4 bv2 = __ldg(bp + 2); uint4 bv3 = __ldg(bp + 3);
+#endif
+#else /* !BIAS_BF16 */
 #if BIAS_SMEM
                 const uint32_t bs = bias_smem_base + nc * 4;
                 float4 bv0, bv1, bv2, bv3, bv4, bv5, bv6, bv7;
@@ -454,6 +530,7 @@ void epilogue_store(
                 float4 bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
                 float4 bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
 #endif
+#endif /* BIAS_BF16 */
 
                 /* Residual from SMEM — use precomputed swizzle offsets */
                 const uint32_t rs = res_staging_saddr
@@ -477,6 +554,20 @@ void epilogue_store(
                 /* Output staging — use precomputed swizzle offsets */
                 const uint32_t srow = srow_base + res_ri * STAGING_REGION_BYTES;
 
+#if BIAS_BF16
+                BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                    bv0.x,bv0.y,bv0.z,bv0.w,
+                    rv0.x,rv0.y,rv0.z,rv0.w, srow + rsw0);
+                BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                    bv1.x,bv1.y,bv1.z,bv1.w,
+                    rv1.x,rv1.y,rv1.z,rv1.w, srow + rsw1);
+                BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                    bv2.x,bv2.y,bv2.z,bv2.w,
+                    rv2.x,rv2.y,rv2.z,rv2.w, srow + rsw2);
+                BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                    bv3.x,bv3.y,bv3.z,bv3.w,
+                    rv3.x,rv3.y,rv3.z,rv3.w, srow + rsw3);
+#else
                 BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                     bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w,
                     rv0.x,rv0.y,rv0.z,rv0.w, srow + rsw0);
@@ -489,6 +580,7 @@ void epilogue_store(
                 BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
                     bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w,
                     rv3.x,rv3.y,rv3.z,rv3.w, srow + rsw3);
+#endif
 
 #if PREFETCH_BEFORE_STORE
                 if (nc + 32 < pnc_e) {
@@ -624,13 +716,17 @@ void epilogue_store(
             craw6 = *reinterpret_cast<const uint4*>(comb_ptr2_pre + 16);
             craw7 = *reinterpret_cast<const uint4*>(comb_ptr2_pre + 24);
 #endif
-        } else if constexpr (Op == EpilogueOp::BIAS_GELU || Op == EpilogueOp::BIAS_RESIDUAL) {
+        } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
+            const float* bp = reinterpret_cast<const float*>(side_data) + n_start + nc;
+            bv0 = __ldg(reinterpret_cast<const float4*>(bp));
+            bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
+#if !BIAS_BF16
+        } else if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
             const float* bp = side_data + n_start + nc;
             bv0 = __ldg(reinterpret_cast<const float4*>(bp));
             bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
-            if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
-                rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
-            }
+            rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
+#endif
         }
 #endif
 
@@ -641,13 +737,17 @@ void epilogue_store(
             comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
             craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
-        } else if constexpr (Op == EpilogueOp::BIAS_GELU || Op == EpilogueOp::BIAS_RESIDUAL) {
+        } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
+            const float* bp = reinterpret_cast<const float*>(side_data) + n_start + nc;
+            bv0 = __ldg(reinterpret_cast<const float4*>(bp));
+            bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
+#if !BIAS_BF16
+        } else if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
             const float* bp = side_data + n_start + nc;
             bv0 = __ldg(reinterpret_cast<const float4*>(bp));
             bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
-            if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
-                rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
-            }
+            rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
+#endif
         }
 #endif
 
@@ -721,6 +821,34 @@ void epilogue_store(
             }
         } else if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
             static_assert(HAS_BIAS_RES_CVT, "BIAS_RESIDUAL requires BIAS_RES_CVT_STS_V4 macro — define before #include \"kernel_body.cuh\"");
+#if BIAS_BF16
+            {
+                uint4 bv1 = __ldg(reinterpret_cast<const uint4*>(side_data + n_start + nc + 8));
+                uint4 rv1 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 8));
+                BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w, rv0.x,rv0.y,rv0.z,rv0.w, srow + (0 ^ xor_val));
+                uint4 bv2 = __ldg(reinterpret_cast<const uint4*>(side_data + n_start + nc + 16));
+                uint4 rv2 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 16));
+                BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, bv1.x,bv1.y,bv1.z,bv1.w, rv1.x,rv1.y,rv1.z,rv1.w, srow + (16 ^ xor_val));
+                uint4 bv3 = __ldg(reinterpret_cast<const uint4*>(side_data + n_start + nc + 24));
+                uint4 rv3 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 24));
+                BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, bv2.x,bv2.y,bv2.z,bv2.w, rv2.x,rv2.y,rv2.z,rv2.w, srow + (32 ^ xor_val));
+                BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv3.x,bv3.y,bv3.z,bv3.w, rv3.x,rv3.y,rv3.z,rv3.w, srow + (48 ^ xor_val));
+            }
+            {
+                uint4 bv4 = __ldg(reinterpret_cast<const uint4*>(side_data + n_start + nc + 32));
+                uint4 rv4 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 32));
+                uint4 bv5 = __ldg(reinterpret_cast<const uint4*>(side_data + n_start + nc + 40));
+                uint4 rv5 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 40));
+                BIAS_RES_CVT_STS_V4(a32,a33,a34,a35,a36,a37,a38,a39, bv4.x,bv4.y,bv4.z,bv4.w, rv4.x,rv4.y,rv4.z,rv4.w, srow + (64 ^ xor_val));
+                uint4 bv6 = __ldg(reinterpret_cast<const uint4*>(side_data + n_start + nc + 48));
+                uint4 rv6 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 48));
+                BIAS_RES_CVT_STS_V4(a40,a41,a42,a43,a44,a45,a46,a47, bv5.x,bv5.y,bv5.z,bv5.w, rv5.x,rv5.y,rv5.z,rv5.w, srow + (80 ^ xor_val));
+                uint4 bv7 = __ldg(reinterpret_cast<const uint4*>(side_data + n_start + nc + 56));
+                uint4 rv7 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 56));
+                BIAS_RES_CVT_STS_V4(a48,a49,a50,a51,a52,a53,a54,a55, bv6.x,bv6.y,bv6.z,bv6.w, rv6.x,rv6.y,rv6.z,rv6.w, srow + (96 ^ xor_val));
+                BIAS_RES_CVT_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63, bv7.x,bv7.y,bv7.z,bv7.w, rv7.x,rv7.y,rv7.z,rv7.w, srow + (112 ^ xor_val));
+            }
+#else
             const float* bp = side_data + n_start + nc;
             {
                 BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bv0.x,bv0.y,bv0.z,bv0.w,bv1.x,bv1.y,bv1.z,bv1.w, rv0.x,rv0.y,rv0.z,rv0.w, srow + (0 ^ xor_val));
@@ -755,6 +883,7 @@ void epilogue_store(
                 uint4 rv7 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 56));
                 BIAS_RES_CVT_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63, bv14.x,bv14.y,bv14.z,bv14.w,bv15.x,bv15.y,bv15.z,bv15.w, rv7.x,rv7.y,rv7.z,rv7.w, srow + (112 ^ xor_val));
             }
+#endif
         }
 
 #if PREFETCH_BEFORE_STORE
@@ -851,37 +980,39 @@ void epilogue_store(
             craw2 = *reinterpret_cast<const uint4*>(comb_ptr + 16);
             craw3 = *reinterpret_cast<const uint4*>(comb_ptr + 24);
 #endif
-        } else if constexpr (Op == EpilogueOp::BIAS_GELU || Op == EpilogueOp::BIAS_RESIDUAL) {
-            bp = side_data + n_start + nc;
+        } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
+            bp = reinterpret_cast<const float*>(side_data) + n_start + nc;
             bv0 = __ldg(reinterpret_cast<const float4*>(bp));
             bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
 #if PRELOAD_MODE == 2
             /* Full preload: all 32 bias values before TMEM_WAIT.
                Fills the TMEM latency window with useful LDG traffic and
                removes interleaved LDG from the GELU critical path. */
-            if constexpr (Op == EpilogueOp::BIAS_GELU) {
-                bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
-                bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
-                bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
-                bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
-                bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
-                bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
-            }
-            if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
-                bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
-                bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
-                bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
-                bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
-                bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
-                bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
-                rv1 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 8));
-                rv2 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 16));
-                rv3 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 24));
-            }
+            bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
+            bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
+            bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
+            bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
+            bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
+            bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
 #endif
-            if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
-                rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
-            }
+#if !BIAS_BF16
+        } else if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+            bp = side_data + n_start + nc;
+            bv0 = __ldg(reinterpret_cast<const float4*>(bp));
+            bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
+#if PRELOAD_MODE == 2
+            bv2 = __ldg(reinterpret_cast<const float4*>(bp + 8));
+            bv3 = __ldg(reinterpret_cast<const float4*>(bp + 12));
+            bv4 = __ldg(reinterpret_cast<const float4*>(bp + 16));
+            bv5 = __ldg(reinterpret_cast<const float4*>(bp + 20));
+            bv6 = __ldg(reinterpret_cast<const float4*>(bp + 24));
+            bv7 = __ldg(reinterpret_cast<const float4*>(bp + 28));
+            rv1 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 8));
+            rv2 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 16));
+            rv3 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 24));
+#endif
+            rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
+#endif
         }
 #endif
 
@@ -892,13 +1023,17 @@ void epilogue_store(
             comb_ptr = comb_base + (long long)((n_start + nc) / COMB_BLOCK_COLS) * COMB_BLOCK_ELEMS;
             craw0 = *reinterpret_cast<const uint4*>(comb_ptr);
             craw1 = *reinterpret_cast<const uint4*>(comb_ptr + 8);
-        } else if constexpr (Op == EpilogueOp::BIAS_GELU || Op == EpilogueOp::BIAS_RESIDUAL) {
+        } else if constexpr (Op == EpilogueOp::BIAS_GELU) {
+            bp = reinterpret_cast<const float*>(side_data) + n_start + nc;
+            bv0 = __ldg(reinterpret_cast<const float4*>(bp));
+            bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
+#if !BIAS_BF16
+        } else if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
             bp = side_data + n_start + nc;
             bv0 = __ldg(reinterpret_cast<const float4*>(bp));
             bv1 = __ldg(reinterpret_cast<const float4*>(bp + 4));
-            if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
-                rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
-            }
+            rv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
+#endif
         }
 #endif
 
@@ -1063,6 +1198,22 @@ void epilogue_store(
             GELU_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, srow + ((byte_base + 48) ^ xor_val));
 #endif
         } else if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+#if BIAS_BF16
+            {
+                uint4 bbv0 = __ldg(reinterpret_cast<const uint4*>(side_data + n_start + nc));
+                uint4 rrv0 = __ldg(reinterpret_cast<const uint4*>(res_row + nc));
+                uint4 bbv1 = __ldg(reinterpret_cast<const uint4*>(side_data + n_start + nc + 8));
+                uint4 rrv1 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 8));
+                BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, bbv0.x,bbv0.y,bbv0.z,bbv0.w, rrv0.x,rrv0.y,rrv0.z,rrv0.w, srow + (byte_base ^ xor_val));
+                uint4 bbv2 = __ldg(reinterpret_cast<const uint4*>(side_data + n_start + nc + 16));
+                uint4 rrv2 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 16));
+                BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, bbv1.x,bbv1.y,bbv1.z,bbv1.w, rrv1.x,rrv1.y,rrv1.z,rrv1.w, srow + ((byte_base + 16) ^ xor_val));
+                uint4 bbv3 = __ldg(reinterpret_cast<const uint4*>(side_data + n_start + nc + 24));
+                uint4 rrv3 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 24));
+                BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, bbv2.x,bbv2.y,bbv2.z,bbv2.w, rrv2.x,rrv2.y,rrv2.z,rrv2.w, srow + ((byte_base + 32) ^ xor_val));
+                BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bbv3.x,bbv3.y,bbv3.z,bbv3.w, rrv3.x,rrv3.y,rrv3.z,rrv3.w, srow + ((byte_base + 48) ^ xor_val));
+            }
+#else /* !BIAS_BF16 */
 #if BATCH_EPILOGUE
             /*
             Batched epilogue: load all side-data, compute all 32 bias+residual adds
@@ -1133,6 +1284,7 @@ void epilogue_store(
             uint4 rv3 = __ldg(reinterpret_cast<const uint4*>(res_row + nc + 24));
             BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, bv6.x,bv6.y,bv6.z,bv6.w,bv7.x,bv7.y,bv7.z,bv7.w, rv3.x,rv3.y,rv3.z,rv3.w, srow + ((byte_base + 48) ^ xor_val));
 #endif
+#endif /* BIAS_BF16 */
         }
 
 #if PREFETCH_BEFORE_STORE

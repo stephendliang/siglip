@@ -105,6 +105,9 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef BIAS_SMEM
 #define BIAS_SMEM 0              // 0=LDG bias per-chunk, 1=load bias to SMEM once per tile (fc2/fc1 only)
 #endif
+#ifndef BIAS_BF16
+#define BIAS_BF16 0              // 0=FP32 bias, 1=BF16 bias with bf16x2 epilogue arithmetic (fc2 only)
+#endif
 
 #if EPILOGUE_LOOP
 #undef PHASE1_UNROLL
@@ -163,7 +166,11 @@ Problem dimensions — N_DIM must be defined before including this header
 #define OFF_MAINLOOP_MBAR  (OFF_MMA_MBAR + N_STAGES * 8)
 #define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
 #if BIAS_SMEM
+#if BIAS_BF16
+#define BIAS_SMEM_BYTES    (TN * 2)          /* 256 bf16 = 512 bytes */
+#else
 #define BIAS_SMEM_BYTES    (TN * 4)          /* 256 floats = 1024 bytes */
+#endif
 #else
 #define BIAS_SMEM_BYTES    0
 #endif

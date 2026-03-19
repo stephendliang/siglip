@@ -176,7 +176,7 @@ KERNELS = {
 # ── Cross-tier interaction groups ──
 INTERACTIONS = {
     'epilogue': {
-        'params': ['BATCH_EPILOGUE', 'INTERLEAVE_STRATEGY', 'PRELOAD_MODE'],
+        'params': ['BATCH_EPILOGUE', 'INTERLEAVE_STRATEGY', 'PRELOAD_MODE', 'STORE_TIMING'],
         'kernels': ['fc1_gelu', 'fc2'],
     },
     'gelu': {
@@ -196,7 +196,7 @@ INTERACTIONS = {
         'kernels': ['fc1_gelu', 'fc2'],
     },
     'gelu_interleave': {
-        'params': ['GELU_VARIANT', 'INTERLEAVE_STRATEGY'],
+        'params': ['GELU_VARIANT', 'INTERLEAVE_STRATEGY', 'STORE_TIMING'],
         'kernels': ['fc1_gelu'],
     },
     'gelu_width': {
@@ -282,7 +282,7 @@ def is_valid(cfg, kernel='patch_embed'):
             mbar_end = off_res_mbar + num_epi * 8
     else:
         mbar_end = off_epilogue_mbar + 16
-    bias_smem_bytes = 256 * 4 if cfg.get('BIAS_SMEM', 0) else 0
+    bias_smem_bytes = (256 * 2 if kernel == 'fc2' else 256 * 4) if cfg.get('BIAS_SMEM', 0) else 0
     off_staging = (mbar_end + bias_smem_bytes + 1023) & ~1023
     staging_warp_bytes = 4 * 32 * 128  # 16384
     smem_total = (off_staging + num_epi * staging_warp_bytes + 127) & ~127
@@ -424,7 +424,8 @@ def smem_kb(cfg):
             mbar_end = off_res_mbar + num_epi * 8
     else:
         mbar_end = off_epilogue_mbar + 16
-    bias_smem_bytes = 256 * 4 if cfg.get('BIAS_SMEM', 0) else 0
+    is_fc2 = 'TMA_RESIDUAL' in cfg  # FC2-only param → BIAS_BF16 active
+    bias_smem_bytes = (256 * 2 if is_fc2 else 256 * 4) if cfg.get('BIAS_SMEM', 0) else 0
     off_staging = (mbar_end + bias_smem_bytes + 1023) & ~1023
     staging_warp_bytes = 4 * 32 * 128
     smem_total = (off_staging + num_epi * staging_warp_bytes + 127) & ~127
