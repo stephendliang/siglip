@@ -127,8 +127,29 @@ Usage: #define N_DIM and K_DIM before including this header.
 #if SIX_WARP_EPI && !NON_OVERLAPPED
 #error "SIX_WARP_EPI requires NON_OVERLAPPED"
 #endif
+#if SINGLE_PRODUCER_RES && !NON_OVERLAPPED
+#error "SINGLE_PRODUCER_RES requires NON_OVERLAPPED"
+#endif
+#if SINGLE_PRODUCER_RES && !TMA_RESIDUAL
+#error "SINGLE_PRODUCER_RES requires TMA_RESIDUAL"
+#endif
+#if SINGLE_PRODUCER_RES && DIRECT_STG
+#error "SINGLE_PRODUCER_RES incompatible with DIRECT_STG"
+#endif
+#if SINGLE_PRODUCER_RES && (W0_RES_PREFETCH || W0_RES_FULL)
+#error "SINGLE_PRODUCER_RES mutually exclusive with W0_RES_PREFETCH/W0_RES_FULL"
+#endif
 #if SINGLE_PRODUCER_RES && FOLDED_RESIDUAL
 #error "SINGLE_PRODUCER_RES and FOLDED_RESIDUAL are mutually exclusive"
+#endif
+#if FOLDED_RESIDUAL && !NON_OVERLAPPED
+#error "FOLDED_RESIDUAL requires NON_OVERLAPPED"
+#endif
+#if FOLDED_RESIDUAL && !TMA_RESIDUAL
+#error "FOLDED_RESIDUAL requires TMA_RESIDUAL"
+#endif
+#if FOLDED_RESIDUAL && (W0_RES_PREFETCH || W0_RES_FULL)
+#error "FOLDED_RESIDUAL mutually exclusive with W0_RES_PREFETCH/W0_RES_FULL"
 #endif
 #if FOLDED_RESIDUAL && !DIRECT_STG && N_STAGES > 3
 #error "FOLDED_RESIDUAL without DIRECT_STG requires N_STAGES <= 3 (SMEM budget)"
@@ -201,7 +222,9 @@ Problem dimensions — N_DIM must be defined before including this header
 #endif
 #if TMA_RESIDUAL
 #define OFF_RES_MBAR       (OFF_EPILOGUE_MBAR + 16)
-#if W0_RES_FULL
+#if SINGLE_PRODUCER_RES
+#define _MBAR_END          (OFF_RES_MBAR + 8)
+#elif W0_RES_FULL
 #define OFF_RES_CONSUMED_MBAR  (OFF_RES_MBAR + NUM_EPI_WARPS * 8)
 #define OFF_RES_PASS_MBAR      (OFF_RES_CONSUMED_MBAR + 8)
 #define _MBAR_END              (OFF_RES_PASS_MBAR + 8)
@@ -215,11 +238,17 @@ Problem dimensions — N_DIM must be defined before including this header
 #else
 #define _MBAR_END          (OFF_EPILOGUE_MBAR + 16)
 #endif
+#if FOLDED_RESIDUAL
+#define OFF_FOLD_RES_MBAR  (_MBAR_END)
+#define _MBAR_END_2        (OFF_FOLD_RES_MBAR + 8)
+#else
+#define _MBAR_END_2        _MBAR_END
+#endif
 #if BIAS_SMEM
-#define OFF_BIAS_SMEM      ((_MBAR_END + 15) & ~15)                       // 16-align for ld.shared.v4.b32
+#define OFF_BIAS_SMEM      ((_MBAR_END_2 + 15) & ~15)                       // 16-align for ld.shared.v4.b32
 #define OFF_STAGING        ((OFF_BIAS_SMEM + BIAS_SMEM_BYTES + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
 #else
-#define OFF_STAGING        ((_MBAR_END + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
+#define OFF_STAGING        ((_MBAR_END_2 + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
 #endif
 #define STAGING_REGION_ROW_BYTES  128                                               // 64 BF16 cols = 128 bytes (SWIZZLE_128B)
 #define STAGING_REGION_BYTES      (32 * STAGING_REGION_ROW_BYTES)                   // 4096 bytes per region (32 rows x 128B)
@@ -234,6 +263,13 @@ Problem dimensions — N_DIM must be defined before including this header
 #define STAGING_EPI_WARPS         NUM_EPI_WARPS
 #endif
 #define SMEM_BYTES                ((OFF_STAGING + STAGING_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
+#if FOLDED_RESIDUAL
+#define FOLD_RG_STRIDE     (4 * STAGING_REGION_BYTES)
+#define FOLD_RES_BYTES     (4 * FOLD_RG_STRIDE)
+#define OFF_FOLDED_RES     ((OFF_STAGING + STAGING_EPI_WARPS * STAGING_WARP_BYTES + 1023) & ~1023)
+#undef SMEM_BYTES
+#define SMEM_BYTES         ((OFF_FOLDED_RES + FOLD_RES_BYTES + 127) & ~127)
+#endif
 
 // WGMMA / TMEM constants
 #define TMEM_COLS      512

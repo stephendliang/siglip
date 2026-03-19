@@ -82,6 +82,10 @@ void epilogue_store(
 #if W0_RES_FULL
     , uint32_t res_pass_mbar_addr
 #endif
+#if SINGLE_PRODUCER_RES
+    , int ew
+    , int m_start_base
+#endif
 #ifdef TIMING
     , long long& t_phase1_end
 #endif
@@ -303,7 +307,22 @@ void epilogue_store(
             const int pnc_s = NC_START + pass * PASS_COLS;
             const int pnc_e = pnc_s + PASS_COLS;
 
-#if !W0_RES_FULL
+#if SINGLE_PRODUCER_RES
+            if (ew == 0 && lane == 0) {
+                uint32_t base_stg = staging_saddr - ew * STAGING_WARP_BYTES;
+                mbar_arrive_expect_tx(res_mbar_addr,
+                    STAGING_EPI_WARPS * PASS_REGIONS * STAGING_REGION_BYTES);
+                for (int w = 0; w < STAGING_EPI_WARPS; w++) {
+                    uint32_t w_stg = base_stg + w * STAGING_WARP_BYTES + RES_STAGING_OFFSET;
+                    int w_gm = m_start_base + (w % 4) * 32;
+                    tma_load_2d_cta(w_stg, tma_res_desc,
+                        n_start + pnc_s, w_gm, res_mbar_addr);
+                    if constexpr (PASS_REGIONS >= 2)
+                        tma_load_2d_cta(w_stg + STAGING_REGION_BYTES, tma_res_desc,
+                            n_start + pnc_s + 64, w_gm, res_mbar_addr);
+                }
+            }
+#elif !W0_RES_FULL && !FOLDED_RESIDUAL
             if (!(FIRST_PASS_PRELOADED && pass == 0)) {
                 if (lane == 0) {
                     mbar_arrive_expect_tx(res_mbar_addr, PASS_REGIONS * STAGING_REGION_BYTES);
@@ -333,8 +352,10 @@ void epilogue_store(
                           a48,a49,a50,a51,a52,a53,a54,a55,a56,a57,a58,a59,a60,a61,a62,a63,
                           taddr_base + pnc_s);
 
+#if !FOLDED_RESIDUAL
             mbar_wait(res_mbar_addr, res_phase);
             res_phase ^= 1;
+#endif
 
 #if DEFERRED_WAIT
             if (pass > 0) {
@@ -350,11 +371,19 @@ void epilogue_store(
 #else
             PRAGMA_UNROLL(PHASE1_UNROLL)
 #endif
+#if FOLDED_RESIDUAL
+            const uint32_t fold_res_off = ((pnc_s - NC_START) / 64) * STAGING_REGION_BYTES;
+#endif
             for (int nc = pnc_s; nc < pnc_e; nc += 64) {
                 const int ri = (nc - pnc_s) >> 6;
                 const uint32_t srow = srow_base + ri * STAGING_REGION_BYTES;
+#if FOLDED_RESIDUAL
+                const uint32_t rs = res_staging_saddr + fold_res_off + ri * STAGING_REGION_BYTES
+                    + lane * STAGING_REGION_ROW_BYTES;
+#else
                 const uint32_t rs = res_staging_saddr + ri * STAGING_REGION_BYTES
                     + lane * STAGING_REGION_ROW_BYTES;
+#endif
 
 #if BIAS_BF16
 #if BIAS_SMEM
@@ -559,6 +588,11 @@ void epilogue_store(
                     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                 }
             }
+#if SINGLE_PRODUCER_RES
+            if (pass < LOCAL_PASSES - 1) {
+                asm volatile("bar.sync 3, %0;" :: "r"(STAGING_EPI_WARPS * 32) : "memory");
+            }
+#endif
 #if W0_RES_FULL
             /* Signal pass consumed so W0 can load next pass (or tile done) */
             if (pass < LOCAL_PASSES - 1) {
@@ -574,7 +608,22 @@ void epilogue_store(
             const int pnc_s = NC_START + pass * PASS_COLS;
             const int pnc_e = pnc_s + PASS_COLS;
 
-#if !W0_RES_FULL
+#if SINGLE_PRODUCER_RES
+            if (ew == 0 && lane == 0) {
+                uint32_t base_stg = staging_saddr - ew * STAGING_WARP_BYTES;
+                mbar_arrive_expect_tx(res_mbar_addr,
+                    STAGING_EPI_WARPS * PASS_REGIONS * STAGING_REGION_BYTES);
+                for (int w = 0; w < STAGING_EPI_WARPS; w++) {
+                    uint32_t w_stg = base_stg + w * STAGING_WARP_BYTES + RES_STAGING_OFFSET;
+                    int w_gm = m_start_base + (w % 4) * 32;
+                    tma_load_2d_cta(w_stg, tma_res_desc,
+                        n_start + pnc_s, w_gm, res_mbar_addr);
+                    if constexpr (PASS_REGIONS >= 2)
+                        tma_load_2d_cta(w_stg + STAGING_REGION_BYTES, tma_res_desc,
+                            n_start + pnc_s + 64, w_gm, res_mbar_addr);
+                }
+            }
+#elif !W0_RES_FULL && !FOLDED_RESIDUAL
             if (!(FIRST_PASS_PRELOADED && pass == 0)) {
                 if (lane == 0) {
                     mbar_arrive_expect_tx(res_mbar_addr, PASS_REGIONS * STAGING_REGION_BYTES);
@@ -601,8 +650,10 @@ void epilogue_store(
                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                          taddr_base + pnc_s);
 
+#if !FOLDED_RESIDUAL
             mbar_wait(res_mbar_addr, res_phase);
             res_phase ^= 1;
+#endif
 
 #if DEFERRED_WAIT
             if (pass > 0) {
@@ -613,6 +664,9 @@ void epilogue_store(
             }
 #endif
 
+#if FOLDED_RESIDUAL
+            const uint32_t fold_res_off = ((pnc_s - NC_START) / 64) * STAGING_REGION_BYTES;
+#endif
 #if EPILOGUE_LOOP
 #pragma unroll 1
 #else
@@ -662,8 +716,13 @@ void epilogue_store(
 #endif /* BIAS_BF16 */
 
                 /* Residual from SMEM — use precomputed swizzle offsets */
+#if FOLDED_RESIDUAL
+                const uint32_t rs = res_staging_saddr + fold_res_off
+                    + res_ri * STAGING_REGION_BYTES + lane * STAGING_REGION_ROW_BYTES;
+#else
                 const uint32_t rs = res_staging_saddr
                     + res_ri * STAGING_REGION_BYTES + lane * STAGING_REGION_ROW_BYTES;
+#endif
                 const uint32_t rsw0 = half ? sw4 : sw0;
                 const uint32_t rsw1 = half ? sw5 : sw1;
                 const uint32_t rsw2 = half ? sw6 : sw2;
@@ -778,6 +837,11 @@ void epilogue_store(
                     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                 }
             }
+#if SINGLE_PRODUCER_RES
+            if (pass < LOCAL_PASSES - 1) {
+                asm volatile("bar.sync 3, %0;" :: "r"(STAGING_EPI_WARPS * 32) : "memory");
+            }
+#endif
 #if W0_RES_FULL
             /* Signal pass consumed so W0 can load next pass (or tile done) */
             if (pass < LOCAL_PASSES - 1) {
@@ -1570,12 +1634,18 @@ persistent_gemm(
         }
 #endif
 #if TMA_RESIDUAL
-#if SIX_WARP_EPI
+#if SINGLE_PRODUCER_RES
+        mbar_init(smem_to_uint(smem + OFF_RES_MBAR), 1);
+#elif SIX_WARP_EPI
         for (int w = 0; w < 6; w++)
+            mbar_init(smem_to_uint(smem + OFF_RES_MBAR + w * 8), 1);
 #else
         for (int w = 0; w < NUM_EPI_WARPS; w++)
-#endif
             mbar_init(smem_to_uint(smem + OFF_RES_MBAR + w * 8), 1);
+#endif
+#if FOLDED_RESIDUAL
+        mbar_init(smem_to_uint(smem + OFF_FOLD_RES_MBAR), 1);
+#endif
 #if !NON_OVERLAPPED
 #if W0_RES_FULL
         mbar_init(smem_to_uint(smem + OFF_RES_CONSUMED_MBAR), NUM_EPI_WARPS);
@@ -1612,6 +1682,9 @@ persistent_gemm(
 
     int tma_phase[N_STAGES] = {0};
     int mma_phase[N_STAGES] = {0};
+#if FOLDED_RESIDUAL
+    int fold_res_phase = 0;
+#endif
 
     uint64_t desc_a_base[N_STAGES], desc_b_base[N_STAGES];
     for (int s = 0; s < N_STAGES; s++) {
@@ -1692,6 +1765,24 @@ persistent_gemm(
                            "r"(n_start + cta_rank * (TN/2)), "r"(TMA_BYTES)
                         : "memory");
                 }
+#if FOLDED_RESIDUAL
+                if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+                    constexpr int FOLD_START = K_ITERS - 4;
+                    if (ki >= FOLD_START && lane == 0) {
+                        const int fold_ki = ki - FOLD_START;
+                        const uint32_t fold_base = smem_base + OFF_FOLDED_RES;
+                        const uint32_t fold_mbar = smem_base + OFF_FOLD_RES_MBAR;
+                        if (fold_ki == 0)
+                            mbar_arrive_expect_tx(fold_mbar, FOLD_RES_BYTES);
+                        for (int fl = 0; fl < 4; fl++) {
+                            int idx = fold_ki * 4 + fl;
+                            int rg = idx / 4, ci = idx % 4;
+                            tma_load_2d_cta(fold_base + rg * FOLD_RG_STRIDE + ci * STAGING_REGION_BYTES,
+                                &tma_res, n_start + ci * 64, m_start + rg * 32, fold_mbar);
+                        }
+                    }
+                }
+#endif
             }
             /* No W0_RES_FULL/PREFETCH in NON_OVERLAPPED — residual handled by epilogue warps */
         }
@@ -1744,6 +1835,15 @@ persistent_gemm(
         asm volatile("bar.sync 2, %0;" :: "r"(THREADS) : "memory");
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
+#if FOLDED_RESIDUAL
+        if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+            if (warp == 0 && lane == 0)
+                mbar_wait(smem_to_uint(smem + OFF_FOLD_RES_MBAR), fold_res_phase);
+            asm volatile("bar.sync 3, %0;" :: "r"(THREADS) : "memory");
+            fold_res_phase ^= 1;
+        }
+#endif
+
         /* Phase 2: Epilogue on current tile */
         {
 #if SIX_WARP_EPI
@@ -1765,7 +1865,19 @@ persistent_gemm(
                 epilogue_store<0, TN, Op, false>(0, row_group, lane, gm_base, n_start,
                     side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #if TMA_RESIDUAL
-                    , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#if SINGLE_PRODUCER_RES
+                    , &tma_res, smem_to_uint(smem + OFF_RES_MBAR)
+                    , staging_saddr + RES_STAGING_OFFSET
+#elif FOLDED_RESIDUAL
+                    , &tma_res, 0
+                    , smem_to_uint(smem + OFF_FOLDED_RES) + row_group * FOLD_RG_STRIDE
+#else
+                    , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8)
+                    , staging_saddr + RES_STAGING_OFFSET
+#endif
+#endif
+#if SINGLE_PRODUCER_RES
+                    , ew, m_start
 #endif
 #ifdef TIMING
                     , epi_t1_no

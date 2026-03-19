@@ -42,39 +42,48 @@ log "========================================="
 nvidia-smi --query-gpu=name,clocks.sm,clocks.mem --format=csv,noheader 2>/dev/null | head -1 | tee -a "$OUTDIR/session.log" || true
 
 # ── Shared base flags (FC2 best known params, excluding arch flags) ──
-BASE="-DBIAS_SMEM=1 -DN_STAGES=5 -DPHASE1_UNROLL=1 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=0"
+BASE="-DBIAS_SMEM=1 -DN_STAGES=5 -DPHASE1_UNROLL=1 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=0 -DTMA_RESIDUAL=1"
 
 # ── Configs: NAME FLAGS ──
 declare -a NAMES FLAGS
 add() { NAMES+=("$1"); FLAGS+=("$2"); }
 
 # --- Baseline: current best overlapped architecture ---
-add "overlapped_base"       "$BASE -DINTERLEAVE_STRATEGY=1 -DTMA_RESIDUAL=1"
-add "overlapped_is0"        "$BASE -DINTERLEAVE_STRATEGY=0 -DTMA_RESIDUAL=1"
+add "overlapped_base"       "$BASE -DINTERLEAVE_STRATEGY=1"
+add "overlapped_is0"        "$BASE -DINTERLEAVE_STRATEGY=0"
 
 # --- Variant 1: NON_OVERLAPPED (single-buffered TMEM, barrier sync) ---
-add "nonoverlap"            "$BASE -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=1 -DTMA_RESIDUAL=1"
-add "nonoverlap_is0"        "$BASE -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=0 -DTMA_RESIDUAL=1"
+add "nonoverlap"            "$BASE -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=1"
+add "nonoverlap_is0"        "$BASE -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=0"
 add "nonoverlap_nores"      "$BASE -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=1 -DTMA_RESIDUAL=0"
 
 # --- Variant 2: SIX_WARP_EPI (all 6 warps, requires NON_OVERLAPPED) ---
 # N_STAGES=4 mandatory — 6 staging regions won't fit with NS=5
-add "6warp"                 "$BASE -DNON_OVERLAPPED=1 -DSIX_WARP_EPI=1 -DN_STAGES=4 -DINTERLEAVE_STRATEGY=1 -DTMA_RESIDUAL=1"
-add "6warp_is0"             "$BASE -DNON_OVERLAPPED=1 -DSIX_WARP_EPI=1 -DN_STAGES=4 -DINTERLEAVE_STRATEGY=0 -DTMA_RESIDUAL=1"
+add "6warp"                 "$BASE -DNON_OVERLAPPED=1 -DSIX_WARP_EPI=1 -DN_STAGES=4 -DINTERLEAVE_STRATEGY=1"
+add "6warp_is0"             "$BASE -DNON_OVERLAPPED=1 -DSIX_WARP_EPI=1 -DN_STAGES=4 -DINTERLEAVE_STRATEGY=0"
 
 # --- Variant 3: DIRECT_STG (no SMEM staging, st.global from regs) ---
-add "direct_stg"            "$BASE -DDIRECT_STG=1 -DINTERLEAVE_STRATEGY=0"
-add "direct_stg_nonoverlap" "$BASE -DDIRECT_STG=1 -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=0"
-add "direct_stg_6warp"      "$BASE -DDIRECT_STG=1 -DNON_OVERLAPPED=1 -DSIX_WARP_EPI=1 -DN_STAGES=4 -DINTERLEAVE_STRATEGY=0"
+add "direct_stg"            "$BASE -DDIRECT_STG=1 -DINTERLEAVE_STRATEGY=0 -DTMA_RESIDUAL=0"
+add "direct_stg_nonoverlap" "$BASE -DDIRECT_STG=1 -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=0 -DTMA_RESIDUAL=0"
+add "direct_stg_6warp"      "$BASE -DDIRECT_STG=1 -DNON_OVERLAPPED=1 -DSIX_WARP_EPI=1 -DN_STAGES=4 -DINTERLEAVE_STRATEGY=0 -DTMA_RESIDUAL=0"
+
+# --- Variant 4: SINGLE_PRODUCER_RES (one warp loads all residual) ---
+add "spr"                   "$BASE -DNON_OVERLAPPED=1 -DSINGLE_PRODUCER_RES=1 -DINTERLEAVE_STRATEGY=1"
+add "spr_6warp"             "$BASE -DNON_OVERLAPPED=1 -DSINGLE_PRODUCER_RES=1 -DSIX_WARP_EPI=1 -DN_STAGES=4 -DINTERLEAVE_STRATEGY=1"
+
+# --- Variant 5: FOLDED_RESIDUAL (W0 preloads residual during K-loop) ---
+add "fold_res"              "$BASE -DNON_OVERLAPPED=1 -DFOLDED_RESIDUAL=1 -DINTERLEAVE_STRATEGY=1"
+add "fold_res_direct"       "$BASE -DNON_OVERLAPPED=1 -DFOLDED_RESIDUAL=1 -DDIRECT_STG=1 -DINTERLEAVE_STRATEGY=0"
+add "fold_res_ns3"          "$BASE -DNON_OVERLAPPED=1 -DFOLDED_RESIDUAL=1 -DN_STAGES=3 -DINTERLEAVE_STRATEGY=1"
 
 # --- Parameter variations on best arch (for comparison) ---
-add "overlapped_ph1u2"      "$BASE -DINTERLEAVE_STRATEGY=1 -DTMA_RESIDUAL=1 -DPHASE1_UNROLL=2"
-add "overlapped_st1"        "$BASE -DINTERLEAVE_STRATEGY=1 -DTMA_RESIDUAL=1 -DSTORE_TIMING=1"
-add "nonoverlap_ph1u2"      "$BASE -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=1 -DTMA_RESIDUAL=1 -DPHASE1_UNROLL=2"
+add "overlapped_ph1u2"      "$BASE -DINTERLEAVE_STRATEGY=1 -DPHASE1_UNROLL=2"
+add "overlapped_st1"        "$BASE -DINTERLEAVE_STRATEGY=1 -DSTORE_TIMING=1"
+add "nonoverlap_ph1u2"      "$BASE -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=1 -DPHASE1_UNROLL=2"
 
 if [ "$QUICK" = "1" ]; then
-    # Quick mode: baseline + nonoverlap + direct_stg + 6warp
-    INDICES=(0 2 7 8)
+    # Quick mode: baseline + nonoverlap + direct_stg + spr + fold_res
+    INDICES=(0 2 8 11 13)
     log "Quick mode: ${#INDICES[@]} configs"
 else
     INDICES=($(seq 0 $((${#NAMES[@]} - 1))))
@@ -148,7 +157,7 @@ for idx in "${INDICES[@]}"; do
 
     # Verdict (overlapped configs only — NON_OVERLAPPED won't have epi_wait)
     verdict="?"
-    if echo "$name" | grep -q "nonoverlap\|6warp\|direct_stg"; then
+    if echo "$name" | grep -q "nonoverlap\|6warp\|direct_stg\|spr\|fold_res"; then
         verdict="NON-OVERLAP"
     elif [ -n "$w1_epi" ] && [ -n "$w1_kloop" ]; then
         if [ "$w1_epi" -lt 100 ]; then verdict="COMPUTE-BOUND"
