@@ -1789,6 +1789,9 @@ persistent_gemm(
 
         if (warp == 1) {
             if (lane == 0 && cta_rank == 0) {
+#ifdef TIMING
+                t_tile_start = clock64();
+#endif
                 mbar_wait(tma_mbar[0], tma_phase[0]);
                 tma_phase[0] ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1828,6 +1831,9 @@ persistent_gemm(
                     K_ITER_ACCUM(ki % N_STAGES);
                 }
                 /* No mainloop_mbar signal — bar.sync below replaces it */
+#ifdef TIMING
+                t_kloop_end = clock64();
+#endif
             }
         }
 
@@ -1861,6 +1867,8 @@ persistent_gemm(
                 const int gm_base = m_start + row_group * 32;
 #ifdef TIMING
                 long long epi_t1_no = 0;
+                long long epi_t0_no = 0;
+                if (lane == 0 && cta_rank == 0) epi_t0_no = clock64();
 #endif
                 epilogue_store<0, TN, Op, false>(0, row_group, lane, gm_base, n_start,
                     side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
@@ -1890,11 +1898,45 @@ persistent_gemm(
                 }
                 __syncwarp();
 #endif
+#ifdef TIMING
+                if (lane == 0 && cta_rank == 0) {
+                    long long p1 = epi_t1_no - epi_t0_no;
+                    epi_sum_p1 += p1;
+                    if (p1 < epi_min_p1) epi_min_p1 = p1;
+                    if (p1 > epi_max_p1) epi_max_p1 = p1;
+                    epi_count++;
+                    if (ew == 1) {
+                        long long epi_t2_no = clock64();
+                        long long drain = epi_t2_no - epi_t1_no;
+                        epi_sum_p2 += drain;
+                        if (drain < epi_min_p2) epi_min_p2 = drain;
+                        if (drain > epi_max_p2) epi_max_p2 = drain;
+                    }
+                }
+#endif
             }
         }
 
         /* Barrier: epilogue complete, safe for next tile */
         asm volatile("bar.sync 2, %0;" :: "r"(THREADS) : "memory");
+
+#ifdef TIMING
+        /* W1: measure total tile including epilogue idle time */
+        if (warp == 1 && lane == 0 && cta_rank == 0) {
+            long long t_tile_end = clock64();
+            long long dt_kloop = t_kloop_end - t_tile_start;
+            long long dt_epi = t_tile_end - t_kloop_end;
+            long long dt_total = t_tile_end - t_tile_start;
+            sum_epi_wait += dt_epi;
+            sum_kloop += dt_kloop;
+            sum_total += dt_total;
+            if (dt_kloop < min_kloop) min_kloop = dt_kloop;
+            if (dt_kloop > max_kloop) max_kloop = dt_kloop;
+            if (dt_total < min_total) min_total = dt_total;
+            if (dt_total > max_total) max_total = dt_total;
+            tile_count++;
+        }
+#endif
 
 #else  /* !NON_OVERLAPPED — original overlapped tile loop */
         const int buf = tile_idx & 1;
