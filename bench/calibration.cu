@@ -1549,6 +1549,539 @@ extern "C" __global__ void k23_stg_throughput(long long* out) {
     out[1] = readback;
 }
 
+/*
+FP32 arithmetic benchmarks: FADD, FMUL, FFMA.
+These are the dominant instructions in CUTLASS's epilogue (64 FMUL+FFMA per region).
+Critical for understanding FP32 vs BF16 pipeline diversity.
+*/
+
+extern "C" __global__ void k27a_fadd_throughput(long long* out) {
+    volatile float* gin = (volatile float*)out;
+    float a=gin[0]+1, b=gin[1]+2, c=gin[2]+3, d=gin[3]+4;
+    float e=gin[4]+5, f=gin[5]+6, g=gin[6]+7, h=gin[7]+8;
+    float i0=gin[8]+9, j=gin[9]+10, k=gin[10]+11, l=gin[11]+12;
+    float m=gin[12]+13, n=gin[13]+14, o=gin[14]+15, p=gin[15]+16;
+    float inc = gin[threadIdx.x];
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "add.f32 %0, %0, %16;\n\t"
+            "add.f32 %1, %1, %16;\n\t"
+            "add.f32 %2, %2, %16;\n\t"
+            "add.f32 %3, %3, %16;\n\t"
+            "add.f32 %4, %4, %16;\n\t"
+            "add.f32 %5, %5, %16;\n\t"
+            "add.f32 %6, %6, %16;\n\t"
+            "add.f32 %7, %7, %16;\n\t"
+            "add.f32 %8, %8, %16;\n\t"
+            "add.f32 %9, %9, %16;\n\t"
+            "add.f32 %10, %10, %16;\n\t"
+            "add.f32 %11, %11, %16;\n\t"
+            "add.f32 %12, %12, %16;\n\t"
+            "add.f32 %13, %13, %16;\n\t"
+            "add.f32 %14, %14, %16;\n\t"
+            "add.f32 %15, %15, %16;\n\t"
+            : "+f"(a), "+f"(b), "+f"(c), "+f"(d),
+              "+f"(e), "+f"(f), "+f"(g), "+f"(h),
+              "+f"(i0), "+f"(j), "+f"(k), "+f"(l),
+              "+f"(m), "+f"(n), "+f"(o), "+f"(p)
+            : "f"(inc)
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    volatile float* fout = (volatile float*)(out + 1);
+    fout[0] = a+b+c+d+e+f+g+h+i0+j+k+l+m+n+o+p;
+}
+
+extern "C" __global__ void k27b_fadd_latency(long long* out) {
+    volatile float* gin = (volatile float*)out;
+    float a = gin[threadIdx.x];
+    float inc = gin[threadIdx.x + 32];
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            "add.f32 %0, %0, %1;\n\t"
+            : "+f"(a)
+            : "f"(inc)
+        );
+    }
+    long long t1 = clock64();
+
+    if (threadIdx.x == 0) {
+        out[0] = t1 - t0;
+        volatile float* fout = (volatile float*)(out + 1);
+        fout[0] = a;
+    }
+}
+
+extern "C" __global__ void k28a_fmul_throughput(long long* out) {
+    volatile float* gin = (volatile float*)out;
+    float a=gin[0]+1, b=gin[1]+2, c=gin[2]+3, d=gin[3]+4;
+    float e=gin[4]+5, f=gin[5]+6, g=gin[6]+7, h=gin[7]+8;
+    float i0=gin[8]+9, j=gin[9]+10, k=gin[10]+11, l=gin[11]+12;
+    float m=gin[12]+13, n=gin[13]+14, o=gin[14]+15, p=gin[15]+16;
+    float scale = gin[threadIdx.x] + 1.0001f; // not 1.0 to prevent optimize-away
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "mul.f32 %0, %0, %16;\n\t"
+            "mul.f32 %1, %1, %16;\n\t"
+            "mul.f32 %2, %2, %16;\n\t"
+            "mul.f32 %3, %3, %16;\n\t"
+            "mul.f32 %4, %4, %16;\n\t"
+            "mul.f32 %5, %5, %16;\n\t"
+            "mul.f32 %6, %6, %16;\n\t"
+            "mul.f32 %7, %7, %16;\n\t"
+            "mul.f32 %8, %8, %16;\n\t"
+            "mul.f32 %9, %9, %16;\n\t"
+            "mul.f32 %10, %10, %16;\n\t"
+            "mul.f32 %11, %11, %16;\n\t"
+            "mul.f32 %12, %12, %16;\n\t"
+            "mul.f32 %13, %13, %16;\n\t"
+            "mul.f32 %14, %14, %16;\n\t"
+            "mul.f32 %15, %15, %16;\n\t"
+            : "+f"(a), "+f"(b), "+f"(c), "+f"(d),
+              "+f"(e), "+f"(f), "+f"(g), "+f"(h),
+              "+f"(i0), "+f"(j), "+f"(k), "+f"(l),
+              "+f"(m), "+f"(n), "+f"(o), "+f"(p)
+            : "f"(scale)
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    volatile float* fout = (volatile float*)(out + 1);
+    fout[0] = a+b+c+d+e+f+g+h+i0+j+k+l+m+n+o+p;
+}
+
+extern "C" __global__ void k28b_fmul_latency(long long* out) {
+    volatile float* gin = (volatile float*)out;
+    float a = gin[threadIdx.x] + 1.0001f;
+    float scale = gin[threadIdx.x + 32] + 1.0001f;
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            "mul.f32 %0, %0, %1;\n\t"
+            : "+f"(a)
+            : "f"(scale)
+        );
+    }
+    long long t1 = clock64();
+
+    if (threadIdx.x == 0) {
+        out[0] = t1 - t0;
+        volatile float* fout = (volatile float*)(out + 1);
+        fout[0] = a;
+    }
+}
+
+extern "C" __global__ void k29a_ffma_throughput(long long* out) {
+    volatile float* gin = (volatile float*)out;
+    float a=gin[0]+1, b=gin[1]+2, c=gin[2]+3, d=gin[3]+4;
+    float e=gin[4]+5, f=gin[5]+6, g=gin[6]+7, h=gin[7]+8;
+    float i0=gin[8]+9, j=gin[9]+10, k=gin[10]+11, l=gin[11]+12;
+    float m=gin[12]+13, n=gin[13]+14, o=gin[14]+15, p=gin[15]+16;
+    float scale = gin[threadIdx.x] + 1.0001f;
+    float bias = gin[threadIdx.x + 32];
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "fma.rn.f32 %0, %0, %16, %17;\n\t"
+            "fma.rn.f32 %1, %1, %16, %17;\n\t"
+            "fma.rn.f32 %2, %2, %16, %17;\n\t"
+            "fma.rn.f32 %3, %3, %16, %17;\n\t"
+            "fma.rn.f32 %4, %4, %16, %17;\n\t"
+            "fma.rn.f32 %5, %5, %16, %17;\n\t"
+            "fma.rn.f32 %6, %6, %16, %17;\n\t"
+            "fma.rn.f32 %7, %7, %16, %17;\n\t"
+            "fma.rn.f32 %8, %8, %16, %17;\n\t"
+            "fma.rn.f32 %9, %9, %16, %17;\n\t"
+            "fma.rn.f32 %10, %10, %16, %17;\n\t"
+            "fma.rn.f32 %11, %11, %16, %17;\n\t"
+            "fma.rn.f32 %12, %12, %16, %17;\n\t"
+            "fma.rn.f32 %13, %13, %16, %17;\n\t"
+            "fma.rn.f32 %14, %14, %16, %17;\n\t"
+            "fma.rn.f32 %15, %15, %16, %17;\n\t"
+            : "+f"(a), "+f"(b), "+f"(c), "+f"(d),
+              "+f"(e), "+f"(f), "+f"(g), "+f"(h),
+              "+f"(i0), "+f"(j), "+f"(k), "+f"(l),
+              "+f"(m), "+f"(n), "+f"(o), "+f"(p)
+            : "f"(scale), "f"(bias)
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    volatile float* fout = (volatile float*)(out + 1);
+    fout[0] = a+b+c+d+e+f+g+h+i0+j+k+l+m+n+o+p;
+}
+
+extern "C" __global__ void k29b_ffma_latency(long long* out) {
+    volatile float* gin = (volatile float*)out;
+    float a = gin[threadIdx.x];
+    float scale = gin[threadIdx.x + 32] + 1.0001f;
+    float bias = gin[threadIdx.x + 64];
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            "fma.rn.f32 %0, %0, %1, %2;\n\t"
+            : "+f"(a)
+            : "f"(scale), "f"(bias)
+        );
+    }
+    long long t1 = clock64();
+
+    if (threadIdx.x == 0) {
+        out[0] = t1 - t0;
+        volatile float* fout = (volatile float*)(out + 1);
+        fout[0] = a;
+    }
+}
+
+/*
+Pipeline conflict / dual-issue probes.
+If throughput ≈ max(A_alone, B_alone) → different ports (can dual-issue or overlap).
+If throughput ≈ A_alone + B_alone → same port (serialized).
+*/
+
+extern "C" __global__ void k30_fadd_sts_conflict(long long* out) {
+    __shared__ int smem[1024];
+    volatile float* gin = (volatile float*)out;
+    float a=gin[0], b=gin[1], c=gin[2], d=gin[3];
+    float e=gin[4], f=gin[5], g=gin[6], h=gin[7];
+    float inc = gin[threadIdx.x];
+    int tid = threadIdx.x;
+    uint32_t saddr = (uint32_t)(uint64_t)(&smem[tid * 16]);
+    unsigned v0 = 0xdeadbeef, v1 = 0xcafebabe, v2 = 0x12345678, v3 = 0x9abcdef0;
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "add.f32 %0, %0, %8;\n\t"
+            "st.shared.v4.b32 [%9],    {%10,%11,%12,%13};\n\t"
+            "add.f32 %1, %1, %8;\n\t"
+            "st.shared.v4.b32 [%9+16], {%10,%11,%12,%13};\n\t"
+            "add.f32 %2, %2, %8;\n\t"
+            "st.shared.v4.b32 [%9+32], {%10,%11,%12,%13};\n\t"
+            "add.f32 %3, %3, %8;\n\t"
+            "st.shared.v4.b32 [%9+48], {%10,%11,%12,%13};\n\t"
+            "add.f32 %4, %4, %8;\n\t"
+            "st.shared.v4.b32 [%9],    {%10,%11,%12,%13};\n\t"
+            "add.f32 %5, %5, %8;\n\t"
+            "st.shared.v4.b32 [%9+16], {%10,%11,%12,%13};\n\t"
+            "add.f32 %6, %6, %8;\n\t"
+            "st.shared.v4.b32 [%9+32], {%10,%11,%12,%13};\n\t"
+            "add.f32 %7, %7, %8;\n\t"
+            "st.shared.v4.b32 [%9+48], {%10,%11,%12,%13};\n\t"
+            : "+f"(a), "+f"(b), "+f"(c), "+f"(d),
+              "+f"(e), "+f"(f), "+f"(g), "+f"(h)
+            : "f"(inc), "r"(saddr),
+              "r"(v0), "r"(v1), "r"(v2), "r"(v3)
+            : "memory"
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    volatile float* fout = (volatile float*)(out + 1);
+    fout[0] = a+b+c+d+e+f+g+h;
+}
+
+extern "C" __global__ void k31_fmul_hadd2_conflict(long long* out) {
+    /* Interleaved FMUL (FP32) and HADD2 (BF16) — tests if they share a port.
+       8 FMUL + 8 HADD2 = 16 instructions per iteration. */
+    volatile float* gin = (volatile float*)out;
+    float fa=gin[0]+1, fb=gin[1]+2, fc=gin[2]+3, fd=gin[3]+4;
+    float fe=gin[4]+5, ff=gin[5]+6, fg=gin[6]+7, fh=gin[7]+8;
+    float scale = gin[threadIdx.x] + 1.0001f;
+
+    volatile unsigned* uin = (volatile unsigned*)out;
+    unsigned ha=uin[0], hb=uin[1], hc=uin[2], hd=uin[3];
+    unsigned he=uin[4], hf=uin[5], hg=uin[6], hh=uin[7];
+    unsigned hinc = uin[threadIdx.x + 32];
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "mul.f32 %0, %0, %16;\n\t"
+            "add.bf16x2 %8,  %8,  %17;\n\t"
+            "mul.f32 %1, %1, %16;\n\t"
+            "add.bf16x2 %9,  %9,  %17;\n\t"
+            "mul.f32 %2, %2, %16;\n\t"
+            "add.bf16x2 %10, %10, %17;\n\t"
+            "mul.f32 %3, %3, %16;\n\t"
+            "add.bf16x2 %11, %11, %17;\n\t"
+            "mul.f32 %4, %4, %16;\n\t"
+            "add.bf16x2 %12, %12, %17;\n\t"
+            "mul.f32 %5, %5, %16;\n\t"
+            "add.bf16x2 %13, %13, %17;\n\t"
+            "mul.f32 %6, %6, %16;\n\t"
+            "add.bf16x2 %14, %14, %17;\n\t"
+            "mul.f32 %7, %7, %16;\n\t"
+            "add.bf16x2 %15, %15, %17;\n\t"
+            : "+f"(fa), "+f"(fb), "+f"(fc), "+f"(fd),
+              "+f"(fe), "+f"(ff), "+f"(fg), "+f"(fh),
+              "+r"(ha), "+r"(hb), "+r"(hc), "+r"(hd),
+              "+r"(he), "+r"(hf), "+r"(hg), "+r"(hh)
+            : "f"(scale), "r"(hinc)
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    volatile float* fout = (volatile float*)(out + 1);
+    fout[0] = fa+fb+fc+fd+fe+ff+fg+fh;
+    out[2] = ha+hb+hc+hd+he+hf+hg+hh;
+}
+
+extern "C" __global__ void k32_lop3_f2fp_conflict(long long* out) {
+    /* Interleaved LOP3 (INT) and F2FP (CVT) — tests if they share a port.
+       8 LOP3 + 8 F2FP = 16 instructions per iteration. */
+    volatile unsigned* gin = (volatile unsigned*)out;
+    unsigned la=gin[0]+1, lb=gin[1]+2, lc=gin[2]+3, ld=gin[3]+4;
+    unsigned le=gin[4]+5, lf=gin[5]+6, lg=gin[6]+7, lh=gin[7]+8;
+    unsigned mask = gin[threadIdx.x + 32];
+
+    volatile unsigned* fin = (volatile unsigned*)(out + 16);
+    unsigned fa0=fin[0], fb0=fin[1], fa1=fin[2], fb1=fin[3];
+    unsigned fa2=fin[4], fb2=fin[5], fa3=fin[6], fb3=fin[7];
+    unsigned c0=gin[8], c1=gin[9], c2=gin[10], c3=gin[11];
+    unsigned c4=gin[12], c5=gin[13], c6=gin[14], c7=gin[15];
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "{ .reg .f32 fa, fb;\n\t"
+            "lop3.b32 %0, %0, %16, 0, 0xc0;\n\t"
+            "mov.b32 fa, %17; mov.b32 fb, %18; cvt.rn.bf16x2.f32 %8,  fa, fb;\n\t"
+            "lop3.b32 %1, %1, %16, 0, 0xc0;\n\t"
+            "mov.b32 fa, %19; mov.b32 fb, %20; cvt.rn.bf16x2.f32 %9,  fa, fb;\n\t"
+            "lop3.b32 %2, %2, %16, 0, 0xc0;\n\t"
+            "mov.b32 fa, %21; mov.b32 fb, %22; cvt.rn.bf16x2.f32 %10, fa, fb;\n\t"
+            "lop3.b32 %3, %3, %16, 0, 0xc0;\n\t"
+            "mov.b32 fa, %23; mov.b32 fb, %18; cvt.rn.bf16x2.f32 %11, fa, fb;\n\t"
+            "lop3.b32 %4, %4, %16, 0, 0xc0;\n\t"
+            "mov.b32 fa, %17; mov.b32 fb, %20; cvt.rn.bf16x2.f32 %12, fa, fb;\n\t"
+            "lop3.b32 %5, %5, %16, 0, 0xc0;\n\t"
+            "mov.b32 fa, %19; mov.b32 fb, %22; cvt.rn.bf16x2.f32 %13, fa, fb;\n\t"
+            "lop3.b32 %6, %6, %16, 0, 0xc0;\n\t"
+            "mov.b32 fa, %21; mov.b32 fb, %18; cvt.rn.bf16x2.f32 %14, fa, fb;\n\t"
+            "lop3.b32 %7, %7, %16, 0, 0xc0;\n\t"
+            "mov.b32 fa, %23; mov.b32 fb, %20; cvt.rn.bf16x2.f32 %15, fa, fb;\n\t"
+            "}\n\t"
+            : "+r"(la), "+r"(lb), "+r"(lc), "+r"(ld),
+              "+r"(le), "+r"(lf), "+r"(lg), "+r"(lh),
+              "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3),
+              "+r"(c4), "+r"(c5), "+r"(c6), "+r"(c7)
+            : "r"(mask),
+              "r"(fa0), "r"(fb0), "r"(fa1), "r"(fb1),
+              "r"(fa2), "r"(fb2), "r"(fa3), "r"(fb3)
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    out[1] = la+lb+lc+ld+le+lf+lg+lh + c0+c1+c2+c3+c4+c5+c6+c7;
+}
+
+extern "C" __global__ void k33_ffma_f2fp_conflict(long long* out) {
+    /* Interleaved FFMA (FP32) and F2FP (CVT) — the CUTLASS combo.
+       8 FFMA + 8 F2FP = 16 instructions per iteration. */
+    volatile float* gin = (volatile float*)out;
+    float fa=gin[0]+1, fb=gin[1]+2, fc=gin[2]+3, fd=gin[3]+4;
+    float fe=gin[4]+5, ff=gin[5]+6, fg=gin[6]+7, fh=gin[7]+8;
+    float scale = gin[threadIdx.x] + 1.0001f;
+    float bias = gin[threadIdx.x + 32];
+
+    volatile unsigned* uin = (volatile unsigned*)(out + 16);
+    unsigned ca0=uin[0], cb0=uin[1], ca1=uin[2], cb1=uin[3];
+    unsigned ca2=uin[4], cb2=uin[5], ca3=uin[6], cb3=uin[7];
+    unsigned c0=uin[8], c1=uin[9], c2=uin[10], c3=uin[11];
+    unsigned c4=uin[12], c5=uin[13], c6=uin[14], c7=uin[15];
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "{ .reg .f32 va, vb;\n\t"
+            "fma.rn.f32 %0, %0, %16, %17;\n\t"
+            "mov.b32 va, %18; mov.b32 vb, %19; cvt.rn.bf16x2.f32 %8,  va, vb;\n\t"
+            "fma.rn.f32 %1, %1, %16, %17;\n\t"
+            "mov.b32 va, %20; mov.b32 vb, %21; cvt.rn.bf16x2.f32 %9,  va, vb;\n\t"
+            "fma.rn.f32 %2, %2, %16, %17;\n\t"
+            "mov.b32 va, %22; mov.b32 vb, %23; cvt.rn.bf16x2.f32 %10, va, vb;\n\t"
+            "fma.rn.f32 %3, %3, %16, %17;\n\t"
+            "mov.b32 va, %24; mov.b32 vb, %19; cvt.rn.bf16x2.f32 %11, va, vb;\n\t"
+            "fma.rn.f32 %4, %4, %16, %17;\n\t"
+            "mov.b32 va, %18; mov.b32 vb, %21; cvt.rn.bf16x2.f32 %12, va, vb;\n\t"
+            "fma.rn.f32 %5, %5, %16, %17;\n\t"
+            "mov.b32 va, %20; mov.b32 vb, %23; cvt.rn.bf16x2.f32 %13, va, vb;\n\t"
+            "fma.rn.f32 %6, %6, %16, %17;\n\t"
+            "mov.b32 va, %22; mov.b32 vb, %19; cvt.rn.bf16x2.f32 %14, va, vb;\n\t"
+            "fma.rn.f32 %7, %7, %16, %17;\n\t"
+            "mov.b32 va, %24; mov.b32 vb, %21; cvt.rn.bf16x2.f32 %15, va, vb;\n\t"
+            "}\n\t"
+            : "+f"(fa), "+f"(fb), "+f"(fc), "+f"(fd),
+              "+f"(fe), "+f"(ff), "+f"(fg), "+f"(fh),
+              "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3),
+              "+r"(c4), "+r"(c5), "+r"(c6), "+r"(c7)
+            : "f"(scale), "f"(bias),
+              "r"(ca0), "r"(cb0), "r"(ca1), "r"(cb1),
+              "r"(ca2), "r"(cb2), "r"(ca3), "r"(cb3)
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    volatile float* fout = (volatile float*)(out + 1);
+    fout[0] = fa+fb+fc+fd+fe+ff+fg+fh;
+    out[2] = c0+c1+c2+c3+c4+c5+c6+c7;
+}
+
+extern "C" __global__ void k34_hadd2_sts_conflict(long long* out) {
+    /* Interleaved HADD2 (BF16) and STS.v4 — tests if BF16 ALU conflicts with STS.
+       8 HADD2 + 8 STS = 16 instructions per iteration. Compare vs K10+K6. */
+    __shared__ int smem[1024];
+    volatile unsigned* gin = (volatile unsigned*)out;
+    unsigned ha=gin[0], hb=gin[1], hc=gin[2], hd=gin[3];
+    unsigned he=gin[4], hf=gin[5], hg=gin[6], hh=gin[7];
+    unsigned hinc = gin[threadIdx.x + 32];
+    int tid = threadIdx.x;
+    uint32_t saddr = (uint32_t)(uint64_t)(&smem[tid * 16]);
+    unsigned v0 = 0xdeadbeef, v1 = 0xcafebabe, v2 = 0x12345678, v3 = 0x9abcdef0;
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "add.bf16x2 %0, %0, %8;\n\t"
+            "st.shared.v4.b32 [%9],    {%10,%11,%12,%13};\n\t"
+            "add.bf16x2 %1, %1, %8;\n\t"
+            "st.shared.v4.b32 [%9+16], {%10,%11,%12,%13};\n\t"
+            "add.bf16x2 %2, %2, %8;\n\t"
+            "st.shared.v4.b32 [%9+32], {%10,%11,%12,%13};\n\t"
+            "add.bf16x2 %3, %3, %8;\n\t"
+            "st.shared.v4.b32 [%9+48], {%10,%11,%12,%13};\n\t"
+            "add.bf16x2 %4, %4, %8;\n\t"
+            "st.shared.v4.b32 [%9],    {%10,%11,%12,%13};\n\t"
+            "add.bf16x2 %5, %5, %8;\n\t"
+            "st.shared.v4.b32 [%9+16], {%10,%11,%12,%13};\n\t"
+            "add.bf16x2 %6, %6, %8;\n\t"
+            "st.shared.v4.b32 [%9+32], {%10,%11,%12,%13};\n\t"
+            "add.bf16x2 %7, %7, %8;\n\t"
+            "st.shared.v4.b32 [%9+48], {%10,%11,%12,%13};\n\t"
+            : "+r"(ha), "+r"(hb), "+r"(hc), "+r"(hd),
+              "+r"(he), "+r"(hf), "+r"(hg), "+r"(hh)
+            : "r"(hinc), "r"(saddr),
+              "r"(v0), "r"(v1), "r"(v2), "r"(v3)
+            : "memory"
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    out[1] = ha+hb+hc+hd+he+hf+hg+hh;
+}
+
+extern "C" __global__ void k35_ffma_lop3_conflict(long long* out) {
+    /* Interleaved FFMA (FP32) and LOP3 (INT) — both appear in CUTLASS epilogue.
+       8 FFMA + 8 LOP3 = 16 instructions per iteration. */
+    volatile float* gin = (volatile float*)out;
+    float fa=gin[0]+1, fb=gin[1]+2, fc=gin[2]+3, fd=gin[3]+4;
+    float fe=gin[4]+5, ff=gin[5]+6, fg=gin[6]+7, fh=gin[7]+8;
+    float scale = gin[threadIdx.x] + 1.0001f;
+    float bias = gin[threadIdx.x + 32];
+
+    volatile unsigned* uin = (volatile unsigned*)(out + 16);
+    unsigned la=uin[0]+1, lb=uin[1]+2, lc=uin[2]+3, ld=uin[3]+4;
+    unsigned le=uin[4]+5, lf=uin[5]+6, lg=uin[6]+7, lh=uin[7]+8;
+    unsigned mask = uin[threadIdx.x + 16];
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "fma.rn.f32 %0, %0, %16, %17;\n\t"
+            "lop3.b32 %8,  %8,  %18, 0, 0xc0;\n\t"
+            "fma.rn.f32 %1, %1, %16, %17;\n\t"
+            "lop3.b32 %9,  %9,  %18, 0, 0xc0;\n\t"
+            "fma.rn.f32 %2, %2, %16, %17;\n\t"
+            "lop3.b32 %10, %10, %18, 0, 0xc0;\n\t"
+            "fma.rn.f32 %3, %3, %16, %17;\n\t"
+            "lop3.b32 %11, %11, %18, 0, 0xc0;\n\t"
+            "fma.rn.f32 %4, %4, %16, %17;\n\t"
+            "lop3.b32 %12, %12, %18, 0, 0xc0;\n\t"
+            "fma.rn.f32 %5, %5, %16, %17;\n\t"
+            "lop3.b32 %13, %13, %18, 0, 0xc0;\n\t"
+            "fma.rn.f32 %6, %6, %16, %17;\n\t"
+            "lop3.b32 %14, %14, %18, 0, 0xc0;\n\t"
+            "fma.rn.f32 %7, %7, %16, %17;\n\t"
+            "lop3.b32 %15, %15, %18, 0, 0xc0;\n\t"
+            : "+f"(fa), "+f"(fb), "+f"(fc), "+f"(fd),
+              "+f"(fe), "+f"(ff), "+f"(fg), "+f"(fh),
+              "+r"(la), "+r"(lb), "+r"(lc), "+r"(ld),
+              "+r"(le), "+r"(lf), "+r"(lg), "+r"(lh)
+            : "f"(scale), "f"(bias), "r"(mask)
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    volatile float* fout = (volatile float*)(out + 1);
+    fout[0] = fa+fb+fc+fd+fe+ff+fg+fh;
+    out[2] = la+lb+lc+ld+le+lf+lg+lh;
+}
+
 struct Bench {
     const char* name;
     int instrs_per_iter;
@@ -1596,6 +2129,18 @@ int main() {
         {"K22a: LDS throughput (16 indep)",        16, k22a_lds_throughput},
         {"K22b: LDS latency (pointer chase)",      16, k22b_lds_latency},
         {"K23:  STG throughput (16 indep)",         16, k23_stg_throughput},
+        {"K27a: FADD throughput (16 indep)",       16, k27a_fadd_throughput},
+        {"K27b: FADD latency (dep chain)",         16, k27b_fadd_latency},
+        {"K28a: FMUL throughput (16 indep)",       16, k28a_fmul_throughput},
+        {"K28b: FMUL latency (dep chain)",         16, k28b_fmul_latency},
+        {"K29a: FFMA throughput (16 indep)",       16, k29a_ffma_throughput},
+        {"K29b: FFMA latency (dep chain)",         16, k29b_ffma_latency},
+        {"K30:  FADD+STS conflict (interleaved)",  16, k30_fadd_sts_conflict},
+        {"K31:  FMUL+HADD2 conflict (cross-pipe)", 16, k31_fmul_hadd2_conflict},
+        {"K32:  LOP3+F2FP conflict (cross-pipe)",  16, k32_lop3_f2fp_conflict},
+        {"K33:  FFMA+F2FP conflict (CUTLASS mix)", 16, k33_ffma_f2fp_conflict},
+        {"K34:  HADD2+STS conflict (our mix)",     16, k34_hadd2_sts_conflict},
+        {"K35:  FFMA+LOP3 conflict (CUTLASS mix)", 16, k35_ffma_lop3_conflict},
     };
     int n_benches = sizeof(benches) / sizeof(benches[0]);
 
@@ -1650,6 +2195,15 @@ int main() {
     printf("  K25b cyc/instr = SEL data-path latency (output→input chain, pred independent)\n");
     printf("  K26a cyc/instr = IABS+VIADD throughput (16 indep streams, abs+add interleave)\n");
     printf("  K26b cyc/instr = IABS+VIADD chain latency (subtract VIADD latency from K19b)\n");
+    printf("  K27  FADD throughput/latency — FP32 add pipe (CUTLASS uses for residual add)\n");
+    printf("  K28  FMUL throughput/latency — FP32 mul pipe (CUTLASS alpha*acc)\n");
+    printf("  K29  FFMA throughput/latency — FP32 fma pipe (CUTLASS beta*src+acc)\n");
+    printf("  K30  vs K27a+K6:  if ≈max → FADD/STS different ports; if ≈sum → same port\n");
+    printf("  K31  vs K28a+K10: if ≈max → FMUL/HADD2 different ports (key for pipeline diversity)\n");
+    printf("  K32  vs K15a+K1:  if ≈max → LOP3/F2FP different ports\n");
+    printf("  K33  vs K29a+K1:  if ≈max → FFMA/F2FP different ports (CUTLASS combo)\n");
+    printf("  K34  vs K10+K6:   if ≈max → HADD2/STS different ports (our combo)\n");
+    printf("  K35  vs K29a+K15a: if ≈max → FFMA/LOP3 different ports (CUTLASS combo)\n");
 
     cudaFree(d_out);
     return 0;
