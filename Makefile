@@ -9,7 +9,7 @@ CUTLASS_DIR = third_party/cutlass
 CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUTLASS_FLAGS = -std=c++17 --expt-relaxed-constexpr
 
-.PHONY: all clean timing fc1-gelu fc2 fc2-timing cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare
+.PHONY: all clean timing fc1-gelu fc2 fc2-timing cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-all
 
 all: $(TARGET)
 
@@ -60,6 +60,23 @@ cutlass-sass: cutlass-bench
 calibration: bench/calibration.cu
 	$(NVCC) $(CFLAGS) $< -o $@
 
+# ── Generated calibration benchmarks (instruction DB + generator) ──
+CALIB_GEN = bench/calib/gen_kernels.py bench/calib/instruction_db.py
+
+bench/calib/gen_tput.cu bench/calib/gen_lat.cu bench/calib/gen_conflict.cu: $(CALIB_GEN)
+	python3 bench/calib/gen_kernels.py
+
+calib-tput: bench/calib/gen_tput.cu
+	$(NVCC) $(CFLAGS) $< -o $@
+
+calib-lat: bench/calib/gen_lat.cu
+	$(NVCC) $(CFLAGS) $< -o $@
+
+calib-conflict: bench/calib/gen_conflict.cu
+	$(NVCC) $(CFLAGS) $< -o $@
+
+calib-all: calib-tput calib-lat calib-conflict
+
 cublas-bench: bench/cublas_bench.cu
 	$(NVCC) $(CFLAGS) -std=c++17 $< -o $@ -lcublasLt -lcublas
 
@@ -91,5 +108,5 @@ compare-fast:
 	python3 tools/compare_all.py --runs 5 --layer patch_embed --csv data/compare.csv
 
 clean:
-	rm -f $(TARGET) patch_embed_timing fc1-gelu fc2 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cublas-bench cublas-bench-fc1 cublas-bench-fc2 calibration
+	rm -f $(TARGET) patch_embed_timing fc1-gelu fc2 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cublas-bench cublas-bench-fc1 cublas-bench-fc2 calibration calib-tput calib-lat calib-conflict
 	rm -rf sass/
