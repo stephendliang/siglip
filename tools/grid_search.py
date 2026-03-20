@@ -55,6 +55,10 @@ DEFAULTS = {
     'TMA_RESIDUAL': 0,
     'W0_RES_PREFETCH': 0,
     'W0_RES_FULL': 0,
+    'PREFETCH_MBAR': 0,
+    'EPI_LOAD_WARP': 0,
+    'OVERLAP_EPI_WAIT': 0,
+    'BATCH_MMA': 0,
     'BATCH_EPILOGUE': 0,
     'GELU_VECTOR_WIDTH': 32,
     'STORE_TIMING': 0,
@@ -63,11 +67,6 @@ DEFAULTS = {
     'EPI_SYNC': 0,
     'NUM_PASSES_PARAM': 0,
     'BIAS_SMEM': 0,
-    'NON_OVERLAPPED': 0,
-    'SIX_WARP_EPI': 0,
-    'DIRECT_STG': 0,
-    'SINGLE_PRODUCER_RES': 0,
-    'FOLDED_RESIDUAL': 0,
 }
 
 # ── Parameter ranges ──
@@ -90,6 +89,10 @@ RANGES = {
     'TMA_RESIDUAL': [0, 1, 2],
     'W0_RES_PREFETCH': [0, 1],
     'W0_RES_FULL': [0, 1],
+    'PREFETCH_MBAR': [0, 1],
+    'EPI_LOAD_WARP': [0, 1],
+    'OVERLAP_EPI_WAIT': [0, 1],
+    'BATCH_MMA': [0, 1],
     'BATCH_EPILOGUE': [0, 1],
     'GELU_VECTOR_WIDTH': [8, 16, 32],
     'STORE_TIMING': [0, 1],
@@ -99,11 +102,6 @@ RANGES = {
     'NUM_PASSES_PARAM': [0, 4],
     'BIAS_SMEM': [0, 1],
     'DEFERRED_WAIT': [0, 1],
-    'NON_OVERLAPPED': [0, 1],
-    'SIX_WARP_EPI': [0, 1],
-    'DIRECT_STG': [0, 1],
-    'SINGLE_PRODUCER_RES': [0, 1],
-    'FOLDED_RESIDUAL': [0, 1],
 }
 
 # ── Tier definitions (generic, used by --tier 1/2/3/4/5) ──
@@ -130,7 +128,7 @@ KERNEL_TIERS = {
         3: ['EPILOGUE_LOOP', 'STS_WIDTH', 'EPI_SYNC', 'GELU_VECTOR_WIDTH'],
     },
     'fc2': {
-        1: ['N_STAGES', 'K_LOOP_UNROLL', 'TMA_RESIDUAL', 'W0_RES_PREFETCH', 'W0_RES_FULL'],
+        1: ['N_STAGES', 'K_LOOP_UNROLL', 'TMA_RESIDUAL', 'W0_RES_PREFETCH', 'W0_RES_FULL', 'BATCH_MMA'],
         2: ['INTERLEAVE_STRATEGY', 'PHASE1_UNROLL', 'BIAS_SMEM', 'TMEM_LOAD_WIDTH'],
         3: ['BATCH_EPILOGUE', 'STORE_TIMING', 'STS_WIDTH', 'PRELOAD_MODE', 'DEFERRED_WAIT'],
         4: ['EPILOGUE_LOOP', 'EPI_SYNC', 'NUM_PASSES_PARAM'],
@@ -150,10 +148,9 @@ KERNEL_CROSS_PARAMS = {
         'PHASE1_UNROLL', 'STORE_TIMING', 'PRELOAD_MODE', 'BATCH_EPILOGUE',  # tier 2
     ],
     'fc2': [
-        'N_STAGES', 'TMA_RESIDUAL', 'W0_RES_PREFETCH', 'W0_RES_FULL',          # tier 1 (drop KLU — η²<0.01)
-        'NON_OVERLAPPED', 'SINGLE_PRODUCER_RES', 'FOLDED_RESIDUAL',             # architecture flags
-        'INTERLEAVE_STRATEGY', 'PHASE1_UNROLL', 'BIAS_SMEM', 'BATCH_EPILOGUE',  # tier 2
-        'STORE_TIMING', 'DEFERRED_WAIT',                                         # tier 3 (drop PRELOAD_MODE — noise with TMAR=1)
+        'N_STAGES', 'TMA_RESIDUAL', 'W0_RES_PREFETCH', 'W0_RES_FULL', 'BATCH_MMA',  # tier 1
+        'INTERLEAVE_STRATEGY', 'PHASE1_UNROLL', 'BIAS_SMEM', 'BATCH_EPILOGUE',       # tier 2
+        'STORE_TIMING', 'DEFERRED_WAIT',                                               # tier 3
     ],
     'patch_embed': [
         'N_STAGES', 'K_LOOP_UNROLL', 'W0_LOOP_UNROLL',          # tier 1
@@ -165,7 +162,7 @@ KERNEL_CROSS_PARAMS = {
 # These change pipeline depth or fundamental kernel structure — later tiers
 # may interact differently with each value, so both must survive.
 BRANCH_PARAMS = {
-    'fc2': {'N_STAGES'},
+    'fc2': {'N_STAGES', 'BATCH_MMA'},
 }
 
 # Best-known configs per kernel (pin non-swept params here).
@@ -298,12 +295,10 @@ def is_valid(cfg, kernel='patch_embed'):
     tma_res = cfg.get('TMA_RESIDUAL', 0)
     w0_res_pf = cfg.get('W0_RES_PREFETCH', 0)
     w0_res_full = cfg.get('W0_RES_FULL', 0)
-    spr_flag = cfg.get('SINGLE_PRODUCER_RES', 0)
+    epi_load_warp_ = cfg.get('EPI_LOAD_WARP', 0)
     if tma_res:
         off_res_mbar = off_epilogue_mbar + 16
-        if spr_flag:
-            mbar_end = off_res_mbar + 8
-        elif w0_res_full:
+        if w0_res_full or epi_load_warp_:
             off_res_consumed_mbar = off_res_mbar + num_epi * 8
             off_res_pass_mbar = off_res_consumed_mbar + 8
             mbar_end = off_res_pass_mbar + 8
@@ -314,23 +309,10 @@ def is_valid(cfg, kernel='patch_embed'):
             mbar_end = off_res_mbar + num_epi * 8
     else:
         mbar_end = off_epilogue_mbar + 16
-    fold_res_flag = cfg.get('FOLDED_RESIDUAL', 0)
-    if fold_res_flag:
-        mbar_end_2 = mbar_end + 8  # OFF_FOLD_RES_MBAR
-    else:
-        mbar_end_2 = mbar_end
     bias_smem_bytes = (256 * 2 if kernel == 'fc2' else 256 * 4) if cfg.get('BIAS_SMEM', 0) else 0
-    off_staging = (mbar_end_2 + bias_smem_bytes + 1023) & ~1023
-    direct_stg_flag = cfg.get('DIRECT_STG', 0)
-    six_warp_flag = cfg.get('SIX_WARP_EPI', 0)
-    staging_warp_bytes = 0 if direct_stg_flag else 4 * 32 * 128  # 16384
-    staging_epi_warps = 6 if six_warp_flag else num_epi
-    smem_total = (off_staging + staging_epi_warps * staging_warp_bytes + 127) & ~127
-    if fold_res_flag:
-        fold_rg_stride = 4 * 32 * 128  # 4 * STAGING_REGION_BYTES
-        fold_res_bytes = 4 * fold_rg_stride
-        off_folded_res = (off_staging + staging_epi_warps * staging_warp_bytes + 1023) & ~1023
-        smem_total = (off_folded_res + fold_res_bytes + 127) & ~127
+    off_staging = (mbar_end + bias_smem_bytes + 1023) & ~1023
+    staging_warp_bytes = 4 * 32 * 128  # 16384
+    smem_total = (off_staging + num_epi * staging_warp_bytes + 127) & ~127
     if smem_total > SMEM_LIMIT:
         return False, f'SMEM {smem_total} > {SMEM_LIMIT}'
 
@@ -357,6 +339,15 @@ def is_valid(cfg, kernel='patch_embed'):
             return False, 'W0_RES_FULL requires TMA_RESIDUAL>=1'
         if cfg.get('W0_RES_PREFETCH', 0) == 1:
             return False, 'W0_RES_FULL and W0_RES_PREFETCH are mutually exclusive'
+
+    # EPI_LOAD_WARP: fc2 only, requires TMA_RESIDUAL>=1, exclusive with W0_RES_*
+    if cfg.get('EPI_LOAD_WARP', 0) == 1:
+        if kernel != 'fc2':
+            return False, 'EPI_LOAD_WARP only for fc2'
+        if cfg.get('TMA_RESIDUAL', 0) < 1:
+            return False, 'EPI_LOAD_WARP requires TMA_RESIDUAL>=1'
+        if cfg.get('W0_RES_FULL', 0) == 1 or cfg.get('W0_RES_PREFETCH', 0) == 1:
+            return False, 'EPI_LOAD_WARP mutually exclusive with W0_RES_FULL/W0_RES_PREFETCH'
 
     # CVT_ADD_FUSED only meaningful for patch_embed (dead code on fc1/fc2)
     if cfg.get('CVT_ADD_FUSED', 1) != 1 and kernel != 'patch_embed':
@@ -440,57 +431,6 @@ def is_valid(cfg, kernel='patch_embed'):
     if cfg.get('BIAS_SMEM', 0) != 0 and kernel == 'patch_embed':
         return False, 'BIAS_SMEM only for fc1_gelu/fc2'
 
-    # NON_OVERLAPPED only meaningful for fc2 (PE/FC1 are epilogue-bound, not worth testing)
-    non_overlap = cfg.get('NON_OVERLAPPED', 0)
-    if non_overlap and kernel != 'fc2':
-        return False, 'NON_OVERLAPPED only for fc2'
-
-    # SIX_WARP_EPI requires NON_OVERLAPPED
-    six_warp = cfg.get('SIX_WARP_EPI', 0)
-    if six_warp and not non_overlap:
-        return False, 'SIX_WARP_EPI requires NON_OVERLAPPED'
-    if six_warp and kernel != 'fc2':
-        return False, 'SIX_WARP_EPI only for fc2'
-
-    # DIRECT_STG only for fc2
-    direct_stg = cfg.get('DIRECT_STG', 0)
-    if direct_stg and kernel != 'fc2':
-        return False, 'DIRECT_STG only for fc2'
-
-    # SINGLE_PRODUCER_RES constraints
-    spr = cfg.get('SINGLE_PRODUCER_RES', 0)
-    if spr:
-        if kernel != 'fc2':
-            return False, 'SINGLE_PRODUCER_RES only for fc2'
-        if not non_overlap:
-            return False, 'SINGLE_PRODUCER_RES requires NON_OVERLAPPED'
-        if cfg.get('TMA_RESIDUAL', 0) < 1:
-            return False, 'SINGLE_PRODUCER_RES requires TMA_RESIDUAL>=1'
-        if direct_stg:
-            return False, 'SINGLE_PRODUCER_RES incompatible with DIRECT_STG'
-        if cfg.get('W0_RES_PREFETCH', 0) or cfg.get('W0_RES_FULL', 0):
-            return False, 'SINGLE_PRODUCER_RES mutually exclusive with W0_RES_PREFETCH/W0_RES_FULL'
-        if six_warp:
-            return False, 'SINGLE_PRODUCER_RES incompatible with SIX_WARP_EPI'
-
-    # FOLDED_RESIDUAL constraints
-    fold_res = cfg.get('FOLDED_RESIDUAL', 0)
-    if fold_res:
-        if kernel != 'fc2':
-            return False, 'FOLDED_RESIDUAL only for fc2'
-        if not non_overlap:
-            return False, 'FOLDED_RESIDUAL requires NON_OVERLAPPED'
-        if cfg.get('TMA_RESIDUAL', 0) < 1:
-            return False, 'FOLDED_RESIDUAL requires TMA_RESIDUAL>=1'
-        if cfg.get('W0_RES_PREFETCH', 0) or cfg.get('W0_RES_FULL', 0):
-            return False, 'FOLDED_RESIDUAL mutually exclusive with W0_RES_PREFETCH/W0_RES_FULL'
-        if not direct_stg and n_stages > 3:
-            return False, 'FOLDED_RESIDUAL without DIRECT_STG requires N_STAGES<=3'
-
-    # SINGLE_PRODUCER_RES and FOLDED_RESIDUAL are mutually exclusive
-    if spr and fold_res:
-        return False, 'SINGLE_PRODUCER_RES and FOLDED_RESIDUAL are mutually exclusive'
-
     return True, 'ok'
 
 
@@ -507,12 +447,10 @@ def smem_kb(cfg):
     tma_res = cfg.get('TMA_RESIDUAL', 0)
     w0_res_pf = cfg.get('W0_RES_PREFETCH', 0)
     w0_res_full = cfg.get('W0_RES_FULL', 0)
-    spr_flag = cfg.get('SINGLE_PRODUCER_RES', 0)
+    epi_load_warp = cfg.get('EPI_LOAD_WARP', 0)
     if tma_res:
         off_res_mbar = off_epilogue_mbar + 16
-        if spr_flag:
-            mbar_end = off_res_mbar + 8
-        elif w0_res_full:
+        if w0_res_full or epi_load_warp:
             off_res_consumed_mbar = off_res_mbar + num_epi * 8
             off_res_pass_mbar = off_res_consumed_mbar + 8
             mbar_end = off_res_pass_mbar + 8
@@ -523,24 +461,11 @@ def smem_kb(cfg):
             mbar_end = off_res_mbar + num_epi * 8
     else:
         mbar_end = off_epilogue_mbar + 16
-    fold_res_flag = cfg.get('FOLDED_RESIDUAL', 0)
-    if fold_res_flag:
-        mbar_end_2 = mbar_end + 8
-    else:
-        mbar_end_2 = mbar_end
     is_fc2 = 'TMA_RESIDUAL' in cfg  # FC2-only param → BIAS_BF16 active
     bias_smem_bytes = (256 * 2 if is_fc2 else 256 * 4) if cfg.get('BIAS_SMEM', 0) else 0
-    off_staging = (mbar_end_2 + bias_smem_bytes + 1023) & ~1023
-    direct_stg_flag = cfg.get('DIRECT_STG', 0)
-    six_warp_flag = cfg.get('SIX_WARP_EPI', 0)
-    staging_warp_bytes = 0 if direct_stg_flag else 4 * 32 * 128
-    staging_epi_warps = 6 if six_warp_flag else num_epi
-    smem_total = (off_staging + staging_epi_warps * staging_warp_bytes + 127) & ~127
-    if fold_res_flag:
-        fold_rg_stride = 4 * 32 * 128
-        fold_res_bytes = 4 * fold_rg_stride
-        off_folded_res = (off_staging + staging_epi_warps * staging_warp_bytes + 1023) & ~1023
-        smem_total = (off_folded_res + fold_res_bytes + 127) & ~127
+    off_staging = (mbar_end + bias_smem_bytes + 1023) & ~1023
+    staging_warp_bytes = 4 * 32 * 128
+    smem_total = (off_staging + num_epi * staging_warp_bytes + 127) & ~127
     return smem_total / 1024
 
 

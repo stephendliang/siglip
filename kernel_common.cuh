@@ -63,8 +63,26 @@ Usage: #define N_DIM and K_DIM before including this header.
 #if W0_RES_FULL && W0_RES_PREFETCH
 #error "W0_RES_FULL and W0_RES_PREFETCH are mutually exclusive"
 #endif
+#ifndef PREFETCH_MBAR
+#define PREFETCH_MBAR 0          // 0=off, 1=W1 K-loop prefetches next stage's TMA barrier
+#endif
+#ifndef EPI_LOAD_WARP
+#define EPI_LOAD_WARP 0          // 0=off, 1=dedicated warp for residual TMA loading (fc2 only)
+#endif
+#ifndef OVERLAP_EPI_WAIT
+#define OVERLAP_EPI_WAIT 0       // 0=off, 1=prefetch epilogue mbar at end of K-loop
+#endif
+#if EPI_LOAD_WARP && !TMA_RESIDUAL
+#error "EPI_LOAD_WARP requires TMA_RESIDUAL >= 1"
+#endif
+#if EPI_LOAD_WARP && (W0_RES_FULL || W0_RES_PREFETCH)
+#error "EPI_LOAD_WARP mutually exclusive with W0_RES_FULL/W0_RES_PREFETCH"
+#endif
 #ifndef SUB_MMA_UNROLL
 #define SUB_MMA_UNROLL  0    // Sub-MMA inner loop: 0=no pragma, 1=no unroll, N=unroll by N
+#endif
+#ifndef BATCH_MMA
+#define BATCH_MMA 0              // 0=separate asm per sub-MMA (default), 1=all 4 in one asm block
 #endif
 #ifndef PRELOAD_MODE
 #define PRELOAD_MODE 1         // 0=no preload, 1=partial (8 bias), 2=full (all side-data before TMEM_WAIT)
@@ -108,55 +126,6 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef BIAS_BF16
 #define BIAS_BF16 0              // 0=FP32 bias, 1=BF16 bias with bf16x2 epilogue arithmetic (fc2 only)
 #endif
-#ifndef NON_OVERLAPPED
-#define NON_OVERLAPPED 0         // 0=overlapped epilogue (default), 1=barrier-separated K-loop + epilogue
-#endif
-#ifndef SIX_WARP_EPI
-#define SIX_WARP_EPI 0           // 0=W2+ epilogue (default), 1=all 6 warps do epilogue (requires NON_OVERLAPPED)
-#endif
-#ifndef DIRECT_STG
-#define DIRECT_STG 0             // 0=SMEM-staged TMA stores (default), 1=direct STG stores (no staging SMEM)
-#endif
-#ifndef SINGLE_PRODUCER_RES
-#define SINGLE_PRODUCER_RES 0    // 0=per-warp residual loads (default), 1=single producer loads all residual
-#endif
-#ifndef FOLDED_RESIDUAL
-#define FOLDED_RESIDUAL 0        // 0=separate residual (default), 1=fold residual into pipeline stages
-#endif
-
-#if SIX_WARP_EPI && !NON_OVERLAPPED
-#error "SIX_WARP_EPI requires NON_OVERLAPPED"
-#endif
-#if SINGLE_PRODUCER_RES && !NON_OVERLAPPED
-#error "SINGLE_PRODUCER_RES requires NON_OVERLAPPED"
-#endif
-#if SINGLE_PRODUCER_RES && !TMA_RESIDUAL
-#error "SINGLE_PRODUCER_RES requires TMA_RESIDUAL"
-#endif
-#if SINGLE_PRODUCER_RES && DIRECT_STG
-#error "SINGLE_PRODUCER_RES incompatible with DIRECT_STG"
-#endif
-#if SINGLE_PRODUCER_RES && (W0_RES_PREFETCH || W0_RES_FULL)
-#error "SINGLE_PRODUCER_RES mutually exclusive with W0_RES_PREFETCH/W0_RES_FULL"
-#endif
-#if SINGLE_PRODUCER_RES && SIX_WARP_EPI
-#error "SINGLE_PRODUCER_RES incompatible with SIX_WARP_EPI (split-column warps need different residual columns)"
-#endif
-#if SINGLE_PRODUCER_RES && FOLDED_RESIDUAL
-#error "SINGLE_PRODUCER_RES and FOLDED_RESIDUAL are mutually exclusive"
-#endif
-#if FOLDED_RESIDUAL && !NON_OVERLAPPED
-#error "FOLDED_RESIDUAL requires NON_OVERLAPPED"
-#endif
-#if FOLDED_RESIDUAL && !TMA_RESIDUAL
-#error "FOLDED_RESIDUAL requires TMA_RESIDUAL"
-#endif
-#if FOLDED_RESIDUAL && (W0_RES_PREFETCH || W0_RES_FULL)
-#error "FOLDED_RESIDUAL mutually exclusive with W0_RES_PREFETCH/W0_RES_FULL"
-#endif
-#if FOLDED_RESIDUAL && !DIRECT_STG && N_STAGES > 3
-#error "FOLDED_RESIDUAL without DIRECT_STG requires N_STAGES <= 3 (SMEM budget)"
-#endif
 
 #if EPILOGUE_LOOP
 #undef PHASE1_UNROLL
@@ -181,7 +150,7 @@ Usage: #define N_DIM and K_DIM before including this header.
 #endif
 
 // Thread config
-#define THREADS        (32 * (2 + NUM_EPI_WARPS))
+#define THREADS        (32 * (2 + EPI_LOAD_WARP + NUM_EPI_WARPS))
 
 /*
 Problem dimensions — N_DIM must be defined before including this header
@@ -225,9 +194,7 @@ Problem dimensions — N_DIM must be defined before including this header
 #endif
 #if TMA_RESIDUAL
 #define OFF_RES_MBAR       (OFF_EPILOGUE_MBAR + 16)
-#if SINGLE_PRODUCER_RES
-#define _MBAR_END          (OFF_RES_MBAR + 8)
-#elif W0_RES_FULL
+#if W0_RES_FULL || EPI_LOAD_WARP
 #define OFF_RES_CONSUMED_MBAR  (OFF_RES_MBAR + NUM_EPI_WARPS * 8)
 #define OFF_RES_PASS_MBAR      (OFF_RES_CONSUMED_MBAR + 8)
 #define _MBAR_END              (OFF_RES_PASS_MBAR + 8)
@@ -241,38 +208,17 @@ Problem dimensions — N_DIM must be defined before including this header
 #else
 #define _MBAR_END          (OFF_EPILOGUE_MBAR + 16)
 #endif
-#if FOLDED_RESIDUAL
-#define OFF_FOLD_RES_MBAR  (_MBAR_END)
-#define _MBAR_END_2        (OFF_FOLD_RES_MBAR + 8)
-#else
-#define _MBAR_END_2        _MBAR_END
-#endif
 #if BIAS_SMEM
-#define OFF_BIAS_SMEM      ((_MBAR_END_2 + 15) & ~15)                       // 16-align for ld.shared.v4.b32
+#define OFF_BIAS_SMEM      ((_MBAR_END + 15) & ~15)                       // 16-align for ld.shared.v4.b32
 #define OFF_STAGING        ((OFF_BIAS_SMEM + BIAS_SMEM_BYTES + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
 #else
-#define OFF_STAGING        ((_MBAR_END_2 + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
+#define OFF_STAGING        ((_MBAR_END + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
 #endif
 #define STAGING_REGION_ROW_BYTES  128                                               // 64 BF16 cols = 128 bytes (SWIZZLE_128B)
 #define STAGING_REGION_BYTES      (32 * STAGING_REGION_ROW_BYTES)                   // 4096 bytes per region (32 rows x 128B)
-#if DIRECT_STG
-#define STAGING_WARP_BYTES        0
-#else
 #define STAGING_WARP_BYTES        (4 * STAGING_REGION_BYTES)                         // 16384 bytes per warp (4 regions x 4096)
-#endif
-#if SIX_WARP_EPI
-#define STAGING_EPI_WARPS         6
-#else
 #define STAGING_EPI_WARPS         NUM_EPI_WARPS
-#endif
 #define SMEM_BYTES                ((OFF_STAGING + STAGING_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
-#if FOLDED_RESIDUAL
-#define FOLD_RG_STRIDE     (4 * STAGING_REGION_BYTES)
-#define FOLD_RES_BYTES     (4 * FOLD_RG_STRIDE)
-#define OFF_FOLDED_RES     ((OFF_STAGING + STAGING_EPI_WARPS * STAGING_WARP_BYTES + 1023) & ~1023)
-#undef SMEM_BYTES
-#define SMEM_BYTES         ((OFF_FOLDED_RES + FOLD_RES_BYTES + 127) & ~127)
-#endif
 
 // WGMMA / TMEM constants
 #define TMEM_COLS      512
@@ -393,6 +339,108 @@ K-iteration macro (accumulating, for ki >= 1)
 Used for ki=1..K_ITERS-1 where accumulator is already initialized.
 S is the stage index (0..N_STAGES-1); works with runtime values but best with constants.
 */
+#if BATCH_MMA
+/*
+All 4 sub-MMAs in a single asm block — collapses ELECT to once,
+allows compiler to batch R2UR transfers. Descriptor pairs pre-computed
+in C, passed as 8 separate "l" operands.
+*/
+#if PREFETCH_MBAR
+#define K_ITER_ACCUM(S) do { \
+    if (!pf_ready_) mbar_wait(tma_mbar[S], tma_phase[S]); \
+    pf_ready_ = 0; \
+    tma_phase[S] ^= 1; \
+    asm volatile("tcgen05.fence::after_thread_sync;"); \
+    { \
+        uint64_t da0_ = desc_a_base[S], db0_ = desc_b_base[S]; \
+        uint64_t da1_ = da0_+2, da2_ = da0_+4, da3_ = da0_+6; \
+        uint64_t db1_ = db0_+2, db2_ = db0_+4, db3_ = db0_+6; \
+        asm volatile( \
+            "{\n\t" \
+            ".reg .pred p;\n\t" \
+            "setp.ne.b32 p, 1, 0;\n\t" \
+            "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+            "[%0], %1, %2, %3, {%10,%11,%12,%13, %14,%15,%16,%17}, p;\n\t" \
+            "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+            "[%0], %4, %5, %3, {%10,%11,%12,%13, %14,%15,%16,%17}, p;\n\t" \
+            "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+            "[%0], %6, %7, %3, {%10,%11,%12,%13, %14,%15,%16,%17}, p;\n\t" \
+            "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+            "[%0], %8, %9, %3, {%10,%11,%12,%13, %14,%15,%16,%17}, p;\n\t" \
+            "}" \
+            : \
+            : "r"(buf * TN), "l"(da0_), "l"(db0_), "r"(IDESC), \
+              "l"(da1_), "l"(db1_), "l"(da2_), "l"(db2_), "l"(da3_), "l"(db3_), \
+              "r"(0),"r"(0),"r"(0),"r"(0), "r"(0),"r"(0),"r"(0),"r"(0)); \
+    } \
+    tcgen05_commit_mcast(mma_mbar[S], 0x3); \
+} while(0)
+#else
+#define K_ITER_ACCUM(S) do { \
+    mbar_wait(tma_mbar[S], tma_phase[S]); \
+    tma_phase[S] ^= 1; \
+    asm volatile("tcgen05.fence::after_thread_sync;"); \
+    { \
+        uint64_t da0_ = desc_a_base[S], db0_ = desc_b_base[S]; \
+        uint64_t da1_ = da0_+2, da2_ = da0_+4, da3_ = da0_+6; \
+        uint64_t db1_ = db0_+2, db2_ = db0_+4, db3_ = db0_+6; \
+        asm volatile( \
+            "{\n\t" \
+            ".reg .pred p;\n\t" \
+            "setp.ne.b32 p, 1, 0;\n\t" \
+            "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+            "[%0], %1, %2, %3, {%10,%11,%12,%13, %14,%15,%16,%17}, p;\n\t" \
+            "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+            "[%0], %4, %5, %3, {%10,%11,%12,%13, %14,%15,%16,%17}, p;\n\t" \
+            "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+            "[%0], %6, %7, %3, {%10,%11,%12,%13, %14,%15,%16,%17}, p;\n\t" \
+            "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+            "[%0], %8, %9, %3, {%10,%11,%12,%13, %14,%15,%16,%17}, p;\n\t" \
+            "}" \
+            : \
+            : "r"(buf * TN), "l"(da0_), "l"(db0_), "r"(IDESC), \
+              "l"(da1_), "l"(db1_), "l"(da2_), "l"(db2_), "l"(da3_), "l"(db3_), \
+              "r"(0),"r"(0),"r"(0),"r"(0), "r"(0),"r"(0),"r"(0),"r"(0)); \
+    } \
+    tcgen05_commit_mcast(mma_mbar[S], 0x3); \
+} while(0)
+#endif /* PREFETCH_MBAR */
+#elif PREFETCH_MBAR
+#define K_ITER_ACCUM(S) do { \
+    if (!pf_ready_) mbar_wait(tma_mbar[S], tma_phase[S]); \
+    pf_ready_ = 0; \
+    tma_phase[S] ^= 1; \
+    asm volatile("tcgen05.fence::after_thread_sync;"); \
+    { \
+        uint64_t da_ = desc_a_base[S], db_ = desc_b_base[S]; \
+        asm volatile( \
+            "{\n\t" \
+            ".reg .pred p;\n\t" \
+            "setp.ne.b32 p, 1, 0;\n\t" \
+            "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+            "[%0], %1, %2, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t" \
+            "}" \
+            : \
+            : "r"(buf * TN), "l"(da_), "l"(db_), "r"(IDESC), \
+              "r"(0),"r"(0),"r"(0),"r"(0), "r"(0),"r"(0),"r"(0),"r"(0)); \
+        MAYBE_UNROLL_SUB \
+        for (int sub_ = 1; sub_ < MMA_PER_KI; sub_++) { \
+            da_ += 2; db_ += 2; \
+            asm volatile( \
+                "{\n\t" \
+                ".reg .pred p;\n\t" \
+                "setp.ne.b32 p, 1, 0;\n\t" \
+                "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+                "[%0], %1, %2, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t" \
+                "}" \
+                : \
+                : "r"(buf * TN), "l"(da_), "l"(db_), "r"(IDESC), \
+                  "r"(0),"r"(0),"r"(0),"r"(0), "r"(0),"r"(0),"r"(0),"r"(0)); \
+        } \
+    } \
+    tcgen05_commit_mcast(mma_mbar[S], 0x3); \
+} while(0)
+#else
 #define K_ITER_ACCUM(S) do { \
     mbar_wait(tma_mbar[S], tma_phase[S]); \
     tma_phase[S] ^= 1; \
@@ -426,6 +474,7 @@ S is the stage index (0..N_STAGES-1); works with runtime values but best with co
     } \
     tcgen05_commit_mcast(mma_mbar[S], 0x3); \
 } while(0)
+#endif /* PREFETCH_MBAR */
 
 // TMEM load macros
 

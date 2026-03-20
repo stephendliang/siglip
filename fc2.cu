@@ -45,39 +45,6 @@ f0-f7: FP32 accumulators, b0-b3: BF16x2 bias pairs, r0-r3: BF16x2 residual pairs
            "r"(SADDR) \
         : "memory")
 
-#if DIRECT_STG
-/*
-DIRECT_STG macro: same compute as STS but st.global.v4.b32 to HBM directly.
-Eliminates SMEM staging, fence.proxy.async, and TMA store overhead.
-Trade: scattered stores (each thread writes a different row → 32 cache lines per warp).
-GADDR is a __nv_bfloat16* global pointer, cast to uint32_t* for v4.b32.
-*/
-#define BIAS_RES_CVT_STG_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3, r0,r1,r2,r3, GADDR) \
-    asm volatile( \
-        "{\n\t" \
-        ".reg .b32 o0, o1, o2, o3;\n\t" \
-        "cvt.rn.bf16x2.f32 o0, %1, %0;\n\t" \
-        "cvt.rn.bf16x2.f32 o1, %3, %2;\n\t" \
-        "cvt.rn.bf16x2.f32 o2, %5, %4;\n\t" \
-        "cvt.rn.bf16x2.f32 o3, %7, %6;\n\t" \
-        "add.rn.bf16x2 o0, o0, %8;\n\t" \
-        "add.rn.bf16x2 o1, o1, %9;\n\t" \
-        "add.rn.bf16x2 o2, o2, %10;\n\t" \
-        "add.rn.bf16x2 o3, o3, %11;\n\t" \
-        "add.rn.bf16x2 o0, o0, %12;\n\t" \
-        "add.rn.bf16x2 o1, o1, %13;\n\t" \
-        "add.rn.bf16x2 o2, o2, %14;\n\t" \
-        "add.rn.bf16x2 o3, o3, %15;\n\t" \
-        "st.global.v4.b32 [%16], {o0,o1,o2,o3};\n\t" \
-        "}" \
-        :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
-           "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
-           "r"(b0),"r"(b1),"r"(b2),"r"(b3), \
-           "r"(r0),"r"(r1),"r"(r2),"r"(r3), \
-           "l"((const uint32_t*)(GADDR)) \
-        : "memory")
-#endif
-
 #include "kernel_body.cuh"
 
 // Device init kernel for residual matrix

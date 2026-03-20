@@ -1,22 +1,25 @@
 #!/bin/bash
-# FC2 Architecture Search: test structural kernel variants on B200.
+# FC2 Architecture Search: combinatorial sweep of structural kernel variants on B200.
 # Each config: compile with -DTIMING (cycle breakdown), then compile clean (perf numbers).
 #
-# Architectural variants tested (from tests.txt):
-#   1. NON_OVERLAPPED — barrier-separated K-loop + epilogue (no TMEM double-buffer)
-#   2. SIX_WARP_EPI   — all 6 warps do epilogue (requires NON_OVERLAPPED)
-#   3. DIRECT_STG     — st.global from registers, no SMEM staging or TMA stores
-#   4. SINGLE_PRODUCER_RES — [TODO: not yet implemented]
-#   5. FOLDED_RESIDUAL     — [TODO: not yet implemented]
+# Swept axes (full combinatorial):
+#   BATCH_MMA          {0,1}  — all 4 sub-MMAs in single asm block
+#   PREFETCH_MBAR      {0,1}  — W1 K-loop: try_wait prefetch for next TMA stage barrier
+#   EPI_LOAD_WARP      {0,1}  — dedicated warp for residual TMA loading (adds 1 warp)
+#   OVERLAP_EPI_WAIT   {0,1}  — prefetch epilogue mbar at end of K-loop
+#   N_STAGES           {4,5}  — pipeline depth (may flip with shorter BATCH_MMA K-loop)
+#   INTERLEAVE_STRATEGY {1,2} — TMA store interleaving (IS=2 may win with faster K-loop)
+#
+# Total: 2^4 × 2 × 2 = 64 configs (--quick), +16 W0_RES variants (full) = 80
 #
 # Key metrics:
-#   - epi_wait: W1 waiting for epilogue to free TMEM (overlapped only)
+#   - epi_wait: W1 waiting for epilogue to free TMEM
 #   - kloop:    W1 K-loop time
 #   - ms/TFLOPS: wall-clock performance (clean build, no timing overhead)
 #
 # Usage:
-#   ./tools/fc2_arch_search.sh              # full search
-#   ./tools/fc2_arch_search.sh --quick      # 4 key configs only
+#   ./tools/fc2_arch_search.sh              # full search (64 combos + W0_RES variants)
+#   ./tools/fc2_arch_search.sh --quick      # 64 combinatorial configs only
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -41,65 +44,62 @@ log "  FC2 ARCHITECTURE SEARCH $TIMESTAMP"
 log "========================================="
 nvidia-smi --query-gpu=name,clocks.sm,clocks.mem --format=csv,noheader 2>/dev/null | head -1 | tee -a "$OUTDIR/session.log" || true
 
-# ── Shared base flags (FC2 best known params, excluding arch flags) ──
-BASE="-DBIAS_SMEM=1 -DN_STAGES=5 -DPHASE1_UNROLL=1 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=0 -DTMA_RESIDUAL=1"
+# ── Shared base flags (FC2 best known params, N_STAGES and IS swept separately) ──
+BASE_CORE="-DBIAS_SMEM=1 -DPHASE1_UNROLL=1 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=0 -DTMA_RESIDUAL=1"
 
 # ── Configs: NAME FLAGS ──
 declare -a NAMES FLAGS
 add() { NAMES+=("$1"); FLAGS+=("$2"); }
 
-# --- Baseline: current best overlapped architecture ---
-add "overlapped_base"       "$BASE -DINTERLEAVE_STRATEGY=1"
-add "overlapped_is0"        "$BASE -DINTERLEAVE_STRATEGY=0"
+# --- Full combinatorial: 4 binary flags × N_STAGES{4,5} × IS{1,2} = 64 configs ---
+BIN_NAMES=("BM" "PF" "ELW" "OEW")
+BIN_DEFS=("-DBATCH_MMA=1" "-DPREFETCH_MBAR=1" "-DEPI_LOAD_WARP=1" "-DOVERLAP_EPI_WAIT=1")
 
-# --- Variant 1: NON_OVERLAPPED (single-buffered TMEM, barrier sync) ---
-add "nonoverlap"            "$BASE -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=1"
-add "nonoverlap_is0"        "$BASE -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=0"
-add "nonoverlap_nores"      "$BASE -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=1 -DTMA_RESIDUAL=0"
+for ns in 4 5; do
+    for is in 1 2; do
+        for bits in $(seq 0 15); do
+            name="NS${ns}.IS${is}"
+            flags="$BASE_CORE -DN_STAGES=${ns} -DINTERLEAVE_STRATEGY=${is}"
+            for i in 0 1 2 3; do
+                if (( bits & (1 << i) )); then
+                    name="${name}.${BIN_NAMES[$i]}"
+                    flags="$flags ${BIN_DEFS[$i]}"
+                fi
+            done
+            [ "$name" = "NS${ns}.IS${is}" ] && name="${name}.base"
+            add "$name" "$flags"
+        done
+    done
+done
 
-# --- Variant 2: SIX_WARP_EPI (all 6 warps, requires NON_OVERLAPPED) ---
-# N_STAGES=4 mandatory — 6 staging regions won't fit with NS=5
-add "6warp"                 "$BASE -DNON_OVERLAPPED=1 -DSIX_WARP_EPI=1 -DN_STAGES=4 -DINTERLEAVE_STRATEGY=1"
-add "6warp_is0"             "$BASE -DNON_OVERLAPPED=1 -DSIX_WARP_EPI=1 -DN_STAGES=4 -DINTERLEAVE_STRATEGY=0"
-
-# --- Variant 3: DIRECT_STG (no SMEM staging, st.global from regs) ---
-add "direct_stg"            "$BASE -DDIRECT_STG=1 -DINTERLEAVE_STRATEGY=0 -DTMA_RESIDUAL=0"
-add "direct_stg_nonoverlap" "$BASE -DDIRECT_STG=1 -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=0 -DTMA_RESIDUAL=0"
-add "direct_stg_6warp"      "$BASE -DDIRECT_STG=1 -DNON_OVERLAPPED=1 -DSIX_WARP_EPI=1 -DN_STAGES=4 -DINTERLEAVE_STRATEGY=0 -DTMA_RESIDUAL=0"
-
-# --- Variant 4: SINGLE_PRODUCER_RES (one warp loads all residual) ---
-add "spr"                   "$BASE -DNON_OVERLAPPED=1 -DSINGLE_PRODUCER_RES=1 -DINTERLEAVE_STRATEGY=1"
-add "spr_is0"               "$BASE -DNON_OVERLAPPED=1 -DSINGLE_PRODUCER_RES=1 -DINTERLEAVE_STRATEGY=0"
-
-# --- Variant 5: FOLDED_RESIDUAL (W0 preloads residual during K-loop) ---
-add "fold_res"              "$BASE -DNON_OVERLAPPED=1 -DFOLDED_RESIDUAL=1 -DN_STAGES=3 -DINTERLEAVE_STRATEGY=1"
-add "fold_res_direct"       "$BASE -DNON_OVERLAPPED=1 -DFOLDED_RESIDUAL=1 -DDIRECT_STG=1 -DINTERLEAVE_STRATEGY=0"
-add "fold_res_ns3"          "$BASE -DNON_OVERLAPPED=1 -DFOLDED_RESIDUAL=1 -DN_STAGES=3 -DINTERLEAVE_STRATEGY=1"
-
-# --- Parameter variations on best arch (for comparison) ---
-add "overlapped_ph1u2"      "$BASE -DINTERLEAVE_STRATEGY=1 -DPHASE1_UNROLL=2"
-add "overlapped_st1"        "$BASE -DINTERLEAVE_STRATEGY=1 -DSTORE_TIMING=1"
-add "nonoverlap_ph1u2"      "$BASE -DNON_OVERLAPPED=1 -DINTERLEAVE_STRATEGY=1 -DPHASE1_UNROLL=2"
-
-if [ "$QUICK" = "1" ]; then
-    # Quick mode: baseline + nonoverlap + direct_stg + spr + fold_res
-    INDICES=(0 2 8 11 13)
-    log "Quick mode: ${#INDICES[@]} configs"
-else
-    INDICES=($(seq 0 $((${#NAMES[@]} - 1))))
-    log "Full mode: ${#NAMES[@]} configs"
+if [ "$QUICK" = "0" ]; then
+    # --- W0_RES variants: cross {W0_RES_PREFETCH, W0_RES_FULL} × {BM, no-BM} × {NS4, NS5} ---
+    # EPI_LOAD_WARP is mutually exclusive with W0_RES_*, so these are separate
+    for ns in 4 5; do
+        for bm in 0 1; do
+            bm_flag=""; bm_tag=""
+            [ "$bm" = "1" ] && { bm_flag=" -DBATCH_MMA=1"; bm_tag=".BM"; }
+            add "NS${ns}.IS1${bm_tag}.W0RP" "$BASE_CORE -DN_STAGES=${ns} -DINTERLEAVE_STRATEGY=1${bm_flag} -DW0_RES_PREFETCH=1"
+            add "NS${ns}.IS1${bm_tag}.W0RF" "$BASE_CORE -DN_STAGES=${ns} -DINTERLEAVE_STRATEGY=1${bm_flag} -DW0_RES_FULL=1"
+            add "NS${ns}.IS1${bm_tag}.PF.W0RF" "$BASE_CORE -DN_STAGES=${ns} -DINTERLEAVE_STRATEGY=1${bm_flag} -DPREFETCH_MBAR=1 -DW0_RES_FULL=1"
+            add "NS${ns}.IS1${bm_tag}.PF.OEW.W0RF" "$BASE_CORE -DN_STAGES=${ns} -DINTERLEAVE_STRATEGY=1${bm_flag} -DPREFETCH_MBAR=1 -DOVERLAP_EPI_WAIT=1 -DW0_RES_FULL=1"
+        done
+    done
 fi
+
+INDICES=($(seq 0 $((${#NAMES[@]} - 1))))
+log "${#INDICES[@]} configs"
 
 # ── Results table ──
 SUMMARY="$OUTDIR/summary.txt"
 CSV="$OUTDIR/results.csv"
-printf "%-24s %7s %8s %5s  %7s %7s %7s %7s %7s %7s %7s  %s\n" \
+printf "%-32s %7s %8s %5s  %7s %7s %7s %7s %7s %7s %7s  %s\n" \
     "CONFIG" "ms" "TFLOPS" "REGS" \
     "epi_w" "tma0_w" "kloop" "total" \
     "e_ml_w" "e_ph1" "e_ph2" \
     "VERDICT" > "$SUMMARY"
-printf "%s\n" "$(printf '%.0s-' {1..150})" >> "$SUMMARY"
-echo "config,ms,tflops,regs,w1_epi_wait,w1_tma0_wait,w1_kloop,w1_total,epi_ml_wait,epi_phase1,epi_phase2,verdict" > "$CSV"
+printf "%s\n" "$(printf '%.0s-' {1..160})" >> "$SUMMARY"
+echo "config,ms,tflops,regs,N_STAGES,INTERLEAVE_STRATEGY,BATCH_MMA,PREFETCH_MBAR,EPI_LOAD_WARP,OVERLAP_EPI_WAIT,W0_RES_PREFETCH,W0_RES_FULL,w1_epi_wait,w1_tma0_wait,w1_kloop,w1_total,epi_ml_wait,epi_phase1,epi_phase2,verdict" > "$CSV"
 
 for idx in "${INDICES[@]}"; do
     name="${NAMES[$idx]}"
@@ -107,6 +107,17 @@ for idx in "${INDICES[@]}"; do
     log ""
     log "── $name ──"
     log "  $flags"
+
+    # Extract flag values for CSV
+    ns=4; is=1; bm=0; pf=0; elw=0; oew=0; w0rp=0; w0rf=0
+    [[ "$flags" =~ N_STAGES=([0-9]+) ]] && ns="${BASH_REMATCH[1]}"
+    [[ "$flags" =~ INTERLEAVE_STRATEGY=([0-9]+) ]] && is="${BASH_REMATCH[1]}"
+    [[ "$flags" == *"BATCH_MMA=1"* ]] && bm=1
+    [[ "$flags" == *"PREFETCH_MBAR=1"* ]] && pf=1
+    [[ "$flags" == *"EPI_LOAD_WARP=1"* ]] && elw=1
+    [[ "$flags" == *"OVERLAP_EPI_WAIT=1"* ]] && oew=1
+    [[ "$flags" == *"W0_RES_PREFETCH=1"* ]] && w0rp=1
+    [[ "$flags" == *"W0_RES_FULL=1"* ]] && w0rf=1
 
     # ── Timing build ──
     TOUT="$OUTDIR/timing_${name}.txt"
@@ -155,11 +166,9 @@ for idx in "${INDICES[@]}"; do
     epi_p1=$(grep -oP 'Phase 1[^:]*:\s+\K\d+(?=\s+cycles)' "$TOUT" | head -1)
     epi_p2=$(grep -oP 'Phase 2[^:]*:\s+\K\d+(?=\s+cycles)' "$TOUT" | head -1)
 
-    # Verdict (overlapped configs only — NON_OVERLAPPED won't have epi_wait)
+    # Verdict based on epilogue/K-loop balance
     verdict="?"
-    if echo "$name" | grep -q "nonoverlap\|6warp\|direct_stg\|spr\|fold_res"; then
-        verdict="NON-OVERLAP"
-    elif [ -n "$w1_epi" ] && [ -n "$w1_kloop" ]; then
+    if [ -n "$w1_epi" ] && [ -n "$w1_kloop" ]; then
         if [ "$w1_epi" -lt 100 ]; then verdict="COMPUTE-BOUND"
         elif [ "$w1_epi" -gt "$w1_kloop" ]; then verdict="EPILOGUE-BOUND"
         else verdict="BALANCED"
@@ -168,11 +177,11 @@ for idx in "${INDICES[@]}"; do
 
     log "  ms=${perf_ms:-?} TFLOPS=${perf_tflops:-?} regs=${regs:-?} verdict=${verdict}"
 
-    printf "%-24s %7s %8s %5s  %7s %7s %7s %7s %7s %7s %7s  %s\n" \
+    printf "%-32s %7s %8s %5s  %7s %7s %7s %7s %7s %7s %7s  %s\n" \
         "$name" "${perf_ms:-?}" "${perf_tflops:-?}" "${regs:-?}" \
         "${w1_epi:-?}" "${w1_tma0:-?}" "${w1_kloop:-?}" "${w1_total:-?}" \
         "${epi_ml:-?}" "${epi_p1:-?}" "${epi_p2:-?}" "$verdict" >> "$SUMMARY"
-    echo "$name,${perf_ms:-},${perf_tflops:-},${regs:-},${w1_epi:-},${w1_tma0:-},${w1_kloop:-},${w1_total:-},${epi_ml:-},${epi_p1:-},${epi_p2:-},$verdict" >> "$CSV"
+    echo "$name,${perf_ms:-},${perf_tflops:-},${regs:-},$ns,$is,$bm,$pf,$elw,$oew,$w0rp,$w0rf,${w1_epi:-},${w1_tma0:-},${w1_kloop:-},${w1_total:-},${epi_ml:-},${epi_p1:-},${epi_p2:-},$verdict" >> "$CSV"
 
     # Full timing analysis
     [ -n "$w1_epi" ] && python3 tools/analyze_timing.py "$TOUT" --ref-tflops 3564 \
@@ -186,9 +195,17 @@ log "  RESULTS"
 log "========================================="
 cat "$SUMMARY" | tee -a "$OUTDIR/session.log"
 log ""
-log "Key: epi_w = W1 waiting for epilogue to free TMEM (0 in NON-OVERLAP)"
-log "     kloop = W1 K-loop time (should be similar across all)"
+log "Key: epi_w = W1 waiting for epilogue to free TMEM"
+log "     kloop = W1 K-loop time"
 log "     ms/TFLOPS = wall-clock perf (clean build, no timing noise)"
+log ""
+log "Swept axes (full combinatorial, ${#INDICES[@]} configs):"
+log "  BATCH_MMA          {0,1}  = all 4 sub-MMAs in single asm block"
+log "  PREFETCH_MBAR      {0,1}  = try_wait prefetch in W1 K-loop"
+log "  EPI_LOAD_WARP      {0,1}  = dedicated warp for residual TMA loading"
+log "  OVERLAP_EPI_WAIT   {0,1}  = prefetch epilogue mbar at end of K-loop"
+log "  N_STAGES           {4,5}  = pipeline depth"
+log "  INTERLEAVE_STRATEGY {1,2} = TMA store interleaving"
 log ""
 log "Per-config analysis: $OUTDIR/analysis_*.txt"
 log "CSV: $CSV"
