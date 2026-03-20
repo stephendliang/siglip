@@ -126,7 +126,9 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef BIAS_BF16
 #define BIAS_BF16 0              // 0=FP32 bias, 1=BF16 bias with bf16x2 epilogue arithmetic (fc2 only)
 #endif
-
+#ifndef FP32_EPILOGUE
+#define FP32_EPILOGUE 0          // 0=BF16 path, 1=FP32 residual+late CVT, 2=full FP32
+#endif
 #if EPILOGUE_LOOP
 #undef PHASE1_UNROLL
 #define PHASE1_UNROLL 1

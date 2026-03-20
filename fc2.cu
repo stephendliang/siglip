@@ -15,10 +15,13 @@ Epilogue: FP32 acc + bias + residual(BF16) → BF16 CVT → SMEM staging → TMA
 #include "kernel_common.cuh"
 
 /*
-Fused bias+residual+CVT+STS macro — BF16 arithmetic path
-CVT acc FP32→BF16x2 first, then HADD2 bias + HADD2 residual, STS.
-13 instructions vs 33 in the FP32 path. Precision: ≤1 ULP vs FP32 path.
-f0-f7: FP32 accumulators, b0-b3: BF16x2 bias pairs, r0-r3: BF16x2 residual pairs
+Fused bias+residual+CVT+STS macro — three paths selected by FP32_EPILOGUE.
+f0-f7: FP32 accumulators, b0-b3: BF16x2 bias pairs, r0-r1,r2-r3: BF16x2 residual pairs
+*/
+#if FP32_EPILOGUE == 0
+/*
+BF16 arithmetic path (original): CVT FP32→BF16x2 early, HADD2 bias, HADD2 residual, STS.
+13 instructions between STS calls.
 */
 #define BIAS_RES_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3, r0,r1,r2,r3, SADDR) \
     asm volatile( \
@@ -44,6 +47,124 @@ f0-f7: FP32 accumulators, b0-b3: BF16x2 bias pairs, r0-r3: BF16x2 residual pairs
            "r"(r0),"r"(r1),"r"(r2),"r"(r3), \
            "r"(SADDR) \
         : "memory")
+
+#elif FP32_EPILOGUE == 1
+/*
+FP32 residual path: unpack residual BF16→FP32, FADD residual in FP32, late CVT, HADD2 bias in BF16.
+29 instructions between STS calls — hides 32-cycle STS throughput.
+*/
+#define BIAS_RES_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3, r0,r1,r2,r3, SADDR) \
+    asm volatile( \
+        "{\n\t" \
+        ".reg .b16 rl0,rh0,rl1,rh1,rl2,rh2,rl3,rh3;\n\t" \
+        ".reg .f32 fr0,fr1,fr2,fr3,fr4,fr5,fr6,fr7;\n\t" \
+        ".reg .b32 o0,o1,o2,o3;\n\t" \
+        "mov.b32 {rl0,rh0}, %12;\n\t" \
+        "mov.b32 {rl1,rh1}, %13;\n\t" \
+        "mov.b32 {rl2,rh2}, %14;\n\t" \
+        "mov.b32 {rl3,rh3}, %15;\n\t" \
+        "cvt.rn.f32.bf16 fr0, rl0;\n\t" \
+        "cvt.rn.f32.bf16 fr1, rh0;\n\t" \
+        "cvt.rn.f32.bf16 fr2, rl1;\n\t" \
+        "cvt.rn.f32.bf16 fr3, rh1;\n\t" \
+        "cvt.rn.f32.bf16 fr4, rl2;\n\t" \
+        "cvt.rn.f32.bf16 fr5, rh2;\n\t" \
+        "cvt.rn.f32.bf16 fr6, rl3;\n\t" \
+        "cvt.rn.f32.bf16 fr7, rh3;\n\t" \
+        "add.f32 %0, %0, fr0;\n\t" \
+        "add.f32 %1, %1, fr1;\n\t" \
+        "add.f32 %2, %2, fr2;\n\t" \
+        "add.f32 %3, %3, fr3;\n\t" \
+        "add.f32 %4, %4, fr4;\n\t" \
+        "add.f32 %5, %5, fr5;\n\t" \
+        "add.f32 %6, %6, fr6;\n\t" \
+        "add.f32 %7, %7, fr7;\n\t" \
+        "cvt.rn.bf16x2.f32 o0, %1, %0;\n\t" \
+        "cvt.rn.bf16x2.f32 o1, %3, %2;\n\t" \
+        "cvt.rn.bf16x2.f32 o2, %5, %4;\n\t" \
+        "cvt.rn.bf16x2.f32 o3, %7, %6;\n\t" \
+        "add.rn.bf16x2 o0, o0, %8;\n\t" \
+        "add.rn.bf16x2 o1, o1, %9;\n\t" \
+        "add.rn.bf16x2 o2, o2, %10;\n\t" \
+        "add.rn.bf16x2 o3, o3, %11;\n\t" \
+        "st.shared.v4.b32 [%16], {o0,o1,o2,o3};\n\t" \
+        "}" \
+        :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
+           "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
+           "r"(b0),"r"(b1),"r"(b2),"r"(b3), \
+           "r"(r0),"r"(r1),"r"(r2),"r"(r3), \
+           "r"(SADDR) \
+        : "memory")
+
+#elif FP32_EPILOGUE == 2
+/*
+Full FP32 path: unpack both bias+residual BF16→FP32, all arithmetic in FP32, late CVT.
+45 instructions between STS calls — maximum compute/STS ratio.
+*/
+#define BIAS_RES_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3, r0,r1,r2,r3, SADDR) \
+    asm volatile( \
+        "{\n\t" \
+        ".reg .b16 bl0,bh0,bl1,bh1,bl2,bh2,bl3,bh3;\n\t" \
+        ".reg .f32 fb0,fb1,fb2,fb3,fb4,fb5,fb6,fb7;\n\t" \
+        ".reg .b16 rl0,rh0,rl1,rh1,rl2,rh2,rl3,rh3;\n\t" \
+        ".reg .f32 fr0,fr1,fr2,fr3,fr4,fr5,fr6,fr7;\n\t" \
+        ".reg .b32 o0,o1,o2,o3;\n\t" \
+        "mov.b32 {bl0,bh0}, %8;\n\t" \
+        "mov.b32 {bl1,bh1}, %9;\n\t" \
+        "mov.b32 {bl2,bh2}, %10;\n\t" \
+        "mov.b32 {bl3,bh3}, %11;\n\t" \
+        "cvt.rn.f32.bf16 fb0, bl0;\n\t" \
+        "cvt.rn.f32.bf16 fb1, bh0;\n\t" \
+        "cvt.rn.f32.bf16 fb2, bl1;\n\t" \
+        "cvt.rn.f32.bf16 fb3, bh1;\n\t" \
+        "cvt.rn.f32.bf16 fb4, bl2;\n\t" \
+        "cvt.rn.f32.bf16 fb5, bh2;\n\t" \
+        "cvt.rn.f32.bf16 fb6, bl3;\n\t" \
+        "cvt.rn.f32.bf16 fb7, bh3;\n\t" \
+        "mov.b32 {rl0,rh0}, %12;\n\t" \
+        "mov.b32 {rl1,rh1}, %13;\n\t" \
+        "mov.b32 {rl2,rh2}, %14;\n\t" \
+        "mov.b32 {rl3,rh3}, %15;\n\t" \
+        "cvt.rn.f32.bf16 fr0, rl0;\n\t" \
+        "cvt.rn.f32.bf16 fr1, rh0;\n\t" \
+        "cvt.rn.f32.bf16 fr2, rl1;\n\t" \
+        "cvt.rn.f32.bf16 fr3, rh1;\n\t" \
+        "cvt.rn.f32.bf16 fr4, rl2;\n\t" \
+        "cvt.rn.f32.bf16 fr5, rh2;\n\t" \
+        "cvt.rn.f32.bf16 fr6, rl3;\n\t" \
+        "cvt.rn.f32.bf16 fr7, rh3;\n\t" \
+        "add.f32 %0, %0, fb0;\n\t" \
+        "add.f32 %1, %1, fb1;\n\t" \
+        "add.f32 %2, %2, fb2;\n\t" \
+        "add.f32 %3, %3, fb3;\n\t" \
+        "add.f32 %4, %4, fb4;\n\t" \
+        "add.f32 %5, %5, fb5;\n\t" \
+        "add.f32 %6, %6, fb6;\n\t" \
+        "add.f32 %7, %7, fb7;\n\t" \
+        "add.f32 %0, %0, fr0;\n\t" \
+        "add.f32 %1, %1, fr1;\n\t" \
+        "add.f32 %2, %2, fr2;\n\t" \
+        "add.f32 %3, %3, fr3;\n\t" \
+        "add.f32 %4, %4, fr4;\n\t" \
+        "add.f32 %5, %5, fr5;\n\t" \
+        "add.f32 %6, %6, fr6;\n\t" \
+        "add.f32 %7, %7, fr7;\n\t" \
+        "cvt.rn.bf16x2.f32 o0, %1, %0;\n\t" \
+        "cvt.rn.bf16x2.f32 o1, %3, %2;\n\t" \
+        "cvt.rn.bf16x2.f32 o2, %5, %4;\n\t" \
+        "cvt.rn.bf16x2.f32 o3, %7, %6;\n\t" \
+        "st.shared.v4.b32 [%16], {o0,o1,o2,o3};\n\t" \
+        "}" \
+        :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
+           "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
+           "r"(b0),"r"(b1),"r"(b2),"r"(b3), \
+           "r"(r0),"r"(r1),"r"(r2),"r"(r3), \
+           "r"(SADDR) \
+        : "memory")
+
+#else
+#error "FP32_EPILOGUE must be 0, 1, or 2"
+#endif
 
 #include "kernel_body.cuh"
 
@@ -258,16 +379,22 @@ int main() {
 
             float b_val = (col & 1) ? 1.0f : 1.5f;
             float gemm = (float)K_DIM * 1.5f * b_val;
-            /*
-            BF16 arithmetic order: bf16(bf16(gemm) + bf16(bias)) + residual
-            Each add.rn.bf16x2 promotes to FP32 internally, adds, rounds back.
-            */
-            float acc_rounded = __bfloat162float(__float2bfloat16(gemm));
-            float bias_bf16_f = __bfloat162float(__float2bfloat16((float)(col + 1)));
-            float after_bias = __bfloat162float(__float2bfloat16(acc_rounded + bias_bf16_f));
             float res_bf16_f = __bfloat162float(__float2bfloat16(
                 (float)((int)row % 128) * 0.25f + (float)col * 0.125f));
+            float bias_bf16_f = __bfloat162float(__float2bfloat16((float)(col + 1)));
+#if FP32_EPILOGUE == 0
+            /* BF16 path: bf16(bf16(gemm) + bf16(bias)) + residual */
+            float acc_rounded = __bfloat162float(__float2bfloat16(gemm));
+            float after_bias = __bfloat162float(__float2bfloat16(acc_rounded + bias_bf16_f));
             __nv_bfloat16 expected = __float2bfloat16(after_bias + res_bf16_f);
+#elif FP32_EPILOGUE == 1
+            /* FP32 residual path: bf16(f32(acc) + f32(residual)) then bf16 bias add */
+            float after_res = __bfloat162float(__float2bfloat16(gemm + res_bf16_f));
+            __nv_bfloat16 expected = __float2bfloat16(after_res + bias_bf16_f);
+#elif FP32_EPILOGUE == 2
+            /* Full FP32 path: bf16(f32(gemm) + f32(bias) + f32(residual)) */
+            __nv_bfloat16 expected = __float2bfloat16(gemm + bias_bf16_f + res_bf16_f);
+#endif
             __nv_bfloat16 actual = h_C[row * N_DIM + col];
 
             float ef = __bfloat162float(expected);
@@ -294,11 +421,19 @@ int main() {
     printf("DIAG row0 expected: ");
     for (int c = 0; c < 8; c++) {
         float b_val = (c & 1) ? 1.0f : 1.5f;
-        float g_r = __bfloat162float(__float2bfloat16((float)K_DIM * 1.5f * b_val));
+        float gemm_f = (float)K_DIM * 1.5f * b_val;
         float b_r = __bfloat162float(__float2bfloat16((float)(c + 1)));
-        float ab = __bfloat162float(__float2bfloat16(g_r + b_r));
         float r = __bfloat162float(__float2bfloat16((float)c * 0.125f));
+#if FP32_EPILOGUE == 0
+        float g_r = __bfloat162float(__float2bfloat16(gemm_f));
+        float ab = __bfloat162float(__float2bfloat16(g_r + b_r));
         printf("%.1f ", __bfloat162float(__float2bfloat16(ab + r)));
+#elif FP32_EPILOGUE == 1
+        float ar = __bfloat162float(__float2bfloat16(gemm_f + r));
+        printf("%.1f ", __bfloat162float(__float2bfloat16(ar + b_r)));
+#elif FP32_EPILOGUE == 2
+        printf("%.1f ", __bfloat162float(__float2bfloat16(gemm_f + b_r + r)));
+#endif
     }
     printf("\n");
     printf("@@RESULT ms=%.3f tflops=%.2f checksum=%f valid=%d c0=%.1f\n",

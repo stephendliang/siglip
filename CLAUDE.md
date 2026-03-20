@@ -5,60 +5,59 @@ FP8 (E4M3) precision, tcgen05 WGMMA, TMA, `cta_group::2` with 2-CTA clusters. Cr
 
 ## Current state
 
-Three fused GEMM kernels for the vision encoder MLP:
+Three fused GEMM kernels for the vision encoder MLP. **Only FC2 is being actively optimized** — PE and FC1 beat CUTLASS and are done. Do NOT suggest or run grid search / B200 sessions on PE or FC1.
 
-| Kernel | Shape | Epilogue | Best ms | TFLOPS | Regs | vs CUTLASS fused |
-|--------|-------|----------|---------|--------|------|------------------|
-| **patch_embed** | [928256,768]×[768,768]^T | bias + pos_embed | 0.525 | 2085 | 174-214 | **2% faster** (0.536) |
-| **fc1_gelu** | [928256,768]×[768,3072]^T | bias + GELU | 2.267 | 1932 | 244 | **3% faster** (2.323) |
-| **fc2** | [928256,3072]×[3072,768]^T | bias + residual | 1.466 | 2988 | 184-217 | **20% slower** (1.225) |
+| Kernel | Shape | Epilogue | Best ms | TFLOPS | Regs | vs CUTLASS fused | Status |
+|--------|-------|----------|---------|--------|------|------------------|--------|
+| **patch_embed** | [928256,768]×[768,768]^T | bias + pos_embed | 0.525 | 2085 | 174-214 | **2% faster** (0.536) | **DONE** |
+| **fc1_gelu** | [928256,768]×[768,3072]^T | bias + GELU | 2.267 | 1932 | 244 | **3% faster** (2.323) | **DONE** |
+| **fc2** | [928256,3072]×[3072,768]^T | bias + residual | 1.452 | 3016 | 207 | **19% slower** (1.225) | **ACTIVE** |
 
 Batch = 4736 images × 196 patches = 928256 rows. BF16 output, FP8 inputs.
 
-The kernels' value is **fusion**: overlapped epilogues eliminate unfused overhead entirely. All three are correct (non-uniform validation, checksum validated) and stable.
+### FC2 gap analysis (session 2026-03-19)
 
-**PE is exhausted** — 145 balanced configs all within 0.001ms. No parameter moves the needle.
-**FC1** — won via interaction sweeps finding GV=4+IS=0+PH1U=4. Prior best 2.247ms (IS=1+ST=1).
-**FC2** — biggest opportunity. 20% gap to CUTLASS. W0 restructured (all threads compute addrs, lane 0 issues TMA), `W0_RES_FULL` added, `DEFERRED_WAIT` added. New params untested on B200.
+Best: **1.452ms / 3016 TFLOPS** (NS5, IS1, base config). CUTLASS: 1.225ms. Gap = **227μs (19%)**.
 
-## Grid search
+Cycle breakdown (NS5.IS1.base, timing build):
+- **K-loop: 16705 cycles** — tight, well-optimized, NOT the bottleneck
+- **Epilogue Phase 1: 8430 cycles** — THIS is where CUTLASS wins
+- Epilogue Phase 2: 63 cycles (trivial)
+- epi_wait: 107 cycles (balanced producer-consumer)
+- tma0_wait: 721 cycles
 
-The primary optimization tool. Per-kernel tiered parameter sweep with top-lock analysis, interaction sweeps, and dynamic branching.
+The gap is in the epilogue, specifically Phase 1 (TMEM load → epilogue compute → CVT → STS → TMA store). No K-loop or W1 optimization will help — the pipeline hides all W1 overhead.
+
+## Grid search (FC2 only)
+
+Per-kernel tiered parameter sweep with top-lock analysis, interaction sweeps, and dynamic branching. **Only run on FC2** — PE and FC1 are exhausted/won.
 
 ### How it works
 
-1. **Per-kernel tiers**: Each kernel has ordered tiers of params (most impactful first). Sweep tier 1, carry top-k winners as branches into tier 2, etc.
+1. **Per-kernel tiers**: Ordered tiers of params (most impactful first). Sweep tier 1, carry top-k winners as branches into tier 2, etc.
 2. **Top-lock analysis**: After each tier, checks if any param is universally locked at the top (single value in all top-5/10/20 results, base rate <70%). Auto-pins into subsequent tier branches.
-3. **Dynamic k**: Reduces branching when the gap is clear (>2% → k=1, >0.5% → k≤2). Structural params (`BRANCH_PARAMS`) override this — N_STAGES always branches both values for FC2.
-4. **Interaction sweeps**: After all tiers, tests cross-tier param combinations (e.g., epilogue: BATCH_EPILOGUE × IS × PRELOAD_MODE). Skipped only if ALL params in the group are noise (not in any tier).
+3. **Dynamic k**: Reduces branching when the gap is clear (>2% → k=1, >0.5% → k≤2). Structural params (`BRANCH_PARAMS`) override this.
+4. **Interaction sweeps**: After all tiers, tests cross-tier param combinations. Skipped only if ALL params in the group are noise.
 5. **Inline η²**: Per-param eta-squared printed after each tier/interaction.
 
-### Per-kernel tier ordering
+### FC2 tier ordering (K=3072, N=768, 3 N-tiles, 24 K-iterations)
 
-Based on balanced-η² from session_20260315. Params not in any tier are pinned at `KERNEL_BASES` values.
-
-**FC1** (K=768, N=3072, 12 N-tiles):
-- Tier 1: `GELU_VARIANT`, `INTERLEAVE_STRATEGY` — IS is dominant (η²=0.533)
-- Tier 2: `PHASE1_UNROLL`, `STORE_TIMING`, `PRELOAD_MODE`, `BATCH_EPILOGUE` — PH1U=4 is critical (η²=0.842)
-- Tier 3: `EPILOGUE_LOOP`, `STS_WIDTH`, `EPI_SYNC`, `GELU_VECTOR_WIDTH`
-- Pinned: N_STAGES=5 (mandatory, 23% slower at 4), KLU=5, SMU=3
-
-**FC2** (K=3072, N=768, 3 N-tiles, 24 K-iterations):
-- Tier 1: `N_STAGES`, `K_LOOP_UNROLL`, `TMA_RESIDUAL`, `W0_RES_PREFETCH`, `W0_RES_FULL` — TMAR=1 is key (η²=0.435)
+- Tier 1: `N_STAGES`, `K_LOOP_UNROLL`, `TMA_RESIDUAL`, `W0_RES_PREFETCH`, `W0_RES_FULL`, `BATCH_MMA`
 - Tier 2: `INTERLEAVE_STRATEGY`, `PHASE1_UNROLL`, `BIAS_SMEM`, `TMEM_LOAD_WIDTH`
 - Tier 3: `BATCH_EPILOGUE`, `STORE_TIMING`, `STS_WIDTH`, `PRELOAD_MODE`, `DEFERRED_WAIT`
 - Tier 4: `EPILOGUE_LOOP`, `EPI_SYNC`, `NUM_PASSES_PARAM`
-- N_STAGES is a `BRANCH_PARAM` — both 4 and 5 always survive dynamic-k
+- N_STAGES and BATCH_MMA are `BRANCH_PARAMS` — always branch both values
 
-**PE** (K=768, N=768, 3 N-tiles): Exhausted. Tiers exist but return same 0.525ms.
+### FC2 confirmed results (session 2026-03-19)
 
-### Key findings
-
-- **SNAKE_ORDER=1**: Mandatory (pinned). SNAKE=0 is catastrophic (+49μs PE, never wins anywhere).
-- **FC1 breakthrough**: GV=4+IS=0+PH1U=4 found via interaction sweeps, not tier search. IS=3 won tier 1 but IS=0 was the real winner.
-- **FC2 regs**: 184-217 depending on config (down from 255 after W0 restructure). No longer at allocator ceiling.
-- **Top-lock vs η²**: η² catches params that create spread. Top-lock catches params required for peak. Complementary — η² says what to avoid, top-lock says what to pin.
-- **Tiered data is confounded**: Raw η², RF, Pearson/Spearman all give wrong rankings. Only balanced-subset η² works.
+- **N_STAGES=5 mandatory**: 1.452ms vs 1.594ms (NS4) — 10% gap, never test NS4 again
+- **IS1 ≈ IS2**: Noise for FC2 (both within ±0.003ms)
+- **BATCH_MMA**: Zero effect — K-loop overhead hidden by pipeline overlap
+- **PREFETCH_MBAR, OVERLAP_EPI_WAIT**: Noise
+- **W0_RES_FULL**: Catastrophic (+15%), epi_wait 107→5400 cycles
+- **W0_RES_PREFETCH**: Neutral
+- **EPI_LOAD_WARP**: Runtime hang (mbarrier bug)
+- Regs: 207 (NS5 base), down from 255 after W0 restructure
 
 ## Kernel structure
 
@@ -99,24 +98,22 @@ All kernels share `kernel_common.cuh` (pipeline, TMEM, TMA, mbarriers, tuning pa
 edit kernel_common.cuh / kernel_body.cuh / patch_embed.cu / fc1_gelu.cu / fc2.cu -> make -> ./patch_embed (or ./fc1_gelu, ./fc2)
 ```
 
-### Compile-time tuning params
+### Compile-time tuning params (FC2-relevant)
 
 Key params (controlled via `-D` flags, swept by grid_search.py):
 
-| Param | Values | Effect |
-|-------|--------|--------|
-| `N_STAGES` | 3,4,5 | Pipeline depth. FC1 needs 5. FC2 tests both 4 and 5. |
-| `K_LOOP_UNROLL` | 1,2,4,6,8 | K-loop unroll factor |
-| `PHASE1_UNROLL` | 1,2,4 | Epilogue unroll. PH1U=4 critical for FC1, neutral for PE. |
-| `INTERLEAVE_STRATEGY` | 0,1,2,3 | TMA store interleaving. IS=0 wins FC1, IS=2 wins PE. |
-| `GELU_VARIANT` | 0,4,5 | FC1 only. V4 (batched asm) is best. |
-| `TMA_RESIDUAL` | 0,1,2 | FC2 only. TMAR=1 (TMA coalesced) is key. |
-| `W0_RES_PREFETCH` | 0,1 | FC2 only. W0 prefetches pass-0 residual after K-loop. Requires TMA_RESIDUAL≥1. |
-| `W0_RES_FULL` | 0,1 | FC2 only. W0 loads ALL residual (both passes) with pass handshake. Requires TMA_RESIDUAL≥1, mutually exclusive with W0_RES_PREFETCH. |
-| `DEFERRED_WAIT` | 0,1 | FC2 only. Defers `wait_group 0` until after TMEM load + residual mbar_wait. Requires TMA_RESIDUAL≥1. |
-| `BIAS_SMEM` | 0,1 | FC1/FC2 only. Load bias vector into SMEM (vs global `__ldg`). |
-| `STORE_TIMING` | 0,1 | 0=inline stores, 1=all deferred after Phase 1. |
-| `BATCH_EPILOGUE` | 0,1 | 1=separate compute/store phases (FC1/FC2 only). |
+| Param | Values | FC2 best | Effect |
+|-------|--------|----------|--------|
+| `N_STAGES` | 3,4,5 | **5** | Pipeline depth. NS5 mandatory (10% gap vs NS4). |
+| `K_LOOP_UNROLL` | 1,2,4,6,8 | 4 | K-loop unroll factor |
+| `TMA_RESIDUAL` | 0,1,2 | **1** | TMAR=1 (TMA coalesced) is key. |
+| `BIAS_SMEM` | 0,1 | 1 | Load bias vector into SMEM (vs global `__ldg`). |
+| `INTERLEAVE_STRATEGY` | 0,1,2,3 | 1 | TMA store interleaving. IS1≈IS2 for FC2. |
+| `PHASE1_UNROLL` | 1,2,4 | 1 | Epilogue unroll. |
+| `BATCH_MMA` | 0,1 | 0 | Single asm block for 4 sub-MMAs. **Noise** — hidden by overlap. |
+| `BATCH_EPILOGUE` | 0,1 | 0 | 1=separate compute/store phases. |
+| `STORE_TIMING` | 0,1 | 0 | 0=inline stores, 1=all deferred after Phase 1. |
+| `DEFERRED_WAIT` | 0,1 | 0 | Defers `wait_group 0` after TMEM load. |
 
 See grid_search.py `RANGES` dict for full parameter list and valid values.
 
@@ -180,33 +177,33 @@ docs/                   # Experiments (F1-F40), proposals, grid search, SASS not
 ## Build and run
 
 ```bash
-make                    # compile patch_embed.cu -> patch_embed
-./patch_embed           # run on B200, prints timing + TFLOPS + checksum
-make fc1-gelu           # compile fc1_gelu.cu -> fc1-gelu
-./fc1-gelu              # run FC1+GELU kernel
+# FC2 — the active target
 make fc2                # compile fc2.cu -> fc2
-./fc2                   # run FC2 kernel
+./fc2                   # run on B200, prints timing + TFLOPS + checksum
+make fc2-timing         # compile with -DTIMING for cycle breakdown
 
-# Parameter grid search — per-kernel tiered (default)
-python3 tools/grid_search.py                                    # per-kernel tiered (default)
-python3 tools/grid_search.py --kernel fc1_gelu                  # FC1 tiers
-python3 tools/grid_search.py --kernel fc2                       # FC2 tiers
-python3 tools/grid_search.py --tier all --no-interact           # tiers only, skip interactions
-python3 tools/grid_search.py --full-cross                       # all parameters crossed
-python3 tools/grid_search.py --only K_LOOP_UNROLL TMA_RESIDUAL  # sweep specific params
-python3 tools/grid_search.py --interact epilogue --kernel fc2   # single interaction group
-python3 tools/grid_search.py --only BATCH_EPILOGUE --base MBAR_EARLY=1  # --base sets baseline
+# FC2 architecture search (combinatorial sweep on B200)
+./tools/fc2_arch_search.sh              # full: 48 configs (32 combinatorial + 16 W0_RES)
+./tools/fc2_arch_search.sh --quick      # 32 combinatorial configs only
 
-# CUTLASS comparison
-make cutlass-bench-max && ./cutlass-bench-max         # PE
-make cutlass-bench-fc1-max && ./cutlass-bench-fc1-max # FC1
-make cutlass-bench-fc2-max && ./cutlass-bench-fc2-max # FC2
-python3 tools/compare_all.py --runs 20 --csv data/compare.csv   # full ANOVA comparison
+# FC2 grid search
+python3 tools/grid_search.py --kernel fc2 --tier all            # FC2 tiered sweep
+python3 tools/grid_search.py --kernel fc2 --full-cross          # FC2 full cross-product
+python3 tools/grid_search.py --kernel fc2 --only TMA_RESIDUAL   # sweep specific params
+python3 tools/grid_search.py --kernel fc2 --interact residual   # residual interaction group
 
-# Analysis (all run locally, no GPU)
-python3 tools/analyze_sweep.py data/session_*/sweep_*.csv       # param importance rankings
-python3 tools/balanced_eta.py data/session_*/sweep_fc2.csv      # balanced η² for FC2
-python3 tools/sass_analysis.py --cubin patch_embed --deps       # SASS dependency analysis
+# CUTLASS FC2 comparison
+make cutlass-bench-fc2-max && ./cutlass-bench-fc2-max
+python3 tools/compare_all.py --runs 20 --csv data/compare.csv
+
+# Analysis (local, no GPU)
+python3 tools/analyze_sweep.py data/session_*/sweep_fc2.csv
+python3 tools/balanced_eta.py data/session_*/sweep_fc2.csv
+python3 tools/sass_analysis.py --cubin fc2 --deps
+
+# PE and FC1 (done — do NOT sweep or optimize)
+make                    # compile patch_embed.cu -> patch_embed
+make fc1-gelu           # compile fc1_gelu.cu -> fc1-gelu
 ```
 
 ## Key constraints
