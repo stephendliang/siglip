@@ -5,12 +5,13 @@
 # Swept axes (full combinatorial):
 #   BATCH_MMA          {0,1}  — all 4 sub-MMAs in single asm block
 #   PREFETCH_MBAR      {0,1}  — W1 K-loop: try_wait prefetch for next TMA stage barrier
-#   EPI_LOAD_WARP      {0,1}  — dedicated warp for residual TMA loading (adds 1 warp)
 #   OVERLAP_EPI_WAIT   {0,1}  — prefetch epilogue mbar at end of K-loop
 #   N_STAGES           {4,5}  — pipeline depth (may flip with shorter BATCH_MMA K-loop)
 #   INTERLEAVE_STRATEGY {1,2} — TMA store interleaving (IS=2 may win with faster K-loop)
 #
-# Total: 2^4 × 2 × 2 = 64 configs (--quick), +16 W0_RES variants (full) = 80
+# EPI_LOAD_WARP excluded — hangs at runtime (mbarrier bug, never validated on B200)
+#
+# Total: 2^3 × 2 × 2 = 32 configs (--quick), +16 W0_RES variants (full) = 48
 #
 # Key metrics:
 #   - epi_wait: W1 waiting for epilogue to free TMEM
@@ -18,8 +19,8 @@
 #   - ms/TFLOPS: wall-clock performance (clean build, no timing overhead)
 #
 # Usage:
-#   ./tools/fc2_arch_search.sh              # full search (64 combos + W0_RES variants)
-#   ./tools/fc2_arch_search.sh --quick      # 64 combinatorial configs only
+#   ./tools/fc2_arch_search.sh              # full search (32 combos + 16 W0_RES = 48)
+#   ./tools/fc2_arch_search.sh --quick      # 32 combinatorial configs only
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -51,16 +52,17 @@ BASE_CORE="-DBIAS_SMEM=1 -DPHASE1_UNROLL=1 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=0 -
 declare -a NAMES FLAGS
 add() { NAMES+=("$1"); FLAGS+=("$2"); }
 
-# --- Full combinatorial: 4 binary flags × N_STAGES{4,5} × IS{1,2} = 64 configs ---
-BIN_NAMES=("BM" "PF" "ELW" "OEW")
-BIN_DEFS=("-DBATCH_MMA=1" "-DPREFETCH_MBAR=1" "-DEPI_LOAD_WARP=1" "-DOVERLAP_EPI_WAIT=1")
+# --- Full combinatorial: 3 binary flags × N_STAGES{4,5} × IS{1,2} = 32 configs ---
+# EPI_LOAD_WARP excluded — hangs at runtime (mbarrier bug, never validated on B200)
+BIN_NAMES=("BM" "PF" "OEW")
+BIN_DEFS=("-DBATCH_MMA=1" "-DPREFETCH_MBAR=1" "-DOVERLAP_EPI_WAIT=1")
 
 for ns in 4 5; do
     for is in 1 2; do
-        for bits in $(seq 0 15); do
+        for bits in $(seq 0 7); do
             name="NS${ns}.IS${is}"
             flags="$BASE_CORE -DN_STAGES=${ns} -DINTERLEAVE_STRATEGY=${is}"
-            for i in 0 1 2 3; do
+            for i in 0 1 2; do
                 if (( bits & (1 << i) )); then
                     name="${name}.${BIN_NAMES[$i]}"
                     flags="$flags ${BIN_DEFS[$i]}"
@@ -74,7 +76,6 @@ done
 
 if [ "$QUICK" = "0" ]; then
     # --- W0_RES variants: cross {W0_RES_PREFETCH, W0_RES_FULL} × {BM, no-BM} × {NS4, NS5} ---
-    # EPI_LOAD_WARP is mutually exclusive with W0_RES_*, so these are separate
     for ns in 4 5; do
         for bm in 0 1; do
             bm_flag=""; bm_tag=""
@@ -99,7 +100,7 @@ printf "%-32s %7s %8s %5s  %7s %7s %7s %7s %7s %7s %7s  %s\n" \
     "e_ml_w" "e_ph1" "e_ph2" \
     "VERDICT" > "$SUMMARY"
 printf "%s\n" "$(printf '%.0s-' {1..160})" >> "$SUMMARY"
-echo "config,ms,tflops,regs,N_STAGES,INTERLEAVE_STRATEGY,BATCH_MMA,PREFETCH_MBAR,EPI_LOAD_WARP,OVERLAP_EPI_WAIT,W0_RES_PREFETCH,W0_RES_FULL,w1_epi_wait,w1_tma0_wait,w1_kloop,w1_total,epi_ml_wait,epi_phase1,epi_phase2,verdict" > "$CSV"
+echo "config,ms,tflops,regs,N_STAGES,INTERLEAVE_STRATEGY,BATCH_MMA,PREFETCH_MBAR,OVERLAP_EPI_WAIT,W0_RES_PREFETCH,W0_RES_FULL,w1_epi_wait,w1_tma0_wait,w1_kloop,w1_total,epi_ml_wait,epi_phase1,epi_phase2,verdict" > "$CSV"
 
 for idx in "${INDICES[@]}"; do
     name="${NAMES[$idx]}"
@@ -109,12 +110,11 @@ for idx in "${INDICES[@]}"; do
     log "  $flags"
 
     # Extract flag values for CSV
-    ns=4; is=1; bm=0; pf=0; elw=0; oew=0; w0rp=0; w0rf=0
+    ns=4; is=1; bm=0; pf=0; oew=0; w0rp=0; w0rf=0
     [[ "$flags" =~ N_STAGES=([0-9]+) ]] && ns="${BASH_REMATCH[1]}"
     [[ "$flags" =~ INTERLEAVE_STRATEGY=([0-9]+) ]] && is="${BASH_REMATCH[1]}"
     [[ "$flags" == *"BATCH_MMA=1"* ]] && bm=1
     [[ "$flags" == *"PREFETCH_MBAR=1"* ]] && pf=1
-    [[ "$flags" == *"EPI_LOAD_WARP=1"* ]] && elw=1
     [[ "$flags" == *"OVERLAP_EPI_WAIT=1"* ]] && oew=1
     [[ "$flags" == *"W0_RES_PREFETCH=1"* ]] && w0rp=1
     [[ "$flags" == *"W0_RES_FULL=1"* ]] && w0rf=1
@@ -133,7 +133,7 @@ for idx in "${INDICES[@]}"; do
     log "  Regs: ${regs:-?}, Spills: ${spills:-0}"
     [ "${spills:-0}" -gt 0 ] && { log "  SKIP: spills"; continue; }
 
-    if timeout 120 "$BIN" > "$TOUT" 2>&1; then
+    if timeout 20 "$BIN" > "$TOUT" 2>&1; then
         log "  Timing OK"
     else
         log "  RUNTIME ERROR/TIMEOUT (timing)"
@@ -145,7 +145,7 @@ for idx in "${INDICES[@]}"; do
     POUT="$OUTDIR/perf_${name}.txt"
     cmd="$NVCC $CFLAGS $flags $SRC -o $BIN $LDFLAGS"
     if eval "$cmd" > /dev/null 2>&1; then
-        if timeout 120 "$BIN" > "$POUT" 2>&1; then
+        if timeout 20 "$BIN" > "$POUT" 2>&1; then
             log "  Perf OK"
         else
             log "  RUNTIME ERROR (perf)"
@@ -181,7 +181,7 @@ for idx in "${INDICES[@]}"; do
         "$name" "${perf_ms:-?}" "${perf_tflops:-?}" "${regs:-?}" \
         "${w1_epi:-?}" "${w1_tma0:-?}" "${w1_kloop:-?}" "${w1_total:-?}" \
         "${epi_ml:-?}" "${epi_p1:-?}" "${epi_p2:-?}" "$verdict" >> "$SUMMARY"
-    echo "$name,${perf_ms:-},${perf_tflops:-},${regs:-},$ns,$is,$bm,$pf,$elw,$oew,$w0rp,$w0rf,${w1_epi:-},${w1_tma0:-},${w1_kloop:-},${w1_total:-},${epi_ml:-},${epi_p1:-},${epi_p2:-},$verdict" >> "$CSV"
+    echo "$name,${perf_ms:-},${perf_tflops:-},${regs:-},$ns,$is,$bm,$pf,$oew,$w0rp,$w0rf,${w1_epi:-},${w1_tma0:-},${w1_kloop:-},${w1_total:-},${epi_ml:-},${epi_p1:-},${epi_p2:-},$verdict" >> "$CSV"
 
     # Full timing analysis
     [ -n "$w1_epi" ] && python3 tools/analyze_timing.py "$TOUT" --ref-tflops 3564 \
@@ -202,7 +202,6 @@ log ""
 log "Swept axes (full combinatorial, ${#INDICES[@]} configs):"
 log "  BATCH_MMA          {0,1}  = all 4 sub-MMAs in single asm block"
 log "  PREFETCH_MBAR      {0,1}  = try_wait prefetch in W1 K-loop"
-log "  EPI_LOAD_WARP      {0,1}  = dedicated warp for residual TMA loading"
 log "  OVERLAP_EPI_WAIT   {0,1}  = prefetch epilogue mbar at end of K-loop"
 log "  N_STAGES           {4,5}  = pipeline depth"
 log "  INTERLEAVE_STRATEGY {1,2} = TMA store interleaving"
