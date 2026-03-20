@@ -290,7 +290,12 @@ extern "C" __global__ void k6_sts_throughput(long long* out) {
 }
 
 extern "C" __global__ void k7a_iadd_independent(long long* out) {
-    volatile int* gin = (volatile int*)out; // opaque to ptxas
+    /*
+    16 independent IADD3 feedback chains. ptxas unrolls by 2 and merges
+    pairs (a+=x; a+=x → IADD3 a,a,x,x). IADD3 is SM100a's native integer
+    add — this is unfixable. instrs_per_iter=8 accounts for the 2x merge.
+    */
+    volatile int* gin = (volatile int*)out;
     int inc = gin[threadIdx.x];
     int a=inc+1, b=inc+2, c=inc+3, d=inc+4, e=inc+5, f=inc+6, g=inc+7, h=inc+8;
     int i0=inc+9, j=inc+10, k=inc+11, l=inc+12, m=inc+13, n=inc+14, o=inc+15, p=inc+16;
@@ -323,11 +328,16 @@ extern "C" __global__ void k7a_iadd_independent(long long* out) {
     }
     long long t1 = clock64();
 
-    out[0] = t1 - t0; // all threads write — prevents compiler sinking loop past clock
+    out[0] = t1 - t0;
     out[1] = a+b+c+d+e+f+g+h+i0+j+k+l+m+n+o+p;
 }
 
 extern "C" __global__ void k7b_iadd_dependent(long long* out) {
+    /*
+    Dependent IADD3 chain. Same merge issue as K7a — ptxas folds
+    consecutive dependent adds via IADD3 three-operand addition.
+    instrs_per_iter=8 accounts for the 2x merge.
+    */
     volatile int* gin = (volatile int*)out;
     int a = gin[threadIdx.x];
     int inc = gin[threadIdx.x + 32];
@@ -2100,8 +2110,8 @@ int main() {
         {"K4: HFMA2 throughput (16 indep)",        16, k4_hfma2_throughput},
         {"K5: HFMA2+F2FP conflict (interleaved)", 16, k5_hfma2_f2fp_conflict},
         {"K6: STS.v4 throughput (16 indep)",       16, k6_sts_throughput},
-        {"K7a: IADD independent (decoder)",        16, k7a_iadd_independent},
-        {"K7b: IADD dependent (decoder)",          16, k7b_iadd_dependent},
+        {"K7a: IADD3 throughput (16→8 merged)",     8, k7a_iadd_independent},
+        {"K7b: IADD3 latency (16→8 merged)",       8, k7b_iadd_dependent},
         {"K8: PRMT throughput (16 feedback)",       16, k8_prmt_throughput},
         {"K9: F2FP throughput (32 indep)",         32, k9_f2fp_wide},
         {"K10: HADD2 throughput (8 after ptxas)",   8, k10_hadd2_throughput},
@@ -2172,7 +2182,8 @@ int main() {
     printf("  K3  vs K1+K6: if K3 ≈ max(K1,K6) → different pipes; if K3 ≈ K1+K6 → same pipe\n");
     printf("  K4  cyc/instr = HFMA2 throughput (volatile accumulators, 16 independent)\n");
     printf("  K5  vs K1+K4: HFMA2 self-accum + F2FP feedback chains interleaved\n");
-    printf("  K7a vs K7b: stall count = K7b_cyc/instr - K7a_cyc/instr (verify bits [3:0])\n");
+    printf("  K7a/K7b: IADD3 (native SM100a integer add). ptxas merges pairs via 3-operand\n");
+    printf("    IADD3 (a+=x; a+=x → IADD3 a,a,x,x). Count=8 per iter (16 PTX → 8 SASS).\n");
     printf("  K8  cyc/instr = PRMT throughput (16 feedback chains, 8 control words)\n");
     printf("  K9  vs K1: check if throughput degrades at 32-wide (register file pressure)\n");
     printf("  K10 cyc/instr = HADD2 throughput (ptxas reduces 16→8, still valid)\n");
