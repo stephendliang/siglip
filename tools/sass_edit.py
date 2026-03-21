@@ -1,0 +1,1807 @@
+#!/usr/bin/env python3
+"""
+SM100a SASS binary editor — parse, view, reorder, and patch cubin instructions.
+
+Works on standalone .cubin files (ELF format). Cross-references with
+cuobjdump --dump-sass text output for mnemonic annotation.
+
+Usage:
+    sass_edit.py info CUBIN
+    sass_edit.py dump CUBIN [--kernel NAME] [--start ADDR] [--end ADDR] [--sass FILE]
+    sass_edit.py swap CUBIN ADDR_A ADDR_B -o OUTPUT [--sass FILE] [--force]
+    sass_edit.py reorder CUBIN START END ADDR,ADDR,... -o OUTPUT [--sass FILE] [--force]
+    sass_edit.py patch CUBIN ADDR --stall N [--yield N] [--raw_lo HEX] -o OUTPUT
+    sass_edit.py script CUBIN SCRIPT_FILE -o OUTPUT
+    sass_edit.py verify CUBIN --sass FILE [--kernel NAME]
+    sass_edit.py diff CUBIN_A CUBIN_B [--kernel NAME]
+    sass_edit.py deps CUBIN --sass FILE --start ADDR --end ADDR [--reorder ADDR,ADDR,...]
+    sass_edit.py fatbin-patch HOST_BINARY --sass FILE [--script FILE | --stall ADDR VAL] -o OUTPUT
+"""
+
+import argparse
+import io
+import os
+import re
+import struct
+import sys
+import tempfile
+from pathlib import Path
+
+from elftools.elf.elffile import ELFFile
+
+INSN_SIZE = 16  # 128-bit instructions = 16 bytes
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Control word decode/encode
+#
+# Bit layout (tentative SM100a — stall field verified, others from SM89):
+#   [3:0]   stall count (0-15)  ← VERIFIED
+#   [4]     yield hint          ← plausible
+#   [9:5]   write barrier       ← SM89 layout, may differ on SM100a
+#   [14:10] read barrier        ← SM89 layout, may differ on SM100a
+#   [20:15] barrier wait mask   ← SM89 layout, may differ on SM100a
+#   [22:21] register reuse      ← SM89 layout, may differ on SM100a
+#   [63:23] upper bits (purpose unknown, preserved on edits)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def decode_ctrl(ctrl):
+    """Decode control word into field dict (SM89 layout, stall verified for SM100a)."""
+    return {
+        'stall':     ctrl & 0xf,
+        'yield':     (ctrl >> 4) & 1,
+        'wr_bar':    (ctrl >> 5) & 0x1f,
+        'rd_bar':    (ctrl >> 10) & 0x1f,
+        'wait_mask': (ctrl >> 15) & 0x3f,
+        'reuse':     (ctrl >> 21) & 3,
+    }
+
+
+def encode_ctrl(fields, original_ctrl):
+    """Encode control word fields, preserving bits above [22]."""
+    mask = 0x7fffff  # bits [22:0]
+    val = ((fields['stall'] & 0xf) |
+           ((fields['yield'] & 1) << 4) |
+           ((fields['wr_bar'] & 0x1f) << 5) |
+           ((fields['rd_bar'] & 0x1f) << 10) |
+           ((fields['wait_mask'] & 0x3f) << 15) |
+           ((fields['reuse'] & 3) << 21))
+    return (original_ctrl & ~mask) | val
+
+
+def ctrl_str(ctrl_val):
+    """Format control word for display."""
+    c = decode_ctrl(ctrl_val)
+    parts = ['st=%2d' % c['stall']]
+    if c['yield']:
+        parts.append('Y')
+    # Show raw low 23 bits for full visibility
+    parts.append('lo=%06x' % (ctrl_val & 0x7fffff))
+    hi = ctrl_val >> 23
+    if hi:
+        parts.append('hi=%010x' % hi)
+    return ' '.join(parts)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Instruction / Kernel types
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class Instruction:
+    __slots__ = ('offset', 'encoding', 'control', 'mnemonic', 'operands')
+
+    def __init__(self, offset, encoding, control):
+        self.offset = offset
+        self.encoding = encoding
+        self.control = control
+        self.mnemonic = None
+        self.operands = None
+
+    @property
+    def stall(self):
+        return self.control & 0xf
+
+    def clone(self):
+        i = Instruction(self.offset, self.encoding, self.control)
+        i.mnemonic = self.mnemonic
+        i.operands = self.operands
+        return i
+
+
+class Kernel:
+    def __init__(self, name, section_name, section_idx, file_offset, size):
+        self.name = name
+        self.section_name = section_name
+        self.section_idx = section_idx
+        self.file_offset = file_offset
+        self.size = size
+        self.instructions = []
+
+    @property
+    def short_name(self):
+        """Demangled-ish short name."""
+        # Try to extract template function name
+        m = re.search(r'_Z\d+(\w+)', self.name)
+        return m.group(1) if m else self.name[:60]
+
+    @property
+    def n_insns(self):
+        return len(self.instructions)
+
+    def parse_instructions(self, data):
+        self.instructions = []
+        for i in range(0, len(data) - 15, INSN_SIZE):
+            enc = struct.unpack_from('<Q', data, i)[0]
+            ctrl = struct.unpack_from('<Q', data, i + 8)[0]
+            self.instructions.append(Instruction(i, enc, ctrl))
+
+    def to_bytes(self):
+        buf = bytearray(len(self.instructions) * INSN_SIZE)
+        for i, insn in enumerate(self.instructions):
+            struct.pack_into('<Q', buf, i * 16, insn.encoding)
+            struct.pack_into('<Q', buf, i * 16 + 8, insn.control)
+        return bytes(buf)
+
+    def insn_at(self, addr):
+        idx = addr // INSN_SIZE
+        if 0 <= idx < len(self.instructions):
+            return self.instructions[idx]
+        return None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Register def/use analysis
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Regex patterns for operand parsing
+_RE_GPR = re.compile(r'\bR(\d+)')           # R0-R255
+_RE_URG = re.compile(r'\bUR(\d+)')          # UR0-UR63
+_RE_PRED = re.compile(r'\bP(\d)\b')         # P0-P6 (not PT)
+_RE_UPRED = re.compile(r'\bUP(\d)\b')       # UP0-UP6 (not UPT)
+
+# Instructions that store to memory (no register def from the data operands)
+_STORE_OPS = frozenset([
+    'STS', 'STG', 'STL', 'STS.64', 'STS.128',
+    'STG.64', 'STG.128', 'STL.64', 'STL.128',
+    'STG.E', 'STG.E.64', 'STG.E.128',
+    'STG.E.SYS', 'STG.E.SYS.128',
+])
+
+# Instructions that are pure control flow / barriers (no GPR defs)
+_NO_DEF_OPS = frozenset([
+    'NOP', 'EXIT', 'RET', 'BRA', 'BRA.U', 'BRA.DIV',
+    'BSSY', 'BSYNC', 'BSYNC.RECONVERGENT',
+    'BAR.SYNC', 'WARPSYNC', 'WARPSYNC.ALL',
+    'MEMBAR', 'MEMBAR.ALL.CTA', 'MEMBAR.SC.GPU',
+    'FENCE', 'FENCE.VIEW.ASYNC.S',
+    'YIELD', 'NANOSLEEP',
+])
+
+# Instructions with predicate output in a non-first-operand position
+_PRED_DEF_OPS = frozenset([
+    'ISETP', 'FSETP', 'HSETP2', 'DSETP',
+    'PLOP3', 'PLOP3.LUT', 'VOTEU', 'VOTEU.ALL',
+])
+
+# Vector width implied by instruction suffix
+_VECTOR_WIDTHS = {
+    '.128': 4,    # 4 x 32-bit regs
+    '.64': 2,     # 2 x 32-bit regs
+}
+
+
+def _base_op(mnemonic):
+    """Strip predicate guard and get base opcode (before first dot, or full name)."""
+    op = mnemonic
+    if op.startswith('@'):
+        op = op.split(None, 1)[-1] if ' ' in op else op
+    return op
+
+
+def _strip_pred(mnemonic):
+    """Return (guard_pred_str_or_None, bare_opcode)."""
+    if not mnemonic.startswith('@'):
+        return None, mnemonic
+    parts = mnemonic.split(None, 1)
+    return parts[0], parts[1] if len(parts) > 1 else ''
+
+
+def _parse_guard_pred(mnemonic):
+    """Extract guard predicate register from @P0 or @!P1 prefix. Returns set of pred reg strings."""
+    if not mnemonic or not mnemonic.startswith('@'):
+        return set()
+    guard = mnemonic.split()[0]  # "@P0" or "@!P1" or "@!UP0"
+    m = re.match(r'@!?U?P(\d)', guard)
+    if m:
+        if 'UP' in guard:
+            return {'UP' + m.group(1)}
+        return {'P' + m.group(1)}
+    return set()
+
+
+def _vector_width(opcode):
+    """Determine how many consecutive registers a load/store uses."""
+    for suffix, width in _VECTOR_WIDTHS.items():
+        if suffix in opcode:
+            return width
+    return 1
+
+
+def _ldtm_width(opcode, operands):
+    """LDTM.xN defines N consecutive registers starting from the dest reg."""
+    m = re.search(r'\.x(\d+)', opcode)
+    if m:
+        return int(m.group(1))
+    return 1
+
+
+def _reg_range(base_reg, width, prefix='R'):
+    """Generate set of register names for a vector of width regs starting at base_reg."""
+    return {prefix + str(base_reg + i) for i in range(width)}
+
+
+def parse_reg_operands(mnemonic, operands):
+    """Parse SASS instruction into (defs, uses) sets of register names.
+
+    Register names: 'R0'-'R255', 'UR0'-'UR63', 'P0'-'P6', 'UP0'-'UP6'.
+    Ignores RZ, URZ, PT, UPT (zero/true constants).
+
+    Returns (defs: set[str], uses: set[str]).
+    """
+    if not mnemonic or not operands:
+        return set(), set()
+
+    defs = set()
+    uses = set()
+
+    guard_pred, bare_op = _strip_pred(mnemonic)
+
+    # Guard predicate is always a USE
+    uses |= _parse_guard_pred(mnemonic)
+
+    # Split operands by comma, respecting brackets
+    raw_ops = _split_operands(operands)
+
+    # Determine instruction class from bare_op
+    op_base = bare_op.split('.')[0]
+    full_op = bare_op
+
+    # --- Store instructions: all operands are uses ---
+    # For vector stores (STS.128, STG.64, etc.), the data register
+    # expands to consecutive regs based on vector width
+    if _is_store(full_op):
+        width = _vector_width(full_op)
+        for i, op in enumerate(raw_ops):
+            if i == len(raw_ops) - 1 and width > 1:
+                # Last operand is the data source — expand to vector
+                m = _RE_GPR.search(op.replace('.reuse', ''))
+                if m:
+                    base = int(m.group(1))
+                    uses |= _reg_range(base, width)
+                else:
+                    uses |= _extract_regs(op)
+            else:
+                uses |= _extract_regs(op)
+        return defs, uses
+
+    # --- No-def instructions (branches, barriers, fences) ---
+    if full_op in _NO_DEF_OPS or op_base in ('BRA', 'BSSY', 'BSYNC', 'EXIT',
+                                               'RET', 'WARPSYNC', 'BAR',
+                                               'MEMBAR', 'FENCE', 'NOP',
+                                               'YIELD', 'NANOSLEEP', 'KILL'):
+        for op in raw_ops:
+            uses |= _extract_regs(op)
+        return defs, uses
+
+    # --- UTMASTG: TMA store, all operands are uses (uniform regs) ---
+    if op_base == 'UTMASTG':
+        for op in raw_ops:
+            uses |= _extract_regs(op)
+        return defs, uses
+
+    # --- UTCBAR: barrier op, all operands are uses ---
+    if op_base == 'UTCBAR':
+        for op in raw_ops:
+            uses |= _extract_regs(op)
+        return defs, uses
+
+    # --- Predicate-defining instructions (ISETP, PLOP3, VOTEU, etc.) ---
+    if op_base in ('ISETP', 'FSETP', 'HSETP2', 'DSETP'):
+        # Format: ISETP.cc.AND P0, PT, R36, RZ, PT
+        # Defs: first two operands (pred, pred), Uses: rest
+        for i, op in enumerate(raw_ops):
+            if i < 2:
+                defs |= _extract_preds(op)
+            else:
+                uses |= _extract_regs(op)
+        return defs, uses
+
+    if op_base == 'PLOP3':
+        # PLOP3.LUT P2, PT, P1, PT, PT, 0x8, 0x80
+        # Defs: first two operands, Uses: rest
+        for i, op in enumerate(raw_ops):
+            if i < 2:
+                defs |= _extract_preds(op)
+            else:
+                uses |= _extract_regs(op)
+        return defs, uses
+
+    if op_base == 'VOTEU':
+        # VOTEU.ALL UP0, P1
+        # Defs: first operand (uniform pred), second is use
+        if raw_ops:
+            defs |= _extract_preds(raw_ops[0])
+        for op in raw_ops[1:]:
+            uses |= _extract_regs(op)
+        return defs, uses
+
+    # --- R2UR: move GPR to uniform reg ---
+    if op_base == 'R2UR':
+        # R2UR UR6, R4  or  R2UR P0, UR10, R99  or  R2UR.OR P0, UR9, R60
+        # First operand(s) that are UR/P are defs, GPR sources are uses
+        for i, op in enumerate(raw_ops):
+            op_stripped = op.strip()
+            if i == 0:
+                # Could be pred def (P0) or UR def
+                defs |= _extract_preds(op_stripped)
+                defs |= _extract_uregs(op_stripped)
+            elif _RE_URG.search(op_stripped) and i <= 1 and 'P' in raw_ops[0]:
+                # Second operand is UR def when first was pred
+                defs |= _extract_uregs(op_stripped)
+            else:
+                uses |= _extract_regs(op_stripped)
+        return defs, uses
+
+    # --- LDTM: load from TMEM, defines N consecutive GPRs ---
+    if op_base == 'LDTM':
+        width = _ldtm_width(full_op, operands)
+        if raw_ops:
+            m = _RE_GPR.search(raw_ops[0])
+            if m:
+                base = int(m.group(1))
+                defs |= _reg_range(base, width)
+        for op in raw_ops[1:]:
+            uses |= _extract_regs(op)
+        return defs, uses
+
+    # --- LDC: load constant, defines dest reg(s) ---
+    if op_base == 'LDC':
+        width = 2 if '.64' in full_op else 1
+        if raw_ops:
+            m = _RE_GPR.search(raw_ops[0])
+            if m:
+                base = int(m.group(1))
+                defs |= _reg_range(base, width)
+        # c[x][y] operands have no register refs typically
+        for op in raw_ops[1:]:
+            uses |= _extract_regs(op)
+        return defs, uses
+
+    # --- LDG/LDS/LDL: load from memory, defines dest regs ---
+    if op_base in ('LDG', 'LDS', 'LDL', 'LDSM'):
+        width = _vector_width(full_op)
+        if raw_ops:
+            m = _RE_GPR.search(raw_ops[0])
+            if m:
+                base = int(m.group(1))
+                defs |= _reg_range(base, width)
+        for op in raw_ops[1:]:
+            uses |= _extract_regs(op)
+        return defs, uses
+
+    # --- UMOV: move to/from uniform regs ---
+    if op_base == 'UMOV':
+        if raw_ops:
+            defs |= _extract_uregs(raw_ops[0])
+        for op in raw_ops[1:]:
+            uses |= _extract_regs(op)
+        return defs, uses
+
+    # --- IMAD with predicate output ---
+    # IMAD can write a carry predicate: IMAD.IADD R142, R115, 0x1, R142
+    # But IADD3 has explicit pred outputs: IADD3 R130, P0, PT, R156, 0x2, RZ
+    if op_base == 'IADD3':
+        # IADD3 Rd, Pcarry, Pborrow, Ra, imm/Rb, Rc [, Pcarry_in, Pborrow_in]
+        # First op = GPR def, next two = pred defs, rest = uses
+        if raw_ops:
+            m = _RE_GPR.search(raw_ops[0])
+            if m:
+                defs.add('R' + m.group(1))
+        for i, op in enumerate(raw_ops[1:3], 1):
+            defs |= _extract_preds(op)
+        for op in raw_ops[3:]:
+            uses |= _extract_regs(op)
+        return defs, uses
+
+    # --- LEA / LEA.HI ---
+    if op_base == 'LEA':
+        if raw_ops:
+            m = _RE_GPR.search(raw_ops[0])
+            if m:
+                defs.add('R' + m.group(1))
+        for op in raw_ops[1:]:
+            uses |= _extract_regs(op)
+        return defs, uses
+
+    # --- Default: first operand is def, rest are uses ---
+    if raw_ops:
+        first = raw_ops[0].strip()
+        # Check if first operand looks like a register (not a memory address)
+        if first.startswith('[') or first.startswith('tmem'):
+            # Unusual — treat everything as uses (safety)
+            for op in raw_ops:
+                uses |= _extract_regs(op)
+        else:
+            # First operand: defs
+            m_gpr = _RE_GPR.search(first)
+            if m_gpr:
+                base = int(m_gpr.group(1))
+                # Check for vector width on the instruction
+                width = _vector_width(full_op)
+                defs |= _reg_range(base, width)
+            defs |= _extract_uregs(first)
+            defs |= _extract_preds(first)
+
+            # Remaining operands: uses
+            for op in raw_ops[1:]:
+                uses |= _extract_regs(op)
+
+    return defs, uses
+
+
+def _is_store(opcode):
+    """Check if opcode is a store instruction (no register def)."""
+    if opcode in _NO_DEF_OPS:
+        return False
+    base = opcode.split('.')[0]
+    if base in ('STS', 'STG', 'STL', 'ATOMS', 'ATOMG', 'RED'):
+        return True
+    if opcode in _STORE_OPS:
+        return True
+    return False
+
+
+def _split_operands(operands):
+    """Split operands by comma, respecting brackets."""
+    result = []
+    depth = 0
+    current = []
+    for ch in operands:
+        if ch in '([':
+            depth += 1
+            current.append(ch)
+        elif ch in ')]':
+            depth -= 1
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            result.append(''.join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        result.append(''.join(current).strip())
+    return result
+
+
+def _extract_regs(text):
+    """Extract all register references (GPR, UR, pred) from an operand string.
+    Ignores RZ, URZ, PT, UPT."""
+    regs = set()
+    # Strip .reuse suffix for matching
+    text = text.replace('.reuse', '')
+    for m in _RE_GPR.finditer(text):
+        regs.add('R' + m.group(1))
+    for m in _RE_URG.finditer(text):
+        regs.add('UR' + m.group(1))
+    for m in _RE_PRED.finditer(text):
+        regs.add('P' + m.group(1))
+    for m in _RE_UPRED.finditer(text):
+        regs.add('UP' + m.group(1))
+    return regs
+
+
+def _extract_preds(text):
+    """Extract only predicate registers from text. Ignores PT/UPT."""
+    preds = set()
+    for m in _RE_PRED.finditer(text):
+        preds.add('P' + m.group(1))
+    for m in _RE_UPRED.finditer(text):
+        preds.add('UP' + m.group(1))
+    return preds
+
+
+def _extract_uregs(text):
+    """Extract only uniform registers from text. Ignores URZ."""
+    uregs = set()
+    for m in _RE_URG.finditer(text):
+        uregs.add('UR' + m.group(1))
+    return uregs
+
+
+# Instructions that act as reorder boundaries — no instruction may move
+# across one of these in a reorder, even if register deps are satisfied.
+_BARRIER_BASES = frozenset([
+    'BRA', 'BSSY', 'BSYNC', 'EXIT', 'RET', 'CALL', 'BREAK', 'CONT',
+    'BAR', 'WARPSYNC', 'MEMBAR', 'FENCE',
+    'UTCBAR', 'DEPBAR',
+    'YIELD', 'KILL',
+])
+
+
+def is_barrier(mnemonic):
+    """Check if an instruction is a reorder boundary."""
+    if not mnemonic:
+        return False
+    _, bare = _strip_pred(mnemonic)
+    base = bare.split('.')[0]
+    return base in _BARRIER_BASES
+
+
+class DepViolation:
+    """A dependency violation from a proposed reorder."""
+    __slots__ = ('kind', 'producer_addr', 'consumer_addr', 'reg',
+                 'producer_mnemonic', 'consumer_mnemonic',
+                 'orig_order', 'new_order')
+
+    def __init__(self, kind, producer_addr, consumer_addr, reg,
+                 producer_mn='', consumer_mn=''):
+        self.kind = kind  # 'RAW', 'WAW', 'WAR'
+        self.producer_addr = producer_addr
+        self.consumer_addr = consumer_addr
+        self.reg = reg
+        self.producer_mnemonic = producer_mn
+        self.consumer_mnemonic = consumer_mn
+
+    def __str__(self):
+        return '%s [%04x] %s → [%04x] %s  via %s' % (
+            self.kind,
+            self.producer_addr, self.producer_mnemonic[:30],
+            self.consumer_addr, self.consumer_mnemonic[:30],
+            self.reg)
+
+
+def check_deps(instructions, new_order_addrs=None):
+    """Check for dependency and barrier violations in a proposed reorder.
+
+    instructions: list of Instruction objects (must have mnemonic/operands set)
+    new_order_addrs: if given, list of addresses in the proposed new order.
+        If None, checks the existing order (useful for dumping deps).
+
+    Returns list of DepViolation for any RAW/WAW/WAR or BARRIER violations.
+    """
+    # Build addr→instruction map
+    addr_map = {insn.offset: insn for insn in instructions}
+
+    if new_order_addrs is None:
+        ordered = list(instructions)
+    else:
+        ordered = [addr_map[a] for a in new_order_addrs]
+
+    # Parse defs/uses for each instruction
+    du = {}
+    for insn in ordered:
+        d, u = parse_reg_operands(insn.mnemonic, insn.operands)
+        du[insn.offset] = (d, u)
+
+    orig_pos = {insn.offset: i for i, insn in enumerate(instructions)}
+    new_pos = {insn.offset: i for i, insn in enumerate(ordered)}
+
+    violations = []
+
+    # --- Barrier boundary check ---
+    # A barrier instruction pins all instructions on its original side.
+    # No instruction from before the barrier may appear after it (or vice versa).
+    if new_order_addrs is not None:
+        for insn in instructions:
+            if not is_barrier(insn.mnemonic):
+                continue
+            bar_orig = orig_pos[insn.offset]
+            bar_new = new_pos[insn.offset]
+
+            for other in instructions:
+                if other.offset == insn.offset:
+                    continue
+                oth_orig = orig_pos[other.offset]
+                oth_new = new_pos[other.offset]
+
+                # Was before barrier, now after
+                if oth_orig < bar_orig and oth_new > bar_new:
+                    violations.append(DepViolation(
+                        'BARRIER', other.offset, insn.offset, '-',
+                        other.mnemonic or '', insn.mnemonic or ''))
+                # Was after barrier, now before
+                elif oth_orig > bar_orig and oth_new < bar_new:
+                    violations.append(DepViolation(
+                        'BARRIER', insn.offset, other.offset, '-',
+                        insn.mnemonic or '', other.mnemonic or ''))
+
+    # --- Register dependency check ---
+    addrs = [insn.offset for insn in instructions]
+    n = len(addrs)
+
+    for i in range(n):
+        addr_i = addrs[i]
+        defs_i, uses_i = du[addr_i]
+        mn_i = instructions[i].mnemonic or ''
+
+        for j in range(i + 1, n):
+            addr_j = addrs[j]
+            defs_j, uses_j = du[addr_j]
+            mn_j = instructions[j].mnemonic or ''
+
+            # RAW: i defines R, j uses R → i must come before j
+            raw_regs = defs_i & uses_j
+            for r in raw_regs:
+                if new_pos[addr_i] > new_pos[addr_j]:
+                    violations.append(DepViolation(
+                        'RAW', addr_i, addr_j, r, mn_i, mn_j))
+
+            # WAW: i defines R, j defines R → i must come before j
+            waw_regs = defs_i & defs_j
+            for r in waw_regs:
+                if new_pos[addr_i] > new_pos[addr_j]:
+                    violations.append(DepViolation(
+                        'WAW', addr_i, addr_j, r, mn_i, mn_j))
+
+            # WAR: i uses R, j defines R → i must come before j
+            war_regs = uses_i & defs_j
+            for r in war_regs:
+                if new_pos[addr_i] > new_pos[addr_j]:
+                    violations.append(DepViolation(
+                        'WAR', addr_i, addr_j, r, mn_i, mn_j))
+
+    return violations
+
+
+def dump_deps(instructions):
+    """Print def/use analysis for a list of instructions."""
+    for insn in instructions:
+        defs, uses = parse_reg_operands(insn.mnemonic, insn.operands)
+        def_str = ','.join(sorted(defs)) if defs else '-'
+        use_str = ','.join(sorted(uses)) if uses else '-'
+        mn = insn.mnemonic or '???'
+        ops = insn.operands or ''
+        bar = ' [BARRIER]' if is_barrier(insn.mnemonic) else ''
+        print('[%04x] %-45s  def={%-20s}  use={%s}%s' % (
+            insn.offset, (mn + ' ' + ops)[:45], def_str, use_str, bar))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# cuobjdump SASS cross-reference
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def parse_sass_dump(sass_path, kernel_name_hint=None):
+    """Parse cuobjdump --dump-sass output, return dict of {func_name: {addr: (opcode, operands)}}."""
+    text = Path(sass_path).read_text()
+    func_re = re.compile(r'Function\s*:\s*(\S+)')
+    insn_re = re.compile(
+        r'/\*([0-9a-fA-F]+)\*/\s+'
+        r'(?:(@[!]?U?P\d+)\s+)?'
+        r'(\S+?)\s+'
+        r'(.*?)\s*;'
+    )
+
+    result = {}
+    current_func = None
+
+    for line in text.split('\n'):
+        fm = func_re.search(line)
+        if fm:
+            current_func = fm.group(1)
+            result[current_func] = {}
+            continue
+
+        if current_func is None:
+            continue
+
+        m = insn_re.search(line)
+        if m:
+            addr = int(m.group(1), 16)
+            pred = m.group(2) or ''
+            opcode = m.group(3)
+            operands = m.group(4)
+            if pred:
+                opcode = pred + ' ' + opcode
+            result[current_func][addr] = (opcode, operands)
+
+    return result
+
+
+def apply_sass_xref(kernel, sass_data):
+    """Apply mnemonic annotations from SASS dump to kernel instructions."""
+    # Find matching function in sass data
+    best = None
+    for func_name in sass_data:
+        if func_name in kernel.name or kernel.name in func_name:
+            best = func_name
+            break
+
+    if best is None:
+        # Try partial match
+        for func_name in sass_data:
+            if kernel.short_name in func_name:
+                best = func_name
+                break
+
+    if best is None:
+        return 0
+
+    addr_map = sass_data[best]
+    count = 0
+    for insn in kernel.instructions:
+        if insn.offset in addr_map:
+            insn.mnemonic, insn.operands = addr_map[insn.offset]
+            count += 1
+
+    return count
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CubinEditor
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class CubinEditor:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.data = bytearray(self.path.read_bytes())
+        self.kernels = []
+        self._parse_elf()
+        self._modified = False
+
+    def _parse_elf(self):
+        f = io.BytesIO(bytes(self.data))
+        elf = ELFFile(f)
+
+        # Also grab ELF metadata we need for section manipulation
+        self._ehdr_size = elf.header['e_ehsize']
+        self._shoff = elf.header['e_shoff']
+        self._shentsize = elf.header['e_shentsize']
+        self._shnum = elf.header['e_shnum']
+
+        for idx in range(elf.num_sections()):
+            sec = elf.get_section(idx)
+            name = sec.name
+            if not name.startswith('.text.'):
+                continue
+
+            offset = sec.header['sh_offset']
+            size = sec.header['sh_size']
+            if size == 0:
+                continue
+
+            kernel_name = name[6:]
+            k = Kernel(kernel_name, name, idx, offset, size)
+            k.parse_instructions(self.data[offset:offset + size])
+            self.kernels.append(k)
+
+    def find_kernel(self, name=None):
+        if not self.kernels:
+            return None
+        if name is None:
+            return max(self.kernels, key=lambda k: k.size)
+        for k in self.kernels:
+            if name in k.name or name == k.short_name:
+                return k
+        # Try case-insensitive partial
+        name_lower = name.lower()
+        for k in self.kernels:
+            if name_lower in k.name.lower():
+                return k
+        return None
+
+    def xref(self, sass_path, kernel=None):
+        sass_data = parse_sass_dump(sass_path)
+        if kernel:
+            return apply_sass_xref(kernel, sass_data)
+        total = 0
+        for k in self.kernels:
+            total += apply_sass_xref(k, sass_data)
+        return total
+
+    def swap(self, kernel, addr_a, addr_b, force=False):
+        """Swap two instructions (full 128-bit swap including control words)."""
+        idx_a = addr_a // INSN_SIZE
+        idx_b = addr_b // INSN_SIZE
+        instrs = kernel.instructions
+
+        if not (0 <= idx_a < len(instrs) and 0 <= idx_b < len(instrs)):
+            raise ValueError('Address out of range: 0x%x or 0x%x' % (addr_a, addr_b))
+
+        # Dep check: treat as reorder of the range [min, max+1) with swapped positions
+        lo, hi = sorted([idx_a, idx_b])
+        region = instrs[lo:hi + 1]
+        if region[0].mnemonic is not None:
+            addrs_orig = [insn.offset for insn in region]
+            addrs_new = list(addrs_orig)
+            ia = idx_a - lo
+            ib = idx_b - lo
+            addrs_new[ia], addrs_new[ib] = addrs_new[ib], addrs_new[ia]
+            violations = check_deps(region, addrs_new)
+            if violations:
+                print('WARNING: %d dependency violation(s) in swap:' % len(violations))
+                for v in violations:
+                    print('  %s' % v)
+                if not force:
+                    raise ValueError(
+                        'Swap blocked by dependency violations (use --force to override)')
+
+        a, b = instrs[idx_a], instrs[idx_b]
+        a.encoding, b.encoding = b.encoding, a.encoding
+        a.control, b.control = b.control, a.control
+        a.mnemonic, b.mnemonic = b.mnemonic, a.mnemonic
+        a.operands, b.operands = b.operands, a.operands
+        self._modified = True
+
+    def reorder(self, kernel, start_addr, end_addr, new_order, force=False):
+        """Reorder instructions in [start, end) to the sequence given by new_order (list of addrs)."""
+        start_idx = start_addr // INSN_SIZE
+        end_idx = end_addr // INSN_SIZE
+        instrs = kernel.instructions
+
+        if end_idx > len(instrs):
+            raise ValueError('End address 0x%x out of range (max 0x%x)' % (
+                end_addr, len(instrs) * INSN_SIZE))
+
+        count = end_idx - start_idx
+        if len(new_order) != count:
+            raise ValueError('new_order has %d entries, need %d' % (len(new_order), count))
+
+        valid = set(range(start_addr, end_addr, INSN_SIZE))
+        for addr in new_order:
+            if addr not in valid:
+                raise ValueError('Address 0x%x not in range [0x%x, 0x%x)' % (
+                    addr, start_addr, end_addr))
+        if len(set(new_order)) != count:
+            raise ValueError('Duplicate addresses in new_order')
+
+        # Dep check
+        region = instrs[start_idx:end_idx]
+        if region and region[0].mnemonic is not None:
+            violations = check_deps(region, new_order)
+            if violations:
+                print('WARNING: %d dependency violation(s) in reorder:' % len(violations))
+                for v in violations:
+                    print('  %s' % v)
+                if not force:
+                    raise ValueError(
+                        'Reorder blocked by dependency violations (use --force to override)')
+
+        # Snapshot originals
+        orig = {a: instrs[a // INSN_SIZE].clone() for a in new_order}
+
+        # Write in new order
+        for i, addr in enumerate(new_order):
+            src = orig[addr]
+            dst = instrs[start_idx + i]
+            dst.encoding = src.encoding
+            dst.control = src.control
+            dst.mnemonic = src.mnemonic
+            dst.operands = src.operands
+
+        self._modified = True
+
+    def patch_ctrl_field(self, kernel, addr, **fields):
+        """Modify specific control word fields at addr."""
+        idx = addr // INSN_SIZE
+        insn = kernel.instructions[idx]
+        current = decode_ctrl(insn.control)
+        for key, val in fields.items():
+            if key not in current:
+                raise ValueError('Unknown field: %s' % key)
+            current[key] = val
+        insn.control = encode_ctrl(current, insn.control)
+        self._modified = True
+
+    def patch_ctrl_raw(self, kernel, addr, raw_ctrl):
+        """Replace entire control word at addr."""
+        idx = addr // INSN_SIZE
+        kernel.instructions[idx].control = raw_ctrl
+        self._modified = True
+
+    def patch_stall(self, kernel, addr, stall):
+        """Set stall count at addr (most common operation)."""
+        idx = addr // INSN_SIZE
+        insn = kernel.instructions[idx]
+        insn.control = (insn.control & ~0xf) | (stall & 0xf)
+        self._modified = True
+
+    def save(self, output_path):
+        """Write modified cubin. Never overwrites the original."""
+        out_path = Path(output_path)
+        if out_path.resolve() == self.path.resolve():
+            raise ValueError('Cannot overwrite source cubin. Use a different output path.')
+
+        out = bytearray(self.data)
+        for k in self.kernels:
+            new_bytes = k.to_bytes()
+            if len(new_bytes) != k.size:
+                raise ValueError(
+                    'Kernel %s: instruction bytes (%d) != section size (%d). '
+                    'Instruction count changed — not supported.' % (
+                        k.short_name, len(new_bytes), k.size))
+            out[k.file_offset:k.file_offset + k.size] = new_bytes
+
+        out_path.write_bytes(bytes(out))
+        return out_path
+
+    def verify(self, sass_path, kernel=None):
+        """Cross-reference binary with SASS dump to validate byte-level encoding match."""
+        sass_data = parse_sass_dump(sass_path)
+        k = kernel or self.find_kernel()
+        if not k:
+            print('No kernel found')
+            return False
+
+        # Parse the raw hex values from the SASS dump too
+        text = Path(sass_path).read_text()
+        hex_re = re.compile(r'/\*\s*0x([0-9a-fA-F]+)\s*\*/')
+        func_re = re.compile(r'Function\s*:\s*(\S+)')
+
+        in_target = False
+        lines = text.split('\n')
+        sass_insns = []  # (addr, encoding, control)
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            fm = func_re.search(line)
+            if fm:
+                fname = fm.group(1)
+                in_target = (fname in k.name or k.name in fname)
+                i += 1
+                continue
+
+            if not in_target:
+                i += 1
+                continue
+
+            # Try to parse instruction line (has addr + ;)
+            addr_m = re.search(r'/\*([0-9a-fA-F]+)\*/', line)
+            if addr_m and ';' in line:
+                addr = int(addr_m.group(1), 16)
+                hexvals = hex_re.findall(line)
+                enc = int(hexvals[-1], 16) if hexvals else 0
+
+                # Next line: control word
+                if i + 1 < len(lines):
+                    ctrl_hexvals = hex_re.findall(lines[i + 1])
+                    ctrl = int(ctrl_hexvals[0], 16) if ctrl_hexvals else 0
+                    sass_insns.append((addr, enc, ctrl))
+                    i += 2
+                    continue
+
+            i += 1
+
+        # Compare
+        mismatches = 0
+        matched = 0
+        for addr, sass_enc, sass_ctrl in sass_insns:
+            idx = addr // INSN_SIZE
+            if idx >= len(k.instructions):
+                print('  WARN: SASS addr 0x%04x beyond binary (has %d insns)' % (
+                    addr, len(k.instructions)))
+                continue
+
+            bin_insn = k.instructions[idx]
+            enc_ok = bin_insn.encoding == sass_enc
+            ctrl_ok = bin_insn.control == sass_ctrl
+
+            if not enc_ok or not ctrl_ok:
+                mismatches += 1
+                if mismatches <= 20:
+                    print('  MISMATCH at 0x%04x:' % addr)
+                    if not enc_ok:
+                        print('    enc:  bin=0x%016x  sass=0x%016x' % (bin_insn.encoding, sass_enc))
+                    if not ctrl_ok:
+                        print('    ctrl: bin=0x%016x  sass=0x%016x' % (bin_insn.control, sass_ctrl))
+            else:
+                matched += 1
+
+        total = len(sass_insns)
+        print('Verified %d/%d instructions: %d match, %d mismatch' % (
+            total, k.n_insns, matched, mismatches))
+        return mismatches == 0
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Script parser — batch edit commands
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def parse_script(script_path, editor, kernel):
+    """Parse and execute a batch edit script.
+
+    Script format (one command per line, # comments):
+        swap 0xADDR_A 0xADDR_B
+        stall 0xADDR VALUE
+        ctrl 0xADDR 0xRAW_CTRL_HEX
+        reorder 0xSTART 0xEND 0xA,0xB,0xC,...
+    """
+    lines = Path(script_path).read_text().strip().split('\n')
+    n_ops = 0
+
+    for lineno, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+
+        parts = line.split()
+        cmd = parts[0].lower()
+
+        try:
+            if cmd == 'swap':
+                a, b = int(parts[1], 0), int(parts[2], 0)
+                editor.swap(kernel, a, b)
+                n_ops += 1
+
+            elif cmd == 'stall':
+                addr, val = int(parts[1], 0), int(parts[2], 0)
+                editor.patch_stall(kernel, addr, val)
+                n_ops += 1
+
+            elif cmd == 'ctrl':
+                addr, raw = int(parts[1], 0), int(parts[2], 0)
+                editor.patch_ctrl_raw(kernel, addr, raw)
+                n_ops += 1
+
+            elif cmd == 'reorder':
+                start = int(parts[1], 0)
+                end = int(parts[2], 0)
+                addrs = [int(x, 0) for x in parts[3].split(',')]
+                editor.reorder(kernel, start, end, addrs)
+                n_ops += 1
+
+            else:
+                print('WARN: unknown command "%s" at line %d' % (cmd, lineno))
+
+        except Exception as e:
+            print('ERROR at line %d: %s' % (lineno, e))
+            raise
+
+    return n_ops
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CLI commands
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def cmd_info(args):
+    ed = CubinEditor(args.cubin)
+    print('Cubin: %s (%d bytes)' % (args.cubin, len(ed.data)))
+    print('Kernels: %d' % len(ed.kernels))
+    print()
+    for k in ed.kernels:
+        print('  %-40s  %6d insns  %6d bytes  file_off=0x%x' % (
+            k.short_name[:40], k.n_insns, k.size, k.file_offset))
+
+
+def cmd_dump(args):
+    ed = CubinEditor(args.cubin)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found: %s' % args.kernel)
+        print('Available: %s' % ', '.join(kk.short_name for kk in ed.kernels))
+        sys.exit(1)
+
+    if args.sass:
+        n = ed.xref(args.sass, k)
+        sys.stderr.write('Cross-referenced %d/%d instructions\n' % (n, k.n_insns))
+
+    start = int(args.start, 0) if args.start else None
+    end = int(args.end, 0) if args.end else None
+
+    print('Kernel: %s  (%d insns, %d bytes)' % (k.short_name[:60], k.n_insns, k.size))
+    print('=' * 120)
+
+    for insn in k.instructions:
+        if start is not None and insn.offset < start:
+            continue
+        if end is not None and insn.offset >= end:
+            break
+
+        stall = insn.control & 0xf
+        stall_bar = '#' * stall if stall else '.'
+
+        if insn.mnemonic:
+            mnem_str = insn.mnemonic
+            if insn.operands:
+                mnem_str += ' ' + insn.operands[:50]
+            print('[%04x] st=%2d %-15s  enc=%016x ctrl=%016x  %-60s' % (
+                insn.offset, stall, stall_bar, insn.encoding, insn.control,
+                mnem_str[:60]))
+        else:
+            print('[%04x] st=%2d %-15s  enc=%016x ctrl=%016x' % (
+                insn.offset, stall, stall_bar, insn.encoding, insn.control))
+
+
+def cmd_swap(args):
+    ed = CubinEditor(args.cubin)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found')
+        sys.exit(1)
+
+    addr_a = int(args.addr_a, 0)
+    addr_b = int(args.addr_b, 0)
+
+    if args.sass:
+        ed.xref(args.sass, k)
+
+    insn_a = k.insn_at(addr_a)
+    insn_b = k.insn_at(addr_b)
+    print('Swapping:')
+    print('  [%04x] %s' % (addr_a, insn_a.mnemonic or ('enc=0x%016x' % insn_a.encoding)))
+    print('  [%04x] %s' % (addr_b, insn_b.mnemonic or ('enc=0x%016x' % insn_b.encoding)))
+
+    ed.swap(k, addr_a, addr_b, force=getattr(args, 'force', False))
+    out = ed.save(args.output)
+    print('Saved: %s' % out)
+
+
+def cmd_reorder(args):
+    ed = CubinEditor(args.cubin)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found')
+        sys.exit(1)
+
+    start = int(args.start, 0)
+    end = int(args.end, 0)
+    new_order = [int(x, 0) for x in args.order.split(',')]
+
+    if args.sass:
+        ed.xref(args.sass, k)
+
+    print('Reordering [0x%x, 0x%x): %d instructions' % (start, end, len(new_order)))
+    for i, addr in enumerate(new_order):
+        insn = k.insn_at(addr)
+        tag = insn.mnemonic or ('enc=0x%016x' % insn.encoding)
+        print('  %d: [%04x] %s' % (i, addr, tag))
+
+    ed.reorder(k, start, end, new_order, force=getattr(args, 'force', False))
+    out = ed.save(args.output)
+    print('Saved: %s' % out)
+
+
+def cmd_patch(args):
+    ed = CubinEditor(args.cubin)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found')
+        sys.exit(1)
+
+    addr = int(args.addr, 0)
+
+    if args.raw_ctrl is not None:
+        raw = int(args.raw_ctrl, 0)
+        ed.patch_ctrl_raw(k, addr, raw)
+        print('Patched [%04x] ctrl = 0x%016x' % (addr, raw))
+    else:
+        fields = {}
+        if args.stall is not None:
+            fields['stall'] = args.stall
+        if args.yield_hint is not None:
+            fields['yield'] = args.yield_hint
+        if args.wr_bar is not None:
+            fields['wr_bar'] = args.wr_bar
+        if args.rd_bar is not None:
+            fields['rd_bar'] = args.rd_bar
+        if args.wait_mask is not None:
+            fields['wait_mask'] = int(args.wait_mask, 0)
+        if args.reuse is not None:
+            fields['reuse'] = args.reuse
+
+        if not fields:
+            print('No fields specified')
+            sys.exit(1)
+
+        ed.patch_ctrl_field(k, addr, **fields)
+        insn = k.insn_at(addr)
+        print('Patched [%04x] ctrl = 0x%016x  (%s)' % (addr, insn.control, ctrl_str(insn.control)))
+
+    out = ed.save(args.output)
+    print('Saved: %s' % out)
+
+
+def cmd_script(args):
+    ed = CubinEditor(args.cubin)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found')
+        sys.exit(1)
+
+    if args.sass:
+        ed.xref(args.sass, k)
+
+    n = parse_script(args.script, ed, k)
+    print('Executed %d operations' % n)
+
+    out = ed.save(args.output)
+    print('Saved: %s' % out)
+
+
+def cmd_verify(args):
+    ed = CubinEditor(args.cubin)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found')
+        sys.exit(1)
+
+    ok = ed.verify(args.sass, k)
+    sys.exit(0 if ok else 1)
+
+
+def cmd_sass(args):
+    """Run cuobjdump on the cubin and optionally filter by kernel/address range."""
+    import subprocess
+    result = subprocess.run(
+        ['cuobjdump', '--dump-sass', args.cubin],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print('cuobjdump failed: %s' % result.stderr.strip())
+        sys.exit(1)
+
+    # If no filter, print everything
+    if not args.start and not args.end and not args.kernel:
+        print(result.stdout, end='')
+        return
+
+    # Filter by kernel and/or address range
+    func_re = re.compile(r'Function\s*:\s*(\S+)')
+    insn_re = re.compile(r'/\*([0-9a-fA-F]+)\*/.*?;')  # instruction line has ; after addr
+    ctrl_re = re.compile(r'^\s+/\*\s*0x[0-9a-fA-F]+\s*\*/\s*$')  # control-word-only line
+    in_target = args.kernel is None
+    start = int(args.start, 0) if args.start else None
+    end = int(args.end, 0) if args.end else None
+    show_next_ctrl = False
+
+    for line in result.stdout.split('\n'):
+        fm = func_re.search(line)
+        if fm:
+            fname = fm.group(1)
+            if args.kernel:
+                in_target = args.kernel in fname
+            if in_target:
+                print(line)
+            show_next_ctrl = False
+            continue
+
+        if not in_target:
+            continue
+
+        # Control word line (follows instruction line)
+        if ctrl_re.match(line):
+            if show_next_ctrl:
+                print(line)
+            show_next_ctrl = False
+            continue
+
+        # Instruction line
+        im = insn_re.search(line)
+        if im:
+            addr = int(im.group(1), 16)
+            if (start is not None and addr < start) or (end is not None and addr >= end):
+                show_next_ctrl = False
+                continue
+            print(line)
+            show_next_ctrl = True
+            continue
+
+        # Non-instruction, non-control lines (headers, blank lines)
+        if start is None and end is None:
+            print(line)
+
+
+def cmd_gen_loader(args):
+    """Generate a minimal CUDA driver API loader for running patched cubins."""
+    cubin_path = args.cubin
+    ed = CubinEditor(cubin_path)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found')
+        sys.exit(1)
+
+    # The loader needs to know the kernel's mangled name for cuModuleGetFunction
+    mangled = k.name
+
+    loader_src = '''\
+/*
+ Generated by sass_edit.py gen-loader
+ Loads a patched cubin via CUDA driver API and launches the kernel.
+
+ Build:  nvcc -O2 -std=c++17 -lcuda loader.cu -o loader
+ Usage:  ./loader [patched.cubin]
+*/
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cuda.h>
+
+#define CU_CHECK(x) do {{ \\
+    CUresult r = (x); \\
+    if (r != CUDA_SUCCESS) {{ \\
+        const char* es; cuGetErrorString(r, &es); \\
+        fprintf(stderr, "CUDA error at %s:%d: %s\\n", __FILE__, __LINE__, es); \\
+        exit(1); \\
+    }} \\
+}} while(0)
+
+int main(int argc, char** argv) {{
+    const char* cubin_path = argc > 1 ? argv[1] : "{cubin_default}";
+
+    CU_CHECK(cuInit(0));
+
+    CUdevice dev;
+    CU_CHECK(cuDeviceGet(&dev, 0));
+
+    CUcontext ctx;
+    CU_CHECK(cuCtxCreate(&ctx, 0, dev));
+
+    CUmodule mod;
+    CUresult r = cuModuleLoad(&mod, cubin_path);
+    if (r != CUDA_SUCCESS) {{
+        const char* es;
+        cuGetErrorString(r, &es);
+        fprintf(stderr, "Failed to load cubin '%s': %s\\n", cubin_path, es);
+        fprintf(stderr, "This cubin was compiled for sm_100a — requires B200 GPU\\n");
+        return 1;
+    }}
+
+    CUfunction func;
+    r = cuModuleGetFunction(&func, mod, "{mangled}");
+    if (r != CUDA_SUCCESS) {{
+        const char* es;
+        cuGetErrorString(r, &es);
+        fprintf(stderr, "Failed to find kernel: %s\\n", es);
+        return 1;
+    }}
+
+    printf("Loaded cubin: %s\\n", cubin_path);
+    printf("Kernel: {short_name}\\n");
+
+    /* TODO: set up kernel arguments matching fc2.cu's main() */
+    /* The kernel signature and launch config must match the original. */
+    /* Copy the argument setup from fc2.cu's main() function. */
+    printf("Kernel loaded successfully. Add launch code for your specific kernel.\\n");
+
+    cuModuleUnload(mod);
+    cuCtxDestroy(ctx);
+    return 0;
+}}
+'''.format(
+        cubin_default=cubin_path,
+        mangled=mangled,
+        short_name=k.short_name[:40]
+    )
+
+    out_path = Path(args.output)
+    out_path.write_text(loader_src)
+    print('Generated loader: %s' % out_path)
+    print('Build: nvcc -O2 -std=c++17 -lcuda %s -o loader' % out_path)
+    print('Usage: ./loader [patched.cubin]')
+
+
+def cmd_diff(args):
+    ed_a = CubinEditor(args.cubin_a)
+    ed_b = CubinEditor(args.cubin_b)
+
+    k_a = ed_a.find_kernel(args.kernel)
+    k_b = ed_b.find_kernel(args.kernel)
+
+    if not k_a or not k_b:
+        print('Kernel not found in one or both cubins')
+        sys.exit(1)
+
+    if args.sass:
+        ed_a.xref(args.sass, k_a)
+        ed_b.xref(args.sass, k_b)
+
+    print('Diff: %s vs %s' % (args.cubin_a, args.cubin_b))
+    print('Kernel: %s' % k_a.short_name[:60])
+    print('  A: %d insns, B: %d insns' % (k_a.n_insns, k_b.n_insns))
+
+    max_insns = max(k_a.n_insns, k_b.n_insns)
+    diffs = 0
+
+    for i in range(max_insns):
+        if i >= k_a.n_insns:
+            print('  [%04x] A: <end>  B: enc=%016x ctrl=%016x' % (
+                i * INSN_SIZE, k_b.instructions[i].encoding, k_b.instructions[i].control))
+            diffs += 1
+            continue
+        if i >= k_b.n_insns:
+            print('  [%04x] A: enc=%016x ctrl=%016x  B: <end>' % (
+                i * INSN_SIZE, k_a.instructions[i].encoding, k_a.instructions[i].control))
+            diffs += 1
+            continue
+
+        a = k_a.instructions[i]
+        b = k_b.instructions[i]
+
+        if a.encoding != b.encoding or a.control != b.control:
+            diffs += 1
+            mnem_a = a.mnemonic or '?'
+            mnem_b = b.mnemonic or '?'
+
+            enc_diff = '  enc' if a.encoding != b.encoding else '     '
+            ctrl_diff = '  ctrl' if a.control != b.control else '      '
+
+            stall_a = a.control & 0xf
+            stall_b = b.control & 0xf
+            stall_str = ''
+            if stall_a != stall_b:
+                stall_str = '  st: %d->%d' % (stall_a, stall_b)
+
+            print('  [%04x]%s%s  %-20s -> %-20s%s' % (
+                i * INSN_SIZE, enc_diff, ctrl_diff,
+                mnem_a[:20], mnem_b[:20], stall_str))
+
+    print('\n%d differences in %d instructions' % (diffs, max_insns))
+
+
+def cmd_deps(args):
+    """Show register def/use analysis and check dependencies in an address range."""
+    ed = CubinEditor(args.cubin)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found')
+        sys.exit(1)
+
+    if args.sass:
+        n = ed.xref(args.sass, k)
+        sys.stderr.write('Cross-referenced %d/%d instructions\n' % (n, k.n_insns))
+    else:
+        sys.stderr.write('WARNING: no --sass provided, mnemonics unavailable. '
+                         'Dep analysis requires SASS cross-reference.\n')
+        sys.exit(1)
+
+    start = int(args.start, 0)
+    end = int(args.end, 0)
+    start_idx = start // INSN_SIZE
+    end_idx = end // INSN_SIZE
+
+    if end_idx > len(k.instructions):
+        print('End address 0x%x out of range' % end)
+        sys.exit(1)
+
+    region = k.instructions[start_idx:end_idx]
+
+    print('Def/use analysis [0x%x, 0x%x): %d instructions' % (start, end, len(region)))
+    print('=' * 100)
+    dump_deps(region)
+
+    # Check current ordering for any issues
+    violations = check_deps(region)
+    if violations:
+        print('\nDependency issues in current order: %d' % len(violations))
+        for v in violations:
+            print('  %s' % v)
+    else:
+        print('\nNo dependency issues in current order.')
+
+    # If a proposed reorder is given via --reorder, check that too
+    if args.reorder:
+        new_order = [int(x, 0) for x in args.reorder.split(',')]
+        print('\nProposed reorder: %s' % ', '.join('0x%x' % a for a in new_order))
+        violations = check_deps(region, new_order)
+        if violations:
+            print('VIOLATIONS: %d' % len(violations))
+            for v in violations:
+                print('  %s' % v)
+        else:
+            print('OK: no dependency violations in proposed reorder.')
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Fatbin patcher — patch embedded cubin inside compiled CUDA host binary
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ELF_MAGIC = b'\x7fELF'
+
+
+def find_cubin_in_fatbin(host_data):
+    """Find embedded cubin(s) inside a compiled CUDA binary's .nv_fatbin section.
+
+    Parses the host ELF to locate .nv_fatbin, then scans for embedded ELF
+    images that contain .text. sections (cubins have kernel code, PTX ELFs don't).
+
+    Returns list of (offset_in_host, size) sorted by size descending (largest first).
+    """
+    f = io.BytesIO(bytes(host_data))
+    elf = ELFFile(f)
+
+    # find .nv_fatbin section
+    fatbin_sec = None
+    for idx in range(elf.num_sections()):
+        sec = elf.get_section(idx)
+        if sec.name == '.nv_fatbin':
+            fatbin_sec = sec
+            break
+
+    if fatbin_sec is None:
+        raise ValueError('No .nv_fatbin section found in host binary')
+
+    fb_offset = fatbin_sec.header['sh_offset']
+    fb_size = fatbin_sec.header['sh_size']
+
+    # scan for ELF magic within the fatbin section
+    cubins = []
+    pos = 0
+    while pos < fb_size - 4:
+        idx = host_data.find(ELF_MAGIC, fb_offset + pos, fb_offset + fb_size)
+        if idx < 0:
+            break
+        pos = idx - fb_offset + 1
+
+        # parse candidate ELF to get its size and check for .text. sections
+        try:
+            candidate = io.BytesIO(bytes(host_data[idx:fb_offset + fb_size]))
+            celf = ELFFile(candidate)
+
+            # total size = max of section end, segment end, shdr table end
+            elf_size = celf.header['e_ehsize']
+
+            # section headers table end
+            if celf.header['e_shoff'] > 0:
+                sh_end = celf.header['e_shoff'] + celf.header['e_shentsize'] * celf.header['e_shnum']
+                elf_size = max(elf_size, sh_end)
+
+            # section data ends
+            has_text = False
+            for si in range(celf.num_sections()):
+                s = celf.get_section(si)
+                s_end = s.header['sh_offset'] + s.header['sh_size']
+                elf_size = max(elf_size, s_end)
+                if s.name.startswith('.text.'):
+                    has_text = True
+
+            # program header table end
+            if celf.header['e_phoff'] > 0 and celf.header['e_phnum'] > 0:
+                ph_end = celf.header['e_phoff'] + celf.header['e_phentsize'] * celf.header['e_phnum']
+                elf_size = max(elf_size, ph_end)
+
+            # segment data ends
+            for seg in celf.iter_segments():
+                seg_end = seg.header['p_offset'] + seg.header['p_filesz']
+                elf_size = max(elf_size, seg_end)
+
+            if has_text:
+                cubins.append((idx, elf_size))
+
+        except Exception:
+            continue
+
+    # sort largest first
+    cubins.sort(key=lambda x: -x[1])
+    return cubins
+
+
+def cmd_fatbin_patch(args):
+    """Patch embedded cubin inside a compiled CUDA binary."""
+    host_path = Path(args.binary)
+    host_data = bytearray(host_path.read_bytes())
+
+    cubins = find_cubin_in_fatbin(host_data)
+    if not cubins:
+        print('No embedded cubins found in %s' % host_path)
+        sys.exit(1)
+
+    print('Found %d embedded cubin(s):' % len(cubins))
+    for i, (off, sz) in enumerate(cubins):
+        print('  [%d] offset=0x%x  size=%d bytes' % (i, off, sz))
+
+    ci = args.cubin_index
+    if ci >= len(cubins):
+        print('Cubin index %d out of range (have %d)' % (ci, len(cubins)))
+        sys.exit(1)
+
+    cubin_offset, cubin_size = cubins[ci]
+    cubin_bytes = bytes(host_data[cubin_offset:cubin_offset + cubin_size])
+
+    # write to temp file so CubinEditor can parse it
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.cubin')
+    os.close(tmp_fd)
+    tmp = Path(tmp_path)
+    tmp.write_bytes(cubin_bytes)
+
+    try:
+        ed = CubinEditor(str(tmp))
+        k = ed.find_kernel(args.kernel)
+        if not k:
+            print('Kernel not found')
+            if ed.kernels:
+                print('Available: %s' % ', '.join(kk.short_name for kk in ed.kernels))
+            sys.exit(1)
+
+        print('Kernel: %s (%d insns)' % (k.short_name[:60], k.n_insns))
+
+        if args.sass:
+            n = ed.xref(args.sass, k)
+            sys.stderr.write('Cross-referenced %d/%d instructions\n' % (n, k.n_insns))
+
+        n_ops = 0
+        if args.script:
+            n_ops += parse_script(args.script, ed, k)
+        if args.stall:
+            addr, val = int(args.stall[0], 0), int(args.stall[1], 0)
+            ed.patch_stall(k, addr, val)
+            n_ops += 1
+
+        if n_ops == 0:
+            print('No edits specified (use --script or --stall)')
+            sys.exit(1)
+
+        # save patched cubin to another temp file
+        tmp2_fd, tmp2_path = tempfile.mkstemp(suffix='.cubin')
+        os.close(tmp2_fd)
+        tmp2 = Path(tmp2_path)
+        ed.save(str(tmp2))
+        patched_cubin = tmp2.read_bytes()
+        tmp2.unlink()
+    finally:
+        tmp.unlink()
+
+    if len(patched_cubin) != cubin_size:
+        print('ERROR: cubin size changed (%d -> %d) — not supported' % (
+            cubin_size, len(patched_cubin)))
+        sys.exit(1)
+
+    # splice patched cubin back into host binary
+    host_data[cubin_offset:cubin_offset + cubin_size] = patched_cubin
+
+    out_path = Path(args.output)
+    out_path.write_bytes(bytes(host_data))
+    os.chmod(str(out_path), 0o755)
+
+    print('Applied %d edit(s). Patched %s -> %s (cubin at 0x%x, %d bytes)' % (
+        n_ops, host_path, out_path, cubin_offset, cubin_size))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Main
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def parse_addr(s):
+    """Parse hex or decimal address."""
+    return int(s, 0)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description='SM100a SASS binary editor',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+    sub = p.add_subparsers(dest='cmd')
+
+    # info
+    s = sub.add_parser('info', help='List kernels in cubin')
+    s.add_argument('cubin')
+
+    # dump
+    s = sub.add_parser('dump', help='Print instructions with control word decode')
+    s.add_argument('cubin')
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--start', '-s', default=None, help='Start address (hex)')
+    s.add_argument('--end', '-e', default=None, help='End address (hex)')
+    s.add_argument('--sass', default=None, help='cuobjdump SASS dump for mnemonic xref')
+
+    # swap
+    s = sub.add_parser('swap', help='Swap two instructions')
+    s.add_argument('cubin')
+    s.add_argument('addr_a', help='First address (hex)')
+    s.add_argument('addr_b', help='Second address (hex)')
+    s.add_argument('-o', '--output', required=True)
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--sass', default=None)
+    s.add_argument('--force', '-f', action='store_true',
+                   help='Override dependency violation checks')
+
+    # reorder
+    s = sub.add_parser('reorder', help='Reorder instructions in a range')
+    s.add_argument('cubin')
+    s.add_argument('start', help='Start address (hex)')
+    s.add_argument('end', help='End address (hex)')
+    s.add_argument('order', help='Comma-separated new address order')
+    s.add_argument('-o', '--output', required=True)
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--sass', default=None)
+    s.add_argument('--force', '-f', action='store_true',
+                   help='Override dependency violation checks')
+
+    # patch
+    s = sub.add_parser('patch', help='Modify control word fields')
+    s.add_argument('cubin')
+    s.add_argument('addr', help='Instruction address (hex)')
+    s.add_argument('-o', '--output', required=True)
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--stall', type=int, default=None)
+    s.add_argument('--yield-hint', type=int, default=None)
+    s.add_argument('--wr-bar', type=int, default=None)
+    s.add_argument('--rd-bar', type=int, default=None)
+    s.add_argument('--wait-mask', default=None, help='Hex wait mask')
+    s.add_argument('--reuse', type=int, default=None)
+    s.add_argument('--raw-ctrl', default=None, help='Replace entire control word (hex)')
+
+    # script
+    s = sub.add_parser('script', help='Apply batch edits from script file')
+    s.add_argument('cubin')
+    s.add_argument('script', help='Script file path')
+    s.add_argument('-o', '--output', required=True)
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--sass', default=None)
+
+    # verify
+    s = sub.add_parser('verify', help='Verify binary matches SASS dump')
+    s.add_argument('cubin')
+    s.add_argument('--sass', required=True)
+    s.add_argument('--kernel', '-k', default=None)
+
+    # sass (cuobjdump wrapper)
+    s = sub.add_parser('sass', help='Dump SASS via cuobjdump (with optional filter)')
+    s.add_argument('cubin')
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--start', '-s', default=None, help='Start address (hex)')
+    s.add_argument('--end', '-e', default=None, help='End address (hex)')
+
+    # gen-loader
+    s = sub.add_parser('gen-loader', help='Generate CUDA driver API loader for patched cubins')
+    s.add_argument('cubin')
+    s.add_argument('-o', '--output', default='loader.cu')
+    s.add_argument('--kernel', '-k', default=None)
+
+    # diff
+    s = sub.add_parser('diff', help='Compare two cubins')
+    s.add_argument('cubin_a')
+    s.add_argument('cubin_b')
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--sass', default=None)
+
+    # deps
+    s = sub.add_parser('deps', help='Show register def/use analysis for an address range')
+    s.add_argument('cubin')
+    s.add_argument('--start', '-s', required=True, help='Start address (hex)')
+    s.add_argument('--end', '-e', required=True, help='End address (hex)')
+    s.add_argument('--sass', required=True, help='cuobjdump SASS dump for mnemonic xref')
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--reorder', default=None,
+                   help='Comma-separated proposed address order to check')
+
+    # fatbin-patch
+    s = sub.add_parser('fatbin-patch', help='Patch embedded cubin in compiled CUDA binary')
+    s.add_argument('binary', help='Host binary (e.g., fc2)')
+    s.add_argument('--sass', required=True, help='SASS dump for cross-reference')
+    s.add_argument('--script', default=None, help='Edit script file')
+    s.add_argument('--stall', nargs=2, default=None, metavar=('ADDR', 'VAL'),
+                   help='Patch single stall count')
+    s.add_argument('-o', '--output', required=True, help='Output patched binary')
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--cubin-index', type=int, default=0, help='Which cubin (0=largest)')
+    s.add_argument('--force', '-f', action='store_true')
+
+    args = p.parse_args()
+
+    if not args.cmd:
+        p.print_help()
+        sys.exit(1)
+
+    cmds = {
+        'info': cmd_info,
+        'dump': cmd_dump,
+        'swap': cmd_swap,
+        'reorder': cmd_reorder,
+        'patch': cmd_patch,
+        'script': cmd_script,
+        'verify': cmd_verify,
+        'sass': cmd_sass,
+        'gen-loader': cmd_gen_loader,
+        'diff': cmd_diff,
+        'deps': cmd_deps,
+        'fatbin-patch': cmd_fatbin_patch,
+    }
+    cmds[args.cmd](args)
+
+
+if __name__ == '__main__':
+    main()
