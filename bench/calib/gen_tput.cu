@@ -5,6 +5,7 @@
 
 #define REPS 1024
 #define WARMUP 64
+#define LDG_BUF_SIZE 16777216
 
 extern "C" __global__ void tput_FADD_ilp1(long long* out) {
     volatile float* gin = (volatile float*)out;
@@ -18,14 +19,13 @@ extern "C" __global__ void tput_FADD_ilp1(long long* out) {
             "add.f32 %0, %0, %1;\n\t"
             : "+f"(_a0)
             : "f"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FADD_ilp2(long long* out) {
@@ -42,14 +42,13 @@ extern "C" __global__ void tput_FADD_ilp2(long long* out) {
             "add.f32 %1, %1, %2;\n\t"
             : "+f"(_a0), "+f"(_a1)
             : "f"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0 + _a1;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0 + _a1; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FADD_ilp4(long long* out) {
@@ -70,14 +69,13 @@ extern "C" __global__ void tput_FADD_ilp4(long long* out) {
             "add.f32 %3, %3, %4;\n\t"
             : "+f"(_a0), "+f"(_a1), "+f"(_a2), "+f"(_a3)
             : "f"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0 + _a1 + _a2 + _a3;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0 + _a1 + _a2 + _a3; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FADD_ilp8(long long* out) {
@@ -106,14 +104,13 @@ extern "C" __global__ void tput_FADD_ilp8(long long* out) {
             "add.f32 %7, %7, %8;\n\t"
             : "+f"(_a0), "+f"(_a1), "+f"(_a2), "+f"(_a3), "+f"(_a4), "+f"(_a5), "+f"(_a6), "+f"(_a7)
             : "f"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FADD_ilp16(long long* out) {
@@ -158,14 +155,13 @@ extern "C" __global__ void tput_FADD_ilp16(long long* out) {
             "add.f32 %15, %15, %16;\n\t"
             : "+f"(_a0), "+f"(_a1), "+f"(_a2), "+f"(_a3), "+f"(_a4), "+f"(_a5), "+f"(_a6), "+f"(_a7), "+f"(_a8), "+f"(_a9), "+f"(_a10), "+f"(_a11), "+f"(_a12), "+f"(_a13), "+f"(_a14), "+f"(_a15)
             : "f"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FMUL_ilp1(long long* out) {
@@ -180,14 +176,13 @@ extern "C" __global__ void tput_FMUL_ilp1(long long* out) {
             "mul.f32 %0, %0, %1;\n\t"
             : "+f"(_a0)
             : "f"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FMUL_ilp2(long long* out) {
@@ -204,14 +199,13 @@ extern "C" __global__ void tput_FMUL_ilp2(long long* out) {
             "mul.f32 %1, %1, %2;\n\t"
             : "+f"(_a0), "+f"(_a1)
             : "f"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0 + _a1;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0 + _a1; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FMUL_ilp4(long long* out) {
@@ -232,14 +226,13 @@ extern "C" __global__ void tput_FMUL_ilp4(long long* out) {
             "mul.f32 %3, %3, %4;\n\t"
             : "+f"(_a0), "+f"(_a1), "+f"(_a2), "+f"(_a3)
             : "f"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0 + _a1 + _a2 + _a3;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0 + _a1 + _a2 + _a3; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FMUL_ilp8(long long* out) {
@@ -268,14 +261,13 @@ extern "C" __global__ void tput_FMUL_ilp8(long long* out) {
             "mul.f32 %7, %7, %8;\n\t"
             : "+f"(_a0), "+f"(_a1), "+f"(_a2), "+f"(_a3), "+f"(_a4), "+f"(_a5), "+f"(_a6), "+f"(_a7)
             : "f"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FMUL_ilp16(long long* out) {
@@ -320,14 +312,13 @@ extern "C" __global__ void tput_FMUL_ilp16(long long* out) {
             "mul.f32 %15, %15, %16;\n\t"
             : "+f"(_a0), "+f"(_a1), "+f"(_a2), "+f"(_a3), "+f"(_a4), "+f"(_a5), "+f"(_a6), "+f"(_a7), "+f"(_a8), "+f"(_a9), "+f"(_a10), "+f"(_a11), "+f"(_a12), "+f"(_a13), "+f"(_a14), "+f"(_a15)
             : "f"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FFMA_ilp1(long long* out) {
@@ -343,14 +334,13 @@ extern "C" __global__ void tput_FFMA_ilp1(long long* out) {
             "fma.rn.f32 %0, %0, %1, %2;\n\t"
             : "+f"(_a0)
             : "f"(_s0), "f"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FFMA_ilp2(long long* out) {
@@ -368,14 +358,13 @@ extern "C" __global__ void tput_FFMA_ilp2(long long* out) {
             "fma.rn.f32 %1, %1, %2, %3;\n\t"
             : "+f"(_a0), "+f"(_a1)
             : "f"(_s0), "f"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0 + _a1;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0 + _a1; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FFMA_ilp4(long long* out) {
@@ -397,14 +386,13 @@ extern "C" __global__ void tput_FFMA_ilp4(long long* out) {
             "fma.rn.f32 %3, %3, %4, %5;\n\t"
             : "+f"(_a0), "+f"(_a1), "+f"(_a2), "+f"(_a3)
             : "f"(_s0), "f"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0 + _a1 + _a2 + _a3;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0 + _a1 + _a2 + _a3; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FFMA_ilp8(long long* out) {
@@ -434,14 +422,13 @@ extern "C" __global__ void tput_FFMA_ilp8(long long* out) {
             "fma.rn.f32 %7, %7, %8, %9;\n\t"
             : "+f"(_a0), "+f"(_a1), "+f"(_a2), "+f"(_a3), "+f"(_a4), "+f"(_a5), "+f"(_a6), "+f"(_a7)
             : "f"(_s0), "f"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_FFMA_ilp16(long long* out) {
@@ -487,14 +474,13 @@ extern "C" __global__ void tput_FFMA_ilp16(long long* out) {
             "fma.rn.f32 %15, %15, %16, %17;\n\t"
             : "+f"(_a0), "+f"(_a1), "+f"(_a2), "+f"(_a3), "+f"(_a4), "+f"(_a5), "+f"(_a6), "+f"(_a7), "+f"(_a8), "+f"(_a9), "+f"(_a10), "+f"(_a11), "+f"(_a12), "+f"(_a13), "+f"(_a14), "+f"(_a15)
             : "f"(_s0), "f"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_HADD2_ilp1(long long* out) {
@@ -509,13 +495,12 @@ extern "C" __global__ void tput_HADD2_ilp1(long long* out) {
             "add.rn.bf16x2 %0, %0, %1;\n\t"
             : "+r"(_a0)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_HADD2_ilp2(long long* out) {
@@ -532,13 +517,12 @@ extern "C" __global__ void tput_HADD2_ilp2(long long* out) {
             "add.rn.bf16x2 %1, %1, %2;\n\t"
             : "+r"(_a0), "+r"(_a1)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_HADD2_ilp4(long long* out) {
@@ -559,13 +543,12 @@ extern "C" __global__ void tput_HADD2_ilp4(long long* out) {
             "add.rn.bf16x2 %3, %3, %4;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_HADD2_ilp8(long long* out) {
@@ -594,13 +577,12 @@ extern "C" __global__ void tput_HADD2_ilp8(long long* out) {
             "add.rn.bf16x2 %7, %7, %8;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_HADD2_ilp16(long long* out) {
@@ -645,13 +627,12 @@ extern "C" __global__ void tput_HADD2_ilp16(long long* out) {
             "add.rn.bf16x2 %15, %15, %16;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_HFMA2_ilp1(long long* out) {
@@ -666,13 +647,12 @@ extern "C" __global__ void tput_HFMA2_ilp1(long long* out) {
             "fma.rn.bf16x2 %0, %1, %1, %0;\n\t"
             : "+r"(_a0)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_HFMA2_ilp2(long long* out) {
@@ -689,13 +669,12 @@ extern "C" __global__ void tput_HFMA2_ilp2(long long* out) {
             "fma.rn.bf16x2 %1, %2, %2, %1;\n\t"
             : "+r"(_a0), "+r"(_a1)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_HFMA2_ilp4(long long* out) {
@@ -716,13 +695,12 @@ extern "C" __global__ void tput_HFMA2_ilp4(long long* out) {
             "fma.rn.bf16x2 %3, %4, %4, %3;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_HFMA2_ilp8(long long* out) {
@@ -751,13 +729,12 @@ extern "C" __global__ void tput_HFMA2_ilp8(long long* out) {
             "fma.rn.bf16x2 %7, %8, %8, %7;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_HFMA2_ilp16(long long* out) {
@@ -802,13 +779,12 @@ extern "C" __global__ void tput_HFMA2_ilp16(long long* out) {
             "fma.rn.bf16x2 %15, %16, %16, %15;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_F2FP_ilp1(long long* out) {
@@ -826,10 +802,12 @@ extern "C" __global__ void tput_F2FP_ilp1(long long* out) {
             "}\n\t"
             : "+r"(_a0)
             : "r"(_f0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) { out[0] = t1 - t0; out[1] = _a0; }
+    out[2 + threadIdx.x] = (long long)(_a0);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_F2FP_ilp2(long long* out) {
@@ -850,10 +828,12 @@ extern "C" __global__ void tput_F2FP_ilp2(long long* out) {
             "}\n\t"
             : "+r"(_a0), "+r"(_a1)
             : "r"(_f0), "r"(_f1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) { out[0] = t1 - t0; out[1] = _a0 + _a1; }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_F2FP_ilp4(long long* out) {
@@ -880,10 +860,12 @@ extern "C" __global__ void tput_F2FP_ilp4(long long* out) {
             "}\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
             : "r"(_f0), "r"(_f1), "r"(_f2), "r"(_f3)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) { out[0] = t1 - t0; out[1] = _a0 + _a1 + _a2 + _a3; }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_F2FP_ilp8(long long* out) {
@@ -922,10 +904,12 @@ extern "C" __global__ void tput_F2FP_ilp8(long long* out) {
             "}\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
             : "r"(_f0), "r"(_f1), "r"(_f2), "r"(_f3), "r"(_f4), "r"(_f5), "r"(_f6), "r"(_f7)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) { out[0] = t1 - t0; out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7; }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_F2FP_ilp16(long long* out) {
@@ -980,10 +964,12 @@ extern "C" __global__ void tput_F2FP_ilp16(long long* out) {
             "}\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
             : "r"(_f0), "r"(_f1), "r"(_f2), "r"(_f3), "r"(_f4), "r"(_f5), "r"(_f6), "r"(_f7)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) { out[0] = t1 - t0; out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15; }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_LOP3_ilp1(long long* out) {
@@ -999,13 +985,12 @@ extern "C" __global__ void tput_LOP3_ilp1(long long* out) {
             "lop3.b32 %0, %0, %1, %2, 0x96;\n\t"
             : "+r"(_a0)
             : "r"(_s0), "r"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_LOP3_ilp2(long long* out) {
@@ -1023,13 +1008,12 @@ extern "C" __global__ void tput_LOP3_ilp2(long long* out) {
             "lop3.b32 %1, %1, %2, %3, 0x96;\n\t"
             : "+r"(_a0), "+r"(_a1)
             : "r"(_s0), "r"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_LOP3_ilp4(long long* out) {
@@ -1051,13 +1035,12 @@ extern "C" __global__ void tput_LOP3_ilp4(long long* out) {
             "lop3.b32 %3, %3, %4, %5, 0x96;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
             : "r"(_s0), "r"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_LOP3_ilp8(long long* out) {
@@ -1087,13 +1070,12 @@ extern "C" __global__ void tput_LOP3_ilp8(long long* out) {
             "lop3.b32 %7, %7, %8, %9, 0x96;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
             : "r"(_s0), "r"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_LOP3_ilp16(long long* out) {
@@ -1139,13 +1121,12 @@ extern "C" __global__ void tput_LOP3_ilp16(long long* out) {
             "lop3.b32 %15, %15, %16, %17, 0x96;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
             : "r"(_s0), "r"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_SHF_ilp1(long long* out) {
@@ -1160,13 +1141,12 @@ extern "C" __global__ void tput_SHF_ilp1(long long* out) {
             "shf.r.clamp.b32 %0, %0, %1, %0;\n\t"
             : "+r"(_a0)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_SHF_ilp2(long long* out) {
@@ -1183,13 +1163,12 @@ extern "C" __global__ void tput_SHF_ilp2(long long* out) {
             "shf.r.clamp.b32 %1, %1, %2, %1;\n\t"
             : "+r"(_a0), "+r"(_a1)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_SHF_ilp4(long long* out) {
@@ -1210,13 +1189,12 @@ extern "C" __global__ void tput_SHF_ilp4(long long* out) {
             "shf.r.clamp.b32 %3, %3, %4, %3;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_SHF_ilp8(long long* out) {
@@ -1245,13 +1223,12 @@ extern "C" __global__ void tput_SHF_ilp8(long long* out) {
             "shf.r.clamp.b32 %7, %7, %8, %7;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_SHF_ilp16(long long* out) {
@@ -1296,13 +1273,12 @@ extern "C" __global__ void tput_SHF_ilp16(long long* out) {
             "shf.r.clamp.b32 %15, %15, %16, %15;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_PRMT_ilp1(long long* out) {
@@ -1317,13 +1293,12 @@ extern "C" __global__ void tput_PRMT_ilp1(long long* out) {
             "prmt.b32 %0, %0, %1, 0x5410;\n\t"
             : "+r"(_a0)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_PRMT_ilp2(long long* out) {
@@ -1340,13 +1315,12 @@ extern "C" __global__ void tput_PRMT_ilp2(long long* out) {
             "prmt.b32 %1, %1, %2, 0x5410;\n\t"
             : "+r"(_a0), "+r"(_a1)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_PRMT_ilp4(long long* out) {
@@ -1367,13 +1341,12 @@ extern "C" __global__ void tput_PRMT_ilp4(long long* out) {
             "prmt.b32 %3, %3, %4, 0x5410;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_PRMT_ilp8(long long* out) {
@@ -1402,13 +1375,12 @@ extern "C" __global__ void tput_PRMT_ilp8(long long* out) {
             "prmt.b32 %7, %7, %8, 0x5410;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_PRMT_ilp16(long long* out) {
@@ -1453,13 +1425,12 @@ extern "C" __global__ void tput_PRMT_ilp16(long long* out) {
             "prmt.b32 %15, %15, %16, 0x5410;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_VIADD_ilp1(long long* out) {
@@ -1474,13 +1445,12 @@ extern "C" __global__ void tput_VIADD_ilp1(long long* out) {
             "vadd.s32.s32.s32 %0, %0, %1;\n\t"
             : "+r"(_a0)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_VIADD_ilp2(long long* out) {
@@ -1497,13 +1467,12 @@ extern "C" __global__ void tput_VIADD_ilp2(long long* out) {
             "vadd.s32.s32.s32 %1, %1, %2;\n\t"
             : "+r"(_a0), "+r"(_a1)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_VIADD_ilp4(long long* out) {
@@ -1524,13 +1493,12 @@ extern "C" __global__ void tput_VIADD_ilp4(long long* out) {
             "vadd.s32.s32.s32 %3, %3, %4;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_VIADD_ilp8(long long* out) {
@@ -1559,13 +1527,12 @@ extern "C" __global__ void tput_VIADD_ilp8(long long* out) {
             "vadd.s32.s32.s32 %7, %7, %8;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_VIADD_ilp16(long long* out) {
@@ -1610,13 +1577,12 @@ extern "C" __global__ void tput_VIADD_ilp16(long long* out) {
             "vadd.s32.s32.s32 %15, %15, %16;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_IADD3_ilp1(long long* out) {
@@ -1631,13 +1597,12 @@ extern "C" __global__ void tput_IADD3_ilp1(long long* out) {
             "add.s32 %0, %0, %1;\n\t"
             : "+r"(_a0)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_IADD3_ilp2(long long* out) {
@@ -1654,13 +1619,12 @@ extern "C" __global__ void tput_IADD3_ilp2(long long* out) {
             "add.s32 %1, %1, %2;\n\t"
             : "+r"(_a0), "+r"(_a1)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_IADD3_ilp4(long long* out) {
@@ -1681,13 +1645,12 @@ extern "C" __global__ void tput_IADD3_ilp4(long long* out) {
             "add.s32 %3, %3, %4;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_IADD3_ilp8(long long* out) {
@@ -1716,13 +1679,12 @@ extern "C" __global__ void tput_IADD3_ilp8(long long* out) {
             "add.s32 %7, %7, %8;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_IADD3_ilp16(long long* out) {
@@ -1767,13 +1729,12 @@ extern "C" __global__ void tput_IADD3_ilp16(long long* out) {
             "add.s32 %15, %15, %16;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_IMAD_ilp1(long long* out) {
@@ -1789,13 +1750,12 @@ extern "C" __global__ void tput_IMAD_ilp1(long long* out) {
             "mad.lo.s32 %0, %0, %1, %2;\n\t"
             : "+r"(_a0)
             : "r"(_s0), "r"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_IMAD_ilp2(long long* out) {
@@ -1813,13 +1773,12 @@ extern "C" __global__ void tput_IMAD_ilp2(long long* out) {
             "mad.lo.s32 %1, %1, %2, %3;\n\t"
             : "+r"(_a0), "+r"(_a1)
             : "r"(_s0), "r"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_IMAD_ilp4(long long* out) {
@@ -1841,13 +1800,12 @@ extern "C" __global__ void tput_IMAD_ilp4(long long* out) {
             "mad.lo.s32 %3, %3, %4, %5;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
             : "r"(_s0), "r"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_IMAD_ilp8(long long* out) {
@@ -1877,13 +1835,12 @@ extern "C" __global__ void tput_IMAD_ilp8(long long* out) {
             "mad.lo.s32 %7, %7, %8, %9;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
             : "r"(_s0), "r"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_IMAD_ilp16(long long* out) {
@@ -1929,13 +1886,12 @@ extern "C" __global__ void tput_IMAD_ilp16(long long* out) {
             "mad.lo.s32 %15, %15, %16, %17;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
             : "r"(_s0), "r"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_SEL_ilp1(long long* out) {
@@ -1955,10 +1911,12 @@ extern "C" __global__ void tput_SEL_ilp1(long long* out) {
             "}\n\t"
             : "+r"(_a0)
             : "r"(_sv)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) { out[0] = t1 - t0; out[1] = _a0; }
+    out[2 + threadIdx.x] = (long long)(_a0);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_SEL_ilp2(long long* out) {
@@ -1980,10 +1938,12 @@ extern "C" __global__ void tput_SEL_ilp2(long long* out) {
             "}\n\t"
             : "+r"(_a0), "+r"(_a1)
             : "r"(_sv)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) { out[0] = t1 - t0; out[1] = _a0 + _a1; }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_SEL_ilp4(long long* out) {
@@ -2009,10 +1969,12 @@ extern "C" __global__ void tput_SEL_ilp4(long long* out) {
             "}\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
             : "r"(_sv)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) { out[0] = t1 - t0; out[1] = _a0 + _a1 + _a2 + _a3; }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_SEL_ilp8(long long* out) {
@@ -2046,10 +2008,12 @@ extern "C" __global__ void tput_SEL_ilp8(long long* out) {
             "}\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
             : "r"(_sv)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) { out[0] = t1 - t0; out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7; }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_SEL_ilp16(long long* out) {
@@ -2099,10 +2063,12 @@ extern "C" __global__ void tput_SEL_ilp16(long long* out) {
             "}\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
             : "r"(_sv)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) { out[0] = t1 - t0; out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15; }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_REDUX_ilp1(long long* out) {
@@ -2115,13 +2081,12 @@ extern "C" __global__ void tput_REDUX_ilp1(long long* out) {
         asm volatile(
             "redux.sync.add.s32 %0, %0, 0xffffffff;\n\t"
             : "+r"(_a0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_REDUX_ilp2(long long* out) {
@@ -2136,13 +2101,12 @@ extern "C" __global__ void tput_REDUX_ilp2(long long* out) {
             "redux.sync.add.s32 %0, %0, 0xffffffff;\n\t"
             "redux.sync.add.s32 %1, %1, 0xffffffff;\n\t"
             : "+r"(_a0), "+r"(_a1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_REDUX_ilp4(long long* out) {
@@ -2161,13 +2125,12 @@ extern "C" __global__ void tput_REDUX_ilp4(long long* out) {
             "redux.sync.add.s32 %2, %2, 0xffffffff;\n\t"
             "redux.sync.add.s32 %3, %3, 0xffffffff;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_REDUX_ilp8(long long* out) {
@@ -2194,13 +2157,12 @@ extern "C" __global__ void tput_REDUX_ilp8(long long* out) {
             "redux.sync.add.s32 %6, %6, 0xffffffff;\n\t"
             "redux.sync.add.s32 %7, %7, 0xffffffff;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_REDUX_ilp16(long long* out) {
@@ -2243,13 +2205,12 @@ extern "C" __global__ void tput_REDUX_ilp16(long long* out) {
             "redux.sync.add.s32 %14, %14, 0xffffffff;\n\t"
             "redux.sync.add.s32 %15, %15, 0xffffffff;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15;
-    }
+    out[2 + threadIdx.x] = (long long)(_a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15);
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_STS_ilp1(long long* out) {
@@ -2268,7 +2229,8 @@ extern "C" __global__ void tput_STS_ilp1(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (_tid == 0) { out[0] = t1 - t0; out[1] = _smem[0]; }
+    out[2 + _tid] = (long long)_smem[_tid];
+    if (_tid == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_STS_ilp2(long long* out) {
@@ -2288,7 +2250,8 @@ extern "C" __global__ void tput_STS_ilp2(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (_tid == 0) { out[0] = t1 - t0; out[1] = _smem[0]; }
+    out[2 + _tid] = (long long)_smem[_tid];
+    if (_tid == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_STS_ilp4(long long* out) {
@@ -2310,7 +2273,8 @@ extern "C" __global__ void tput_STS_ilp4(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (_tid == 0) { out[0] = t1 - t0; out[1] = _smem[0]; }
+    out[2 + _tid] = (long long)_smem[_tid];
+    if (_tid == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_STS_ilp8(long long* out) {
@@ -2336,7 +2300,8 @@ extern "C" __global__ void tput_STS_ilp8(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (_tid == 0) { out[0] = t1 - t0; out[1] = _smem[0]; }
+    out[2 + _tid] = (long long)_smem[_tid];
+    if (_tid == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_STS_ilp16(long long* out) {
@@ -2370,7 +2335,8 @@ extern "C" __global__ void tput_STS_ilp16(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (_tid == 0) { out[0] = t1 - t0; out[1] = _smem[0]; }
+    out[2 + _tid] = (long long)_smem[_tid];
+    if (_tid == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void tput_STG_ilp1(long long* out) {
@@ -2505,6 +2471,7 @@ extern "C" __global__ void tput_LDS_ilp1(long long* out) {
             "}\n\t"
             : "+r"(_a0)
             : "r"(_base)
+            : "memory"
         );
     }
     long long t1 = clock64();
@@ -2529,6 +2496,7 @@ extern "C" __global__ void tput_LDS_ilp2(long long* out) {
             "}\n\t"
             : "+r"(_a0), "+r"(_a1)
             : "r"(_base)
+            : "memory"
         );
     }
     long long t1 = clock64();
@@ -2557,6 +2525,7 @@ extern "C" __global__ void tput_LDS_ilp4(long long* out) {
             "}\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
             : "r"(_base)
+            : "memory"
         );
     }
     long long t1 = clock64();
@@ -2593,6 +2562,7 @@ extern "C" __global__ void tput_LDS_ilp8(long long* out) {
             "}\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
             : "r"(_base)
+            : "memory"
         );
     }
     long long t1 = clock64();
@@ -2645,6 +2615,7 @@ extern "C" __global__ void tput_LDS_ilp16(long long* out) {
             "}\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
             : "r"(_base)
+            : "memory"
         );
     }
     long long t1 = clock64();
@@ -2652,69 +2623,81 @@ extern "C" __global__ void tput_LDS_ilp16(long long* out) {
 }
 
 extern "C" __global__ void tput_LDG_ilp1(long long* out) {
-    const int* _data = (const int*)(out + 64);
+    const char* _buf = (const char*)out + 4096;
     volatile int* gin = (volatile int*)out;
     int _a0 = gin[0];
+    const char* _data = _buf;
     long long t0 = clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "{ .reg .s32 _gt;\n\t"
-            "ld.global.b32 _gt, [%1+0]; xor.b32 %0, %0, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%1+0]; xor.b32 %0, %0, _gt;\n\t"
             "}\n\t"
             : "+r"(_a0)
             : "l"(_data)
+            : "memory"
         );
+        _data += 4;
+        if (_data >= _buf + LDG_BUF_SIZE) _data = _buf;
     }
     long long t1 = clock64();
     out[0] = t1 - t0; out[1] = _a0;
 }
 
 extern "C" __global__ void tput_LDG_ilp2(long long* out) {
-    const int* _data = (const int*)(out + 64);
+    const char* _buf = (const char*)out + 4096;
     volatile int* gin = (volatile int*)out;
     int _a0 = gin[0];
     int _a1 = gin[1];
+    const char* _data = _buf;
     long long t0 = clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "{ .reg .s32 _gt;\n\t"
-            "ld.global.b32 _gt, [%2+0]; xor.b32 %0, %0, _gt;\n\t"
-            "ld.global.b32 _gt, [%2+4]; xor.b32 %1, %1, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%2+0]; xor.b32 %0, %0, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%2+4]; xor.b32 %1, %1, _gt;\n\t"
             "}\n\t"
             : "+r"(_a0), "+r"(_a1)
             : "l"(_data)
+            : "memory"
         );
+        _data += 8;
+        if (_data >= _buf + LDG_BUF_SIZE) _data = _buf;
     }
     long long t1 = clock64();
     out[0] = t1 - t0; out[1] = _a0 + _a1;
 }
 
 extern "C" __global__ void tput_LDG_ilp4(long long* out) {
-    const int* _data = (const int*)(out + 64);
+    const char* _buf = (const char*)out + 4096;
     volatile int* gin = (volatile int*)out;
     int _a0 = gin[0];
     int _a1 = gin[1];
     int _a2 = gin[2];
     int _a3 = gin[3];
+    const char* _data = _buf;
     long long t0 = clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "{ .reg .s32 _gt;\n\t"
-            "ld.global.b32 _gt, [%4+0]; xor.b32 %0, %0, _gt;\n\t"
-            "ld.global.b32 _gt, [%4+4]; xor.b32 %1, %1, _gt;\n\t"
-            "ld.global.b32 _gt, [%4+8]; xor.b32 %2, %2, _gt;\n\t"
-            "ld.global.b32 _gt, [%4+12]; xor.b32 %3, %3, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%4+0]; xor.b32 %0, %0, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%4+4]; xor.b32 %1, %1, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%4+8]; xor.b32 %2, %2, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%4+12]; xor.b32 %3, %3, _gt;\n\t"
             "}\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
             : "l"(_data)
+            : "memory"
         );
+        _data += 16;
+        if (_data >= _buf + LDG_BUF_SIZE) _data = _buf;
     }
     long long t1 = clock64();
     out[0] = t1 - t0; out[1] = _a0 + _a1 + _a2 + _a3;
 }
 
 extern "C" __global__ void tput_LDG_ilp8(long long* out) {
-    const int* _data = (const int*)(out + 64);
+    const char* _buf = (const char*)out + 4096;
     volatile int* gin = (volatile int*)out;
     int _a0 = gin[0];
     int _a1 = gin[1];
@@ -2724,29 +2707,33 @@ extern "C" __global__ void tput_LDG_ilp8(long long* out) {
     int _a5 = gin[5];
     int _a6 = gin[6];
     int _a7 = gin[7];
+    const char* _data = _buf;
     long long t0 = clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "{ .reg .s32 _gt;\n\t"
-            "ld.global.b32 _gt, [%8+0]; xor.b32 %0, %0, _gt;\n\t"
-            "ld.global.b32 _gt, [%8+4]; xor.b32 %1, %1, _gt;\n\t"
-            "ld.global.b32 _gt, [%8+8]; xor.b32 %2, %2, _gt;\n\t"
-            "ld.global.b32 _gt, [%8+12]; xor.b32 %3, %3, _gt;\n\t"
-            "ld.global.b32 _gt, [%8+16]; xor.b32 %4, %4, _gt;\n\t"
-            "ld.global.b32 _gt, [%8+20]; xor.b32 %5, %5, _gt;\n\t"
-            "ld.global.b32 _gt, [%8+24]; xor.b32 %6, %6, _gt;\n\t"
-            "ld.global.b32 _gt, [%8+28]; xor.b32 %7, %7, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%8+0]; xor.b32 %0, %0, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%8+4]; xor.b32 %1, %1, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%8+8]; xor.b32 %2, %2, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%8+12]; xor.b32 %3, %3, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%8+16]; xor.b32 %4, %4, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%8+20]; xor.b32 %5, %5, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%8+24]; xor.b32 %6, %6, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%8+28]; xor.b32 %7, %7, _gt;\n\t"
             "}\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
             : "l"(_data)
+            : "memory"
         );
+        _data += 32;
+        if (_data >= _buf + LDG_BUF_SIZE) _data = _buf;
     }
     long long t1 = clock64();
     out[0] = t1 - t0; out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7;
 }
 
 extern "C" __global__ void tput_LDG_ilp16(long long* out) {
-    const int* _data = (const int*)(out + 64);
+    const char* _buf = (const char*)out + 4096;
     volatile int* gin = (volatile int*)out;
     int _a0 = gin[0];
     int _a1 = gin[1];
@@ -2764,30 +2751,34 @@ extern "C" __global__ void tput_LDG_ilp16(long long* out) {
     int _a13 = gin[13];
     int _a14 = gin[14];
     int _a15 = gin[15];
+    const char* _data = _buf;
     long long t0 = clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "{ .reg .s32 _gt;\n\t"
-            "ld.global.b32 _gt, [%16+0]; xor.b32 %0, %0, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+4]; xor.b32 %1, %1, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+8]; xor.b32 %2, %2, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+12]; xor.b32 %3, %3, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+16]; xor.b32 %4, %4, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+20]; xor.b32 %5, %5, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+24]; xor.b32 %6, %6, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+28]; xor.b32 %7, %7, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+32]; xor.b32 %8, %8, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+36]; xor.b32 %9, %9, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+40]; xor.b32 %10, %10, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+44]; xor.b32 %11, %11, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+48]; xor.b32 %12, %12, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+52]; xor.b32 %13, %13, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+56]; xor.b32 %14, %14, _gt;\n\t"
-            "ld.global.b32 _gt, [%16+60]; xor.b32 %15, %15, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+0]; xor.b32 %0, %0, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+4]; xor.b32 %1, %1, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+8]; xor.b32 %2, %2, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+12]; xor.b32 %3, %3, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+16]; xor.b32 %4, %4, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+20]; xor.b32 %5, %5, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+24]; xor.b32 %6, %6, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+28]; xor.b32 %7, %7, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+32]; xor.b32 %8, %8, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+36]; xor.b32 %9, %9, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+40]; xor.b32 %10, %10, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+44]; xor.b32 %11, %11, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+48]; xor.b32 %12, %12, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+52]; xor.b32 %13, %13, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+56]; xor.b32 %14, %14, _gt;\n\t"
+            "ld.global.cg.b32 _gt, [%16+60]; xor.b32 %15, %15, _gt;\n\t"
             "}\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
             : "l"(_data)
+            : "memory"
         );
+        _data += 64;
+        if (_data >= _buf + LDG_BUF_SIZE) _data = _buf;
     }
     long long t1 = clock64();
     out[0] = t1 - t0; out[1] = _a0 + _a1 + _a2 + _a3 + _a4 + _a5 + _a6 + _a7 + _a8 + _a9 + _a10 + _a11 + _a12 + _a13 + _a14 + _a15;
@@ -2802,8 +2793,8 @@ struct Bench {
 
 int main() {
     long long *d_out, h_out[2];
-    cudaMalloc(&d_out, 4096);
-    cudaMemset(d_out, 0, 4096);
+    cudaMalloc(&d_out, LDG_BUF_SIZE + 4096);
+    cudaMemset(d_out, 0, LDG_BUF_SIZE + 4096);
 
     Bench benches[] = {
     {"FADD tput ilp=1", 1, tput_FADD_ilp1},

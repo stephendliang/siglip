@@ -5,6 +5,7 @@
 
 #define REPS 1024
 #define WARMUP 64
+#define LDG_BUF_SIZE 16777216
 
 extern "C" __global__ void lat_FADD(long long* out) {
     volatile float* gin = (volatile float*)out;
@@ -33,14 +34,13 @@ extern "C" __global__ void lat_FADD(long long* out) {
             "add.f32 %0, %0, %1;\n\t"
             : "+f"(_a0)
             : "f"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_FMUL(long long* out) {
@@ -70,14 +70,13 @@ extern "C" __global__ void lat_FMUL(long long* out) {
             "mul.f32 %0, %0, %1;\n\t"
             : "+f"(_a0)
             : "f"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_FFMA(long long* out) {
@@ -108,14 +107,13 @@ extern "C" __global__ void lat_FFMA(long long* out) {
             "fma.rn.f32 %0, %0, %1, %2;\n\t"
             : "+f"(_a0)
             : "f"(_s0), "f"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        volatile float* _fo = (volatile float*)(out + 1);
-        _fo[0] = _a0;
-    }
+    { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
+      *_sink = _a0; }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_HADD2(long long* out) {
@@ -145,13 +143,12 @@ extern "C" __global__ void lat_HADD2(long long* out) {
             "add.rn.bf16x2 %0, %0, %1;\n\t"
             : "+r"(_a0)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)_a0;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_HFMA2(long long* out) {
@@ -181,13 +178,12 @@ extern "C" __global__ void lat_HFMA2(long long* out) {
             "fma.rn.bf16x2 %0, %1, %1, %0;\n\t"
             : "+r"(_a0)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)_a0;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_F2FP(long long* out) {
@@ -215,10 +211,11 @@ extern "C" __global__ void lat_F2FP(long long* out) {
             "mov.b32 _fa, %0; cvt.rn.bf16x2.f32 %0, _fa, _fa;\n\t"
             "mov.b32 _fa, %0; cvt.rn.bf16x2.f32 %0, _fa, _fa;\n\t"
             "}\n\t"
-            : "+r"(_a0));
+            : "+r"(_a0) :: "memory");
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) { out[0] = t1 - t0; out[1] = _a0; }
+    out[2 + threadIdx.x] = (long long)_a0;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_LOP3(long long* out) {
@@ -249,13 +246,12 @@ extern "C" __global__ void lat_LOP3(long long* out) {
             "lop3.b32 %0, %0, %1, %2, 0x96;\n\t"
             : "+r"(_a0)
             : "r"(_s0), "r"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)_a0;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_SHF(long long* out) {
@@ -285,13 +281,12 @@ extern "C" __global__ void lat_SHF(long long* out) {
             "shf.r.clamp.b32 %0, %0, %1, %0;\n\t"
             : "+r"(_a0)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)_a0;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_PRMT(long long* out) {
@@ -321,13 +316,12 @@ extern "C" __global__ void lat_PRMT(long long* out) {
             "prmt.b32 %0, %0, %1, 0x5410;\n\t"
             : "+r"(_a0)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)_a0;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_VIADD(long long* out) {
@@ -357,13 +351,12 @@ extern "C" __global__ void lat_VIADD(long long* out) {
             "vadd.s32.s32.s32 %0, %0, %1;\n\t"
             : "+r"(_a0)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)_a0;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_IADD3(long long* out) {
@@ -393,13 +386,12 @@ extern "C" __global__ void lat_IADD3(long long* out) {
             "add.s32 %0, %0, %1;\n\t"
             : "+r"(_a0)
             : "r"(_s0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)_a0;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_IMAD(long long* out) {
@@ -430,13 +422,12 @@ extern "C" __global__ void lat_IMAD(long long* out) {
             "mad.lo.s32 %0, %0, %1, %2;\n\t"
             : "+r"(_a0)
             : "r"(_s0), "r"(_s1)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)_a0;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_SEL(long long* out) {
@@ -468,10 +459,11 @@ extern "C" __global__ void lat_SEL(long long* out) {
             "selp.b32 %0, %0, %2, _p;\n\t"
             "selp.b32 %0, %2, %0, _p;\n\t"
             "}\n\t"
-            : "+r"(_a0) : "r"(_cond), "r"(_sv));
+            : "+r"(_a0) : "r"(_cond), "r"(_sv) : "memory");
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) { out[0] = t1 - t0; out[1] = _a0; }
+    out[2 + threadIdx.x] = (long long)_a0;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_REDUX(long long* out) {
@@ -499,13 +491,12 @@ extern "C" __global__ void lat_REDUX(long long* out) {
             "redux.sync.add.s32 %0, %0, 0xffffffff;\n\t"
             "redux.sync.add.s32 %0, %0, 0xffffffff;\n\t"
             : "+r"(_a0)
+            : "memory"
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-        out[1] = _a0;
-    }
+    out[2 + threadIdx.x] = (long long)_a0;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_LDS(long long* out) {
@@ -521,69 +512,71 @@ extern "C" __global__ void lat_LDS(long long* out) {
     }
     long long t0 = clock64();
     for (int _i = 0; _i < REPS; _i++) {
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
-        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base));
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr)); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
+        { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
     }
     long long t1 = clock64();
-    if (_tid == 0) { out[0] = t1 - t0; out[1] = _idx; }
+    out[2 + _tid] = (long long)_idx;
+    if (_tid == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void lat_LDG(long long* out) {
-    const int* _data = (const int*)(out + 64);
+    const int* _data = (const int*)(out + 512);
     int _idx = 0;
     for (int _w = 0; _w < WARMUP; _w++)
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
     long long t0 = clock64();
     for (int _i = 0; _i < REPS; _i++) {
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
-        asm volatile("ld.global.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx));
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
+        asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) { out[0] = t1 - t0; out[1] = _idx; }
+    out[2 + threadIdx.x] = (long long)_idx;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 
@@ -595,8 +588,8 @@ struct Bench {
 
 int main() {
     long long *d_out, h_out[2];
-    cudaMalloc(&d_out, 4096);
-    cudaMemset(d_out, 0, 4096);
+    cudaMalloc(&d_out, LDG_BUF_SIZE + 4096);
+    cudaMemset(d_out, 0, LDG_BUF_SIZE + 4096);
 
     Bench benches[] = {
     {"FADD lat depth=16", 16, lat_FADD},

@@ -1,4 +1,4 @@
-# Build artifacts
+# Build artifacts — binaries
 patch_embed
 patch_embed_timing
 cutlass-bench
@@ -7,15 +7,50 @@ cutlass-bench-fc1
 cutlass-bench-fc2
 cutlass-bench-fc1-max
 cutlass-bench-fc2-max
+cutlass-bench-*
 cublas-bench
 cublas-bench-fc1
 cublas-bench-fc2
 fc1-gelu
+fc1-gelu-ptx
 fc2
 calibration
+calib-tput
+calib-conflict
+calib-lat
+siglip_vision
+siglip_best
+siglip_timing
+siglip_s0
+siglip_s2
+siglip_x32
+siglip_x64
+cutlass-256x256x64
+
+# Build intermediates (nvcc keep files, dlink, etc.)
+*.o
+*.cubin
+*.fatbin
+*.fatbin.c
+*.ptx
+*.ii
+*.module_id
+*.reg.c
+*.cudafe1.*
+*.stub.c
+*_dlink.*
+*.gpu
+
+# Libraries
+*.so
+*.so.*
 
 # SASS dumps (large, regenerable)
 sass/
+
+# Test/scratch
+tests.txt
+k
 
 # Python cache
 __pycache__/

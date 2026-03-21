@@ -153,6 +153,7 @@ tools/                  # Analysis & sweep scripts
   analyze_sweep.py      # Grid search analysis: eta-squared, balanced subsets, RF importance
   balanced_eta.py       # Standalone balanced-subset eta-squared tool
   sass_analysis.py      # SASS scheduling analyzer (control words, dep graphs, slack)
+  sass_edit.py          # SASS binary editor — cubin instruction reorder/patch/swap (see docs/sass_binary_editing.md)
   analyze_timing.py     # clock64 timing → equilibrium analysis
   analyze_source_counters.py  # ncu SourceCounters CSV → stall breakdown
   simulate_lhs.py       # Bootstrap convergence simulation (no GPU)
@@ -169,9 +170,15 @@ bench/                  # Benchmark & calibration kernels
   calibration.cu        # SASS latency microbenchmarks (K1-K26)
   common.h              # Shared PTX helpers (mbarrier, TMA, tcgen05)
   profiler.h            # globaltimer-based kernel profiler
+  calib/                # Generated calibration benchmarks (instruction DB + codegen)
+    instruction_db.py   # 18 SM100a instruction families, resource class hypotheses
+    gen_kernels.py      # Generates tput/lat/conflict .cu files from instruction_db.py
+    run.sh              # Generate → build → SASS verify → run all calibration suites
 
 data/                   # Sweep results, ncu profiles, session outputs (data/session_*/)
 docs/                   # Experiments (F1-F40), proposals, grid search, SASS notes, ncu analysis
+  sass_binary_editing.md # SASS binary editor: capabilities, workflow, FC2 patching plan
+  sass_editor_roadmap.md # SASS editor improvement checklist — deps, barriers, latency, loader
 ```
 
 ## Build and run
@@ -200,6 +207,20 @@ python3 tools/compare_all.py --runs 20 --csv data/compare.csv
 python3 tools/analyze_sweep.py data/session_*/sweep_fc2.csv
 python3 tools/balanced_eta.py data/session_*/sweep_fc2.csv
 python3 tools/sass_analysis.py --cubin fc2 --deps
+
+# SASS binary editing (local, no GPU needed for editing)
+nvcc --cubin -arch=sm_100a -O3 fc2.cu -o fc2.cubin       # produce standalone cubin
+python3 tools/sass_edit.py info fc2.cubin                  # list kernels
+python3 tools/sass_edit.py dump fc2.cubin --sass sass/fc2.txt --start 0x50f0 --end 0x5160
+python3 tools/sass_edit.py script fc2.cubin recipe.txt -o fc2_patched.cubin
+python3 tools/sass_edit.py diff fc2.cubin fc2_patched.cubin
+# see docs/sass_binary_editing.md for full workflow + FC2 patching plan
+
+# Calibration microbenchmarks (generated from instruction DB)
+./bench/calib/run.sh              # generate + build + SASS verify + run (all 3 suites)
+./bench/calib/run.sh tput         # throughput ILP sweep only (90 kernels)
+./bench/calib/run.sh conflict     # NxN conflict matrix (153 pairwise tests)
+make calib-all                    # just build (Makefile targets)
 
 # PE and FC1 (done — do NOT sweep or optimize)
 make                    # compile patch_embed.cu -> patch_embed

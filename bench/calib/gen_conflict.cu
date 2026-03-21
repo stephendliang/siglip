@@ -5,6 +5,7 @@
 
 #define REPS 1024
 #define WARMUP 64
+#define LDG_BUF_SIZE 16777216
 
 extern "C" __global__ void conf_FADD_FMUL(long long* out) {
     volatile float* a_gin = (volatile float*)out;
@@ -51,11 +52,9 @@ extern "C" __global__ void conf_FADD_FMUL(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    volatile float* _fo2 = (volatile float*)(out + 2); _fo2[0] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    volatile float* _fo2 = (volatile float*)(out + 34 + threadIdx.x); _fo2[0] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_FFMA(long long* out) {
@@ -104,11 +103,9 @@ extern "C" __global__ void conf_FADD_FFMA(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    volatile float* _fo2 = (volatile float*)(out + 2); _fo2[0] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    volatile float* _fo2 = (volatile float*)(out + 34 + threadIdx.x); _fo2[0] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_HADD2(long long* out) {
@@ -156,11 +153,9 @@ extern "C" __global__ void conf_FADD_HADD2(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_HFMA2(long long* out) {
@@ -208,11 +203,9 @@ extern "C" __global__ void conf_FADD_HFMA2(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_F2FP(long long* out) {
@@ -270,11 +263,9 @@ extern "C" __global__ void conf_FADD_F2FP(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_LOP3(long long* out) {
@@ -323,11 +314,9 @@ extern "C" __global__ void conf_FADD_LOP3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_SHF(long long* out) {
@@ -375,11 +364,9 @@ extern "C" __global__ void conf_FADD_SHF(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_PRMT(long long* out) {
@@ -427,11 +414,9 @@ extern "C" __global__ void conf_FADD_PRMT(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_VIADD(long long* out) {
@@ -479,11 +464,9 @@ extern "C" __global__ void conf_FADD_VIADD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_IADD3(long long* out) {
@@ -531,11 +514,9 @@ extern "C" __global__ void conf_FADD_IADD3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_IMAD(long long* out) {
@@ -584,11 +565,9 @@ extern "C" __global__ void conf_FADD_IMAD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_SEL(long long* out) {
@@ -641,11 +620,9 @@ extern "C" __global__ void conf_FADD_SEL(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_REDUX(long long* out) {
@@ -692,11 +669,9 @@ extern "C" __global__ void conf_FADD_REDUX(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_STS(long long* out) {
@@ -738,10 +713,8 @@ extern "C" __global__ void conf_FADD_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_STG(long long* out) {
@@ -782,10 +755,8 @@ extern "C" __global__ void conf_FADD_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_LDS(long long* out) {
@@ -839,11 +810,9 @@ extern "C" __global__ void conf_FADD_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FADD_LDG(long long* out) {
@@ -893,11 +862,9 @@ extern "C" __global__ void conf_FADD_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_FFMA(long long* out) {
@@ -946,11 +913,9 @@ extern "C" __global__ void conf_FMUL_FFMA(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    volatile float* _fo2 = (volatile float*)(out + 2); _fo2[0] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    volatile float* _fo2 = (volatile float*)(out + 34 + threadIdx.x); _fo2[0] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_HADD2(long long* out) {
@@ -998,11 +963,9 @@ extern "C" __global__ void conf_FMUL_HADD2(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_HFMA2(long long* out) {
@@ -1050,11 +1013,9 @@ extern "C" __global__ void conf_FMUL_HFMA2(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_F2FP(long long* out) {
@@ -1112,11 +1073,9 @@ extern "C" __global__ void conf_FMUL_F2FP(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_LOP3(long long* out) {
@@ -1165,11 +1124,9 @@ extern "C" __global__ void conf_FMUL_LOP3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_SHF(long long* out) {
@@ -1217,11 +1174,9 @@ extern "C" __global__ void conf_FMUL_SHF(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_PRMT(long long* out) {
@@ -1269,11 +1224,9 @@ extern "C" __global__ void conf_FMUL_PRMT(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_VIADD(long long* out) {
@@ -1321,11 +1274,9 @@ extern "C" __global__ void conf_FMUL_VIADD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_IADD3(long long* out) {
@@ -1373,11 +1324,9 @@ extern "C" __global__ void conf_FMUL_IADD3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_IMAD(long long* out) {
@@ -1426,11 +1375,9 @@ extern "C" __global__ void conf_FMUL_IMAD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_SEL(long long* out) {
@@ -1483,11 +1430,9 @@ extern "C" __global__ void conf_FMUL_SEL(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_REDUX(long long* out) {
@@ -1534,11 +1479,9 @@ extern "C" __global__ void conf_FMUL_REDUX(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_STS(long long* out) {
@@ -1580,10 +1523,8 @@ extern "C" __global__ void conf_FMUL_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_STG(long long* out) {
@@ -1624,10 +1565,8 @@ extern "C" __global__ void conf_FMUL_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_LDS(long long* out) {
@@ -1681,11 +1620,9 @@ extern "C" __global__ void conf_FMUL_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FMUL_LDG(long long* out) {
@@ -1735,11 +1672,9 @@ extern "C" __global__ void conf_FMUL_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_HADD2(long long* out) {
@@ -1788,11 +1723,9 @@ extern "C" __global__ void conf_FFMA_HADD2(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_HFMA2(long long* out) {
@@ -1841,11 +1774,9 @@ extern "C" __global__ void conf_FFMA_HFMA2(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_F2FP(long long* out) {
@@ -1904,11 +1835,9 @@ extern "C" __global__ void conf_FFMA_F2FP(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_LOP3(long long* out) {
@@ -1958,11 +1887,9 @@ extern "C" __global__ void conf_FFMA_LOP3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_SHF(long long* out) {
@@ -2011,11 +1938,9 @@ extern "C" __global__ void conf_FFMA_SHF(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_PRMT(long long* out) {
@@ -2064,11 +1989,9 @@ extern "C" __global__ void conf_FFMA_PRMT(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_VIADD(long long* out) {
@@ -2117,11 +2040,9 @@ extern "C" __global__ void conf_FFMA_VIADD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_IADD3(long long* out) {
@@ -2170,11 +2091,9 @@ extern "C" __global__ void conf_FFMA_IADD3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_IMAD(long long* out) {
@@ -2224,11 +2143,9 @@ extern "C" __global__ void conf_FFMA_IMAD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_SEL(long long* out) {
@@ -2282,11 +2199,9 @@ extern "C" __global__ void conf_FFMA_SEL(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_REDUX(long long* out) {
@@ -2334,11 +2249,9 @@ extern "C" __global__ void conf_FFMA_REDUX(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_STS(long long* out) {
@@ -2381,10 +2294,8 @@ extern "C" __global__ void conf_FFMA_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_STG(long long* out) {
@@ -2426,10 +2337,8 @@ extern "C" __global__ void conf_FFMA_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_LDS(long long* out) {
@@ -2484,11 +2393,9 @@ extern "C" __global__ void conf_FFMA_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_FFMA_LDG(long long* out) {
@@ -2539,11 +2446,9 @@ extern "C" __global__ void conf_FFMA_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    volatile float* _fo = (volatile float*)(out + 1); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    volatile float* _fo = (volatile float*)(out + 2 + threadIdx.x); _fo[0] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_HFMA2(long long* out) {
@@ -2591,11 +2496,9 @@ extern "C" __global__ void conf_HADD2_HFMA2(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_F2FP(long long* out) {
@@ -2653,11 +2556,9 @@ extern "C" __global__ void conf_HADD2_F2FP(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_LOP3(long long* out) {
@@ -2706,11 +2607,9 @@ extern "C" __global__ void conf_HADD2_LOP3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_SHF(long long* out) {
@@ -2758,11 +2657,9 @@ extern "C" __global__ void conf_HADD2_SHF(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_PRMT(long long* out) {
@@ -2810,11 +2707,9 @@ extern "C" __global__ void conf_HADD2_PRMT(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_VIADD(long long* out) {
@@ -2862,11 +2757,9 @@ extern "C" __global__ void conf_HADD2_VIADD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_IADD3(long long* out) {
@@ -2914,11 +2807,9 @@ extern "C" __global__ void conf_HADD2_IADD3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_IMAD(long long* out) {
@@ -2967,11 +2858,9 @@ extern "C" __global__ void conf_HADD2_IMAD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_SEL(long long* out) {
@@ -3024,11 +2913,9 @@ extern "C" __global__ void conf_HADD2_SEL(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_REDUX(long long* out) {
@@ -3075,11 +2962,9 @@ extern "C" __global__ void conf_HADD2_REDUX(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_STS(long long* out) {
@@ -3121,10 +3006,8 @@ extern "C" __global__ void conf_HADD2_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_STG(long long* out) {
@@ -3165,10 +3048,8 @@ extern "C" __global__ void conf_HADD2_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_LDS(long long* out) {
@@ -3222,11 +3103,9 @@ extern "C" __global__ void conf_HADD2_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HADD2_LDG(long long* out) {
@@ -3276,11 +3155,9 @@ extern "C" __global__ void conf_HADD2_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HFMA2_F2FP(long long* out) {
@@ -3338,11 +3215,9 @@ extern "C" __global__ void conf_HFMA2_F2FP(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HFMA2_LOP3(long long* out) {
@@ -3391,11 +3266,9 @@ extern "C" __global__ void conf_HFMA2_LOP3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HFMA2_SHF(long long* out) {
@@ -3443,11 +3316,9 @@ extern "C" __global__ void conf_HFMA2_SHF(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HFMA2_PRMT(long long* out) {
@@ -3495,11 +3366,9 @@ extern "C" __global__ void conf_HFMA2_PRMT(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HFMA2_VIADD(long long* out) {
@@ -3547,11 +3416,9 @@ extern "C" __global__ void conf_HFMA2_VIADD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HFMA2_IADD3(long long* out) {
@@ -3599,11 +3466,9 @@ extern "C" __global__ void conf_HFMA2_IADD3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HFMA2_IMAD(long long* out) {
@@ -3652,11 +3517,9 @@ extern "C" __global__ void conf_HFMA2_IMAD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HFMA2_SEL(long long* out) {
@@ -3709,11 +3572,9 @@ extern "C" __global__ void conf_HFMA2_SEL(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HFMA2_REDUX(long long* out) {
@@ -3760,11 +3621,9 @@ extern "C" __global__ void conf_HFMA2_REDUX(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HFMA2_STS(long long* out) {
@@ -3806,10 +3665,8 @@ extern "C" __global__ void conf_HFMA2_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HFMA2_STG(long long* out) {
@@ -3850,10 +3707,8 @@ extern "C" __global__ void conf_HFMA2_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HFMA2_LDS(long long* out) {
@@ -3907,11 +3762,9 @@ extern "C" __global__ void conf_HFMA2_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_HFMA2_LDG(long long* out) {
@@ -3961,11 +3814,9 @@ extern "C" __global__ void conf_HFMA2_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_F2FP_LOP3(long long* out) {
@@ -4024,11 +3875,9 @@ extern "C" __global__ void conf_F2FP_LOP3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_F2FP_SHF(long long* out) {
@@ -4086,11 +3935,9 @@ extern "C" __global__ void conf_F2FP_SHF(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_F2FP_PRMT(long long* out) {
@@ -4148,11 +3995,9 @@ extern "C" __global__ void conf_F2FP_PRMT(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_F2FP_VIADD(long long* out) {
@@ -4210,11 +4055,9 @@ extern "C" __global__ void conf_F2FP_VIADD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_F2FP_IADD3(long long* out) {
@@ -4272,11 +4115,9 @@ extern "C" __global__ void conf_F2FP_IADD3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_F2FP_IMAD(long long* out) {
@@ -4335,11 +4176,9 @@ extern "C" __global__ void conf_F2FP_IMAD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_F2FP_SEL(long long* out) {
@@ -4400,11 +4239,9 @@ extern "C" __global__ void conf_F2FP_SEL(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_F2FP_REDUX(long long* out) {
@@ -4461,11 +4298,9 @@ extern "C" __global__ void conf_F2FP_REDUX(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_F2FP_STS(long long* out) {
@@ -4517,10 +4352,8 @@ extern "C" __global__ void conf_F2FP_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_F2FP_STG(long long* out) {
@@ -4571,10 +4404,8 @@ extern "C" __global__ void conf_F2FP_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_F2FP_LDS(long long* out) {
@@ -4636,11 +4467,9 @@ extern "C" __global__ void conf_F2FP_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_F2FP_LDG(long long* out) {
@@ -4698,11 +4527,9 @@ extern "C" __global__ void conf_F2FP_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_LOP3_SHF(long long* out) {
@@ -4751,11 +4578,9 @@ extern "C" __global__ void conf_LOP3_SHF(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_LOP3_PRMT(long long* out) {
@@ -4804,11 +4629,9 @@ extern "C" __global__ void conf_LOP3_PRMT(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_LOP3_VIADD(long long* out) {
@@ -4857,11 +4680,9 @@ extern "C" __global__ void conf_LOP3_VIADD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_LOP3_IADD3(long long* out) {
@@ -4910,11 +4731,9 @@ extern "C" __global__ void conf_LOP3_IADD3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_LOP3_IMAD(long long* out) {
@@ -4964,11 +4783,9 @@ extern "C" __global__ void conf_LOP3_IMAD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_LOP3_SEL(long long* out) {
@@ -5022,11 +4839,9 @@ extern "C" __global__ void conf_LOP3_SEL(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_LOP3_REDUX(long long* out) {
@@ -5074,11 +4889,9 @@ extern "C" __global__ void conf_LOP3_REDUX(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_LOP3_STS(long long* out) {
@@ -5121,10 +4934,8 @@ extern "C" __global__ void conf_LOP3_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_LOP3_STG(long long* out) {
@@ -5166,10 +4977,8 @@ extern "C" __global__ void conf_LOP3_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_LOP3_LDS(long long* out) {
@@ -5224,11 +5033,9 @@ extern "C" __global__ void conf_LOP3_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_LOP3_LDG(long long* out) {
@@ -5279,11 +5086,9 @@ extern "C" __global__ void conf_LOP3_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SHF_PRMT(long long* out) {
@@ -5331,11 +5136,9 @@ extern "C" __global__ void conf_SHF_PRMT(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SHF_VIADD(long long* out) {
@@ -5383,11 +5186,9 @@ extern "C" __global__ void conf_SHF_VIADD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SHF_IADD3(long long* out) {
@@ -5435,11 +5236,9 @@ extern "C" __global__ void conf_SHF_IADD3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SHF_IMAD(long long* out) {
@@ -5488,11 +5287,9 @@ extern "C" __global__ void conf_SHF_IMAD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SHF_SEL(long long* out) {
@@ -5545,11 +5342,9 @@ extern "C" __global__ void conf_SHF_SEL(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SHF_REDUX(long long* out) {
@@ -5596,11 +5391,9 @@ extern "C" __global__ void conf_SHF_REDUX(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SHF_STS(long long* out) {
@@ -5642,10 +5435,8 @@ extern "C" __global__ void conf_SHF_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SHF_STG(long long* out) {
@@ -5686,10 +5477,8 @@ extern "C" __global__ void conf_SHF_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SHF_LDS(long long* out) {
@@ -5743,11 +5532,9 @@ extern "C" __global__ void conf_SHF_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SHF_LDG(long long* out) {
@@ -5797,11 +5584,9 @@ extern "C" __global__ void conf_SHF_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_PRMT_VIADD(long long* out) {
@@ -5849,11 +5634,9 @@ extern "C" __global__ void conf_PRMT_VIADD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_PRMT_IADD3(long long* out) {
@@ -5901,11 +5684,9 @@ extern "C" __global__ void conf_PRMT_IADD3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_PRMT_IMAD(long long* out) {
@@ -5954,11 +5735,9 @@ extern "C" __global__ void conf_PRMT_IMAD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_PRMT_SEL(long long* out) {
@@ -6011,11 +5790,9 @@ extern "C" __global__ void conf_PRMT_SEL(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_PRMT_REDUX(long long* out) {
@@ -6062,11 +5839,9 @@ extern "C" __global__ void conf_PRMT_REDUX(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_PRMT_STS(long long* out) {
@@ -6108,10 +5883,8 @@ extern "C" __global__ void conf_PRMT_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_PRMT_STG(long long* out) {
@@ -6152,10 +5925,8 @@ extern "C" __global__ void conf_PRMT_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_PRMT_LDS(long long* out) {
@@ -6209,11 +5980,9 @@ extern "C" __global__ void conf_PRMT_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_PRMT_LDG(long long* out) {
@@ -6263,11 +6032,9 @@ extern "C" __global__ void conf_PRMT_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_VIADD_IADD3(long long* out) {
@@ -6315,11 +6082,9 @@ extern "C" __global__ void conf_VIADD_IADD3(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_VIADD_IMAD(long long* out) {
@@ -6368,11 +6133,9 @@ extern "C" __global__ void conf_VIADD_IMAD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_VIADD_SEL(long long* out) {
@@ -6425,11 +6188,9 @@ extern "C" __global__ void conf_VIADD_SEL(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_VIADD_REDUX(long long* out) {
@@ -6476,11 +6237,9 @@ extern "C" __global__ void conf_VIADD_REDUX(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_VIADD_STS(long long* out) {
@@ -6522,10 +6281,8 @@ extern "C" __global__ void conf_VIADD_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_VIADD_STG(long long* out) {
@@ -6566,10 +6323,8 @@ extern "C" __global__ void conf_VIADD_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_VIADD_LDS(long long* out) {
@@ -6623,11 +6378,9 @@ extern "C" __global__ void conf_VIADD_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_VIADD_LDG(long long* out) {
@@ -6677,11 +6430,9 @@ extern "C" __global__ void conf_VIADD_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_IADD3_IMAD(long long* out) {
@@ -6730,11 +6481,9 @@ extern "C" __global__ void conf_IADD3_IMAD(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_IADD3_SEL(long long* out) {
@@ -6787,11 +6536,9 @@ extern "C" __global__ void conf_IADD3_SEL(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_IADD3_REDUX(long long* out) {
@@ -6838,11 +6585,9 @@ extern "C" __global__ void conf_IADD3_REDUX(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_IADD3_STS(long long* out) {
@@ -6884,10 +6629,8 @@ extern "C" __global__ void conf_IADD3_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_IADD3_STG(long long* out) {
@@ -6928,10 +6671,8 @@ extern "C" __global__ void conf_IADD3_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_IADD3_LDS(long long* out) {
@@ -6985,11 +6726,9 @@ extern "C" __global__ void conf_IADD3_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_IADD3_LDG(long long* out) {
@@ -7039,11 +6778,9 @@ extern "C" __global__ void conf_IADD3_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_IMAD_SEL(long long* out) {
@@ -7097,11 +6834,9 @@ extern "C" __global__ void conf_IMAD_SEL(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_IMAD_REDUX(long long* out) {
@@ -7149,11 +6884,9 @@ extern "C" __global__ void conf_IMAD_REDUX(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_IMAD_STS(long long* out) {
@@ -7196,10 +6929,8 @@ extern "C" __global__ void conf_IMAD_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_IMAD_STG(long long* out) {
@@ -7241,10 +6972,8 @@ extern "C" __global__ void conf_IMAD_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_IMAD_LDS(long long* out) {
@@ -7299,11 +7028,9 @@ extern "C" __global__ void conf_IMAD_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_IMAD_LDG(long long* out) {
@@ -7354,11 +7081,9 @@ extern "C" __global__ void conf_IMAD_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SEL_REDUX(long long* out) {
@@ -7410,11 +7135,9 @@ extern "C" __global__ void conf_SEL_REDUX(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SEL_STS(long long* out) {
@@ -7461,10 +7184,8 @@ extern "C" __global__ void conf_SEL_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SEL_STG(long long* out) {
@@ -7510,10 +7231,8 @@ extern "C" __global__ void conf_SEL_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SEL_LDS(long long* out) {
@@ -7570,11 +7289,9 @@ extern "C" __global__ void conf_SEL_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_SEL_LDG(long long* out) {
@@ -7627,11 +7344,9 @@ extern "C" __global__ void conf_SEL_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_REDUX_STS(long long* out) {
@@ -7672,10 +7387,8 @@ extern "C" __global__ void conf_REDUX_STS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_REDUX_STG(long long* out) {
@@ -7715,10 +7428,8 @@ extern "C" __global__ void conf_REDUX_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_REDUX_LDS(long long* out) {
@@ -7771,11 +7482,9 @@ extern "C" __global__ void conf_REDUX_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_REDUX_LDG(long long* out) {
@@ -7824,11 +7533,9 @@ extern "C" __global__ void conf_REDUX_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_STS_STG(long long* out) {
@@ -7862,9 +7569,7 @@ extern "C" __global__ void conf_STS_STG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    }
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_STS_LDS(long long* out) {
@@ -7912,10 +7617,8 @@ extern "C" __global__ void conf_STS_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_STS_LDG(long long* out) {
@@ -7959,10 +7662,8 @@ extern "C" __global__ void conf_STS_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_STG_LDS(long long* out) {
@@ -8009,10 +7710,8 @@ extern "C" __global__ void conf_STG_LDS(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_STG_LDG(long long* out) {
@@ -8055,10 +7754,8 @@ extern "C" __global__ void conf_STG_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 extern "C" __global__ void conf_LDS_LDG(long long* out) {
@@ -8112,11 +7809,9 @@ extern "C" __global__ void conf_LDS_LDG(long long* out) {
         );
     }
     long long t1 = clock64();
-    if (threadIdx.x == 0) {
-        out[0] = t1 - t0;
-    out[1] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
-    out[2] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
-    }
+    out[2 + threadIdx.x] = a_a0 + a_a1 + a_a2 + a_a3 + a_a4 + a_a5 + a_a6 + a_a7;
+    out[34 + threadIdx.x] = b_a0 + b_a1 + b_a2 + b_a3 + b_a4 + b_a5 + b_a6 + b_a7;
+    if (threadIdx.x == 0) out[0] = t1 - t0;
 }
 
 
@@ -8128,8 +7823,8 @@ struct Bench {
 
 int main() {
     long long *d_out, h_out[2];
-    cudaMalloc(&d_out, 4096);
-    cudaMemset(d_out, 0, 4096);
+    cudaMalloc(&d_out, LDG_BUF_SIZE + 4096);
+    cudaMemset(d_out, 0, LDG_BUF_SIZE + 4096);
 
     Bench benches[] = {
     {"FADD x FMUL", 16, conf_FADD_FMUL},
