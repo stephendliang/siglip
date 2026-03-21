@@ -111,8 +111,8 @@ experiment, but catches mistakes in other regions.
 
 ## 3. Latency table integration + stall validation
 
-`[ ]` **Import calibrated latency values into sass_edit.py**
-`[ ]` **After reorder/stall-patch, warn if stall count is below minimum for data dependency**
+`[x]` **Import calibrated latency values into sass_edit.py**
+`[x]` **After reorder/stall-patch, warn if stall count is below minimum for data dependency**
 
 ### Why this matters
 

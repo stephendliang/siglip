@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import collections
 import io
 import os
 import re
@@ -67,6 +68,48 @@ def encode_ctrl(fields, original_ctrl):
            ((fields['wait_mask'] & 0x3f) << 15) |
            ((fields['reuse'] & 3) << 21))
     return (original_ctrl & ~mask) | val
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Latency table (calibrated on B200, 2026-03-21)
+#
+# Maps SASS mnemonic base → minimum cycles before a dependent consumer can
+# read the register result. Stores have no register output (latency=0).
+# For loads (LDS/LDG/LDTM), latency exceeds the 15-cycle stall cap —
+# the hardware uses barrier mechanisms for these, not stall counts alone.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+LATENCY = {
+    'IADD3': 2, 'LEA': 2, 'MOV': 2, 'UMOV': 2, 'S2R': 2,
+    'FADD': 4, 'FMUL': 4, 'FFMA': 4,
+    'IMAD': 4, 'F2FP': 4, 'LOP3': 4, 'SHF': 4, 'PRMT': 4,
+    'HADD2': 4, 'HFMA2': 4,
+    'ISETP': 4, 'FSETP': 4, 'HSETP2': 4, 'PLOP3': 4,
+    'SEL': 5, 'CSEL': 5,
+    'R2UR': 4,
+    'VIADD': 10, 'SHFL': 10,
+    'REDUX': 44,
+    'LDS': 20, 'LDSM': 20,
+    'LDG': 40, 'LDC': 20,
+    'LDTM': 20,
+}
+LATENCY_DEFAULT = 4
+MAX_STALL = 15
+
+STORE_NO_REG_OUTPUT = frozenset([
+    'STS', 'STG', 'STL', 'ATOMS', 'ATOMG', 'RED',
+])
+
+
+def get_latency(mnemonic):
+    """Get producer latency in cycles. Stores return 0 (no register output)."""
+    if not mnemonic:
+        return LATENCY_DEFAULT
+    bare = mnemonic.split(None, 1)[-1] if mnemonic.startswith('@') else mnemonic
+    base = bare.split('.')[0]
+    if base in STORE_NO_REG_OUTPUT:
+        return 0
+    return LATENCY.get(base, LATENCY_DEFAULT)
 
 
 def ctrl_str(ctrl_val):
@@ -667,6 +710,138 @@ def dump_deps(instructions):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Stall recomputation + audit
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+StallChange = collections.namedtuple('StallChange', 'addr new_stall old_stall reason')
+StallWarning = collections.namedtuple('StallWarning',
+    'addr mnemonic producer_addr producer_mnemonic needed actual reg')
+
+
+def compute_stalls(instructions, keep_first=True):
+    """Compute minimum-safe stall counts for a (possibly reordered) instruction list.
+
+    For each instruction i, finds its nearest RAW producer j (j < i), sums
+    stall cycles of instructions between j and i, and sets the stall on i
+    to cover any latency deficit.
+
+    Returns list of StallChange for every instruction whose stall changed.
+    """
+    n = len(instructions)
+    if n == 0:
+        return []
+
+    # parse defs/uses
+    du = []
+    for insn in instructions:
+        d, u = parse_reg_operands(insn.mnemonic, insn.operands)
+        du.append((d, u))
+
+    changes = []
+    start = 1 if keep_first else 0
+
+    for i in range(start, n):
+        insn = instructions[i]
+        _, uses_i = du[i]
+        if not uses_i:
+            continue
+
+        max_needed = 0
+        worst_producer = None
+        worst_reg = None
+
+        # scan backwards for nearest producer of each used register
+        for reg in uses_i:
+            for j in range(i - 1, -1, -1):
+                defs_j, _ = du[j]
+                if reg in defs_j:
+                    lat = get_latency(instructions[j].mnemonic)
+                    if lat == 0:
+                        break
+                    # sum stall counts between producer and consumer (exclusive)
+                    covered = sum(instructions[k].control & 0xf for k in range(j + 1, i))
+                    needed = lat - covered
+                    if needed > max_needed:
+                        max_needed = needed
+                        worst_producer = j
+                        worst_reg = reg
+                    break  # found nearest producer for this reg
+
+        if max_needed <= 0:
+            continue
+
+        new_stall = min(max_needed, MAX_STALL)
+        old_stall = insn.control & 0xf
+        if new_stall == old_stall:
+            continue
+
+        reason = ''
+        if worst_producer is not None:
+            pmn = instructions[worst_producer].mnemonic or '?'
+            reason = 'lat=%d from [%04x] %s via %s' % (
+                get_latency(instructions[worst_producer].mnemonic),
+                instructions[worst_producer].offset, pmn, worst_reg)
+            if max_needed > MAX_STALL:
+                reason += ' (NEEDS BARRIER: %d > %d)' % (max_needed, MAX_STALL)
+
+        changes.append(StallChange(insn.offset, new_stall, old_stall, reason))
+
+    return changes
+
+
+def apply_stall_changes(instructions, changes):
+    """Apply stall changes to instruction list. Returns number applied."""
+    addr_map = {insn.offset: insn for insn in instructions}
+    applied = 0
+    for ch in changes:
+        insn = addr_map.get(ch.addr)
+        if insn is None:
+            continue
+        insn.control = (insn.control & ~0xf) | (ch.new_stall & 0xf)
+        applied += 1
+    return applied
+
+
+def audit_stalls(instructions):
+    """Check existing stall counts against minimum latency requirements.
+
+    Returns list of StallWarning for any instruction whose stall count is
+    insufficient to cover its producer's latency.
+    """
+    n = len(instructions)
+    du = []
+    for insn in instructions:
+        d, u = parse_reg_operands(insn.mnemonic, insn.operands)
+        du.append((d, u))
+
+    warnings = []
+    for i in range(1, n):
+        insn = instructions[i]
+        _, uses_i = du[i]
+        if not uses_i:
+            continue
+
+        for reg in uses_i:
+            for j in range(i - 1, -1, -1):
+                defs_j, _ = du[j]
+                if reg in defs_j:
+                    lat = get_latency(instructions[j].mnemonic)
+                    if lat == 0:
+                        break
+                    covered = sum(instructions[k].control & 0xf for k in range(j + 1, i))
+                    if covered < lat:
+                        warnings.append(StallWarning(
+                            insn.offset,
+                            insn.mnemonic or '?',
+                            instructions[j].offset,
+                            instructions[j].mnemonic or '?',
+                            lat, covered, reg))
+                    break
+
+    return warnings
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # cuobjdump SASS cross-reference
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -798,7 +973,7 @@ class CubinEditor:
             total += apply_sass_xref(k, sass_data)
         return total
 
-    def swap(self, kernel, addr_a, addr_b, force=False):
+    def swap(self, kernel, addr_a, addr_b, force=False, no_restall=False):
         """Swap two instructions (full 128-bit swap including control words)."""
         idx_a = addr_a // INSN_SIZE
         idx_b = addr_b // INSN_SIZE
@@ -810,7 +985,8 @@ class CubinEditor:
         # Dep check: treat as reorder of the range [min, max+1) with swapped positions
         lo, hi = sorted([idx_a, idx_b])
         region = instrs[lo:hi + 1]
-        if region[0].mnemonic is not None:
+        has_mnemonics = region[0].mnemonic is not None
+        if has_mnemonics:
             addrs_orig = [insn.offset for insn in region]
             addrs_new = list(addrs_orig)
             ia = idx_a - lo
@@ -832,7 +1008,18 @@ class CubinEditor:
         a.operands, b.operands = b.operands, a.operands
         self._modified = True
 
-    def reorder(self, kernel, start_addr, end_addr, new_order, force=False):
+        # auto-restall the affected region
+        if not no_restall and has_mnemonics:
+            region = instrs[lo:hi + 1]
+            changes = compute_stalls(region, keep_first=True)
+            if changes:
+                apply_stall_changes(region, changes)
+                for ch in changes:
+                    print('  restall [%04x] %d -> %d  (%s)' % (
+                        ch.addr, ch.old_stall, ch.new_stall, ch.reason))
+
+    def reorder(self, kernel, start_addr, end_addr, new_order, force=False,
+                no_restall=False):
         """Reorder instructions in [start, end) to the sequence given by new_order (list of addrs)."""
         start_idx = start_addr // INSN_SIZE
         end_idx = end_addr // INSN_SIZE
@@ -856,7 +1043,8 @@ class CubinEditor:
 
         # Dep check
         region = instrs[start_idx:end_idx]
-        if region and region[0].mnemonic is not None:
+        has_mnemonics = region and region[0].mnemonic is not None
+        if has_mnemonics:
             violations = check_deps(region, new_order)
             if violations:
                 print('WARNING: %d dependency violation(s) in reorder:' % len(violations))
@@ -879,6 +1067,16 @@ class CubinEditor:
             dst.operands = src.operands
 
         self._modified = True
+
+        # auto-restall the reordered region
+        if not no_restall and has_mnemonics:
+            region = instrs[start_idx:end_idx]
+            changes = compute_stalls(region, keep_first=True)
+            if changes:
+                apply_stall_changes(region, changes)
+                for ch in changes:
+                    print('  restall [%04x] %d -> %d  (%s)' % (
+                        ch.addr, ch.old_stall, ch.new_stall, ch.reason))
 
     def patch_ctrl_field(self, kernel, addr, **fields):
         """Modify specific control word fields at addr."""
@@ -1050,6 +1248,37 @@ def parse_script(script_path, editor, kernel):
                 editor.reorder(kernel, start, end, addrs)
                 n_ops += 1
 
+            elif cmd == 'restall':
+                start = int(parts[1], 0)
+                end = int(parts[2], 0)
+                start_idx = start // INSN_SIZE
+                end_idx = end // INSN_SIZE
+                region = kernel.instructions[start_idx:end_idx]
+                changes = compute_stalls(region, keep_first=True)
+                if changes:
+                    apply_stall_changes(region, changes)
+                    for ch in changes:
+                        print('  restall [%04x] %d -> %d  (%s)' % (
+                            ch.addr, ch.old_stall, ch.new_stall, ch.reason))
+                n_ops += 1
+
+            elif cmd == 'audit':
+                start = int(parts[1], 0)
+                end = int(parts[2], 0)
+                start_idx = start // INSN_SIZE
+                end_idx = end // INSN_SIZE
+                region = kernel.instructions[start_idx:end_idx]
+                warnings = audit_stalls(region)
+                if warnings:
+                    for w in warnings:
+                        print('  STALL WARNING: [%04x] %s needs %d cycles after '
+                              '[%04x] %s (via %s), has %d' % (
+                              w.addr, w.mnemonic, w.needed,
+                              w.producer_addr, w.producer_mnemonic,
+                              w.reg, w.actual))
+                else:
+                    print('  audit [0x%x, 0x%x): all stalls OK' % (start, end))
+
             else:
                 print('WARN: unknown command "%s" at line %d' % (cmd, lineno))
 
@@ -1132,7 +1361,9 @@ def cmd_swap(args):
     print('  [%04x] %s' % (addr_a, insn_a.mnemonic or ('enc=0x%016x' % insn_a.encoding)))
     print('  [%04x] %s' % (addr_b, insn_b.mnemonic or ('enc=0x%016x' % insn_b.encoding)))
 
-    ed.swap(k, addr_a, addr_b, force=getattr(args, 'force', False))
+    ed.swap(k, addr_a, addr_b,
+            force=getattr(args, 'force', False),
+            no_restall=getattr(args, 'no_restall', False))
     out = ed.save(args.output)
     print('Saved: %s' % out)
 
@@ -1157,7 +1388,9 @@ def cmd_reorder(args):
         tag = insn.mnemonic or ('enc=0x%016x' % insn.encoding)
         print('  %d: [%04x] %s' % (i, addr, tag))
 
-    ed.reorder(k, start, end, new_order, force=getattr(args, 'force', False))
+    ed.reorder(k, start, end, new_order,
+               force=getattr(args, 'force', False),
+               no_restall=getattr(args, 'no_restall', False))
     out = ed.save(args.output)
     print('Saved: %s' % out)
 
@@ -1492,6 +1725,17 @@ def cmd_deps(args):
         else:
             print('OK: no dependency violations in proposed reorder.')
 
+    # stall audit
+    print('\nStall audit [0x%x, 0x%x):' % (start, end))
+    warnings = audit_stalls(region)
+    if warnings:
+        for w in warnings:
+            print('  WARNING: [%04x] %s needs %d cycles after [%04x] %s (via %s), has %d' % (
+                w.addr, w.mnemonic, w.needed,
+                w.producer_addr, w.producer_mnemonic, w.reg, w.actual))
+    else:
+        print('  All stalls OK.')
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Fatbin patcher — patch embedded cubin inside compiled CUDA host binary
@@ -1697,6 +1941,8 @@ def main():
     s.add_argument('--sass', default=None)
     s.add_argument('--force', '-f', action='store_true',
                    help='Override dependency violation checks')
+    s.add_argument('--no-restall', action='store_true',
+                   help='Skip automatic stall recomputation after edit')
 
     # reorder
     s = sub.add_parser('reorder', help='Reorder instructions in a range')
@@ -1709,6 +1955,8 @@ def main():
     s.add_argument('--sass', default=None)
     s.add_argument('--force', '-f', action='store_true',
                    help='Override dependency violation checks')
+    s.add_argument('--no-restall', action='store_true',
+                   help='Skip automatic stall recomputation after edit')
 
     # patch
     s = sub.add_parser('patch', help='Modify control word fields')
