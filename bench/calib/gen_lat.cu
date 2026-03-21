@@ -7,13 +7,21 @@
 #define WARMUP 64
 #define LDG_BUF_SIZE 16777216
 
+/* asm volatile clock read — prevents ptxas from reordering CS2R past
+   asm volatile blocks (which it does with the clock64() builtin) */
+__device__ __forceinline__ long long asm_clock64() {
+    long long r;
+    asm volatile("mov.u64 %0, %%clock64;" : "=l"(r) :: "memory");
+    return r;
+}
+
 extern "C" __global__ void lat_FADD(long long* out) {
     volatile float* gin = (volatile float*)out;
     float _a0 = gin[threadIdx.x];
     float _s0 = gin[threadIdx.x+32];
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("add.f32 %0, %0, %1;" : "+f"(_a0) : "f"(_s0));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "add.f32 %0, %0, %1;\n\t"
@@ -37,7 +45,7 @@ extern "C" __global__ void lat_FADD(long long* out) {
             : "memory"
         );
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
       *_sink = _a0; }
     if (threadIdx.x == 0) out[0] = t1 - t0;
@@ -49,7 +57,7 @@ extern "C" __global__ void lat_FMUL(long long* out) {
     float _s0 = gin[threadIdx.x+32]+1.0001f;
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("mul.f32 %0, %0, %1;" : "+f"(_a0) : "f"(_s0));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "mul.f32 %0, %0, %1;\n\t"
@@ -73,7 +81,7 @@ extern "C" __global__ void lat_FMUL(long long* out) {
             : "memory"
         );
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
       *_sink = _a0; }
     if (threadIdx.x == 0) out[0] = t1 - t0;
@@ -86,7 +94,7 @@ extern "C" __global__ void lat_FFMA(long long* out) {
     float _s1 = gin[threadIdx.x+64];
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("fma.rn.f32 %0, %0, %1, %2;" : "+f"(_a0) : "f"(_s0), "f"(_s1));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "fma.rn.f32 %0, %0, %1, %2;\n\t"
@@ -110,7 +118,7 @@ extern "C" __global__ void lat_FFMA(long long* out) {
             : "memory"
         );
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     { volatile float* _sink = (volatile float*)(out + 2 + threadIdx.x);
       *_sink = _a0; }
     if (threadIdx.x == 0) out[0] = t1 - t0;
@@ -122,7 +130,7 @@ extern "C" __global__ void lat_HADD2(long long* out) {
     unsigned _s0 = 0x00010001u;
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(_a0) : "r"(_s0));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "add.rn.bf16x2 %0, %0, %1;\n\t"
@@ -146,7 +154,7 @@ extern "C" __global__ void lat_HADD2(long long* out) {
             : "memory"
         );
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     out[2 + threadIdx.x] = (long long)_a0;
     if (threadIdx.x == 0) out[0] = t1 - t0;
 }
@@ -157,7 +165,7 @@ extern "C" __global__ void lat_HFMA2(long long* out) {
     unsigned _s0 = gin[threadIdx.x+32]|0x3c003c00;
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("fma.rn.bf16x2 %0, %1, %1, %0;" : "+r"(_a0) : "r"(_s0));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "fma.rn.bf16x2 %0, %1, %1, %0;\n\t"
@@ -181,7 +189,7 @@ extern "C" __global__ void lat_HFMA2(long long* out) {
             : "memory"
         );
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     out[2 + threadIdx.x] = (long long)_a0;
     if (threadIdx.x == 0) out[0] = t1 - t0;
 }
@@ -190,7 +198,7 @@ extern "C" __global__ void lat_F2FP(long long* out) {
     unsigned _a0 = 0x3f800000u;
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("{ .reg .f32 _fa; mov.b32 _fa, %0; cvt.rn.bf16x2.f32 %0, _fa, _fa; }" : "+r"(_a0));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "{ .reg .f32 _fa;\n\t"
@@ -213,7 +221,7 @@ extern "C" __global__ void lat_F2FP(long long* out) {
             "}\n\t"
             : "+r"(_a0) :: "memory");
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     out[2 + threadIdx.x] = (long long)_a0;
     if (threadIdx.x == 0) out[0] = t1 - t0;
 }
@@ -225,7 +233,7 @@ extern "C" __global__ void lat_LOP3(long long* out) {
     int _s1 = gin[threadIdx.x+64];
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("lop3.b32 %0, %0, %1, %2, 0x96;" : "+r"(_a0) : "r"(_s0), "r"(_s1));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "lop3.b32 %0, %0, %1, %2, 0x96;\n\t"
@@ -249,7 +257,7 @@ extern "C" __global__ void lat_LOP3(long long* out) {
             : "memory"
         );
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     out[2 + threadIdx.x] = (long long)_a0;
     if (threadIdx.x == 0) out[0] = t1 - t0;
 }
@@ -260,7 +268,7 @@ extern "C" __global__ void lat_SHF(long long* out) {
     int _s0 = gin[threadIdx.x+32]&31;
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("shf.r.clamp.b32 %0, %0, %1, %0;" : "+r"(_a0) : "r"(_s0));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "shf.r.clamp.b32 %0, %0, %1, %0;\n\t"
@@ -284,7 +292,7 @@ extern "C" __global__ void lat_SHF(long long* out) {
             : "memory"
         );
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     out[2 + threadIdx.x] = (long long)_a0;
     if (threadIdx.x == 0) out[0] = t1 - t0;
 }
@@ -295,7 +303,7 @@ extern "C" __global__ void lat_PRMT(long long* out) {
     unsigned _s0 = gin[threadIdx.x+32];
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("prmt.b32 %0, %0, %1, 0x5410;" : "+r"(_a0) : "r"(_s0));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "prmt.b32 %0, %0, %1, 0x5410;\n\t"
@@ -319,7 +327,7 @@ extern "C" __global__ void lat_PRMT(long long* out) {
             : "memory"
         );
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     out[2 + threadIdx.x] = (long long)_a0;
     if (threadIdx.x == 0) out[0] = t1 - t0;
 }
@@ -330,7 +338,7 @@ extern "C" __global__ void lat_VIADD(long long* out) {
     int _s0 = gin[threadIdx.x+32];
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("vadd.s32.s32.s32 %0, %0, %1;" : "+r"(_a0) : "r"(_s0));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "vadd.s32.s32.s32 %0, %0, %1;\n\t"
@@ -354,7 +362,7 @@ extern "C" __global__ void lat_VIADD(long long* out) {
             : "memory"
         );
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     out[2 + threadIdx.x] = (long long)_a0;
     if (threadIdx.x == 0) out[0] = t1 - t0;
 }
@@ -365,7 +373,7 @@ extern "C" __global__ void lat_IADD3(long long* out) {
     int _s0 = gin[threadIdx.x+32];
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("add.s32 %0, %0, %1;" : "+r"(_a0) : "r"(_s0));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "add.s32 %0, %0, %1;\n\t"
@@ -389,7 +397,7 @@ extern "C" __global__ void lat_IADD3(long long* out) {
             : "memory"
         );
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     out[2 + threadIdx.x] = (long long)_a0;
     if (threadIdx.x == 0) out[0] = t1 - t0;
 }
@@ -401,7 +409,7 @@ extern "C" __global__ void lat_IMAD(long long* out) {
     int _s1 = gin[threadIdx.x+64];
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("mad.lo.s32 %0, %0, %1, %2;" : "+r"(_a0) : "r"(_s0), "r"(_s1));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "mad.lo.s32 %0, %0, %1, %2;\n\t"
@@ -425,7 +433,7 @@ extern "C" __global__ void lat_IMAD(long long* out) {
             : "memory"
         );
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     out[2 + threadIdx.x] = (long long)_a0;
     if (threadIdx.x == 0) out[0] = t1 - t0;
 }
@@ -437,7 +445,7 @@ extern "C" __global__ void lat_SEL(long long* out) {
     int _cond = gin[threadIdx.x + 64];
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("{ .reg .pred _p; setp.ne.s32 _p, %1, 0; selp.b32 %0, %0, %2, _p; }" : "+r"(_a0) : "r"(_cond), "r"(_sv));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "{ .reg .pred _p;\n\t"
@@ -461,7 +469,7 @@ extern "C" __global__ void lat_SEL(long long* out) {
             "}\n\t"
             : "+r"(_a0) : "r"(_cond), "r"(_sv) : "memory");
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     out[2 + threadIdx.x] = (long long)_a0;
     if (threadIdx.x == 0) out[0] = t1 - t0;
 }
@@ -471,7 +479,7 @@ extern "C" __global__ void lat_REDUX(long long* out) {
     int _a0 = gin[threadIdx.x];
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("redux.sync.add.s32 %0, %0, 0xffffffff;" : "+r"(_a0));
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
             "redux.sync.add.s32 %0, %0, 0xffffffff;\n\t"
@@ -494,7 +502,7 @@ extern "C" __global__ void lat_REDUX(long long* out) {
             :: "memory"
         );
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     out[2 + threadIdx.x] = (long long)_a0;
     if (threadIdx.x == 0) out[0] = t1 - t0;
 }
@@ -510,7 +518,7 @@ extern "C" __global__ void lat_LDS(long long* out) {
         unsigned _addr = _base + _idx * 4;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr));
     }
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
@@ -545,7 +553,7 @@ extern "C" __global__ void lat_LDS(long long* out) {
         { unsigned _addr; asm volatile("mad.lo.u32 %0, %1, 4, %2;" : "=r"(_addr) : "r"(_idx), "r"(_base) : "memory");
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_idx) : "r"(_addr) : "memory"); }
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     out[2 + _tid] = (long long)_idx;
     if (_tid == 0) out[0] = t1 - t0;
 }
@@ -555,7 +563,7 @@ extern "C" __global__ void lat_LDG(long long* out) {
     int _idx = 0;
     for (int _w = 0; _w < WARMUP; _w++)
         asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
-    long long t0 = clock64();
+    long long t0 = asm_clock64();
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
         asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
@@ -574,7 +582,7 @@ extern "C" __global__ void lat_LDG(long long* out) {
         asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
         asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(_idx) : "l"(_data + _idx) : "memory");
     }
-    long long t1 = clock64();
+    long long t1 = asm_clock64();
     out[2 + threadIdx.x] = (long long)_idx;
     if (threadIdx.x == 0) out[0] = t1 - t0;
 }
