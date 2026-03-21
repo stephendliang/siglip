@@ -491,7 +491,7 @@ extern "C" __global__ void lat_REDUX(long long* out) {
             "redux.sync.add.s32 %0, %0, 0xffffffff;\n\t"
             "redux.sync.add.s32 %0, %0, 0xffffffff;\n\t"
             : "+r"(_a0)
-            : "memory"
+            :: "memory"
         );
     }
     long long t1 = clock64();

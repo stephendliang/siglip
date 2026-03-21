@@ -133,7 +133,9 @@ def _alu_tput(insn, ilp):
     o.append(f'            : {ocon}')
     if icon:
         o.append(f'            : {icon}')
-    o.append(f'            : "memory"')
+        o.append(f'            : "memory"')
+    else:
+        o.append(f'            :: "memory"')
     o.append(f'        );')
     o.append(f'    }}')
     o.append(f'    long long t1 = clock64();')
@@ -192,7 +194,9 @@ def _alu_lat(insn):
     o.append(f'            : {ocon}')
     if icon:
         o.append(f'            : {icon}')
-    o.append(f'            : "memory"')
+        o.append(f'            : "memory"')
+    else:
+        o.append(f'            :: "memory"')
     o.append(f'        );')
     o.append(f'    }}')
     o.append(f'    long long t1 = clock64();')

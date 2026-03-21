@@ -2081,7 +2081,7 @@ extern "C" __global__ void tput_REDUX_ilp1(long long* out) {
         asm volatile(
             "redux.sync.add.s32 %0, %0, 0xffffffff;\n\t"
             : "+r"(_a0)
-            : "memory"
+            :: "memory"
         );
     }
     long long t1 = clock64();
@@ -2101,7 +2101,7 @@ extern "C" __global__ void tput_REDUX_ilp2(long long* out) {
             "redux.sync.add.s32 %0, %0, 0xffffffff;\n\t"
             "redux.sync.add.s32 %1, %1, 0xffffffff;\n\t"
             : "+r"(_a0), "+r"(_a1)
-            : "memory"
+            :: "memory"
         );
     }
     long long t1 = clock64();
@@ -2125,7 +2125,7 @@ extern "C" __global__ void tput_REDUX_ilp4(long long* out) {
             "redux.sync.add.s32 %2, %2, 0xffffffff;\n\t"
             "redux.sync.add.s32 %3, %3, 0xffffffff;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3)
-            : "memory"
+            :: "memory"
         );
     }
     long long t1 = clock64();
@@ -2157,7 +2157,7 @@ extern "C" __global__ void tput_REDUX_ilp8(long long* out) {
             "redux.sync.add.s32 %6, %6, 0xffffffff;\n\t"
             "redux.sync.add.s32 %7, %7, 0xffffffff;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7)
-            : "memory"
+            :: "memory"
         );
     }
     long long t1 = clock64();
@@ -2205,7 +2205,7 @@ extern "C" __global__ void tput_REDUX_ilp16(long long* out) {
             "redux.sync.add.s32 %14, %14, 0xffffffff;\n\t"
             "redux.sync.add.s32 %15, %15, 0xffffffff;\n\t"
             : "+r"(_a0), "+r"(_a1), "+r"(_a2), "+r"(_a3), "+r"(_a4), "+r"(_a5), "+r"(_a6), "+r"(_a7), "+r"(_a8), "+r"(_a9), "+r"(_a10), "+r"(_a11), "+r"(_a12), "+r"(_a13), "+r"(_a14), "+r"(_a15)
-            : "memory"
+            :: "memory"
         );
     }
     long long t1 = clock64();
