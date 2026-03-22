@@ -1604,8 +1604,12 @@ void k_mw_real_kloop(__grid_constant__ const CUtensorMap tma_a,
                 if (ki >= N_STAGES || w > 0) {
                     mb_wait(tma_mbar[st], tma_ph[st]); tma_ph[st] ^= 1;
                 }
-                /* Wait for previous MMA on this slot */
-                if (ki >= N_STAGES || w > 0) {
+                /* Wait for previous MMA on this slot.
+                   Always skip for ki < N_STAGES — the drain (or initial fill)
+                   already confirmed these stages are free. Using w > 0 here
+                   would add an extra wait per stage per K-loop (drain + ki=0),
+                   consuming a phase flip that hasn't been produced yet. */
+                if (ki >= N_STAGES) {
                     mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
                 }
                 if (s.lane == 0) {
