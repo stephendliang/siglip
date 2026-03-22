@@ -219,9 +219,17 @@ __device__ bool bench_init(Setup &s,
     return s.cta_rank == 0;
 }
 
-__device__ void bench_fini() {
+__device__ void bench_fini(uint32_t sb) {
+    /* Cluster barrier so CTA0 finishes measurement before dealloc */
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
+
+    /* TMEM dealloc — collective, all threads in both CTAs must execute.
+       Read back the TMEM address that alloc wrote to SMEM. */
+    uint32_t taddr;
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(taddr) : "r"(sb + TMEM_OFF));
+    asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
+        :: "r"(taddr), "r"(TMEM_COLS));
 }
 
 /* ═══════ A. MMA issue throughput — ILP sweep ═══════ */
@@ -232,7 +240,7 @@ void k_mma_tput(__grid_constant__ const CUtensorMap tma_a,
                 __grid_constant__ const CUtensorMap tma_b,
                 long long *out) {
     Setup s;
-    if (!bench_init(s, tma_a, tma_b)) { bench_fini(); return; }
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s.sb); return; }
 
     uint64_t da = s.da[0], db = s.db[0];
 
@@ -255,7 +263,7 @@ void k_mma_tput(__grid_constant__ const CUtensorMap tma_a,
         }
         out[0] = tot;
     }
-    bench_fini();
+    bench_fini(s.sb);
 }
 
 /* ═══════ B. K-iteration decomposition ═══════ */
@@ -266,7 +274,7 @@ void k_fence_only(__grid_constant__ const CUtensorMap tma_a,
                   __grid_constant__ const CUtensorMap tma_b,
                   long long *out) {
     Setup s;
-    if (!bench_init(s, tma_a, tma_b)) { bench_fini(); return; }
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s.sb); return; }
 
     if (s.lane == 0) {
         for (int w = 0; w < WARMUP; w++)
@@ -280,7 +288,7 @@ void k_fence_only(__grid_constant__ const CUtensorMap tma_a,
         }
         out[0] = tot;
     }
-    bench_fini();
+    bench_fini(s.sb);
 }
 
 /* Commit only (need MMA issued first) */
@@ -289,7 +297,7 @@ void k_commit_only(__grid_constant__ const CUtensorMap tma_a,
                    __grid_constant__ const CUtensorMap tma_b,
                    long long *out) {
     Setup s;
-    if (!bench_init(s, tma_a, tma_b)) { bench_fini(); return; }
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s.sb); return; }
 
     uint64_t da = s.da[0], db = s.db[0];
     uint32_t mbar0 = s.sb + MB_MMA(0);
@@ -330,7 +338,7 @@ void k_commit_only(__grid_constant__ const CUtensorMap tma_a,
             mb_wait(mbar, ph); ph ^= 1;
         }
     }
-    bench_fini();
+    bench_fini(s.sb);
 }
 
 /* Full K-iteration: fence + 4×MMA + commit + wait */
@@ -339,7 +347,7 @@ void k_kiter_full(__grid_constant__ const CUtensorMap tma_a,
                   __grid_constant__ const CUtensorMap tma_b,
                   long long *out) {
     Setup s;
-    if (!bench_init(s, tma_a, tma_b)) { bench_fini(); return; }
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s.sb); return; }
 
     uint64_t da = s.da[0], db = s.db[0];
     uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
@@ -374,7 +382,7 @@ void k_kiter_full(__grid_constant__ const CUtensorMap tma_a,
     }
 
     if (s.lane == 0) out[0] = tot;
-    bench_fini();
+    bench_fini(s.sb);
 }
 
 /* ═══════ C. MMA latency — issue to TMEM readable ═══════ */
@@ -384,7 +392,7 @@ void k_mma_lat(__grid_constant__ const CUtensorMap tma_a,
                __grid_constant__ const CUtensorMap tma_b,
                long long *out) {
     Setup s;
-    if (!bench_init(s, tma_a, tma_b)) { bench_fini(); return; }
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s.sb); return; }
 
     uint64_t da = s.da[0], db = s.db[0];
     uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
@@ -441,7 +449,7 @@ void k_mma_lat(__grid_constant__ const CUtensorMap tma_a,
         /* Verification: r0 should be ~288.0 for A=B=1.5 FP8, K=128 */
         out[1] = __float_as_int(r0);
     }
-    bench_fini();
+    bench_fini(s.sb);
 }
 
 /* ═══════ D. TMEM load throughput ═══════ */
@@ -452,7 +460,7 @@ void k_tmem_load(__grid_constant__ const CUtensorMap tma_a,
                  __grid_constant__ const CUtensorMap tma_b,
                  long long *out) {
     Setup s;
-    if (!bench_init(s, tma_a, tma_b)) { bench_fini(); return; }
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s.sb); return; }
 
     uint64_t da = s.da[0], db = s.db[0];
     uint32_t mbar = s.sb + MB_MMA(0);
@@ -500,7 +508,7 @@ void k_tmem_load(__grid_constant__ const CUtensorMap tma_a,
     }
 
     if (s.lane == 0) out[0] = tot;
-    bench_fini();
+    bench_fini(s.sb);
 }
 
 /* x32 variant */
@@ -510,7 +518,7 @@ void k_tmem_load_x32(__grid_constant__ const CUtensorMap tma_a,
                      __grid_constant__ const CUtensorMap tma_b,
                      long long *out) {
     Setup s;
-    if (!bench_init(s, tma_a, tma_b)) { bench_fini(); return; }
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s.sb); return; }
 
     uint64_t da = s.da[0], db = s.db[0];
     uint32_t mbar = s.sb + MB_MMA(0);
@@ -567,7 +575,7 @@ void k_tmem_load_x32(__grid_constant__ const CUtensorMap tma_a,
     }
 
     if (s.lane == 0) out[0] = tot;
-    bench_fini();
+    bench_fini(s.sb);
 }
 
 /* ═══════ E. MMA shadow budget — STS/BF16 between MMA and commit ═══════ */
@@ -580,7 +588,7 @@ void k_mma_shadow_sts(__grid_constant__ const CUtensorMap tma_a,
                       __grid_constant__ const CUtensorMap tma_b,
                       long long *out) {
     Setup s;
-    if (!bench_init(s, tma_a, tma_b)) { bench_fini(); return; }
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s.sb); return; }
 
     uint64_t da = s.da[0], db = s.db[0];
     uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
@@ -625,7 +633,7 @@ void k_mma_shadow_sts(__grid_constant__ const CUtensorMap tma_a,
     }
 
     if (s.lane == 0) out[0] = tot;
-    bench_fini();
+    bench_fini(s.sb);
 }
 
 template <int N_BF16>
@@ -634,7 +642,7 @@ void k_mma_shadow_bf16(__grid_constant__ const CUtensorMap tma_a,
                        __grid_constant__ const CUtensorMap tma_b,
                        long long *out) {
     Setup s;
-    if (!bench_init(s, tma_a, tma_b)) { bench_fini(); return; }
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s.sb); return; }
 
     uint64_t da = s.da[0], db = s.db[0];
     uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
@@ -675,7 +683,7 @@ void k_mma_shadow_bf16(__grid_constant__ const CUtensorMap tma_a,
 
     if (s.lane == 0) out[0] = tot;
     if (bf == 0xDEAD) out[1] = bf;   /* prevent DCE */
-    bench_fini();
+    bench_fini(s.sb);
 }
 
 /* ═══════ F. MMA + TMA overlap ═══════ */
@@ -685,7 +693,7 @@ void k_mma_tma_overlap(__grid_constant__ const CUtensorMap tma_a,
                        __grid_constant__ const CUtensorMap tma_b,
                        long long *out) {
     Setup s;
-    if (!bench_init(s, tma_a, tma_b, 2)) { bench_fini(); return; }
+    if (!bench_init(s, tma_a, tma_b, 2)) { bench_fini(s.sb); return; }
 
     uint64_t da = s.da[0], db = s.db[0];
     uint32_t mbar_mma0 = s.sb + MB_MMA(0), mbar_mma1 = s.sb + MB_MMA(1);
@@ -754,7 +762,7 @@ void k_mma_tma_overlap(__grid_constant__ const CUtensorMap tma_a,
         out[0] = t_mma_only;
         out[1] = t_mma_tma;
     }
-    bench_fini();
+    bench_fini(s.sb);
 }
 
 /* ═══════ G. Full K-loop pipeline ═══════ */
@@ -766,7 +774,7 @@ void k_kloop(__grid_constant__ const CUtensorMap tma_a,
              long long *out) {
     Setup s;
     int n_load = K_ITERS < N_STAGES ? K_ITERS : N_STAGES;
-    if (!bench_init(s, tma_a, tma_b, n_load)) { bench_fini(); return; }
+    if (!bench_init(s, tma_a, tma_b, n_load)) { bench_fini(s.sb); return; }
 
     uint32_t mbar[N_STAGES];
     for (int i = 0; i < N_STAGES; i++)
@@ -813,7 +821,7 @@ void k_kloop(__grid_constant__ const CUtensorMap tma_a,
     }
 
     if (s.lane == 0) out[0] = tot;
-    bench_fini();
+    bench_fini(s.sb);
 }
 
 /* ═══════ H. TMEM double-buffer — read buf0 while MMA writes buf1 ═══════ */
@@ -823,7 +831,7 @@ void k_tmem_dbuf(__grid_constant__ const CUtensorMap tma_a,
                  __grid_constant__ const CUtensorMap tma_b,
                  long long *out) {
     Setup s;
-    if (!bench_init(s, tma_a, tma_b)) { bench_fini(); return; }
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s.sb); return; }
 
     uint64_t da = s.da[0], db = s.db[0];
     uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
@@ -914,7 +922,7 @@ void k_tmem_dbuf(__grid_constant__ const CUtensorMap tma_a,
         out[0] = t_mma_only;
         out[1] = t_mma_rd;
     }
-    bench_fini();
+    bench_fini(s.sb);
 }
 
 /* ═══════ Host ═══════ */
