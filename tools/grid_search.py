@@ -270,8 +270,8 @@ INTERACTIONS = {
 # ── Build config ──
 NVCC = 'nvcc'
 ARCH = 'sm_100a'
-CFLAGS = f'-gencode arch=compute_100a,code={ARCH} -O3 -std=c++17 -lineinfo --ptxas-options=-v'
-LDFLAGS = '-lcurand -lcuda'
+CFLAGS = f'-gencode arch=compute_100a,code={ARCH} -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static'
+LDFLAGS = '-lcurand_static -lculibos -lcuda'
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 COMPILE_TIMEOUT = 120

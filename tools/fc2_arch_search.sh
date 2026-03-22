@@ -23,8 +23,8 @@ OUTDIR="data/fc2_arch_${TIMESTAMP}"
 mkdir -p "$OUTDIR"
 
 NVCC="nvcc"
-CFLAGS="-gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v"
-LDFLAGS="-lcurand -lcuda"
+CFLAGS="-gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static"
+LDFLAGS="-lcurand_static -lculibos -lcuda"
 SRC="fc2.cu"
 BIN="$OUTDIR/fc2_test"
 
@@ -70,6 +70,11 @@ add "stages_c"             "$SC_BASE"
 add "stages_c_pc"          "$SC_BASE -DPRE_COMBINE=1"
 add "stages_c_x64"         "$SC_BASE -DTMEM_LOAD_WIDTH=64"
 add "stages_c_x64_pc"      "$SC_BASE -DTMEM_LOAD_WIDTH=64 -DPRE_COMBINE=1"
+
+# ── StagesC + SMEM reuse (NS5 + StagesC, staging overlaps pipeline stages) ──
+REUSE_BASE="-DN_STAGES=5 -DINTERLEAVE_STRATEGY=1 -DBIAS_SMEM=1 -DPHASE1_UNROLL=1 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=0 -DTMA_RESIDUAL=1 -DSTAGES_C=2 -DEPI_NOINLINE=1 -DEPI_REUSE_SMEM=1"
+add "reuse_sc"             "$REUSE_BASE"
+add "reuse_sc_pc"          "$REUSE_BASE -DPRE_COMBINE=1"
 
 # ── Filter ──
 if [ -n "$ONLY" ]; then

@@ -1620,6 +1620,9 @@ persistent_gemm(
         mbar_init(smem_to_uint(smem + OFF_RES_CONSUMED_MBAR), NUM_EPI_WARPS);
 #endif
 #endif
+#if EPI_REUSE_SMEM
+        mbar_init(smem_to_uint(smem + OFF_EPI_DONE_MBAR), NUM_EPI_WARPS);
+#endif
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
@@ -1647,6 +1650,9 @@ persistent_gemm(
 
     int tma_phase[N_STAGES] = {0};
     int mma_phase[N_STAGES] = {0};
+#if EPI_REUSE_SMEM
+    int epi_done_phase = 0;
+#endif
 
     uint64_t desc_a_base[N_STAGES], desc_b_base[N_STAGES];
     for (int s = 0; s < N_STAGES; s++) {
@@ -1713,6 +1719,15 @@ persistent_gemm(
                     mbar_wait(mma_mbar_s, mma_phase[s]);
                     mma_phase[s] ^= 1;
                 }
+
+#if EPI_REUSE_SMEM
+                /* Wait for previous tile's epilogue to release borrowed pipeline stages.
+                   Only needed once per tile, at the first K-iter using a borrowed stage. */
+                if (ki == EPI_FIRST_BORROW_KI && tile_idx > tile_start) {
+                    mbar_wait(smem_base + OFF_EPI_DONE_MBAR, epi_done_phase);
+                    epi_done_phase ^= 1;
+                }
+#endif
 
                 if (lane == 0) {
                     const uint32_t a_dst = smem_base + s * STAGE_BYTES;
@@ -2247,6 +2262,12 @@ persistent_gemm(
                 }
 #endif
             }
+#if EPI_REUSE_SMEM
+            /* Signal W0 that staging SMEM (borrowed pipeline stages) is free.
+               On tile_start (no epilogue): forward-signal so W0 doesn't block.
+               On subsequent tiles: signals after Phase 1 completes. */
+            if (lane == 0) mbar_arrive(smem_to_uint(smem + OFF_EPI_DONE_MBAR));
+#endif
         }
     }  // tile loop
 

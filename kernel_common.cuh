@@ -147,6 +147,12 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef STAGES_C
 #define STAGES_C 0               // 0=off, 2=2-stage residual pipeline (W0 pre-loads, requires TMA_RESIDUAL)
 #endif
+#ifndef EPI_REUSE_SMEM
+#define EPI_REUSE_SMEM 0         // 1=epilogue staging overlaps pipeline stages (enables NS5+StagesC)
+#endif
+#if EPI_REUSE_SMEM && N_STAGES < 3
+#error "EPI_REUSE_SMEM requires N_STAGES >= 3"
+#endif
 #ifndef BRANCHLESS_EPI
 #define BRANCHLESS_EPI 0         // 1=predicated TMA + deferred stores + full unroll (requires STAGES_C>=2, BIAS_BF16)
 #endif
@@ -238,11 +244,17 @@ Problem dimensions — N_DIM must be defined before including this header
 #else
 #define _MBAR_END          (OFF_EPILOGUE_MBAR + 16)
 #endif
+#if EPI_REUSE_SMEM
+#define OFF_EPI_DONE_MBAR  _MBAR_END
+#define _MBAR_END_FINAL    (OFF_EPI_DONE_MBAR + 8)
+#else
+#define _MBAR_END_FINAL    _MBAR_END
+#endif
 #if BIAS_SMEM
-#define OFF_BIAS_SMEM      ((_MBAR_END + 15) & ~15)                       // 16-align for ld.shared.v4.b32
+#define OFF_BIAS_SMEM      ((_MBAR_END_FINAL + 15) & ~15)                       // 16-align for ld.shared.v4.b32
 #define OFF_STAGING        ((OFF_BIAS_SMEM + BIAS_SMEM_BYTES + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
 #else
-#define OFF_STAGING        ((_MBAR_END + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
+#define OFF_STAGING        ((_MBAR_END_FINAL + 1023) & ~1023)  // 1024-align for SWIZZLE_128B
 #endif
 #define STAGING_REGION_ROW_BYTES  128                                               // 64 BF16 cols = 128 bytes (SWIZZLE_128B)
 #define STAGING_REGION_BYTES      (32 * STAGING_REGION_ROW_BYTES)                   // 4096 bytes per region (32 rows x 128B)
@@ -254,6 +266,24 @@ Problem dimensions — N_DIM must be defined before including this header
 #define STAGING_WARP_BYTES        (STAGING_REGIONS_PER_WARP * STAGING_REGION_BYTES)  // bytes per warp
 #define STAGING_EPI_WARPS         NUM_EPI_WARPS
 #define SMEM_BYTES                ((OFF_STAGING + STAGING_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
+
+#if EPI_REUSE_SMEM
+/*
+Pipeline SMEM reuse: epilogue staging overlaps with last N pipeline stages.
+Saves 64-96KB, enabling NS5+StagesC within 228KB limit.
+W0 waits on epi_done_mbar before loading borrowed stages each tile.
+*/
+#define EPI_BORROW_STAGES   ((STAGING_EPI_WARPS * STAGING_WARP_BYTES + STAGE_BYTES - 1) / STAGE_BYTES)
+#define EPI_FIRST_BORROW_KI (N_STAGES - EPI_BORROW_STAGES)
+#undef OFF_STAGING
+#define OFF_STAGING          (EPI_FIRST_BORROW_KI * STAGE_BYTES)
+#undef SMEM_BYTES
+#if BIAS_SMEM
+#define SMEM_BYTES           ((OFF_BIAS_SMEM + BIAS_SMEM_BYTES + 127) & ~127)
+#else
+#define SMEM_BYTES           ((_MBAR_END_FINAL + 127) & ~127)
+#endif
+#endif /* EPI_REUSE_SMEM */
 
 // WGMMA / TMEM constants
 #define TMEM_COLS      512
