@@ -18,6 +18,12 @@ Sections:
   J. MMA compute time — commit to mbar_wait return (tensor core latency)
   K. Cross-warp epilogue handoff — W1 commit → W2 mbar_wait + TMEM_LD
   L. Multi-warp contention — 4 epilogue warps STS/LDS/BF16 during MMA
+  N. Full epilogue pipeline — TMEM_LD+F2FP+HADD2+STS+fence during MMA
+  O. Combined MMA shadow — full epilogue work in single-warp shadow window
+  P. W0 TMA dispatch during MMA — TMA load contention test
+  Q. fence.proxy.async + mbar_arrive during MMA
+  R. Pipelined K-loop with TMA — W0 TMA + W1 MMA (realistic FC2 pattern)
+  S. TMA store during MMA — cp.async.bulk.tensor store contention
   M. Multi-SM scaling — all 74 clusters, per-cluster throughput variance
 
 Requires: SM100a (B200), cta_group::2, __cluster_dims__(2,1,1)
@@ -27,6 +33,7 @@ Build: make mma-bench && ./mma-bench
 #include <cstdio>
 #include <cstdint>
 #include <cuda.h>
+#include <cuda_bf16.h>
 
 #define WARMUP 32
 #define REPS   256
@@ -1295,6 +1302,449 @@ void k_mw_mixed(__grid_constant__ const CUtensorMap tma_a,
     mw_fini(s);
 }
 
+/* ═══════ N. Full epilogue pipeline during MMA ═══════ */
+/* W1 does MMA. W2-W5 run realistic FC2 epilogue:
+   TMEM_LD → F2FP (f32→bf16) → HADD2 (bias add) → STS.128 → fence.proxy.async.
+   Tests whether the FULL epilogue sequence contends (not just STS like section L). */
+
+__global__ __launch_bounds__(MW_THREADS, 1) __cluster_dims__(2, 1, 1)
+void k_mw_full_epi(__grid_constant__ const CUtensorMap tma_a,
+                   __grid_constant__ const CUtensorMap tma_b,
+                   long long *out) {
+    MWSetup s;
+    if (!mw_init(s, tma_a, tma_b)) { mw_fini(s); return; }
+
+    uint64_t da = s.da[0], db = s.db[0];
+    uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
+
+    if (s.warp == 1) {
+        int ph0 = 0, ph1 = 0;
+        for (int w = 0; w < WARMUP; w++) {
+            uint32_t mbar = (w & 1) ? mbar1 : mbar0;
+            int &ph = (w & 1) ? ph1 : ph0;
+            if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, w > 0 ? 1 : 0); mma_commit(mbar); }
+            mb_wait(mbar, ph); ph ^= 1;
+        }
+        long long tot = 0;
+        for (int rep = 0; rep < REPS; rep++) {
+            uint32_t mbar = (rep & 1) ? mbar1 : mbar0;
+            int &ph = (rep & 1) ? ph1 : ph0;
+            long long t0 = clk();
+            if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, 1); mma_commit(mbar); }
+            mb_wait(mbar, ph); ph ^= 1;
+            long long t1 = clk();
+            if (s.lane == 0) tot += t1 - t0;
+        }
+        if (s.lane == 0) out[0] = tot;
+    } else if (s.warp >= 2) {
+        float r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15;
+        uint32_t sts_addr = s.sb + WORK_OFF + (s.warp - 2) * 1024 + s.lane * 16;
+        uint32_t bf = 0x3c003c00u;
+        #pragma unroll 1
+        for (int i = 0; i < (WARMUP + REPS) * 4; i++) {
+            /* TMEM_LD: read 32 cols of FP32 accumulators */
+            asm volatile(
+                "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+                "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+                : "=f"(r0),"=f"(r1),"=f"(r2),"=f"(r3),"=f"(r4),"=f"(r5),"=f"(r6),"=f"(r7),
+                  "=f"(r8),"=f"(r9),"=f"(r10),"=f"(r11),"=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15)
+                : "r"(0));
+            /* F2FP: convert 8 f32 pairs → 4 bf16x2 */
+            uint32_t b0, b1, b2, b3;
+            asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(b0) : "f"(r0), "f"(r1));
+            asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(b1) : "f"(r2), "f"(r3));
+            asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(b2) : "f"(r4), "f"(r5));
+            asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(b3) : "f"(r6), "f"(r7));
+            /* HADD2: add bias */
+            asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(b0) : "r"(bf));
+            asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(b1) : "r"(bf));
+            asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(b2) : "r"(bf));
+            asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(b3) : "r"(bf));
+            /* STS.128 */
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                         :: "r"(sts_addr), "r"(b0), "r"(b1), "r"(b2), "r"(b3) : "memory");
+            /* fence.proxy.async (required before TMA store in FC2) */
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        }
+        if (bf == 0xDEAD) out[1] = bf;
+    }
+    mw_fini(s);
+}
+
+/* ═══════ O. Combined MMA shadow budget ═══════ */
+/* Full epilogue work inside a single warp's MMA shadow window:
+   TMEM_LD → F2FP → HADD2 → STS → fence.proxy.async, all between dispatch and commit.
+   Section E tested STS and BF16 separately. This tests the realistic combined workload. */
+
+template <int N_CHUNKS>
+__global__ __launch_bounds__(32, 1) __cluster_dims__(2, 1, 1)
+void k_mma_shadow_combined(__grid_constant__ const CUtensorMap tma_a,
+                           __grid_constant__ const CUtensorMap tma_b,
+                           long long *out) {
+    Setup s;
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s); return; }
+
+    uint64_t da = s.da[0], db = s.db[0];
+    uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
+    uint32_t sts_addr = s.sb + WORK_OFF + s.lane * 16;
+    uint32_t bf = 0x3c003c00u;
+    float r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15;
+
+    /* Pre-fill TMEM */
+    if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, 0); mma_commit(mbar0); }
+    mb_wait(mbar0, 0);
+
+    /* Warmup */
+    int ph0 = 1, ph1 = 0;
+    for (int w = 0; w < WARMUP; w++) {
+        uint32_t mbar = (w & 1) ? mbar1 : mbar0;
+        int &ph = (w & 1) ? ph1 : ph0;
+        if (s.lane == 0) {
+            mma_fence();
+            MMA_4SUB(0, da, db, 1);
+        }
+        /* Epilogue work in MMA shadow */
+        for (int c = 0; c < N_CHUNKS; c++) {
+            asm volatile(
+                "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+                "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+                : "=f"(r0),"=f"(r1),"=f"(r2),"=f"(r3),"=f"(r4),"=f"(r5),"=f"(r6),"=f"(r7),
+                  "=f"(r8),"=f"(r9),"=f"(r10),"=f"(r11),"=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15)
+                : "r"(0));
+            uint32_t b0, b1, b2, b3;
+            asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(b0) : "f"(r0), "f"(r1));
+            asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(b1) : "f"(r2), "f"(r3));
+            asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(b2) : "f"(r4), "f"(r5));
+            asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(b3) : "f"(r6), "f"(r7));
+            asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(b0) : "r"(bf));
+            asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(b1) : "r"(bf));
+            asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(b2) : "r"(bf));
+            asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(b3) : "r"(bf));
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                         :: "r"(sts_addr), "r"(b0), "r"(b1), "r"(b2), "r"(b3) : "memory");
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        }
+        if (s.lane == 0) mma_commit(mbar);
+        mb_wait(mbar, ph); ph ^= 1;
+    }
+
+    /* Measure */
+    long long tot = 0;
+    for (int rep = 0; rep < REPS; rep++) {
+        uint32_t mbar = (rep & 1) ? mbar1 : mbar0;
+        int &ph = (rep & 1) ? ph1 : ph0;
+        long long t0 = clk();
+        if (s.lane == 0) {
+            mma_fence();
+            MMA_4SUB(0, da, db, 1);
+        }
+        for (int c = 0; c < N_CHUNKS; c++) {
+            asm volatile(
+                "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+                "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+                : "=f"(r0),"=f"(r1),"=f"(r2),"=f"(r3),"=f"(r4),"=f"(r5),"=f"(r6),"=f"(r7),
+                  "=f"(r8),"=f"(r9),"=f"(r10),"=f"(r11),"=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15)
+                : "r"(0));
+            uint32_t b0, b1, b2, b3;
+            asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(b0) : "f"(r0), "f"(r1));
+            asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(b1) : "f"(r2), "f"(r3));
+            asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(b2) : "f"(r4), "f"(r5));
+            asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(b3) : "f"(r6), "f"(r7));
+            asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(b0) : "r"(bf));
+            asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(b1) : "r"(bf));
+            asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(b2) : "r"(bf));
+            asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(b3) : "r"(bf));
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                         :: "r"(sts_addr), "r"(b0), "r"(b1), "r"(b2), "r"(b3) : "memory");
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        }
+        if (s.lane == 0) mma_commit(mbar);
+        mb_wait(mbar, ph); ph ^= 1;
+        long long t1 = clk();
+        if (s.lane == 0) tot += t1 - t0;
+    }
+    if (s.lane == 0) out[0] = tot;
+    if (bf == 0xDEAD) out[2] = bf;
+    bench_fini(s);
+}
+
+/* ═══════ P. W0 TMA dispatch during MMA ═══════ */
+/* W0 continuously issues TMA loads. W1 does MMA (timed).
+   Tests whether TMA dispatch from a separate warp contends with MMA. */
+
+__global__ __launch_bounds__(MW_THREADS, 1) __cluster_dims__(2, 1, 1)
+void k_mw_tma_mma(__grid_constant__ const CUtensorMap tma_a,
+                   __grid_constant__ const CUtensorMap tma_b,
+                   long long *out) {
+    MWSetup s;
+    if (!mw_init(s, tma_a, tma_b)) { mw_fini(s); return; }
+
+    uint64_t da = s.da[0], db = s.db[0];
+    uint32_t mma_mbar0 = s.sb + MB_MMA(0), mma_mbar1 = s.sb + MB_MMA(1);
+    /* W0 uses TMA mbar slots 2,3 (0 was used by mw_init) */
+    uint32_t tma_m0 = s.sb + MB_TMA(2), tma_m1 = s.sb + MB_TMA(3);
+
+    if (s.warp == 1) {
+        /* MMA warp: timed K-iterations */
+        int ph0 = 0, ph1 = 0;
+        for (int w = 0; w < WARMUP; w++) {
+            uint32_t mbar = (w & 1) ? mma_mbar1 : mma_mbar0;
+            int &ph = (w & 1) ? ph1 : ph0;
+            if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, w > 0 ? 1 : 0); mma_commit(mbar); }
+            mb_wait(mbar, ph); ph ^= 1;
+        }
+        long long tot = 0;
+        for (int rep = 0; rep < REPS; rep++) {
+            uint32_t mbar = (rep & 1) ? mma_mbar1 : mma_mbar0;
+            int &ph = (rep & 1) ? ph1 : ph0;
+            long long t0 = clk();
+            if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, 1); mma_commit(mbar); }
+            mb_wait(mbar, ph); ph ^= 1;
+            long long t1 = clk();
+            if (s.lane == 0) tot += t1 - t0;
+        }
+        if (s.lane == 0) out[0] = tot;
+    } else if (s.warp == 0 && s.lane == 0) {
+        /* TMA warp: continuous TMA loads with backpressure */
+        int tph0 = 0, tph1 = 0;
+        for (int i = 0; i < (WARMUP + REPS) * 2; i++) {
+            uint32_t tmb = (i & 1) ? tma_m1 : tma_m0;
+            int &tph = (i & 1) ? tph1 : tph0;
+            mb_expect_tx(tmb, A_SZ + B_SZ);
+            tma_ld(s.sb + STAGE_A(2), &tma_a,
+                   0, s.cta_rank * BENCH_TM, tmb);
+            tma_ld(s.sb + STAGE_B(2), &tma_b,
+                   0, s.cta_rank * (BENCH_TN / 2), tmb);
+            mb_wait(tmb, tph); tph ^= 1;
+        }
+    }
+    mw_fini(s);
+}
+
+/* ═══════ Q. fence.proxy.async + mbar_arrive during MMA ═══════ */
+/* W2-W5 do continuous fence.proxy.async + mbar_arrive.
+   Isolates whether these specific operations contend with MMA
+   (section L tested STS/LDS but not fence/mbar). */
+
+template <int N_FENCE>
+__global__ __launch_bounds__(MW_THREADS, 1) __cluster_dims__(2, 1, 1)
+void k_mw_fence(__grid_constant__ const CUtensorMap tma_a,
+                __grid_constant__ const CUtensorMap tma_b,
+                long long *out) {
+    MWSetup s;
+    if (!mw_init(s, tma_a, tma_b)) { mw_fini(s); return; }
+
+    uint64_t da = s.da[0], db = s.db[0];
+    uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
+    /* Epilogue warps use their own mbar for arrive testing */
+    uint32_t epi_mbar = s.sb + MBAR_OFF + (12 + s.warp) * 8;
+
+    if (s.warp == 1) {
+        int ph0 = 0, ph1 = 0;
+        for (int w = 0; w < WARMUP; w++) {
+            uint32_t mbar = (w & 1) ? mbar1 : mbar0;
+            int &ph = (w & 1) ? ph1 : ph0;
+            if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, w > 0 ? 1 : 0); mma_commit(mbar); }
+            mb_wait(mbar, ph); ph ^= 1;
+        }
+        long long tot = 0;
+        for (int rep = 0; rep < REPS; rep++) {
+            uint32_t mbar = (rep & 1) ? mbar1 : mbar0;
+            int &ph = (rep & 1) ? ph1 : ph0;
+            long long t0 = clk();
+            if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, 1); mma_commit(mbar); }
+            mb_wait(mbar, ph); ph ^= 1;
+            long long t1 = clk();
+            if (s.lane == 0) tot += t1 - t0;
+        }
+        if (s.lane == 0) out[0] = tot;
+    } else if (s.warp >= 2 && N_FENCE > 0) {
+        #pragma unroll 1
+        for (int i = 0; i < (WARMUP + REPS) * N_FENCE; i++) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            if (s.lane == 0)
+                mb_arrive(epi_mbar);
+        }
+    }
+    mw_fini(s);
+}
+
+/* ═══════ R. Pipelined K-loop with interleaved TMA ═══════ */
+/* W0 does TMA loads, W1 does MMA — the real FC2 K-loop pattern.
+   Pipeline: W0 fills stage s+N_STAGES via TMA while W1 processes stage s via MMA.
+   TMA mbars signal data ready (W0→W1), MMA mbars signal stage free (W1→W0).
+   Measures the true K-loop floor with realistic TMA interleaving. */
+
+#define KLOOP_ITERS 24  /* FC2: K=3072, TK=128 → 24 iterations */
+
+__global__ __launch_bounds__(MW_THREADS, 1) __cluster_dims__(2, 1, 1)
+void k_mw_real_kloop(__grid_constant__ const CUtensorMap tma_a,
+                     __grid_constant__ const CUtensorMap tma_b,
+                     long long *out) {
+    MWSetup s;
+    if (!mw_init(s, tma_a, tma_b, N_STAGES)) { mw_fini(s); return; }
+
+    uint32_t mma_mbar[N_STAGES], tma_mbar[N_STAGES];
+    int mma_ph[N_STAGES], tma_ph[N_STAGES];
+    for (int i = 0; i < N_STAGES; i++) {
+        mma_mbar[i] = s.sb + MB_MMA(i);
+        tma_mbar[i] = s.sb + MB_TMA(i);
+        mma_ph[i] = 0;
+        tma_ph[i] = 1; /* mw_init loaded all N_STAGES, so phase 0 done */
+    }
+
+    if (s.warp == 1) {
+        /* W1: MMA warp — process stages in pipeline order */
+
+        /* Warmup (4 full K-loops) */
+        for (int w = 0; w < 4; w++) {
+            for (int ki = 0; ki < KLOOP_ITERS; ki++) {
+                int st = ki % N_STAGES;
+                /* Wait for TMA data (first pass of first warmup: already loaded) */
+                if (ki >= N_STAGES || w > 0) {
+                    mb_wait(tma_mbar[st], tma_ph[st]); tma_ph[st] ^= 1;
+                }
+                /* Wait for previous MMA on this slot */
+                if (ki >= N_STAGES || w > 0) {
+                    mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+                }
+                if (s.lane == 0) {
+                    mma_fence();
+                    MMA_4SUB(0, s.da[st], s.db[st], ki > 0 || w > 0 ? 1 : 0);
+                    mma_commit(mma_mbar[st]);
+                }
+            }
+            /* Drain: wait for last N_STAGES commits */
+            for (int i = 0; i < N_STAGES && i < KLOOP_ITERS; i++) {
+                int st = (KLOOP_ITERS - N_STAGES + i) % N_STAGES;
+                mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+            }
+        }
+
+        /* Measure */
+        long long tot = 0;
+        for (int rep = 0; rep < REPS; rep++) {
+            long long t0 = clk();
+            for (int ki = 0; ki < KLOOP_ITERS; ki++) {
+                int st = ki % N_STAGES;
+                mb_wait(tma_mbar[st], tma_ph[st]); tma_ph[st] ^= 1;
+                if (ki >= N_STAGES) {
+                    mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+                }
+                if (s.lane == 0) {
+                    mma_fence();
+                    MMA_4SUB(0, s.da[st], s.db[st], 1);
+                    mma_commit(mma_mbar[st]);
+                }
+            }
+            for (int i = 0; i < N_STAGES && i < KLOOP_ITERS; i++) {
+                int st = (KLOOP_ITERS - N_STAGES + i) % N_STAGES;
+                mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+            }
+            long long t1 = clk();
+            if (s.lane == 0) tot += t1 - t0;
+        }
+        if (s.lane == 0) out[0] = tot;
+
+    } else if (s.warp == 0) {
+        /* W0: TMA warp — reload stages for W1's pipeline.
+           For each K-iter (beyond initial fill), wait for MMA to free the stage,
+           then issue TMA loads. Coordinates wrap around the small tensor. */
+        for (int rep = 0; rep < 4 + REPS; rep++) {
+            for (int ki = 0; ki < KLOOP_ITERS; ki++) {
+                int st = ki % N_STAGES;
+                /* Wait for MMA to finish with this stage before overwriting */
+                if (ki >= N_STAGES || rep > 0) {
+                    mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+                }
+                /* Issue TMA loads (only lane 0) */
+                if (s.lane == 0) {
+                    int coord_k = (ki % (GA_K / BENCH_TK)) * BENCH_TK;
+                    mb_expect_tx(tma_mbar[st], A_SZ + B_SZ);
+                    tma_ld(s.sb + STAGE_A(st), &tma_a,
+                           coord_k, s.cta_rank * BENCH_TM, tma_mbar[st]);
+                    tma_ld(s.sb + STAGE_B(st), &tma_b,
+                           coord_k, s.cta_rank * (BENCH_TN / 2), tma_mbar[st]);
+                }
+            }
+        }
+    }
+    /* W2-W5 idle */
+    mw_fini(s);
+}
+
+/* ═══════ S. TMA store during MMA ═══════ */
+/* W2-W5 do TMA stores (cp.async.bulk.tensor.2d) while W1 does MMA.
+   Tests whether TMA store contends with MMA compute.
+   Uses a BF16 output tensor map passed as third kernel argument. */
+
+__device__ __forceinline__
+void tma_st(const void *tm, int x, int y, uint32_t smem_src) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+        :: "l"(tm), "r"(x), "r"(y), "r"(smem_src) : "memory");
+}
+
+template <int N_STORE>
+__global__ __launch_bounds__(MW_THREADS, 1) __cluster_dims__(2, 1, 1)
+void k_mw_tma_store(__grid_constant__ const CUtensorMap tma_a,
+                    __grid_constant__ const CUtensorMap tma_b,
+                    __grid_constant__ const CUtensorMap tma_c,
+                    long long *out) {
+    MWSetup s;
+    if (!mw_init(s, tma_a, tma_b)) { mw_fini(s); return; }
+
+    uint64_t da = s.da[0], db = s.db[0];
+    uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
+
+    /* Pre-fill WORK area with valid BF16 data for TMA stores */
+    if (s.warp == 0) {
+        uint32_t v = 0x3c003c00u;
+        for (int i = s.lane; i < WORK_SZ / 4; i += 32)
+            asm volatile("st.shared.b32 [%0], %1;"
+                :: "r"(s.sb + WORK_OFF + i * 4), "r"(v) : "memory");
+    }
+    __syncthreads();
+
+    if (s.warp == 1) {
+        int ph0 = 0, ph1 = 0;
+        for (int w = 0; w < WARMUP; w++) {
+            uint32_t mbar = (w & 1) ? mbar1 : mbar0;
+            int &ph = (w & 1) ? ph1 : ph0;
+            if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, w > 0 ? 1 : 0); mma_commit(mbar); }
+            mb_wait(mbar, ph); ph ^= 1;
+        }
+        long long tot = 0;
+        for (int rep = 0; rep < REPS; rep++) {
+            uint32_t mbar = (rep & 1) ? mbar1 : mbar0;
+            int &ph = (rep & 1) ? ph1 : ph0;
+            long long t0 = clk();
+            if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, 1); mma_commit(mbar); }
+            mb_wait(mbar, ph); ph ^= 1;
+            long long t1 = clk();
+            if (s.lane == 0) tot += t1 - t0;
+        }
+        if (s.lane == 0) out[0] = tot;
+    } else if (s.warp >= 2 && N_STORE > 0) {
+        /* TMA store from WORK area to global via tma_c.
+           Each store: fence.proxy.async → TMA store → commit_group → wait_group.
+           box=[64,32] BF16 = 4096 bytes per store. */
+        int col = (s.warp - 2) * 64;    /* each warp stores different 64-col region */
+        int row = s.cta_rank * BENCH_TM; /* row offset for this CTA */
+        uint32_t src = s.sb + WORK_OFF + (s.warp - 2) * 4096;
+        #pragma unroll 1
+        for (int i = 0; i < (WARMUP + REPS) * N_STORE; i++) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            if (s.lane == 0) {
+                tma_st(&tma_c, col, row, src);
+                asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+                asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+            }
+        }
+    }
+    mw_fini(s);
+}
+
 /* ═══════ M. Multi-SM scaling ═══════ */
 /* Launch on all 74 clusters (148 SMs). Each measures K-iteration throughput.
    Stresses memory subsystem and reveals system-level contention. */
@@ -1347,8 +1797,16 @@ int main() {
     CUDA_CHECK(cudaMemset(d_A, 0x3C, (size_t)GA_K * GA_M));   /* FP8 E4M3 = 1.5 */
     CUDA_CHECK(cudaMemset(d_B, 0x3C, (size_t)GB_K * GB_N));
 
+    /* BF16 output for TMA store tests (section S) */
+    /* [N_DIM, M_DIM] = [256, 256] BF16 — enough for one tile */
+    #define GC_N 256
+    #define GC_M 256
+    __nv_bfloat16 *d_C;
+    CUDA_CHECK(cudaMalloc(&d_C, (size_t)GC_N * GC_M * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMemset(d_C, 0, (size_t)GC_N * GC_M * sizeof(__nv_bfloat16)));
+
     /* Tensor maps */
-    CUtensorMap tma_a, tma_b;
+    CUtensorMap tma_a, tma_b, tma_c;
     {
         uint64_t dims[2]    = {(uint64_t)GA_K, (uint64_t)GA_M};
         uint64_t strides[1] = {(uint64_t)GA_K};
@@ -1367,6 +1825,18 @@ int main() {
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&tma_b,
             CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (void*)d_B,
+            dims, strides, box, estrides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    }
+    {
+        /* TMA store descriptor: BF16 [N=256, M=256], box=[64,32] matching FC2 */
+        uint64_t dims[2]    = {(uint64_t)GC_N, (uint64_t)GC_M};
+        uint64_t strides[1] = {(uint64_t)GC_N * sizeof(__nv_bfloat16)};
+        uint32_t box[2]     = {64, 32};
+        uint32_t estrides[2]= {1, 1};
+        CU_CHECK(cuTensorMapEncodeTiled(&tma_c,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_C,
             dims, strides, box, estrides,
             CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
             CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
@@ -1422,6 +1892,22 @@ int main() {
     set_smem((const void*)k_mw_sts<8>);
     set_smem((const void*)k_mw_sts<16>);
     set_smem((const void*)k_mw_mixed);
+    set_smem((const void*)k_mw_full_epi);
+    set_smem((const void*)k_mma_shadow_combined<0>);
+    set_smem((const void*)k_mma_shadow_combined<1>);
+    set_smem((const void*)k_mma_shadow_combined<2>);
+    set_smem((const void*)k_mma_shadow_combined<4>);
+    set_smem((const void*)k_mma_shadow_combined<8>);
+    set_smem((const void*)k_mw_tma_mma);
+    set_smem((const void*)k_mw_fence<0>);
+    set_smem((const void*)k_mw_fence<4>);
+    set_smem((const void*)k_mw_fence<8>);
+    set_smem((const void*)k_mw_fence<16>);
+    set_smem((const void*)k_mw_real_kloop);
+    set_smem((const void*)k_mw_tma_store<0>);
+    set_smem((const void*)k_mw_tma_store<1>);
+    set_smem((const void*)k_mw_tma_store<2>);
+    set_smem((const void*)k_mw_tma_store<4>);
     set_smem((const void*)k_multi_sm);
 
     long long *d_out, h[256];
@@ -1705,6 +2191,133 @@ int main() {
         printf("    mixed:       %6.1f cyc/iter\n", (double)h[0] / REPS);
     }
 
+    /* ═══ N. FULL EPILOGUE PIPELINE DURING MMA ═══ */
+    printf("\n═══ N. Full Epilogue Pipeline (TMEM_LD+F2FP+HADD2+STS+fence during MMA) ═══\n\n");
+    cur = "N.full_epi";
+    {
+        dim3 grid_mw(2), block_mw(MW_THREADS);
+        reset(); k_mw_full_epi<<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); sync();
+        double t = (double)h[0] / REPS;
+        printf("  W1 K-iter with full epilogue pipeline on W2-W5:\n");
+        printf("    full_epi:    %6.1f cyc/iter\n", t);
+        printf("  cf. baseline (L, no epi):  %6.1f cyc/iter\n", (double)h[0] / REPS); /* re-use for clarity */
+
+        /* Run L baseline for direct comparison */
+        reset(); k_mw_sts<0><<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); sync();
+        double t_base = (double)h[0] / REPS;
+        printf("    no_epi:      %6.1f cyc/iter  (L baseline re-run)\n", t_base);
+        printf("    overhead:   %+6.1f cyc  (%.1f%%)\n", t - t_base, 100.0 * (t / t_base - 1.0));
+    }
+
+    /* ═══ O. COMBINED MMA SHADOW BUDGET ═══ */
+    printf("\n═══ O. Combined MMA Shadow (TMEM_LD+F2FP+HADD2+STS+fence in shadow window) ═══\n\n");
+    {
+        double base_o = 0;
+        for (int n : {0, 1, 2, 4, 8}) {
+            cur = "O.combined";
+            reset();
+            switch (n) {
+                case 0: k_mma_shadow_combined<0><<<grid, block, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+                case 1: k_mma_shadow_combined<1><<<grid, block, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+                case 2: k_mma_shadow_combined<2><<<grid, block, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+                case 4: k_mma_shadow_combined<4><<<grid, block, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+                case 8: k_mma_shadow_combined<8><<<grid, block, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+            }
+            sync();
+            double t = (double)h[0] / REPS;
+            if (n == 0) base_o = t;
+            printf("  chunks=%d:  %6.1f cyc", n, t);
+            if (n == 0) printf("  (baseline)");
+            else printf("  (%+.1f vs base, %.1f%% hidden)", t - base_o, base_o > 0 ? 100.0 * (1.0 - (t - base_o) / (t - base_o + base_o)) : 0.0);
+            /* Each chunk = 1 TMEM_LD + 4 F2FP + 4 HADD2 + 1 STS + 1 fence */
+            printf("\n");
+        }
+        printf("  (each chunk = TMEM_LD.x16 + 4×F2FP + 4×HADD2 + STS.128 + fence.proxy.async)\n");
+    }
+
+    /* ═══ P. W0 TMA DISPATCH DURING MMA ═══ */
+    printf("\n═══ P. W0 TMA Dispatch During MMA (TMA contention test) ═══\n\n");
+    cur = "P.tma_mma";
+    {
+        dim3 grid_mw(2), block_mw(MW_THREADS);
+        reset(); k_mw_tma_mma<<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); sync();
+        double t_tma = (double)h[0] / REPS;
+
+        /* Baseline: W0 idle */
+        reset(); k_mw_sts<0><<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); sync();
+        double t_base = (double)h[0] / REPS;
+
+        printf("  W1 K-iter with W0 doing continuous TMA loads:\n");
+        printf("    W0 TMA active: %6.1f cyc/iter\n", t_tma);
+        printf("    W0 idle:       %6.1f cyc/iter  (baseline)\n", t_base);
+        printf("    overhead:     %+6.1f cyc  (%.1f%%)\n",
+               t_tma - t_base, 100.0 * (t_tma / t_base - 1.0));
+    }
+
+    /* ═══ Q. FENCE.PROXY.ASYNC + MBAR DURING MMA ═══ */
+    printf("\n═══ Q. fence.proxy.async + mbar_arrive During MMA ═══\n\n");
+    {
+        dim3 grid_mw(2), block_mw(MW_THREADS);
+        printf("  W1 K-iter with W2-W5 doing fence+mbar_arrive:\n");
+        for (int n : {0, 4, 8, 16}) {
+            cur = "Q.fence";
+            reset();
+            switch (n) {
+                case 0:  k_mw_fence<0> <<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+                case 4:  k_mw_fence<4> <<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+                case 8:  k_mw_fence<8> <<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+                case 16: k_mw_fence<16><<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+            }
+            sync();
+            double t = (double)h[0] / REPS;
+            printf("    N_FENCE=%2d:  %6.1f cyc/iter", n, t);
+            if (n == 0) printf("  (baseline)");
+            printf("\n");
+        }
+    }
+
+    /* ═══ R. PIPELINED K-LOOP WITH TMA ═══ */
+    printf("\n═══ R. Pipelined K-Loop (W0=TMA, W1=MMA, %d iters, %d stages) ═══\n\n",
+           KLOOP_ITERS, N_STAGES);
+    cur = "R.kloop_tma";
+    {
+        dim3 grid_mw(2), block_mw(MW_THREADS);
+        reset(); k_mw_real_kloop<<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); sync();
+        double t_tma_kloop = (double)h[0] / REPS;
+        double per_iter = t_tma_kloop / KLOOP_ITERS;
+        printf("  W0 TMA + W1 MMA pipelined K-loop:\n");
+        printf("    total:      %8.1f cyc  (%d iters)\n", t_tma_kloop, KLOOP_ITERS);
+        printf("    per-iter:   %8.1f cyc/iter\n", per_iter);
+        printf("  cf. MMA-only K-loop (G, K=%d):  per-iter=%.1f cyc\n", KLOOP_ITERS,
+               12614.0 / KLOOP_ITERS); /* from section G output, hardcoded for reference */
+        printf("  cf. single K-iter (B):           %.1f cyc\n", t_kiter);
+        printf("  TMA overhead:  %.1f cyc/iter (%.1f%%)\n",
+               per_iter - 525.6, 100.0 * (per_iter / 525.6 - 1.0));
+    }
+
+    /* ═══ S. TMA STORE DURING MMA ═══ */
+    printf("\n═══ S. TMA Store During MMA (cp.async.bulk.tensor.2d contention) ═══\n\n");
+    {
+        dim3 grid_mw(2), block_mw(MW_THREADS);
+        printf("  W1 K-iter with W2-W5 doing TMA stores:\n");
+        for (int n : {0, 1, 2, 4}) {
+            cur = "S.tma_store";
+            reset();
+            switch (n) {
+                case 0: k_mw_tma_store<0><<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, tma_c, d_out); break;
+                case 1: k_mw_tma_store<1><<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, tma_c, d_out); break;
+                case 2: k_mw_tma_store<2><<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, tma_c, d_out); break;
+                case 4: k_mw_tma_store<4><<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, tma_c, d_out); break;
+            }
+            sync();
+            double t = (double)h[0] / REPS;
+            printf("    N_STORE=%d:  %6.1f cyc/iter", n, t);
+            if (n == 0) printf("  (baseline)");
+            printf("\n");
+        }
+        printf("  (each store = fence.proxy.async + TMA store 64×32 BF16 + commit + wait)\n");
+    }
+
     /* ═══ M. MULTI-SM SCALING ═══ */
     printf("\n═══ M. Multi-SM Scaling (%d clusters, K-iter throughput) ═══\n\n", MAX_CLUSTERS);
     cur = "M.multi_sm";
@@ -1736,6 +2349,7 @@ int main() {
 
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
+    CUDA_CHECK(cudaFree(d_C));
     CUDA_CHECK(cudaFree(d_out));
     return 0;
 }

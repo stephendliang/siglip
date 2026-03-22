@@ -83,6 +83,7 @@ void epilogue_store(
 #endif
 #if STAGES_C >= 2
     , uint32_t sc_release_mbar_base
+    , int sc_phase
 #endif
 #if W0_RES_PREFETCH || W0_RES_FULL || EPI_LOAD_WARP
     , uint32_t res_consumed_mbar_addr
@@ -550,12 +551,14 @@ void epilogue_store(
                          taddr_base + pnc_s);
 
 #if STAGES_C >= 2
-            /* Wait for W0's TMA load to complete — per-(warp,stage) mbar */
-            mbar_wait(res_mbar_addr + pass * 8, res_phase);
+            /* Wait for W0's TMA load to complete — per-(warp,stage) mbar.
+               Per-pass mbars all share the same phase (W0 arrives once per tile per mbar),
+               so use sc_phase (tracked per-tile in persistent_gemm), not res_phase. */
+            mbar_wait(res_mbar_addr + pass * 8, sc_phase);
 #else
             mbar_wait(res_mbar_addr, res_phase);
-#endif
             res_phase ^= 1;
+#endif
 
 #if DEFERRED_WAIT
             if (pass > 0) {
@@ -1656,7 +1659,7 @@ persistent_gemm(
     int ml_phase[2]  = {start_buf, 1 - start_buf};
 #if STAGES_C >= 2
     int sc_rel_phase[STAGES_C] = {0};
-    int sc_load_phase[STAGES_C] = {0};
+    int sc_consumer_phase = 0;
 #elif W0_RES_FULL
     int res_consumed_phase = 0;
     int res_pass_phase = 0;
@@ -1738,8 +1741,8 @@ persistent_gemm(
             if (lane == 0) {
                 if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                     for (int pass = 0; pass < 2; pass++) {
-                        /* Wait for consumer to release this stage (skip first 2 tiles) */
-                        if (tile_idx > tile_start + 1) {
+                        /* Wait for consumer to release this stage (skip first tile — no consumer yet) */
+                        if (tile_idx > tile_start) {
                             mbar_wait(smem_base + OFF_SC_REL_MBAR + pass * 8,
                                       sc_rel_phase[pass]);
                             sc_rel_phase[pass] ^= 1;
@@ -2157,6 +2160,7 @@ persistent_gemm(
 #endif
 #if STAGES_C >= 2
                             , smem_to_uint(smem + OFF_SC_REL_MBAR)
+                            , sc_consumer_phase
 #endif
 #if W0_RES_FULL || W0_RES_PREFETCH || EPI_LOAD_WARP
                             , smem_to_uint(smem + OFF_RES_CONSUMED_MBAR)
@@ -2179,6 +2183,7 @@ persistent_gemm(
 #endif
 #if STAGES_C >= 2
                             , smem_to_uint(smem + OFF_SC_REL_MBAR)
+                            , sc_consumer_phase
 #endif
 #if W0_RES_FULL || W0_RES_PREFETCH || EPI_LOAD_WARP
                             , smem_to_uint(smem + OFF_RES_CONSUMED_MBAR)
@@ -2203,6 +2208,7 @@ persistent_gemm(
 #endif
 #if STAGES_C >= 2
                             , smem_to_uint(smem + OFF_SC_REL_MBAR)
+                            , sc_consumer_phase
 #endif
 #if W0_RES_FULL || W0_RES_PREFETCH || EPI_LOAD_WARP
                         , smem_to_uint(smem + OFF_RES_CONSUMED_MBAR)
@@ -2215,6 +2221,9 @@ persistent_gemm(
 #endif
                     );
                 }
+#if STAGES_C >= 2
+                sc_consumer_phase ^= 1;
+#endif
 #ifdef TIMING
                 if (lane == 0 && cta_rank == 0) {
                     long long p1 = epi_t1 - epi_t0;
@@ -2397,6 +2406,7 @@ persistent_gemm(
 #endif
 #if STAGES_C >= 2
                     , smem_to_uint(smem + OFF_SC_REL_MBAR)
+                    , sc_consumer_phase
 #endif
 #if W0_RES_FULL || EPI_LOAD_WARP
                     , 0
@@ -2419,6 +2429,7 @@ persistent_gemm(
 #endif
 #if STAGES_C >= 2
                     , smem_to_uint(smem + OFF_SC_REL_MBAR)
+                    , sc_consumer_phase
 #endif
 #if W0_RES_FULL || EPI_LOAD_WARP
                     , 0
@@ -2443,6 +2454,7 @@ persistent_gemm(
 #endif
 #if STAGES_C >= 2
                 , smem_to_uint(smem + OFF_SC_REL_MBAR)
+                , sc_consumer_phase
 #endif
 #if W0_RES_FULL || EPI_LOAD_WARP
                 , 0

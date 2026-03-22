@@ -87,6 +87,9 @@ Usage: #define N_DIM and K_DIM before including this header.
 #if STAGES_C && (W0_RES_FULL || W0_RES_PREFETCH || EPI_LOAD_WARP)
 #error "STAGES_C mutually exclusive with W0_RES_FULL/W0_RES_PREFETCH/EPI_LOAD_WARP"
 #endif
+#if STAGES_C && defined(TMEM_LOAD_WIDTH) && TMEM_LOAD_WIDTH > 32
+#error "STAGES_C requires TMEM_LOAD_WIDTH=32 (x64 path has broken mbar/staging addressing for STAGES_C)"
+#endif
 #ifndef SUB_MMA_UNROLL
 #define SUB_MMA_UNROLL  0    // Sub-MMA inner loop: 0=no pragma, 1=no unroll, N=unroll by N
 #endif
