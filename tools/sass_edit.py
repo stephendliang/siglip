@@ -15,6 +15,12 @@ Usage:
     sass_edit.py verify CUBIN --sass FILE [--kernel NAME]
     sass_edit.py diff CUBIN_A CUBIN_B [--kernel NAME]
     sass_edit.py deps CUBIN --sass FILE --start ADDR --end ADDR [--reorder ADDR,ADDR,...]
+    sass_edit.py probe-encoding CUBIN --sass FILE [--kernel NAME]
+    sass_edit.py patch-reg CUBIN ADDR FIELD REG -o OUTPUT [--sass FILE]
+    sass_edit.py copy-insn CUBIN SRC DST -o OUTPUT [--sass FILE]
+    sass_edit.py pipeline CUBIN --sass FILE --start ADDR --end ADDR [--generate FILE]
+    sass_edit.py schedule CUBIN --sass FILE --start ADDR --end ADDR [--recipe FILE] [-o OUTPUT]
+    sass_edit.py find-donors CUBIN --sass FILE [--family NAME]
     sass_edit.py fatbin-patch HOST_BINARY --sass FILE [--script FILE | --stall ADDR VAL] -o OUTPUT
 """
 
@@ -124,6 +130,158 @@ def ctrl_str(ctrl_val):
     if hi:
         parts.append('hi=%010x' % hi)
     return ' '.join(parts)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Instruction encoding — register field positions (SM100a)
+#
+# SM100a SASS instructions are 128 bits: encoding (64-bit) + control (64-bit).
+# Register operands are encoded as 8-bit fields in the encoding word.
+# Positions verified empirically by cross-referencing FC2 cuobjdump text
+# (mnemonic + operands) with binary encoding values.
+#
+# Standard ALU layout:
+#   bits[15:0]  = opcode (instruction type + modifiers)
+#   bits[23:16] = destination register (R0-R255, 0xff = RZ)
+#   bits[31:24] = source register 1
+#   bits[39:32] = source register 2 (or immediate for some opcodes)
+#   bits[63:40] = immediate extension / modifier bits
+#
+# Store layout (STS, STG):
+#   bits[15:0]  = opcode
+#   bits[23:16] = 0x00 (no destination)
+#   bits[31:24] = address register
+#   bits[39:32] = data register (base of vector for .128/.64)
+#   bits[63:40] = offset immediate
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+NOP_ENCODING = 0x0000000000007918
+
+
+def insn_family(mnemonic):
+    """Get base instruction family (strip predicate guard + dot suffixes)."""
+    if not mnemonic:
+        return None
+    bare = mnemonic.split(None, 1)[-1] if mnemonic.startswith('@') else mnemonic
+    return bare.split('.')[0]
+
+
+def read_enc_field(encoding, bit_offset, width):
+    """Read a field from the 64-bit encoding word."""
+    return (encoding >> bit_offset) & ((1 << width) - 1)
+
+
+def write_enc_field(encoding, bit_offset, width, value):
+    """Write a field in the 64-bit encoding word, preserving all other bits."""
+    mask = ((1 << width) - 1) << bit_offset
+    return (encoding & ~mask) | ((value & ((1 << width) - 1)) << bit_offset)
+
+
+# Per-family register field layout.
+# Each entry: list of (field_name, text_operand_index, bit_offset, width).
+# text_operand_index = which cuobjdump text operand this field corresponds to.
+# Field positions verified from FC2 NS5 SASS dump cross-reference.
+FAMILY_REG_FIELDS = {
+    # Standard 3-operand ALU: Rd @ [23:16], Rs1 @ [31:24], Rs2 @ [39:32]
+    'F2FP':  [('dst', 0, 16, 8), ('src1', 1, 24, 8), ('src2', 2, 32, 8)],
+    'HADD2': [('dst', 0, 16, 8), ('src1', 1, 24, 8), ('src2', 2, 32, 8)],
+    'HFMA2': [('dst', 0, 16, 8), ('src1', 1, 24, 8), ('src2', 2, 32, 8)],
+    'FADD':  [('dst', 0, 16, 8), ('src1', 1, 24, 8), ('src2', 2, 32, 8)],
+    'FMUL':  [('dst', 0, 16, 8), ('src1', 1, 24, 8), ('src2', 2, 32, 8)],
+    'FFMA':  [('dst', 0, 16, 8), ('src1', 1, 24, 8), ('src2', 2, 32, 8)],
+    'SEL':   [('dst', 0, 16, 8), ('src1', 1, 24, 8), ('src2', 2, 32, 8)],
+    'MOV':   [('dst', 0, 16, 8), ('src1', 1, 24, 8)],
+    'LOP3':  [('dst', 0, 16, 8), ('src1', 1, 24, 8)],
+    'SHF':   [('dst', 0, 16, 8), ('src1', 1, 24, 8)],
+    'PRMT':  [('dst', 0, 16, 8), ('src1', 1, 24, 8)],
+
+    # Integer ALU: dst @ [23:16], first GPR source @ [31:24]
+    'IADD3': [('dst', 0, 16, 8), ('src1', 3, 24, 8)],
+    'IMAD':  [('dst', 0, 16, 8), ('src1', 1, 24, 8)],
+    'LEA':   [('dst', 0, 16, 8), ('src1', 1, 24, 8)],
+
+    # Stores: no dst; addr @ [31:24], data @ [39:32]
+    'STS':   [('addr', 0, 24, 8), ('data', 1, 32, 8)],
+    'STG':   [('addr', 0, 24, 8), ('data', 1, 32, 8)],
+    'STL':   [('addr', 0, 24, 8), ('data', 1, 32, 8)],
+
+    # Loads: dst @ [23:16], addr @ [31:24]
+    'LDG':   [('dst', 0, 16, 8), ('addr', 1, 24, 8)],
+    'LDS':   [('dst', 0, 16, 8), ('addr', 1, 24, 8)],
+    'LDC':   [('dst', 0, 16, 8)],
+    'LDTM':  [('dst', 0, 16, 8)],
+    'LDSM':  [('dst', 0, 16, 8)],
+
+    # System: dst only
+    'S2R':   [('dst', 0, 16, 8)],
+    'R2UR':  [],
+
+    # Tensor core + TMA (uniform register operands, not GPR)
+    # UTCQMMA.2CTA gdesc[URa], gdesc[URb], tmem[URc], tmem[URd], idesc[URe]
+    #   bits[31:24]=URa (gdesc1), [39:32]=URb (gdesc2), [47:40]=URd (tmem_src)
+    #   URc (tmem_dst) and URe (idesc) packed elsewhere
+    'UTCQMMA': [('ur_gdesc1', 0, 24, 8), ('ur_gdesc2', 1, 32, 8),
+                ('ur_tmem_src', 3, 40, 8)],
+    # UTMALDG.2D.2CTA [URa], [URb]
+    #   bits[31:24]=URb (src desc), [39:32]=URa (dst desc)  (reversed from text!)
+    'UTMALDG': [('ur_dst', 0, 32, 8), ('ur_src', 1, 24, 8)],
+    # UTMASTG.2D [URa], [URb] — reversed: URb@[31:24], URa@[39:32]
+    'UTMASTG': [('ur_dst', 0, 32, 8), ('ur_src', 1, 24, 8)],
+
+    # Store-to-async-shared: same layout as STS
+    'STAS':  [('addr', 0, 24, 8), ('data', 1, 32, 8)],
+
+    # Shuffle: SHFL.IDX PT, Rd, Rs, Rclamp, imm
+    # text op0=pred, op1=dst, op2=src, op3=clamp
+    'SHFL':  [('dst', 1, 16, 8), ('src', 2, 24, 8), ('clamp', 3, 32, 8)],
+
+    # Return: non-standard encoding
+    'RET':   [],
+
+    # Uniform find-leading-one: UFLO.U32 URd, URs → dst@[23:16], src@[39:32]
+    'UFLO':  [('ur_dst', 0, 16, 8), ('ur_src', 1, 32, 8)],
+
+    # Tensor core atomics:
+    #   UTCATOMSWS.2CTA.FIND_AND_SET.ALIGN UP, URa, URb → URa@[23:16], URb@[39:32]
+    #   UTCATOMSWS.AND URZ, URa → URa@[39:32]
+    # Only the FIND_AND_SET variant has op at [23:16]; AND variant has 0xff there.
+    # Use the common field (op @ [39:32]) for both.
+    'UTCATOMSWS': [('ur_op', -1, 32, 8)],
+
+    # Predicates: complex encoding, not field-patchable
+    'ISETP': [],
+    'FSETP': [],
+    'HSETP2': [],
+    'PLOP3': [],
+
+    # Control: no patchable register fields
+    'NOP':   [],
+    'EXIT':  [],
+    'BRA':   [],
+    'BSSY':  [],
+    'BSYNC': [],
+    'BAR':   [],
+    'MEMBAR': [],
+    'FENCE': [],
+    'WARPSYNC': [],
+    'YIELD': [],
+    'NANOSLEEP': [],
+    'DEPBAR': [],
+    'UTCBAR': [],
+}
+
+_DEFAULT_REG_FIELDS = [('dst', 0, 16, 8), ('src1', 1, 24, 8), ('src2', 2, 32, 8)]
+
+
+def get_reg_fields(mnemonic):
+    """Get register field layout for an instruction.
+
+    Returns list of (field_name, text_op_index, bit_offset, width).
+    """
+    family = insn_family(mnemonic)
+    if family is None:
+        return []
+    return FAMILY_REG_FIELDS.get(family, _DEFAULT_REG_FIELDS)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -842,6 +1000,844 @@ def audit_stalls(instructions):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Encoding verification + donor lookup
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_RE_GPR_NUM = re.compile(r'\bR(\d+)')
+
+
+def probe_reg_fields(kernel):
+    """Verify register field positions by cross-referencing SASS text with binary.
+
+    For each instruction with known text operands, checks that register numbers
+    parsed from the cuobjdump text match the values at the expected bit positions
+    in the encoding word.
+
+    Returns dict: family → {'matches': n, 'mismatches': n, 'details': [...]}.
+    """
+    results = {}
+
+    for insn in kernel.instructions:
+        if not insn.mnemonic or not insn.operands:
+            continue
+
+        family = insn_family(insn.mnemonic)
+        if family is None:
+            continue
+
+        fields = get_reg_fields(insn.mnemonic)
+        if not fields:
+            continue
+
+        raw_ops = _split_operands(insn.operands)
+
+        if family not in results:
+            results[family] = {'matches': 0, 'mismatches': 0, 'details': []}
+
+        for field_name, text_idx, bit_off, width in fields:
+            if text_idx >= len(raw_ops):
+                continue
+
+            op_text = raw_ops[text_idx].replace('.reuse', '')
+            # Match UR fields with UR regex, GPR fields with GPR regex
+            if field_name.startswith('ur_'):
+                m = _RE_URG.search(op_text)
+            else:
+                m = _RE_GPR_NUM.search(op_text)
+            if not m:
+                continue
+
+            expected = int(m.group(1))
+            actual = read_enc_field(insn.encoding, bit_off, width)
+
+            if actual == expected:
+                results[family]['matches'] += 1
+            else:
+                results[family]['mismatches'] += 1
+                results[family]['details'].append(
+                    '[%04x] %s: %s expected R%d at bits[%d:%d], got %d (0x%02x)' % (
+                        insn.offset, insn.mnemonic, field_name,
+                        expected, bit_off + width - 1, bit_off, actual, actual))
+
+    return results
+
+
+def find_donors(kernel):
+    """Find donor instructions for each opcode family in the kernel.
+
+    Returns dict: family → list of (addr, mnemonic, operands, encoding) for
+    instructions that can serve as encoding templates.
+    """
+    donors = {}
+    for insn in kernel.instructions:
+        if not insn.mnemonic:
+            continue
+        family = insn_family(insn.mnemonic)
+        if family is None:
+            continue
+        if family not in donors:
+            donors[family] = []
+        donors[family].append((insn.offset, insn.mnemonic, insn.operands or '',
+                               insn.encoding))
+    return donors
+
+
+def find_nops(kernel):
+    """Find all NOP instructions in the kernel (available as scratch space).
+
+    Returns list of (addr, control_word).
+    """
+    nops = []
+    for insn in kernel.instructions:
+        if insn.encoding == NOP_ENCODING:
+            nops.append((insn.offset, insn.control))
+        elif insn.mnemonic and insn_family(insn.mnemonic) == 'NOP':
+            nops.append((insn.offset, insn.control))
+    return nops
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Epilogue analysis + software pipelining
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_VECTOR_WIDTHS_ENC = {'.128': 4, '.64': 2}
+
+
+def _enc_vector_width(mnemonic):
+    """Get vector width from mnemonic suffix (for encoding-level analysis)."""
+    if not mnemonic:
+        return 1
+    bare = mnemonic.split(None, 1)[-1] if mnemonic.startswith('@') else mnemonic
+    for suffix, w in _VECTOR_WIDTHS_ENC.items():
+        if suffix in bare:
+            return w
+    return 1
+
+
+class EpilogueGroup:
+    """A compute+store group in the epilogue."""
+
+    def __init__(self, group_idx, compute_insns, store_insns):
+        self.group_idx = group_idx
+        self.compute_insns = compute_insns
+        self.store_insns = store_insns
+
+    @property
+    def compute_range(self):
+        if not self.compute_insns:
+            return (0, 0)
+        return (self.compute_insns[0].offset,
+                self.compute_insns[-1].offset + INSN_SIZE)
+
+    @property
+    def store_range(self):
+        if not self.store_insns:
+            return (0, 0)
+        return (self.store_insns[0].offset,
+                self.store_insns[-1].offset + INSN_SIZE)
+
+    def compute_defs(self):
+        """All registers defined by compute instructions."""
+        defs = set()
+        for insn in self.compute_insns:
+            d, _ = parse_reg_operands(insn.mnemonic, insn.operands)
+            defs |= d
+        return defs
+
+    def compute_uses(self):
+        """All registers used by compute instructions."""
+        uses = set()
+        for insn in self.compute_insns:
+            _, u = parse_reg_operands(insn.mnemonic, insn.operands)
+            uses |= u
+        return uses
+
+    def store_uses(self):
+        """All registers used by store instructions (addr + data vectors)."""
+        uses = set()
+        for insn in self.store_insns:
+            _, u = parse_reg_operands(insn.mnemonic, insn.operands)
+            uses |= u
+        return uses
+
+    def store_data_vectors(self):
+        """Get (base_reg_num, width) for each store's data register.
+
+        For STS.128, this returns the base register and vector width (4),
+        meaning the store reads [base, base+1, base+2, base+3].
+        """
+        vectors = []
+        for insn in self.store_insns:
+            family = insn_family(insn.mnemonic)
+            if family not in ('STS', 'STG', 'STL'):
+                continue
+            width = _enc_vector_width(insn.mnemonic)
+            data_reg = read_enc_field(insn.encoding, 32, 8)
+            vectors.append((data_reg, width))
+        return vectors
+
+
+def identify_epilogue_groups(instructions, store_family='STS'):
+    """Parse instruction list into epilogue groups (compute + store blocks).
+
+    A group is a block of non-store instructions followed by a cluster of
+    store instructions. Groups are identified by finding store clusters and
+    assigning preceding compute instructions to each.
+
+    Returns list of EpilogueGroup.
+    """
+    n = len(instructions)
+
+    # Find store clusters (runs of consecutive store instructions)
+    clusters = []
+    i = 0
+    while i < n:
+        insn = instructions[i]
+        if insn.mnemonic and insn_family(insn.mnemonic) == store_family:
+            start = i
+            while i < n and instructions[i].mnemonic and \
+                    insn_family(instructions[i].mnemonic) == store_family:
+                i += 1
+            clusters.append((start, i))
+        else:
+            i += 1
+
+    if not clusters:
+        return []
+
+    # Build groups: compute block before each store cluster + the cluster
+    groups = []
+    prev_end = 0
+    for gidx, (sstart, send) in enumerate(clusters):
+        compute = instructions[prev_end:sstart]
+        stores = instructions[sstart:send]
+        groups.append(EpilogueGroup(gidx, compute, stores))
+        prev_end = send
+
+    return groups
+
+
+def analyze_interleave(groups):
+    """Analyze interleaving opportunities between adjacent epilogue groups.
+
+    For each pair of adjacent groups (N, N+1), determines:
+    - Register conflicts (group N store uses ∩ group N+1 compute defs)
+    - Vector groups that need full remapping
+    - Number of spare registers needed
+
+    Returns list of dicts, one per adjacent pair.
+    """
+    analyses = []
+
+    for i in range(len(groups) - 1):
+        gn = groups[i]
+        gn1 = groups[i + 1]
+
+        n_store_uses = gn.store_uses()
+        n1_compute_defs = gn1.compute_defs()
+        conflicts = n_store_uses & n1_compute_defs
+
+        # Expand conflicts to full vector groups for stores
+        # If any register in a store's vector range conflicts, the whole vector
+        # must be remapped (STS.128 reads 4 consecutive regs from base)
+        expanded = set()
+        for base_reg, width in gn.store_data_vectors():
+            vec_regs = {'R%d' % (base_reg + j) for j in range(width)}
+            if conflicts & vec_regs:
+                expanded |= vec_regs
+
+        # Also add any non-vector GPR conflicts
+        expanded |= {r for r in conflicts if r.startswith('R')}
+
+        # Compute how many spare GPRs needed for remapping
+        gpr_conflicts = sorted(
+            [r for r in expanded if r.startswith('R')],
+            key=lambda r: int(r[1:]))
+
+        analyses.append({
+            'group_n': i,
+            'group_n1': i + 1,
+            'conflicts': conflicts,
+            'expanded': expanded,
+            'gpr_remap_needed': len(gpr_conflicts),
+            'gpr_conflicts': gpr_conflicts,
+            'n_store_count': len(gn.store_insns),
+            'n1_compute_count': len(gn1.compute_insns),
+        })
+
+    return analyses
+
+
+def plan_remap(conflicts_expanded, spare_start=208, spare_end=255):
+    """Generate register remapping for conflict resolution.
+
+    Maps conflicting GPR names to spare register numbers.
+    Returns dict: reg_name (e.g., 'R89') → new_reg_number (e.g., 208).
+    """
+    remap = {}
+    spare_next = spare_start
+    for reg in sorted(conflicts_expanded,
+                      key=lambda r: int(r[1:]) if r[1:].isdigit() else 999):
+        if not reg.startswith('R'):
+            continue
+        if spare_next > spare_end:
+            break
+        remap[reg] = spare_next
+        spare_next += 1
+    return remap
+
+
+def generate_interleave_recipe(groups, analyses, spare_start=208):
+    """Generate an edit recipe for software-pipelined epilogue.
+
+    Produces a list of edit commands (as strings) that can be written to a
+    script file and applied with the script command.
+
+    Strategy per group pair (N, N+1):
+    1. Remap conflicting registers in group N+1's compute + stores
+    2. Interleave group N+1's compute between group N's store instructions
+    3. Recompute stall counts for the affected region
+    """
+    recipe_lines = []
+    recipe_lines.append('# Auto-generated software pipeline recipe')
+    recipe_lines.append('# Groups: %d, Pairs: %d' % (len(groups), len(analyses)))
+    recipe_lines.append('')
+
+    for analysis in analyses:
+        gi = analysis['group_n']
+        gn = groups[gi]
+        gn1 = groups[gi + 1]
+
+        recipe_lines.append('# === Groups %d-%d interleave ===' % (gi, gi + 1))
+
+        # Register remapping
+        if analysis['expanded']:
+            remap = plan_remap(analysis['expanded'], spare_start)
+            recipe_lines.append('# Register remap (%d registers):' % len(remap))
+            for old_name, new_num in sorted(remap.items(),
+                                            key=lambda x: int(x[0][1:])):
+                recipe_lines.append('#   %s -> R%d' % (old_name, new_num))
+            recipe_lines.append('')
+
+            # Patch registers in group N+1's compute instructions
+            for insn in gn1.compute_insns:
+                if not insn.mnemonic:
+                    continue
+                fields = get_reg_fields(insn.mnemonic)
+                defs, uses = parse_reg_operands(insn.mnemonic, insn.operands)
+
+                # Check if any def or use needs remapping
+                all_regs = defs | uses
+                needs_patch = all_regs & set(remap.keys())
+                if not needs_patch:
+                    continue
+
+                for field_name, text_idx, bit_off, width in fields:
+                    current_val = read_enc_field(insn.encoding, bit_off, width)
+                    current_name = 'R%d' % current_val
+                    if current_name in remap:
+                        recipe_lines.append(
+                            'patch-reg 0x%04x %s %d  # %s -> R%d' % (
+                                insn.offset, field_name, remap[current_name],
+                                current_name, remap[current_name]))
+
+            # Patch registers in group N+1's store instructions
+            for insn in gn1.store_insns:
+                if not insn.mnemonic:
+                    continue
+                fields = get_reg_fields(insn.mnemonic)
+                for field_name, text_idx, bit_off, width in fields:
+                    if field_name != 'data':
+                        continue
+                    current_val = read_enc_field(insn.encoding, bit_off, width)
+                    current_name = 'R%d' % current_val
+                    if current_name in remap:
+                        recipe_lines.append(
+                            'patch-reg 0x%04x %s %d  # %s -> R%d' % (
+                                insn.offset, field_name, remap[current_name],
+                                current_name, remap[current_name]))
+
+            recipe_lines.append('')
+
+        # Interleave schedule: distribute N+1 compute between N stores
+        n_stores = len(gn.store_insns)
+        n1_compute = list(gn1.compute_insns)
+
+        if n_stores > 0 and n1_compute:
+            # Split N+1 compute into chunks to fill between stores
+            # Each STS has 32-cycle throughput → can fit ~15 compute ops in the gap
+            chunk_size = max(1, len(n1_compute) // n_stores)
+            chunks = []
+            for ci in range(n_stores):
+                start = ci * chunk_size
+                end = start + chunk_size if ci < n_stores - 1 else len(n1_compute)
+                chunks.append(n1_compute[start:end])
+
+            recipe_lines.append('# Interleave schedule:')
+            for si, store_insn in enumerate(gn.store_insns):
+                recipe_lines.append('#   STS @ 0x%04x' % store_insn.offset)
+                if si < len(chunks):
+                    for ci_insn in chunks[si]:
+                        recipe_lines.append(
+                            '#     + 0x%04x %s' % (
+                                ci_insn.offset,
+                                (ci_insn.mnemonic or '?')[:40]))
+
+            # Build the reorder address sequence
+            reorder_addrs = []
+            all_addrs = set()
+            for si, store_insn in enumerate(gn.store_insns):
+                reorder_addrs.append(store_insn.offset)
+                all_addrs.add(store_insn.offset)
+                if si < len(chunks):
+                    for ci_insn in chunks[si]:
+                        reorder_addrs.append(ci_insn.offset)
+                        all_addrs.add(ci_insn.offset)
+
+            # Only generate reorder if we have a valid contiguous region
+            # This is complex because the instructions may not be contiguous
+            # (group N stores and group N+1 compute are in different address ranges)
+            recipe_lines.append('')
+            recipe_lines.append(
+                '# NOTE: Interleaving requires swapping instructions between')
+            recipe_lines.append(
+                '# non-contiguous regions. Use copy + nop commands to move')
+            recipe_lines.append(
+                '# instructions from group %d compute into NOP slots near' % (gi + 1))
+            recipe_lines.append(
+                '# group %d stores, then restall.' % gi)
+
+        recipe_lines.append('')
+
+    # Final restall for the whole region
+    if groups:
+        start_addr = groups[0].compute_range[0]
+        end_addr = groups[-1].store_range[1]
+        recipe_lines.append('# Restall the entire edited region')
+        recipe_lines.append('restall 0x%04x 0x%04x' % (start_addr, end_addr))
+
+    return recipe_lines
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CP-SAT optimal instruction scheduler
+#
+# Uses OR-Tools Constraint Programming to find the minimum-cycle instruction
+# ordering for a SASS region, subject to:
+#   - Data dependencies (RAW/WAW/WAR from register def/use analysis)
+#   - Calibrated producer latencies (from B200 measurements)
+#   - Per-pipe throughput constraints (from conflict matrix)
+#   - Stall cap of 15 cycles (SM100a control word is 4 bits)
+#   - Barrier boundaries (no crossing fences/syncs)
+#
+# The SM100a is in-order dispatch — the scheduler chooses an ordering, and
+# the stall counts between consecutive instructions are derived from
+# latency requirements. The key insight: STS.128 has 32-cycle throughput
+# but max stall is 15, so the scheduler MUST interleave independent compute
+# in the STS stall windows.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Execution pipe assignment from B200 conflict matrix.
+# BF16 pipe: 7.5% overhead with STS (nearly independent)
+# ALU pipe: 17% overhead with STS (some contention)
+# STORE pipe: STS/STG/STAS share LSU, nearly additive
+# FAST_INT: IADD3 is free everywhere (2-cycle latency = throughput)
+# LOAD pipe: LDS/LDG/LDC/LDTM — shared memory/global load unit
+
+PIPE_STORE = 'STORE'
+PIPE_BF16 = 'BF16'
+PIPE_ALU = 'ALU'
+PIPE_FAST_INT = 'FAST_INT'
+PIPE_LOAD = 'LOAD'
+PIPE_SPECIAL = 'SPECIAL'
+PIPE_NONE = 'NONE'
+
+_PIPE_MAP = {
+    'STS':    PIPE_STORE,
+    'STG':    PIPE_STORE,
+    'STAS':   PIPE_STORE,
+    'STL':    PIPE_STORE,
+    'HADD2':  PIPE_BF16,
+    'HFMA2':  PIPE_BF16,
+    'F2FP':   PIPE_BF16,
+    'HSETP2': PIPE_BF16,
+    'IADD3':  PIPE_FAST_INT,
+    'LEA':    PIPE_FAST_INT,
+    'MOV':    PIPE_FAST_INT,
+    'FADD':   PIPE_ALU,
+    'FMUL':   PIPE_ALU,
+    'FFMA':   PIPE_ALU,
+    'IMAD':   PIPE_ALU,
+    'LOP3':   PIPE_ALU,
+    'PRMT':   PIPE_ALU,
+    'SHF':    PIPE_ALU,
+    'SEL':    PIPE_ALU,
+    'CSEL':   PIPE_ALU,
+    'ISETP':  PIPE_ALU,
+    'FSETP':  PIPE_ALU,
+    'PLOP3':  PIPE_ALU,
+    'LDS':    PIPE_LOAD,
+    'LDSM':   PIPE_LOAD,
+    'LDG':    PIPE_LOAD,
+    'LDC':    PIPE_LOAD,
+    'LDTM':   PIPE_LOAD,
+    'REDUX':  PIPE_SPECIAL,
+    'SHFL':   PIPE_SPECIAL,
+    'VIADD':  PIPE_SPECIAL,
+    'R2UR':   PIPE_SPECIAL,
+    'S2R':    PIPE_FAST_INT,
+    'UMOV':   PIPE_FAST_INT,
+    'UFLO':   PIPE_SPECIAL,
+}
+
+# Per-pipe throughput: minimum cycles between two instructions on the same pipe.
+# Store pipe throughput is per-instruction (STS.128=32, STG=26).
+# ALU/BF16/FAST_INT all have throughput=2 at saturation.
+_PIPE_THROUGHPUT = {
+    PIPE_STORE:    32,  # STS.128 dominates, STG=26 but conservative
+    PIPE_BF16:     2,
+    PIPE_ALU:      2,
+    PIPE_FAST_INT: 2,
+    PIPE_LOAD:     4,   # LDS=4 throughput
+    PIPE_SPECIAL:  10,  # REDUX=11, SHFL=10, conservative
+    PIPE_NONE:     1,
+}
+
+# Cross-pipe conflict overhead (additive cycles when two pipes co-issue).
+# From the conflict matrix: BF16×STS=7.5% (~2.4 cyc overhead per STS pair),
+# ALU×STS=17% (~5.4 cyc). We model this as minimum gap when interleaving.
+_CROSS_PIPE_MIN_GAP = {
+    (PIPE_BF16, PIPE_STORE): 0,     # 7.5% overhead — nearly free, don't constrain
+    (PIPE_STORE, PIPE_BF16): 0,
+    (PIPE_ALU, PIPE_STORE): 1,      # 17% overhead — mild constraint
+    (PIPE_STORE, PIPE_ALU): 1,
+    (PIPE_FAST_INT, PIPE_STORE): 0,  # IADD3 is free everywhere
+    (PIPE_STORE, PIPE_FAST_INT): 0,
+}
+
+
+def get_pipe(mnemonic):
+    """Get execution pipe for an instruction."""
+    family = insn_family(mnemonic)
+    if family is None:
+        return PIPE_NONE
+    return _PIPE_MAP.get(family, PIPE_ALU)
+
+
+def get_throughput(mnemonic):
+    """Get per-instruction throughput (min cycles between same-type issues)."""
+    family = insn_family(mnemonic)
+    if family == 'STS':
+        return 32
+    if family == 'STG':
+        return 26
+    if family == 'STAS':
+        return 32
+    pipe = get_pipe(mnemonic)
+    return _PIPE_THROUGHPUT.get(pipe, 2)
+
+
+def schedule_cpsat(instructions, time_limit=60.0, verbose=True):
+    """Find optimal instruction ordering using CP-SAT.
+
+    instructions: list of Instruction objects (must have mnemonic/operands set).
+    time_limit: solver time limit in seconds.
+    verbose: print progress and solution details.
+
+    Returns (ordered_addrs, stall_counts, stats) where:
+      - ordered_addrs: list of addresses in optimal order
+      - stall_counts: dict addr → stall count for each instruction
+      - stats: dict with solver statistics
+    Returns (None, None, stats) if no solution found.
+    """
+    try:
+        from ortools.sat.python import cp_model
+    except ImportError:
+        print('ERROR: ortools not installed. pip install ortools')
+        return None, None, {'status': 'NO_ORTOOLS'}
+
+    N = len(instructions)
+    if N == 0:
+        return [], {}, {'status': 'EMPTY'}
+
+    # --- Parse register defs/uses ---
+    du = []
+    for insn in instructions:
+        d, u = parse_reg_operands(insn.mnemonic, insn.operands)
+        du.append((d, u))
+
+    # --- Build dependency edges ---
+    # edges: list of (src_idx, dst_idx, dep_type, reg, latency)
+    edges = []
+    for i in range(N):
+        defs_i, uses_i = du[i]
+        mn_i = instructions[i].mnemonic or ''
+        lat_i = get_latency(mn_i)
+
+        for j in range(i + 1, N):
+            defs_j, uses_j = du[j]
+
+            # RAW: i defines R, j uses R
+            raw = defs_i & uses_j
+            if raw:
+                edges.append((i, j, 'RAW', raw, lat_i))
+
+            # WAW: i defines R, j defines R
+            waw = defs_i & defs_j
+            if waw:
+                edges.append((i, j, 'WAW', waw, 0))
+
+            # WAR: i uses R, j defines R
+            war = uses_i & defs_j
+            if war:
+                edges.append((i, j, 'WAR', war, 0))
+
+    # --- Identify barriers ---
+    barrier_indices = set()
+    for i, insn in enumerate(instructions):
+        if is_barrier(insn.mnemonic):
+            barrier_indices.add(i)
+
+    # --- Pipe classification ---
+    pipes = {}
+    for i, insn in enumerate(instructions):
+        pipe = get_pipe(insn.mnemonic)
+        pipes.setdefault(pipe, []).append(i)
+
+    if verbose:
+        print('CP-SAT scheduler: %d instructions, %d dep edges, %d barriers' % (
+            N, len(edges), len(barrier_indices)))
+        for pipe_name in sorted(pipes.keys()):
+            tp = _PIPE_THROUGHPUT.get(pipe_name, 2)
+            print('  %s: %d insns (throughput=%d)' % (
+                pipe_name, len(pipes[pipe_name]), tp))
+
+    # --- Build CP-SAT model ---
+    model = cp_model.CpModel()
+
+    # Upper bound on makespan: worst case = all instructions serial at max latency
+    max_horizon = N * 40
+
+    # Position in output sequence: pos[i] ∈ [0, N-1], all different
+    pos = [model.new_int_var(0, N - 1, 'pos_%d' % i) for i in range(N)]
+    model.add_all_different(pos)
+
+    # Issue cycle for each instruction
+    time = [model.new_int_var(0, max_horizon, 'time_%d' % i) for i in range(N)]
+
+    # --- Data dependency constraints ---
+    for src, dst, dep_type, regs, latency in edges:
+        # All dep types require original order preserved
+        model.add(pos[src] < pos[dst])
+
+        # RAW dependencies need latency gap
+        if dep_type == 'RAW' and latency > 0:
+            model.add(time[dst] >= time[src] + latency)
+
+    # --- Barrier constraints ---
+    # Barriers pin relative order with all other instructions
+    for bi in barrier_indices:
+        for i in range(N):
+            if i == bi:
+                continue
+            orig_before = (i < bi)
+            if orig_before:
+                model.add(pos[i] < pos[bi])
+            else:
+                model.add(pos[i] > pos[bi])
+
+    # --- Stall cap: adjacent instructions ≤ 15 cycles apart ---
+    # We model this efficiently using circuit/sequence constraints.
+    # For each pair (i, j), if pos[j] = pos[i] + 1 (j is right after i),
+    # then time[j] - time[i] ∈ [1, 15].
+    #
+    # Instead of O(N²) boolean indicators, we use a "next" formulation:
+    # For each position p, exactly one instruction is at that position.
+    # We use element constraints to link positions to times.
+
+    # time_at_pos[p] = time of the instruction at position p
+    time_at_pos = [model.new_int_var(0, max_horizon, 'tap_%d' % p) for p in range(N)]
+
+    # Link: time_at_pos[pos[i]] == time[i]
+    # Using element constraint: for each instruction i, time_at_pos[pos[i]] = time[i]
+    for i in range(N):
+        model.add_element(pos[i], time_at_pos, time[i])
+
+    # Consecutive position constraint: monotonically increasing issue times.
+    # No upper bound — the hardware can stall beyond 15 cycles via scoreboard
+    # waits and pipe contention. The 15-cycle stall cap only limits what we
+    # can encode; actual issue gaps may be larger (hardware blocks naturally).
+    # We clamp to 15 when producing the stall output.
+    for p in range(N - 1):
+        model.add(time_at_pos[p + 1] >= time_at_pos[p] + 1)
+
+    # --- Same-pipe throughput constraints ---
+    # For instructions on the same pipe, enforce minimum gap.
+    for pipe_name, indices in pipes.items():
+        if pipe_name == PIPE_NONE:
+            continue
+        tp = _PIPE_THROUGHPUT.get(pipe_name, 2)
+        if tp <= 1:
+            continue
+
+        # For each pair on this pipe, the one with smaller pos must have
+        # enough time gap to the one with larger pos.
+        for a_idx in range(len(indices)):
+            for b_idx in range(a_idx + 1, len(indices)):
+                i = indices[a_idx]
+                j = indices[b_idx]
+                # One of them comes first — use a boolean to model the disjunction
+                b = model.new_bool_var('pipe_%s_%d_%d' % (pipe_name, i, j))
+                # If b: pos[i] < pos[j] → time[j] >= time[i] + tp
+                model.add(pos[i] < pos[j]).only_enforce_if(b)
+                model.add(time[j] >= time[i] + tp).only_enforce_if(b)
+                # If !b: pos[j] < pos[i] → time[i] >= time[j] + tp
+                model.add(pos[j] < pos[i]).only_enforce_if(b.negated())
+                model.add(time[i] >= time[j] + tp).only_enforce_if(b.negated())
+
+    # --- Objective: minimize makespan ---
+    makespan = model.new_int_var(0, max_horizon, 'makespan')
+    model.add_max_equality(makespan, time)
+    model.minimize(makespan)
+
+    # --- Solve ---
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = time_limit
+    solver.parameters.num_workers = 8
+
+    if verbose:
+        print('Solving (time limit %.0fs)...' % time_limit)
+
+    status = solver.solve(model)
+    status_name = solver.status_name(status)
+
+    stats = {
+        'status': status_name,
+        'wall_time': solver.wall_time,
+        'branches': solver.num_branches,
+        'conflicts': solver.num_conflicts,
+    }
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        if verbose:
+            print('No solution: %s (%.1fs)' % (status_name, solver.wall_time))
+        return None, None, stats
+
+    # --- Extract solution ---
+    sol_pos = [(solver.value(pos[i]), i) for i in range(N)]
+    sol_pos.sort()  # sort by position
+
+    ordered_indices = [idx for _, idx in sol_pos]
+    ordered_addrs = [instructions[idx].offset for idx in ordered_indices]
+
+    # Compute stall counts from issue times
+    stall_counts = {}
+    for p in range(N):
+        idx = ordered_indices[p]
+        addr = instructions[idx].offset
+        if p == 0:
+            stall_counts[addr] = instructions[idx].control & 0xf  # keep original
+        else:
+            prev_idx = ordered_indices[p - 1]
+            gap = solver.value(time[idx]) - solver.value(time[prev_idx])
+            stall_counts[addr] = min(gap, MAX_STALL)
+
+    obj_val = solver.objective_value
+    stats['makespan'] = int(obj_val)
+
+    if verbose:
+        print('Solution: %s, makespan=%d cycles (%.1fs, %d branches, %d conflicts)' % (
+            status_name, int(obj_val), solver.wall_time,
+            solver.num_branches, solver.num_conflicts))
+
+        # Print schedule
+        print('\n%-4s  %-6s  %-4s  %-5s  %-8s  %s' % (
+            'Pos', 'Addr', 'Cyc', 'Stall', 'Pipe', 'Instruction'))
+        print('-' * 90)
+        for p in range(N):
+            idx = ordered_indices[p]
+            insn = instructions[idx]
+            t = solver.value(time[idx])
+            stall = stall_counts[insn.offset]
+            pipe = get_pipe(insn.mnemonic)
+            mn = insn.mnemonic or 'NOP'
+            ops = insn.operands or ''
+            label = '%s %s' % (mn, ops)
+            if len(label) > 55:
+                label = label[:52] + '...'
+            print('%4d  0x%04x  %4d  %5d  %-8s  %s' % (
+                p, insn.offset, t, stall, pipe, label))
+
+        # Summary by pipe
+        print('\nPipe utilization:')
+        pipe_cycles = {}
+        for p in range(N):
+            idx = ordered_indices[p]
+            pipe = get_pipe(instructions[idx].mnemonic)
+            t = solver.value(time[idx])
+            pipe_cycles.setdefault(pipe, []).append(t)
+        for pipe_name in sorted(pipe_cycles.keys()):
+            cycles = sorted(pipe_cycles[pipe_name])
+            if len(cycles) >= 2:
+                span = cycles[-1] - cycles[0]
+                avg_gap = span / (len(cycles) - 1) if len(cycles) > 1 else 0
+                print('  %-10s: %d insns, span=%d cycles, avg gap=%.1f' % (
+                    pipe_name, len(cycles), span, avg_gap))
+            else:
+                print('  %-10s: %d insns' % (pipe_name, len(cycles)))
+
+    # --- Compare with original ---
+    if verbose:
+        orig_stalls = sum(insn.control & 0xf for insn in instructions)
+        new_stalls = sum(stall_counts.values())
+        print('\nOriginal total stalls: %d cycles' % orig_stalls)
+        print('Optimized total stalls: %d cycles' % int(obj_val))
+        delta = orig_stalls - int(obj_val)
+        print('Delta: %d cycles (%+.1f%%)' % (
+            delta, -100.0 * delta / orig_stalls if orig_stalls else 0))
+
+    return ordered_addrs, stall_counts, stats
+
+
+def schedule_to_recipe(instructions, ordered_addrs, stall_counts):
+    """Convert CP-SAT schedule to an edit recipe (list of script command strings).
+
+    The recipe uses reorder + stall patches to implement the schedule.
+    """
+    if not ordered_addrs:
+        return []
+
+    recipe = []
+    recipe.append('# CP-SAT optimal schedule recipe')
+    recipe.append('# Generated by sass_edit.py schedule command')
+    recipe.append('# Instructions: %d' % len(ordered_addrs))
+    recipe.append('')
+
+    start_addr = min(insn.offset for insn in instructions)
+    end_addr = max(insn.offset for insn in instructions) + INSN_SIZE
+
+    # Check if reorder is needed (any instruction moved)
+    orig_addrs = [insn.offset for insn in instructions]
+    if ordered_addrs != orig_addrs:
+        addr_str = ','.join('0x%04x' % a for a in ordered_addrs)
+        recipe.append('reorder 0x%04x 0x%04x %s' % (start_addr, end_addr, addr_str))
+        recipe.append('')
+
+    # Stall patches
+    recipe.append('# Stall count patches')
+    for addr in ordered_addrs:
+        stall = stall_counts.get(addr)
+        if stall is not None:
+            recipe.append('stall 0x%04x %d' % (addr, stall))
+
+    recipe.append('')
+    recipe.append('# Post-schedule audit')
+    recipe.append('audit 0x%04x 0x%04x' % (start_addr, end_addr))
+
+    return recipe
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # cuobjdump SASS cross-reference
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1103,6 +2099,65 @@ class CubinEditor:
         insn.control = (insn.control & ~0xf) | (stall & 0xf)
         self._modified = True
 
+    def patch_reg(self, kernel, addr, field_name, new_reg_num):
+        """Patch a register field in an instruction's encoding.
+
+        field_name: 'dst', 'src1', 'src2', 'addr', 'data'
+        new_reg_num: 0-255 (physical register number)
+        """
+        insn = kernel.insn_at(addr)
+        if insn is None:
+            raise ValueError('No instruction at 0x%x' % addr)
+
+        fields = get_reg_fields(insn.mnemonic)
+        for fname, text_idx, bit_off, width in fields:
+            if fname == field_name:
+                old_val = read_enc_field(insn.encoding, bit_off, width)
+                insn.encoding = write_enc_field(
+                    insn.encoding, bit_off, width, new_reg_num)
+                self._modified = True
+
+                # Update text operands to reflect the change
+                if insn.operands:
+                    insn.operands = insn.operands.replace(
+                        'R%d' % old_val, 'R%d' % new_reg_num, 1)
+
+                return old_val
+
+        known = [f[0] for f in fields]
+        raise ValueError('Field "%s" not found for %s (known: %s)' % (
+            field_name, insn.mnemonic or '?', ', '.join(known) if known else 'none'))
+
+    def copy_insn(self, kernel, src_addr, dst_addr, copy_ctrl=False):
+        """Copy instruction encoding from src to dst.
+
+        By default copies only the encoding word (preserving dst's control word).
+        Set copy_ctrl=True to also copy the control word.
+        """
+        src = kernel.insn_at(src_addr)
+        dst = kernel.insn_at(dst_addr)
+        if src is None:
+            raise ValueError('No instruction at src 0x%x' % src_addr)
+        if dst is None:
+            raise ValueError('No instruction at dst 0x%x' % dst_addr)
+
+        dst.encoding = src.encoding
+        dst.mnemonic = src.mnemonic
+        dst.operands = src.operands
+        if copy_ctrl:
+            dst.control = src.control
+        self._modified = True
+
+    def nop_insn(self, kernel, addr):
+        """Replace instruction at addr with a NOP (preserves control word)."""
+        insn = kernel.insn_at(addr)
+        if insn is None:
+            raise ValueError('No instruction at 0x%x' % addr)
+        insn.encoding = NOP_ENCODING
+        insn.mnemonic = 'NOP'
+        insn.operands = ''
+        self._modified = True
+
     def save(self, output_path):
         """Write modified cubin. Never overwrites the original."""
         out_path = Path(output_path)
@@ -1278,6 +2333,33 @@ def parse_script(script_path, editor, kernel):
                               w.reg, w.actual))
                 else:
                     print('  audit [0x%x, 0x%x): all stalls OK' % (start, end))
+
+            elif cmd == 'patch-reg':
+                # patch-reg 0xADDR FIELD_NAME REG_NUM
+                addr = int(parts[1], 0)
+                field = parts[2]
+                reg_num = int(parts[3], 0)
+                old = editor.patch_reg(kernel, addr, field, reg_num)
+                print('  patch-reg [%04x] %s: R%d -> R%d' % (
+                    addr, field, old, reg_num))
+                n_ops += 1
+
+            elif cmd == 'copy':
+                # copy 0xSRC 0xDST [ctrl]
+                src = int(parts[1], 0)
+                dst = int(parts[2], 0)
+                copy_ctrl = len(parts) > 3 and parts[3].lower() == 'ctrl'
+                editor.copy_insn(kernel, src, dst, copy_ctrl=copy_ctrl)
+                print('  copy [%04x] -> [%04x]%s' % (
+                    src, dst, ' +ctrl' if copy_ctrl else ''))
+                n_ops += 1
+
+            elif cmd == 'nop':
+                # nop 0xADDR
+                addr = int(parts[1], 0)
+                editor.nop_insn(kernel, addr)
+                print('  nop [%04x]' % addr)
+                n_ops += 1
 
             else:
                 print('WARN: unknown command "%s" at line %d' % (cmd, lineno))
@@ -1737,6 +2819,296 @@ def cmd_deps(args):
         print('  All stalls OK.')
 
 
+def cmd_probe_encoding(args):
+    """Verify register field positions against SASS text."""
+    ed = CubinEditor(args.cubin)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found')
+        sys.exit(1)
+
+    n = ed.xref(args.sass, k)
+    sys.stderr.write('Cross-referenced %d/%d instructions\n' % (n, k.n_insns))
+
+    results = probe_reg_fields(k)
+
+    print('Encoding field verification:')
+    print('%-12s  %6s  %6s  %s' % ('Family', 'Match', 'Mismatch', 'Status'))
+    print('-' * 50)
+
+    total_match = 0
+    total_mismatch = 0
+    for family in sorted(results.keys()):
+        r = results[family]
+        total_match += r['matches']
+        total_mismatch += r['mismatches']
+        status = 'OK' if r['mismatches'] == 0 else 'FAIL'
+        print('%-12s  %6d  %6d  %s' % (
+            family, r['matches'], r['mismatches'], status))
+
+    print('-' * 50)
+    print('%-12s  %6d  %6d' % ('TOTAL', total_match, total_mismatch))
+
+    if total_mismatch > 0:
+        print('\nMismatches:')
+        for family in sorted(results.keys()):
+            for detail in results[family]['details']:
+                print('  %s' % detail)
+
+
+def cmd_patch_reg(args):
+    """Patch a register field in an instruction."""
+    ed = CubinEditor(args.cubin)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found')
+        sys.exit(1)
+
+    if args.sass:
+        ed.xref(args.sass, k)
+
+    addr = int(args.addr, 0)
+    reg_num = int(args.reg, 0)
+    old = ed.patch_reg(k, addr, args.field, reg_num)
+
+    insn = k.insn_at(addr)
+    print('[%04x] %s %s: R%d -> R%d' % (
+        addr, insn.mnemonic or '?', args.field, old, reg_num))
+
+    ed.save(args.output)
+    print('Saved to %s' % args.output)
+
+
+def cmd_copy_insn(args):
+    """Copy instruction encoding from one address to another."""
+    ed = CubinEditor(args.cubin)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found')
+        sys.exit(1)
+
+    if args.sass:
+        ed.xref(args.sass, k)
+
+    src = int(args.src, 0)
+    dst = int(args.dst, 0)
+    ed.copy_insn(k, src, dst, copy_ctrl=args.copy_ctrl)
+
+    src_insn = k.insn_at(src)
+    print('Copied [%04x] %s -> [%04x]' % (
+        src, src_insn.mnemonic or '?', dst))
+
+    ed.save(args.output)
+    print('Saved to %s' % args.output)
+
+
+def cmd_pipeline(args):
+    """Analyze epilogue for software pipelining opportunities."""
+    ed = CubinEditor(args.cubin)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found')
+        sys.exit(1)
+
+    n = ed.xref(args.sass, k)
+    sys.stderr.write('Cross-referenced %d/%d instructions\n' % (n, k.n_insns))
+
+    start = int(args.start, 0)
+    end = int(args.end, 0)
+    start_idx = start // INSN_SIZE
+    end_idx = end // INSN_SIZE
+    region = k.instructions[start_idx:end_idx]
+
+    # Identify groups
+    groups = identify_epilogue_groups(region)
+    if not groups:
+        print('No store clusters found in [0x%x, 0x%x)' % (start, end))
+        sys.exit(1)
+
+    print('Epilogue groups: %d' % len(groups))
+    print('=' * 80)
+
+    for g in groups:
+        cs, ce = g.compute_range
+        ss, se = g.store_range
+        print('Group %d: compute [0x%04x-0x%04x] (%d insns), '
+              'store [0x%04x-0x%04x] (%d insns)' % (
+                  g.group_idx, cs, ce, len(g.compute_insns),
+                  ss, se, len(g.store_insns)))
+
+        # Show store data vectors
+        for base, width in g.store_data_vectors():
+            regs = ', '.join('R%d' % (base + i) for i in range(width))
+            print('  STS data: R%d × %d = [%s]' % (base, width, regs))
+
+    # Interleave analysis
+    analyses = analyze_interleave(groups)
+    if analyses:
+        print('\nInterleave analysis:')
+        print('-' * 80)
+
+        total_conflicts = 0
+        total_spare = 0
+
+        for a in analyses:
+            gi, gi1 = a['group_n'], a['group_n1']
+            nc = a['gpr_remap_needed']
+            total_conflicts += len(a['conflicts'])
+            total_spare += nc
+
+            print('Groups %d→%d: %d stores, %d compute ops to interleave' % (
+                gi, gi1, a['n_store_count'], a['n1_compute_count']))
+
+            if a['conflicts']:
+                print('  Conflicts: %s' % ', '.join(sorted(a['conflicts'])))
+                if a['expanded'] != a['conflicts']:
+                    print('  Expanded (vector): %s' % ', '.join(
+                        sorted(a['expanded'])))
+                print('  Spare GPRs needed: %d' % nc)
+
+                # Show proposed remap
+                remap = plan_remap(a['expanded'], args.spare_start)
+                for old_name, new_num in sorted(remap.items(),
+                                                key=lambda x: int(x[0][1:])):
+                    print('    %s -> R%d' % (old_name, new_num))
+            else:
+                print('  No register conflicts — free to interleave')
+
+            # Estimate benefit
+            n_stores = a['n_store_count']
+            n_compute = a['n1_compute_count']
+            sts_cycles = n_stores * 32
+            compute_cycles = n_compute * 3  # ~3 cycles avg per compute op
+            overlap = min(sts_cycles, compute_cycles)
+            print('  Estimated overlap: %d cycles (STS=%d, compute=%d)' % (
+                overlap, sts_cycles, compute_cycles))
+            print()
+
+        print('Summary: %d total conflicts, %d spare GPRs needed (R%d-R255 = %d available)' % (
+            total_conflicts, total_spare, args.spare_start,
+            256 - args.spare_start))
+
+    # Find NOP slots
+    nops = find_nops(k)
+    nops_in_range = [(addr, ctrl) for addr, ctrl in nops
+                     if start <= addr < end]
+    print('\nNOP slots in range: %d (of %d total in kernel)' % (
+        len(nops_in_range), len(nops)))
+    for addr, ctrl in nops_in_range[:20]:
+        print('  0x%04x  ctrl=%s' % (addr, ctrl_str(ctrl)))
+    if len(nops_in_range) > 20:
+        print('  ... and %d more' % (len(nops_in_range) - 20))
+
+    # Find donors
+    if args.donors:
+        donors = find_donors(k)
+        print('\nDonor instructions available:')
+        for family in sorted(donors.keys()):
+            count = len(donors[family])
+            if count > 0:
+                first = donors[family][0]
+                print('  %-10s: %d instances (e.g., [%04x] %s)' % (
+                    family, count, first[0], first[1][:50]))
+
+    # Generate recipe
+    if args.generate:
+        recipe = generate_interleave_recipe(groups, analyses, args.spare_start)
+        out_path = Path(args.generate)
+        out_path.write_text('\n'.join(recipe) + '\n')
+        print('\nRecipe written to %s (%d lines)' % (out_path, len(recipe)))
+
+
+def cmd_schedule(args):
+    """Run CP-SAT optimal scheduler on a SASS region."""
+    ed = CubinEditor(args.cubin)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found')
+        sys.exit(1)
+
+    n = ed.xref(args.sass, k)
+    sys.stderr.write('Cross-referenced %d/%d instructions\n' % (n, k.n_insns))
+
+    start = int(args.start, 0)
+    end = int(args.end, 0)
+    start_idx = start // INSN_SIZE
+    end_idx = end // INSN_SIZE
+
+    if end_idx > len(k.instructions):
+        print('End address 0x%x out of range' % end)
+        sys.exit(1)
+
+    region = k.instructions[start_idx:end_idx]
+
+    # Filter out unannotated instructions (no mnemonic from SASS xref)
+    annotated = [insn for insn in region if insn.mnemonic]
+    if len(annotated) < len(region):
+        sys.stderr.write('WARNING: %d/%d instructions have no mnemonic annotation\n' % (
+            len(region) - len(annotated), len(region)))
+
+    ordered_addrs, stall_counts, stats = schedule_cpsat(
+        region,
+        time_limit=args.time_limit,
+        verbose=not args.quiet)
+
+    if ordered_addrs is None:
+        print('No solution found: %s' % stats.get('status', '?'))
+        sys.exit(1)
+
+    # Generate recipe
+    if args.recipe:
+        recipe = schedule_to_recipe(region, ordered_addrs, stall_counts)
+        Path(args.recipe).write_text('\n'.join(recipe) + '\n')
+        print('\nRecipe written to %s (%d lines)' % (args.recipe, len(recipe)))
+
+    # Apply directly
+    if args.output:
+        # Apply reorder
+        orig_addrs = [insn.offset for insn in region]
+        if ordered_addrs != orig_addrs:
+            ed.reorder(k, start, end, ordered_addrs, force=True)
+
+        # Apply stall counts
+        for addr, stall in stall_counts.items():
+            ed.patch_stall(k, addr, stall)
+
+        ed.save(args.output)
+        print('Patched cubin written to %s' % args.output)
+
+
+def cmd_find_donors(args):
+    """Find donor instructions for each opcode family."""
+    ed = CubinEditor(args.cubin)
+    k = ed.find_kernel(args.kernel)
+    if not k:
+        print('Kernel not found')
+        sys.exit(1)
+
+    ed.xref(args.sass, k)
+    donors = find_donors(k)
+
+    family_filter = args.family.upper() if args.family else None
+
+    for family in sorted(donors.keys()):
+        if family_filter and family != family_filter:
+            continue
+        entries = donors[family]
+        print('%s (%d):' % (family, len(entries)))
+        limit = 5 if not family_filter else len(entries)
+        for addr, mn, ops, enc in entries[:limit]:
+            # Show register field values
+            fields = FAMILY_REG_FIELDS.get(family, _DEFAULT_REG_FIELDS)
+            field_strs = []
+            for fname, _, bit_off, width in fields:
+                val = read_enc_field(enc, bit_off, width)
+                field_strs.append('%s=R%d' % (fname, val))
+            field_info = ', '.join(field_strs) if field_strs else '-'
+            print('  [%04x] %-40s  enc=0x%016x  %s' % (
+                addr, ('%s %s' % (mn, ops))[:40], enc, field_info))
+        if len(entries) > limit:
+            print('  ... and %d more' % (len(entries) - limit))
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Fatbin patcher — patch embedded cubin inside compiled CUDA host binary
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2016,6 +3388,74 @@ def main():
     s.add_argument('--reorder', default=None,
                    help='Comma-separated proposed address order to check')
 
+    # probe-encoding
+    s = sub.add_parser('probe-encoding',
+                       help='Verify register field positions against SASS text')
+    s.add_argument('cubin')
+    s.add_argument('--sass', required=True)
+    s.add_argument('--kernel', '-k', default=None)
+
+    # patch-reg
+    s = sub.add_parser('patch-reg', help='Patch a register field in an instruction')
+    s.add_argument('cubin')
+    s.add_argument('addr', help='Instruction address (hex)')
+    s.add_argument('field', help='Field name: dst, src1, src2, addr, data')
+    s.add_argument('reg', help='New register number (0-255)')
+    s.add_argument('-o', '--output', required=True)
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--sass', default=None)
+
+    # copy-insn
+    s = sub.add_parser('copy-insn', help='Copy instruction encoding to another address')
+    s.add_argument('cubin')
+    s.add_argument('src', help='Source address (hex)')
+    s.add_argument('dst', help='Destination address (hex)')
+    s.add_argument('-o', '--output', required=True)
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--sass', default=None)
+    s.add_argument('--copy-ctrl', action='store_true',
+                   help='Also copy control word (default: preserve destination ctrl)')
+
+    # pipeline
+    s = sub.add_parser('pipeline',
+                       help='Analyze epilogue for software pipelining')
+    s.add_argument('cubin')
+    s.add_argument('--sass', required=True)
+    s.add_argument('--start', '-s', required=True, help='Epilogue start address (hex)')
+    s.add_argument('--end', '-e', required=True, help='Epilogue end address (hex)')
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--spare-start', type=int, default=208,
+                   help='First spare register number (default: 208)')
+    s.add_argument('--donors', action='store_true',
+                   help='Show donor instructions for each family')
+    s.add_argument('--generate', default=None, metavar='RECIPE_FILE',
+                   help='Generate interleave recipe script')
+
+    # schedule (CP-SAT optimal scheduler)
+    s = sub.add_parser('schedule',
+                       help='CP-SAT optimal instruction scheduler')
+    s.add_argument('cubin')
+    s.add_argument('--sass', required=True)
+    s.add_argument('--start', '-s', required=True, help='Region start address (hex)')
+    s.add_argument('--end', '-e', required=True, help='Region end address (hex)')
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--recipe', default=None, metavar='RECIPE_FILE',
+                   help='Write edit recipe to file')
+    s.add_argument('-o', '--output', default=None,
+                   help='Apply schedule and write patched cubin')
+    s.add_argument('--time-limit', type=float, default=60.0,
+                   help='Solver time limit in seconds (default: 60)')
+    s.add_argument('--quiet', '-q', action='store_true',
+                   help='Suppress verbose output')
+
+    # find-donors
+    s = sub.add_parser('find-donors', help='Find donor instructions for each family')
+    s.add_argument('cubin')
+    s.add_argument('--sass', required=True)
+    s.add_argument('--kernel', '-k', default=None)
+    s.add_argument('--family', '-f', default=None,
+                   help='Filter to specific family (e.g., HADD2)')
+
     # fatbin-patch
     s = sub.add_parser('fatbin-patch', help='Patch embedded cubin in compiled CUDA binary')
     s.add_argument('binary', help='Host binary (e.g., fc2)')
@@ -2046,6 +3486,12 @@ def main():
         'gen-loader': cmd_gen_loader,
         'diff': cmd_diff,
         'deps': cmd_deps,
+        'probe-encoding': cmd_probe_encoding,
+        'patch-reg': cmd_patch_reg,
+        'copy-insn': cmd_copy_insn,
+        'pipeline': cmd_pipeline,
+        'find-donors': cmd_find_donors,
+        'schedule': cmd_schedule,
         'fatbin-patch': cmd_fatbin_patch,
     }
     cmds[args.cmd](args)

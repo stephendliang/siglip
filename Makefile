@@ -9,7 +9,7 @@ CUTLASS_DIR = third_party/cutlass
 CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUTLASS_FLAGS = -std=c++17 --expt-relaxed-constexpr
 
-.PHONY: all clean timing fc1-gelu fc2 fc2-timing cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-all
+.PHONY: all clean timing fc1-gelu fc2 fc2-timing cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-all tma-bench
 
 all: $(TARGET)
 
@@ -77,6 +77,10 @@ calib-conflict: bench/calib/gen_conflict.cu
 
 calib-all: calib-tput calib-lat calib-conflict
 
+# ── TMA microbenchmark (latency, throughput, SMEM contention) ──
+tma-bench: bench/tma_bench.cu
+	$(NVCC) $(CFLAGS) $< -o $@ -lcuda
+
 cublas-bench: bench/cublas_bench.cu
 	$(NVCC) $(CFLAGS) -std=c++17 $< -o $@ -lcublasLt -lcublas
 
@@ -108,5 +112,5 @@ compare-fast:
 	python3 tools/compare_all.py --runs 5 --layer patch_embed --csv data/compare.csv
 
 clean:
-	rm -f $(TARGET) patch_embed_timing fc1-gelu fc2 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cublas-bench cublas-bench-fc1 cublas-bench-fc2 calibration calib-tput calib-lat calib-conflict
+	rm -f $(TARGET) patch_embed_timing fc1-gelu fc2 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cublas-bench cublas-bench-fc1 cublas-bench-fc2 calibration calib-tput calib-lat calib-conflict tma-bench
 	rm -rf sass/

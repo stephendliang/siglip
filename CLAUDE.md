@@ -15,18 +15,32 @@ Three fused GEMM kernels for the vision encoder MLP. **Only FC2 is being activel
 
 Batch = 4736 images × 196 patches = 928256 rows. BF16 output, FP8 inputs.
 
-### FC2 gap analysis (session 2026-03-19)
+### FC2 gap analysis (session 2026-03-19, updated 2026-03-21)
 
 Best: **1.452ms / 3016 TFLOPS** (NS5, IS1, base config). CUTLASS: 1.225ms. Gap = **227μs (19%)**.
 
+**CUTLASS uses identical tile/cluster config**: 256×256×128, 2×1 cluster, cta_group::2. Same 96 UTCQMMA per tile. K-loop compute is byte-identical — the **entire 19% gap is from Phase 1 epilogue contention**, not compute throughput. CUTLASS achieves **99.6% of the K-loop throughput bound** (1.225ms vs 1.220ms theoretical) — its epilogue is invisible.
+
 Cycle breakdown (NS5.IS1.base, timing build):
-- **K-loop: 16705 cycles** — tight, well-optimized, NOT the bottleneck
-- **Epilogue Phase 1: 8430 cycles** — THIS is where CUTLASS wins
+- **K-loop: 16705 cycles** — identical MMA work to CUTLASS
+- **Epilogue Phase 1: 8430 cycles** — creates SMEM contention that slows K-loop by ~3300 cyc/tile
 - Epilogue Phase 2: 63 cycles (trivial)
 - epi_wait: 107 cycles (balanced producer-consumer)
 - tma0_wait: 721 cycles
 
-The gap is in the epilogue, specifically Phase 1 (TMEM load → epilogue compute → CVT → STS → TMA store). No K-loop or W1 optimization will help — the pipeline hides all W1 overhead.
+Per-tile: our 20,743 cyc vs CUTLASS 17,500 cyc. K-loop alone = 17,426 cyc. The 3,317 cyc gap is Phase 1 SMEM contention — W2-W5 running Phase 1 competes with W0/W1 K-loop for shared memory bandwidth and dispatch slots. A faster Phase 1 reduces contention for ALL 147 tiles, not just the last tile.
+
+**Root cause — architectural difference with CUTLASS:**
+- CUTLASS loads residual (C matrix) via **TMA into SMEM** (async engine, zero LSU pressure)
+- We load residual via **LDS.128 from SMEM** (7 loads per group, shares LSU with STS)
+- Our epilogue: 7× LDS.128 + 4× STS.128 = **11 LSU ops/group** on the SMEM port
+- CUTLASS epilogue: 4× STS.128 only = **4 LSU ops/group** (C arrived via TMA, not LSU)
+- 2.75× more LSU pressure → saturates SMEM bandwidth → contention with K-loop
+- CUTLASS epilogue source: `third_party/cutlass/.../sm100_epilogue_tma_warpspecialized.hpp`
+
+**Two attack vectors:**
+1. **SASS scheduling** (built): CP-SAT optimal scheduler spreads STS at 32-cycle intervals. 287-insn: 686 cyc (was 1417, -51.6%). Ready for B200 via fatbin-patch.
+2. **TMA residual pipeline** (architectural): restructure epilogue to separate LDS reads from STS stores temporally, or route residual through TMA more like CUTLASS.
 
 ## Grid search (FC2 only)
 
@@ -153,7 +167,7 @@ tools/                  # Analysis & sweep scripts
   analyze_sweep.py      # Grid search analysis: eta-squared, balanced subsets, RF importance
   balanced_eta.py       # Standalone balanced-subset eta-squared tool
   sass_analysis.py      # SASS scheduling analyzer (control words, dep graphs, slack)
-  sass_edit.py          # SASS binary editor — cubin instruction reorder/patch/swap (see docs/sass_binary_editing.md)
+  sass_edit.py          # SASS binary editor + CP-SAT scheduler + fatbin patcher (see docs/sass_binary_editing.md)
   analyze_timing.py     # clock64 timing → equilibrium analysis
   analyze_source_counters.py  # ncu SourceCounters CSV → stall breakdown
   simulate_lhs.py       # Bootstrap convergence simulation (no GPU)
@@ -208,11 +222,14 @@ python3 tools/analyze_sweep.py data/session_*/sweep_fc2.csv
 python3 tools/balanced_eta.py data/session_*/sweep_fc2.csv
 python3 tools/sass_analysis.py --cubin fc2 --deps
 
-# SASS binary editing (local, no GPU needed for editing)
+# SASS binary editing + CP-SAT scheduler (local, no GPU needed)
 nvcc --cubin -arch=sm_100a -O3 fc2.cu -o fc2.cubin       # produce standalone cubin
 python3 tools/sass_edit.py info fc2.cubin                  # list kernels
 python3 tools/sass_edit.py dump fc2.cubin --sass sass/fc2.txt --start 0x50f0 --end 0x5160
+python3 tools/sass_edit.py schedule fc2.cubin --sass sass/fc2.txt -s 0x51c0 -e 0x5620 --recipe recipe.txt
+python3 tools/sass_edit.py schedule fc2.cubin --sass sass/fc2.txt -s 0x51c0 -e 0x63b0 --time-limit 3600  # full epilogue
 python3 tools/sass_edit.py script fc2.cubin recipe.txt -o fc2_patched.cubin
+python3 tools/sass_edit.py fatbin-patch fc2 --sass sass/fc2.txt --script recipe.txt -o fc2_patched
 python3 tools/sass_edit.py diff fc2.cubin fc2_patched.cubin
 # see docs/sass_binary_editing.md for full workflow + FC2 patching plan
 
