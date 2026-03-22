@@ -9,11 +9,16 @@ Sections:
   A. MMA issue throughput — ILP sweep (1/4/8/16 back-to-back UTCQMMA)
   B. K-iteration decomposition — fence + 4×MMA + commit (sub-component costs)
   C. MMA latency — full pipeline: issue → commit → mbar_wait → tcgen05.ld
-  D. TMEM load throughput — tcgen05.ld.sync x16/x32, ILP 1/2/4
+  D. TMEM load throughput — tcgen05.ld.sync x16/x32/x64, ILP sweep
   E. MMA shadow budget — STS/BF16 between MMA issue and commit
   F. MMA + TMA overlap — concurrent TMA load during MMA compute
   G. Full K-loop pipeline — 1/4/8/16/24 iterations amortized throughput
   H. TMEM double-buffer — read buf0 while MMA writes buf1
+  I. STS + TMEM_LD overlap — can epilogue STS and tcgen05.ld run concurrently?
+  J. MMA compute time — commit to mbar_wait return (tensor core latency)
+  K. Cross-warp epilogue handoff — W1 commit → W2 mbar_wait + TMEM_LD
+  L. Multi-warp contention — 4 epilogue warps STS/LDS/BF16 during MMA
+  M. Multi-SM scaling — all 74 clusters, per-cluster throughput variance
 
 Requires: SM100a (B200), cta_group::2, __cluster_dims__(2,1,1)
 Build: make mma-bench && ./mma-bench
@@ -925,6 +930,399 @@ void k_tmem_dbuf(__grid_constant__ const CUtensorMap tma_a,
     bench_fini(s.sb);
 }
 
+/* ═══════ I. STS + TMEM_LD overlap ═══════ */
+/* After MMA is complete, can STS and tcgen05.ld run concurrently?
+   TMEM_LD uses the tensor memory port, STS uses shared memory.
+   Tests: TMEM_LD only, STS only, both together. */
+
+template <int N_STS>
+__global__ __launch_bounds__(32, 1) __cluster_dims__(2, 1, 1)
+void k_sts_tmem_overlap(__grid_constant__ const CUtensorMap tma_a,
+                        __grid_constant__ const CUtensorMap tma_b,
+                        long long *out) {
+    Setup s;
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s.sb); return; }
+
+    uint64_t da = s.da[0], db = s.db[0];
+    uint32_t mbar = s.sb + MB_MMA(0);
+    uint32_t sts_addr = s.sb + WORK_OFF + s.lane * 16;
+    uint32_t v = 0x3c003c00u | s.lane;
+    float r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15;
+
+    /* Pre-fill TMEM */
+    if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, 0); mma_commit(mbar); }
+    mb_wait(mbar, 0);
+
+    /* Warmup all 3 patterns */
+    for (int w = 0; w < WARMUP; w++) {
+        asm volatile(
+            "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+            : "=f"(r0),"=f"(r1),"=f"(r2),"=f"(r3),"=f"(r4),"=f"(r5),"=f"(r6),"=f"(r7),
+              "=f"(r8),"=f"(r9),"=f"(r10),"=f"(r11),"=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15)
+            : "r"(0));
+        #pragma unroll
+        for (int i = 0; i < N_STS; i++)
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                         :: "r"(sts_addr), "r"(v), "r"(v), "r"(v), "r"(v) : "memory");
+    }
+
+    /* 1: TMEM_LD only */
+    long long t_ld = 0;
+    for (int rep = 0; rep < REPS; rep++) {
+        long long t0 = clk();
+        asm volatile(
+            "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+            : "=f"(r0),"=f"(r1),"=f"(r2),"=f"(r3),"=f"(r4),"=f"(r5),"=f"(r6),"=f"(r7),
+              "=f"(r8),"=f"(r9),"=f"(r10),"=f"(r11),"=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15)
+            : "r"(0));
+        t_ld += clk() - t0;
+    }
+
+    /* 2: STS only */
+    long long t_sts = 0;
+    for (int rep = 0; rep < REPS; rep++) {
+        long long t0 = clk();
+        #pragma unroll
+        for (int i = 0; i < N_STS; i++)
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                         :: "r"(sts_addr), "r"(v), "r"(v), "r"(v), "r"(v) : "memory");
+        t_sts += clk() - t0;
+    }
+
+    /* 3: Both together */
+    long long t_both = 0;
+    for (int rep = 0; rep < REPS; rep++) {
+        long long t0 = clk();
+        asm volatile(
+            "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+            : "=f"(r0),"=f"(r1),"=f"(r2),"=f"(r3),"=f"(r4),"=f"(r5),"=f"(r6),"=f"(r7),
+              "=f"(r8),"=f"(r9),"=f"(r10),"=f"(r11),"=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15)
+            : "r"(0));
+        #pragma unroll
+        for (int i = 0; i < N_STS; i++)
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                         :: "r"(sts_addr), "r"(v), "r"(v), "r"(v), "r"(v) : "memory");
+        t_both += clk() - t0;
+    }
+
+    if (s.lane == 0) { out[0] = t_ld; out[1] = t_sts; out[2] = t_both; }
+    bench_fini(s.sb);
+}
+
+/* ═══════ J. MMA compute time — commit to mbar_wait ═══════ */
+/* Isolates tensor core computation latency: time from commit dispatch
+   to mbar_wait returning. MMA dispatch happens before timing starts. */
+
+__global__ __launch_bounds__(32, 1) __cluster_dims__(2, 1, 1)
+void k_mma_compute_lat(__grid_constant__ const CUtensorMap tma_a,
+                       __grid_constant__ const CUtensorMap tma_b,
+                       long long *out) {
+    Setup s;
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s.sb); return; }
+
+    uint64_t da = s.da[0], db = s.db[0];
+    uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
+    int ph0 = 0, ph1 = 0;
+
+    for (int w = 0; w < WARMUP; w++) {
+        uint32_t mbar = (w & 1) ? mbar1 : mbar0;
+        int &ph = (w & 1) ? ph1 : ph0;
+        if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, w > 0 ? 1 : 0); mma_commit(mbar); }
+        mb_wait(mbar, ph); ph ^= 1;
+    }
+
+    long long tot = 0;
+    for (int rep = 0; rep < REPS; rep++) {
+        uint32_t mbar = (rep & 1) ? mbar1 : mbar0;
+        int &ph = (rep & 1) ? ph1 : ph0;
+        if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, 1); }
+        long long t0 = clk();
+        if (s.lane == 0) mma_commit(mbar);
+        mb_wait(mbar, ph); ph ^= 1;
+        long long t1 = clk();
+        if (s.lane == 0) tot += t1 - t0;
+    }
+
+    if (s.lane == 0) out[0] = tot;
+    bench_fini(s.sb);
+}
+
+/* ═══════ K. Cross-warp epilogue handoff ═══════ */
+/* W1 (MMA warp) issues MMA + commit.
+   W2 (epilogue warp) waits on mbar then does TMEM_LD.
+   Measures inter-warp handoff latency: commit → mbar_wait → TMEM_LD.
+   Separately reports wait time and TMEM_LD time. */
+
+#define MW_THREADS 192  /* 6 warps × 32, matching FC2 */
+
+struct MWSetup {
+    uint32_t sb;
+    int lane, warp, cta_rank;
+    uint64_t da[N_STAGES], db[N_STAGES];
+};
+
+__device__ bool mw_init(MWSetup &s,
+                        const CUtensorMap &tma_a, const CUtensorMap &tma_b,
+                        int n_load = 1) {
+    extern __shared__ __align__(128) char smem[];
+    s.sb = to_smem(smem);
+    s.lane = threadIdx.x % 32;
+    s.warp = threadIdx.x / 32;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(s.cta_rank));
+
+    if (s.warp == 0 && s.lane == 0)
+        for (int i = 0; i < N_MBAR; i++)
+            mb_init(s.sb + MBAR_OFF + i * 8, 1);
+    __syncthreads();
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
+
+    /* Warp 1 allocates TMEM (collective within warp, both CTAs) */
+    if (s.warp == 1)
+        asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
+            :: "r"(s.sb + TMEM_OFF), "r"(TMEM_COLS));
+    __syncthreads();
+
+    for (int i = 0; i < N_STAGES; i++) {
+        s.da[i] = make_desc(s.sb + STAGE_A(i));
+        s.db[i] = make_desc(s.sb + STAGE_B(i));
+    }
+
+    /* Warp 0 fills WORK area for LDS tests */
+    if (s.warp == 0) {
+        uint32_t a = s.sb + WORK_OFF + s.lane * 16;
+        uint32_t v = 0x3c003c00u | s.lane;
+        for (int i = 0; i < WORK_SZ / 512; i++)
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                :: "r"(a + i * 512), "r"(v), "r"(v), "r"(v), "r"(v) : "memory");
+    }
+
+    for (int st = 0; st < n_load && st < N_STAGES; st++) {
+        if (s.warp == 0 && s.lane == 0) {
+            uint32_t mb = s.sb + MB_TMA(st);
+            mb_expect_tx(mb, A_SZ + B_SZ);
+            tma_ld(s.sb + STAGE_A(st), &tma_a, st * BENCH_TK, s.cta_rank * BENCH_TM, mb);
+            tma_ld(s.sb + STAGE_B(st), &tma_b, st * BENCH_TK, s.cta_rank * (BENCH_TN / 2), mb);
+        }
+        __syncthreads();
+        if (s.warp == 0) mb_wait(s.sb + MB_TMA(st), 0);
+        __syncthreads();
+    }
+
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
+    return s.cta_rank == 0;
+}
+
+__device__ void mw_fini(uint32_t sb, int warp) {
+    __syncthreads();
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
+    if (warp == 1) {
+        uint32_t taddr;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(taddr) : "r"(sb + TMEM_OFF));
+        asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
+            :: "r"(taddr), "r"(TMEM_COLS));
+    }
+}
+
+__global__ __launch_bounds__(96, 1) __cluster_dims__(2, 1, 1)
+void k_xwarp_handoff(__grid_constant__ const CUtensorMap tma_a,
+                     __grid_constant__ const CUtensorMap tma_b,
+                     long long *out) {
+    MWSetup s;
+    if (!mw_init(s, tma_a, tma_b)) { mw_fini(s.sb, s.warp); return; }
+
+    uint64_t da = s.da[0], db = s.db[0];
+    uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
+
+    if (s.warp == 1 && s.lane == 0) {
+        /* MMA producer: fence → MMA×4 → commit, repeated */
+        for (int rep = 0; rep < WARMUP + REPS; rep++) {
+            uint32_t mbar = (rep & 1) ? mbar1 : mbar0;
+            mma_fence();
+            MMA_4SUB(0, da, db, rep > 0 ? 1 : 0);
+            mma_commit(mbar);
+        }
+    } else if (s.warp == 2) {
+        /* Epilogue consumer: mbar_wait → TMEM_LD, timed */
+        float r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15;
+        int ph0 = 0, ph1 = 0;
+        for (int w = 0; w < WARMUP; w++) {
+            uint32_t mbar = (w & 1) ? mbar1 : mbar0;
+            int &ph = (w & 1) ? ph1 : ph0;
+            mb_wait(mbar, ph); ph ^= 1;
+            asm volatile(
+                "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+                "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+                : "=f"(r0),"=f"(r1),"=f"(r2),"=f"(r3),"=f"(r4),"=f"(r5),"=f"(r6),"=f"(r7),
+                  "=f"(r8),"=f"(r9),"=f"(r10),"=f"(r11),"=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15)
+                : "r"(0));
+        }
+        long long tot_wait = 0, tot_ld = 0;
+        for (int rep = 0; rep < REPS; rep++) {
+            uint32_t mbar = (rep & 1) ? mbar1 : mbar0;
+            int &ph = (rep & 1) ? ph1 : ph0;
+            long long t0 = clk();
+            mb_wait(mbar, ph); ph ^= 1;
+            long long t1 = clk();
+            asm volatile(
+                "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+                "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+                : "=f"(r0),"=f"(r1),"=f"(r2),"=f"(r3),"=f"(r4),"=f"(r5),"=f"(r6),"=f"(r7),
+                  "=f"(r8),"=f"(r9),"=f"(r10),"=f"(r11),"=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15)
+                : "r"(0));
+            long long t2 = clk();
+            if (s.lane == 0) { tot_wait += t1 - t0; tot_ld += t2 - t1; }
+        }
+        if (s.lane == 0) { out[0] = tot_wait; out[1] = tot_ld; }
+    }
+    /* W0 idles */
+    mw_fini(s.sb, s.warp);
+}
+
+/* ═══════ L. Multi-warp contention ═══════ */
+/* W1 does MMA. W2-W5 do continuous STS/LDS/BF16 work.
+   Measures W1's K-iteration time under varying epilogue pressure.
+   EPI_STS=0: no epilogue work (baseline). EPI_STS>0: N STS per iteration per warp. */
+
+template <int EPI_STS>
+__global__ __launch_bounds__(MW_THREADS, 1) __cluster_dims__(2, 1, 1)
+void k_mw_sts(__grid_constant__ const CUtensorMap tma_a,
+              __grid_constant__ const CUtensorMap tma_b,
+              long long *out) {
+    MWSetup s;
+    if (!mw_init(s, tma_a, tma_b)) { mw_fini(s.sb, s.warp); return; }
+
+    uint64_t da = s.da[0], db = s.db[0];
+    uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
+
+    if (s.warp == 1) {
+        /* MMA warp: timed K-iterations */
+        int ph0 = 0, ph1 = 0;
+        for (int w = 0; w < WARMUP; w++) {
+            uint32_t mbar = (w & 1) ? mbar1 : mbar0;
+            int &ph = (w & 1) ? ph1 : ph0;
+            if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, w > 0 ? 1 : 0); mma_commit(mbar); }
+            mb_wait(mbar, ph); ph ^= 1;
+        }
+        long long tot = 0;
+        for (int rep = 0; rep < REPS; rep++) {
+            uint32_t mbar = (rep & 1) ? mbar1 : mbar0;
+            int &ph = (rep & 1) ? ph1 : ph0;
+            long long t0 = clk();
+            if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, 1); mma_commit(mbar); }
+            mb_wait(mbar, ph); ph ^= 1;
+            long long t1 = clk();
+            if (s.lane == 0) tot += t1 - t0;
+        }
+        if (s.lane == 0) out[0] = tot;
+    } else if (s.warp >= 2 && EPI_STS > 0) {
+        /* Epilogue warps: continuous STS to create dispatch contention */
+        uint32_t addr = s.sb + WORK_OFF + (s.warp - 2) * 1024 + s.lane * 16;
+        uint32_t v = 0x3c003c00u | s.lane;
+        #pragma unroll 1
+        for (int i = 0; i < (WARMUP + REPS) * EPI_STS; i++)
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                         :: "r"(addr), "r"(v), "r"(v), "r"(v), "r"(v) : "memory");
+    }
+    /* W0 idles */
+    mw_fini(s.sb, s.warp);
+}
+
+/* Mixed epilogue: LDS + BF16 + STS per iteration (realistic FC2 pattern) */
+__global__ __launch_bounds__(MW_THREADS, 1) __cluster_dims__(2, 1, 1)
+void k_mw_mixed(__grid_constant__ const CUtensorMap tma_a,
+                __grid_constant__ const CUtensorMap tma_b,
+                long long *out) {
+    MWSetup s;
+    if (!mw_init(s, tma_a, tma_b)) { mw_fini(s.sb, s.warp); return; }
+
+    uint64_t da = s.da[0], db = s.db[0];
+    uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
+
+    if (s.warp == 1) {
+        int ph0 = 0, ph1 = 0;
+        for (int w = 0; w < WARMUP; w++) {
+            uint32_t mbar = (w & 1) ? mbar1 : mbar0;
+            int &ph = (w & 1) ? ph1 : ph0;
+            if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, w > 0 ? 1 : 0); mma_commit(mbar); }
+            mb_wait(mbar, ph); ph ^= 1;
+        }
+        long long tot = 0;
+        for (int rep = 0; rep < REPS; rep++) {
+            uint32_t mbar = (rep & 1) ? mbar1 : mbar0;
+            int &ph = (rep & 1) ? ph1 : ph0;
+            long long t0 = clk();
+            if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, 1); mma_commit(mbar); }
+            mb_wait(mbar, ph); ph ^= 1;
+            long long t1 = clk();
+            if (s.lane == 0) tot += t1 - t0;
+        }
+        if (s.lane == 0) out[0] = tot;
+    } else if (s.warp >= 2) {
+        /* Realistic epilogue: 4 LDS + 4 BF16 HADD2 + 4 STS per iteration */
+        uint32_t lds_addr = s.sb + WORK_OFF + (s.warp - 2) * 1024 + s.lane * 16;
+        uint32_t sts_addr = s.sb + WORK_OFF + 8192 + (s.warp - 2) * 1024 + s.lane * 16;
+        uint32_t r0, r1, r2, r3;
+        uint32_t bf = 0x3c003c00u, v = 0x3c003c00u;
+        #pragma unroll 1
+        for (int i = 0; i < (WARMUP + REPS) * 4; i++) {
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                         : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(lds_addr));
+            asm volatile("add.rn.bf16x2 %0, %0, %1;" : "+r"(bf) : "r"(v));
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                         :: "r"(sts_addr), "r"(r0), "r"(r1), "r"(r2), "r"(r3) : "memory");
+        }
+        if (bf == 0xDEAD) out[1] = bf;
+    }
+    mw_fini(s.sb, s.warp);
+}
+
+/* ═══════ M. Multi-SM scaling ═══════ */
+/* Launch on all 74 clusters (148 SMs). Each measures K-iteration throughput.
+   Stresses memory subsystem and reveals system-level contention. */
+
+#define MAX_CLUSTERS 74
+
+__global__ __launch_bounds__(32, 1) __cluster_dims__(2, 1, 1)
+void k_multi_sm(__grid_constant__ const CUtensorMap tma_a,
+                __grid_constant__ const CUtensorMap tma_b,
+                long long *out) {
+    Setup s;
+    if (!bench_init(s, tma_a, tma_b)) { bench_fini(s.sb); return; }
+
+    uint64_t da = s.da[0], db = s.db[0];
+    uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
+    int cluster_id = blockIdx.x / 2;
+
+    int ph0 = 0, ph1 = 0;
+    for (int w = 0; w < WARMUP; w++) {
+        uint32_t mbar = (w & 1) ? mbar1 : mbar0;
+        int &ph = (w & 1) ? ph1 : ph0;
+        if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, w > 0 ? 1 : 0); mma_commit(mbar); }
+        mb_wait(mbar, ph); ph ^= 1;
+    }
+
+    long long tot = 0;
+    for (int rep = 0; rep < REPS; rep++) {
+        uint32_t mbar = (rep & 1) ? mbar1 : mbar0;
+        int &ph = (rep & 1) ? ph1 : ph0;
+        long long t0 = clk();
+        if (s.lane == 0) { mma_fence(); MMA_4SUB(0, da, db, 1); mma_commit(mbar); }
+        mb_wait(mbar, ph); ph ^= 1;
+        long long t1 = clk();
+        if (s.lane == 0) tot += t1 - t0;
+    }
+
+    if (s.lane == 0) out[cluster_id] = tot;
+    bench_fini(s.sb);
+}
+
 /* ═══════ Host ═══════ */
 
 int main() {
@@ -1002,8 +1400,19 @@ int main() {
     set_smem((const void*)k_kloop<16>);
     set_smem((const void*)k_kloop<24>);
     set_smem((const void*)k_tmem_dbuf);
+    set_smem((const void*)k_sts_tmem_overlap<1>);
+    set_smem((const void*)k_sts_tmem_overlap<4>);
+    set_smem((const void*)k_sts_tmem_overlap<8>);
+    set_smem((const void*)k_mma_compute_lat);
+    set_smem((const void*)k_xwarp_handoff);
+    set_smem((const void*)k_mw_sts<0>);
+    set_smem((const void*)k_mw_sts<4>);
+    set_smem((const void*)k_mw_sts<8>);
+    set_smem((const void*)k_mw_sts<16>);
+    set_smem((const void*)k_mw_mixed);
+    set_smem((const void*)k_multi_sm);
 
-    long long *d_out, h[16];
+    long long *d_out, h[256];
     CUDA_CHECK(cudaMalloc(&d_out, sizeof(h)));
     auto reset = [&]() { CUDA_CHECK(cudaMemset(d_out, 0, sizeof(h))); };
     const char *cur = "";
@@ -1106,6 +1515,21 @@ int main() {
                n, cpl, (double)h[0] / REPS, n);
     }
 
+    printf("  x64 (2×x32 sequential, 64 cols):\n");
+    for (int n : {1, 2}) {
+        cur = "D.tmem_x64";
+        reset();
+        /* x64 = 2 back-to-back x32 loads covering 64 columns */
+        switch (n) {
+            case 1: k_tmem_load_x32<2><<<grid, block, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+            case 2: k_tmem_load_x32<4><<<grid, block, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+        }
+        sync();
+        double cpl = (double)h[0] / (REPS * n);
+        printf("    ILP=%d:  %6.1f cyc/x64  (%.1f cyc total, 2×x32 each)\n",
+               n, cpl, (double)h[0] / REPS);
+    }
+
     /* ═══ E. MMA SHADOW BUDGET ═══ */
     printf("\n═══ E. MMA Shadow Budget (work between MMA dispatch and commit+wait) ═══\n\n");
 
@@ -1198,6 +1622,102 @@ int main() {
         printf("  MMA + TMEM read:         %6.1f cyc\n", t_both);
         printf("  overhead:                %+.1f cyc (%.1f%%)\n",
                t_both - t_mma, 100.0 * (t_both / t_mma - 1.0));
+    }
+
+    /* ═══ I. STS + TMEM_LD OVERLAP ═══ */
+    printf("\n═══ I. STS + TMEM_LD Overlap (after MMA complete) ═══\n\n");
+    for (int n : {1, 4, 8}) {
+        cur = "I.overlap";
+        reset();
+        switch (n) {
+            case 1: k_sts_tmem_overlap<1><<<grid, block, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+            case 4: k_sts_tmem_overlap<4><<<grid, block, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+            case 8: k_sts_tmem_overlap<8><<<grid, block, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+        }
+        sync();
+        double t_ld = (double)h[0] / REPS;
+        double t_sts = (double)h[1] / REPS;
+        double t_both = (double)h[2] / REPS;
+        double expected = t_ld + t_sts;
+        printf("  STS=%d:  TMEM_LD=%.1f  STS=%.1f  both=%.1f  (%.1f%% vs sequential)\n",
+               n, t_ld, t_sts, t_both, 100.0 * (t_both / expected - 1.0));
+    }
+
+    /* ═══ J. MMA COMPUTE TIME ═══ */
+    printf("\n═══ J. MMA Compute Time (commit → mbar_wait, tensor core latency) ═══\n\n");
+    cur = "J.compute";
+    reset(); k_mma_compute_lat<<<grid, block, SMEM_TOT>>>(tma_a, tma_b, d_out); sync();
+    {
+        double t = (double)h[0] / REPS;
+        printf("  commit + mbar_wait:      %6.1f cyc  (MMA dispatched before timing)\n", t);
+        printf("  cf. full K_ITER (B):     %6.1f cyc  (includes fence + dispatch)\n", t_kiter);
+    }
+
+    /* ═══ K. CROSS-WARP EPILOGUE HANDOFF ═══ */
+    printf("\n═══ K. Cross-Warp Handoff (W1 MMA+commit → W2 mbar_wait+TMEM_LD) ═══\n\n");
+    cur = "K.xwarp";
+    {
+        dim3 grid3(2), block3(96);
+        reset(); k_xwarp_handoff<<<grid3, block3, SMEM_TOT>>>(tma_a, tma_b, d_out); sync();
+        double t_wait = (double)h[0] / REPS;
+        double t_ld = (double)h[1] / REPS;
+        printf("  W2 mbar_wait (for W1):   %6.1f cyc\n", t_wait);
+        printf("  W2 TMEM_LD (after wait): %6.1f cyc\n", t_ld);
+        printf("  total handoff:           %6.1f cyc\n", t_wait + t_ld);
+    }
+
+    /* ═══ L. MULTI-WARP CONTENTION ═══ */
+    printf("\n═══ L. Multi-Warp Contention (W1=MMA, W2-W5=epilogue STS) ═══\n\n");
+    {
+        dim3 grid_mw(2), block_mw(MW_THREADS);
+        printf("  W1 K-iter time with N epilogue warps doing continuous STS:\n");
+        for (int sts : {0, 4, 8, 16}) {
+            cur = "L.mw_sts";
+            reset();
+            switch (sts) {
+                case 0:  k_mw_sts<0> <<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+                case 4:  k_mw_sts<4> <<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+                case 8:  k_mw_sts<8> <<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+                case 16: k_mw_sts<16><<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); break;
+            }
+            sync();
+            double t = (double)h[0] / REPS;
+            printf("    EPI_STS=%2d:  %6.1f cyc/iter", sts, t);
+            if (sts == 0) printf("  (baseline — no epilogue work)");
+            printf("\n");
+        }
+
+        printf("\n  Mixed epilogue (4× LDS+BF16+STS per warp, realistic FC2):\n");
+        cur = "L.mw_mixed";
+        reset(); k_mw_mixed<<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out); sync();
+        printf("    mixed:       %6.1f cyc/iter\n", (double)h[0] / REPS);
+    }
+
+    /* ═══ M. MULTI-SM SCALING ═══ */
+    printf("\n═══ M. Multi-SM Scaling (%d clusters, K-iter throughput) ═══\n\n", MAX_CLUSTERS);
+    cur = "M.multi_sm";
+    {
+        dim3 grid_all(MAX_CLUSTERS * 2), block1(32);
+        reset(); k_multi_sm<<<grid_all, block1, SMEM_TOT>>>(tma_a, tma_b, d_out); sync();
+        double mn = 1e18, mx = 0, sum = 0;
+        int valid = 0;
+        for (int i = 0; i < MAX_CLUSTERS; i++) {
+            if (h[i] == 0) continue;
+            double t = (double)h[i] / REPS;
+            sum += t; valid++;
+            if (t < mn) mn = t;
+            if (t > mx) mx = t;
+        }
+        if (valid > 0) {
+            double avg = sum / valid;
+            printf("  %d clusters reporting:\n", valid);
+            printf("    avg:  %6.1f cyc/iter\n", avg);
+            printf("    min:  %6.1f cyc/iter\n", mn);
+            printf("    max:  %6.1f cyc/iter\n", mx);
+            printf("    spread: %.1f%%\n", 100.0 * (mx - mn) / avg);
+        }
+        /* Single cluster for comparison (from section B) */
+        printf("  single cluster (B):  %6.1f cyc/iter\n", t_kiter);
     }
 
     printf("\nDone.\n");
