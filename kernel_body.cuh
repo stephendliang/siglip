@@ -1679,6 +1679,7 @@ persistent_gemm(
     long long min_kloop = 0x7FFFFFFFFFFFFFFFLL, max_kloop = 0;
     long long min_total = 0x7FFFFFFFFFFFFFFFLL, max_total = 0;
     int tile_count = 0;
+    long long gt_tile_start = 0, gt_kloop_end = 0, sum_gt_total = 0;
     long long epi_t0 = 0, epi_t1 = 0;
     long long epi_sum_p1 = 0;
     long long epi_min_p1 = 0x7FFFFFFFFFFFFFFFLL, epi_max_p1 = 0;
@@ -1889,6 +1890,7 @@ persistent_gemm(
             if (lane == 0 && cta_rank == 0) {
 #ifdef TIMING
                 t_tile_start = clock64();
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gt_tile_start));
 #endif
 #if OVERLAP_EPI_WAIT
                 if (!epi_pf_ready_)
@@ -2008,6 +2010,7 @@ persistent_gemm(
                 tcgen05_commit_mcast(mainloop_mbar_addr + buf * 8, 0x3);
 #ifdef TIMING
                 t_kloop_end = clock64();
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gt_kloop_end));
                 long long dt_epi = t_after_epi - t_tile_start;
                 long long dt_tma0 = t_after_tma0 - t_after_epi;
                 long long dt_kloop = t_kloop_end - t_after_tma0;
@@ -2016,12 +2019,14 @@ persistent_gemm(
                 sum_tma0_wait += dt_tma0;
                 sum_kloop += dt_kloop;
                 sum_total += dt_total;
+                sum_gt_total += gt_kloop_end - gt_tile_start;
                 if (dt_kloop < min_kloop) min_kloop = dt_kloop;
                 if (dt_kloop > max_kloop) max_kloop = dt_kloop;
                 if (dt_total < min_total) min_total = dt_total;
                 if (dt_total > max_total) max_total = dt_total;
                 tile_count++;
                 t_tile_start = clock64();
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gt_tile_start));
 #endif
             }
         }
@@ -2282,6 +2287,7 @@ persistent_gemm(
         out[5] = max_kloop;
         out[6] = min_total;
         out[7] = max_total;
+        out[30] = sum_gt_total;
     }
     if (warp >= 2 + EPI_LOAD_WARP && lane == 0 && cta_rank == 0) {
         int ew_out = warp - 2 - EPI_LOAD_WARP;
@@ -2526,6 +2532,7 @@ static void print_timing(long long* d_timing, long long* d_spread, size_t spread
     long long g_epi = 0, g_tma0 = 0, g_kloop = 0, g_total = 0;
     long long g_min_kloop = 0x7FFFFFFFFFFFFFFFLL, g_max_kloop = 0;
     long long g_min_total = 0x7FFFFFFFFFFFFFFFLL, g_max_total = 0;
+    long long g_gt_total = 0;
     int total_tiles = 0;
 
     for (int c = 0; c < 74; c++) {
@@ -2536,12 +2543,16 @@ static void print_timing(long long* d_timing, long long* d_spread, size_t spread
         if (d[5] > g_max_kloop) g_max_kloop = d[5];
         if (d[6] < g_min_total) g_min_total = d[6];
         if (d[7] > g_max_total) g_max_total = d[7];
+        g_gt_total += d[30];
         total_tiles += tiles_this;
     }
 
-    double clock_ghz = 2.1;
+    /* Derive actual SM clock from globaltimer (fixed 1 GHz = nanoseconds)
+       vs clock64 (SM cycles). Ratio = actual SM frequency. */
+    double clock_ghz = (g_gt_total > 0) ? (double)g_total / (double)g_gt_total : 2.1;
     printf("\n=== W1 TIMING (clock64, %d tiles across 74 clusters) ===\n", total_tiles);
-    printf("  Per-tile averages (cycles / ns at %.1f GHz):\n", clock_ghz);
+    printf("  SM clock (measured): %.3f GHz  (clock64/globaltimer)\n", clock_ghz);
+    printf("  Per-tile averages (cycles / ns at %.3f GHz):\n", clock_ghz);
     printf("    Epilogue mbar wait:  %7lld cycles / %6.1f ns\n", g_epi / total_tiles, (double)g_epi / total_tiles / clock_ghz);
     printf("    TMA stage-0 wait:    %7lld cycles / %6.1f ns\n", g_tma0 / total_tiles, (double)g_tma0 / total_tiles / clock_ghz);
     printf("    K-loop (6 ki × 4 MMA): %7lld cycles / %6.1f ns\n", g_kloop / total_tiles, (double)g_kloop / total_tiles / clock_ghz);
@@ -2553,7 +2564,8 @@ static void print_timing(long long* d_timing, long long* d_spread, size_t spread
            g_min_kloop > 0 ? (double)g_max_kloop / g_min_kloop : 0.0);
     printf("  Total tile range: min=%lld max=%lld (%.1fx spread)\n", g_min_total, g_max_total,
            g_min_total > 0 ? (double)g_max_total / g_min_total : 0.0);
-    printf("  Expected total cycles (wall clock): %.0f\n", _ms * 1e-3 * clock_ghz * 1e9);
+    printf("  Predicted wall from tile cycles: %.3f ms  (actual: %.3f ms)\n",
+           (double)g_total / (74.0 * clock_ghz * 1e6), _ms);
 
     // Per-warp Phase 1 data
     long long gw_sum_p1[NUM_EPI_WARPS] = {0};
