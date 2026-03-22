@@ -1653,18 +1653,18 @@ void k_mw_real_kloop(__grid_constant__ const CUtensorMap tma_a,
     } else if (s.warp == 0) {
         /* W0: TMA warp — reload stages for W1's pipeline.
            For each K-iter (beyond initial fill), wait for MMA to free the stage,
-           then issue TMA loads. Coordinates wrap around the small tensor. */
+           then issue TMA loads. Coordinates wrap around the small tensor.
+
+           W0 drains mma_mbar after each K-loop (matching W1). This:
+           1. Balances phase tracking (no buffer drift, no race with W1's
+              ki=0 commit that could annihilate a buffered flip).
+           2. Confirms the last N_STAGES MMAs completed, which implies their
+              TMA source data is no longer in flight — safe to mb_expect_tx
+              on the same tma_mbar without corrupting in-flight state. */
         for (int rep = 0; rep < 4 + REPS; rep++) {
             for (int ki = 0; ki < KLOOP_ITERS; ki++) {
                 int st = ki % N_STAGES;
-                /* Wait for MMA to finish with this stage before overwriting.
-                   Also serves as TMA completion guard: without this delay,
-                   mb_expect_tx would fire on a tma_mbar with an in-flight
-                   TMA from ki-N_STAGES (corrupts mbar → hardware trap).
-                   No race with W1's ki=0 commit: mma_commit arrivals are
-                   deferred until MMA completes (~500+ cyc), so W0 always
-                   sees the pre-commit phase and passes immediately. */
-                if (ki >= N_STAGES || rep > 0) {
+                if (ki >= N_STAGES) {
                     mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
                 }
                 /* Issue TMA loads (only lane 0) */
@@ -1676,6 +1676,11 @@ void k_mw_real_kloop(__grid_constant__ const CUtensorMap tma_a,
                     tma_ld(s.sb + STAGE_B(st), &tma_b,
                            coord_k, s.cta_rank * (BENCH_TN / 2), tma_mbar[st]);
                 }
+            }
+            /* Drain: confirm last N_STAGES MMAs done (and their TMAs) */
+            for (int i = 0; i < N_STAGES && i < KLOOP_ITERS; i++) {
+                int st = (KLOOP_ITERS - N_STAGES + i) % N_STAGES;
+                mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
             }
         }
     }
