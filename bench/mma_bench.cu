@@ -1140,13 +1140,21 @@ void k_xwarp_handoff(__grid_constant__ const CUtensorMap tma_a,
     uint64_t da = s.da[0], db = s.db[0];
     uint32_t mbar0 = s.sb + MB_MMA(0), mbar1 = s.sb + MB_MMA(1);
 
-    if (s.warp == 1 && s.lane == 0) {
-        /* MMA producer: fence → MMA×4 → commit, repeated */
+    if (s.warp == 1) {
+        /* MMA producer: fence → MMA×4 → commit → wait (serialized to
+           prevent mbar phase overrun — W1 dispatches ~3x faster than
+           W2 consumes, so without backpressure W1 cycles the mbar past
+           W2's expected phase → deadlock) */
+        int ph0 = 0, ph1 = 0;
         for (int rep = 0; rep < WARMUP + REPS; rep++) {
             uint32_t mbar = (rep & 1) ? mbar1 : mbar0;
-            mma_fence();
-            MMA_4SUB(0, da, db, rep > 0 ? 1 : 0);
-            mma_commit(mbar);
+            int &ph = (rep & 1) ? ph1 : ph0;
+            if (s.lane == 0) {
+                mma_fence();
+                MMA_4SUB(0, da, db, rep > 0 ? 1 : 0);
+                mma_commit(mbar);
+            }
+            mb_wait(mbar, ph); ph ^= 1;
         }
     } else if (s.warp == 2) {
         /* Epilogue consumer: mbar_wait → TMEM_LD, timed */
