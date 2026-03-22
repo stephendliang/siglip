@@ -1658,11 +1658,13 @@ void k_mw_real_kloop(__grid_constant__ const CUtensorMap tma_a,
             for (int ki = 0; ki < KLOOP_ITERS; ki++) {
                 int st = ki % N_STAGES;
                 /* Wait for MMA to finish with this stage before overwriting.
-                   Same rule as W1: skip ki < N_STAGES. The drain (or initial
-                   fill) already freed these stages. Using rep > 0 here races
-                   with W1's ki=0 commit — if W1 commits before W0 checks,
-                   the buffered phase flip is annihilated and W0 deadlocks. */
-                if (ki >= N_STAGES) {
+                   Also serves as TMA completion guard: without this delay,
+                   mb_expect_tx would fire on a tma_mbar with an in-flight
+                   TMA from ki-N_STAGES (corrupts mbar → hardware trap).
+                   No race with W1's ki=0 commit: mma_commit arrivals are
+                   deferred until MMA completes (~500+ cyc), so W0 always
+                   sees the pre-commit phase and passes immediately. */
+                if (ki >= N_STAGES || rep > 0) {
                     mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
                 }
                 /* Issue TMA loads (only lane 0) */
