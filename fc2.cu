@@ -15,13 +15,43 @@ Epilogue: FP32 acc + bias + residual(BF16) → BF16 CVT → SMEM staging → TMA
 #include "kernel_common.cuh"
 
 /*
-Fused bias+residual+CVT+STS macro — three paths selected by FP32_EPILOGUE.
-f0-f7: FP32 accumulators, b0-b3: BF16x2 bias pairs, r0-r1,r2-r3: BF16x2 residual pairs
+Fused bias+residual+CVT+STS macro — paths selected by FP32_EPILOGUE and PRE_COMBINE.
+f0-f7: FP32 accumulators, b0-b3: BF16x2 bias pairs, r0-r3: BF16x2 residual pairs
+PRE_COMBINE=1: bias+residual pre-added before TMEM_WAIT → c0-c3 combined BF16x2.
 */
 #if FP32_EPILOGUE == 0
+#if PRE_COMBINE
+/*
+Pre-combined BF16 path: bias+residual already added → 4 CVT + 4 HADD2 + STS = 9 ops.
+8 BF16 per STS (vs 12 in original). Section P: 8=+55% overhead, fits better in STS shadow.
+*/
+#define COMBINED_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, c0,c1,c2,c3, SADDR) \
+    asm volatile( \
+        "{\n\t" \
+        ".reg .b32 o0, o1, o2, o3;\n\t" \
+        "cvt.rn.bf16x2.f32 o0, %1, %0;\n\t" \
+        "cvt.rn.bf16x2.f32 o1, %3, %2;\n\t" \
+        "cvt.rn.bf16x2.f32 o2, %5, %4;\n\t" \
+        "cvt.rn.bf16x2.f32 o3, %7, %6;\n\t" \
+        "add.rn.bf16x2 o0, o0, %8;\n\t" \
+        "add.rn.bf16x2 o1, o1, %9;\n\t" \
+        "add.rn.bf16x2 o2, o2, %10;\n\t" \
+        "add.rn.bf16x2 o3, o3, %11;\n\t" \
+        "st.shared.v4.b32 [%12], {o0,o1,o2,o3};\n\t" \
+        "}" \
+        :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
+           "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
+           "r"(c0),"r"(c1),"r"(c2),"r"(c3), \
+           "r"(SADDR) \
+        : "memory")
+
+/* Keep old macro for non-PRE_COMBINE code in kernel_body.cuh (unused when PRE_COMBINE=1) */
+#define BIAS_RES_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3, r0,r1,r2,r3, SADDR) \
+    COMBINED_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3, SADDR)
+#else
 /*
 BF16 arithmetic path (original): CVT FP32→BF16x2 early, HADD2 bias, HADD2 residual, STS.
-13 instructions between STS calls.
+12 BF16 + 1 STS = 13 instructions per macro. Section P: 12 BF16 ≈ +100% STS overhead.
 */
 #define BIAS_RES_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3, r0,r1,r2,r3, SADDR) \
     asm volatile( \
@@ -47,6 +77,7 @@ BF16 arithmetic path (original): CVT FP32→BF16x2 early, HADD2 bias, HADD2 resi
            "r"(r0),"r"(r1),"r"(r2),"r"(r3), \
            "r"(SADDR) \
         : "memory")
+#endif
 
 #elif FP32_EPILOGUE == 1
 /*
@@ -383,10 +414,17 @@ int main() {
                 (float)((int)row % 128) * 0.25f + (float)col * 0.125f));
             float bias_bf16_f = __bfloat162float(__float2bfloat16((float)(col + 1)));
 #if FP32_EPILOGUE == 0
+#if PRE_COMBINE
+            /* Pre-combined BF16 path: bf16(gemm) + bf16(bias + residual) */
+            float combined_f = __bfloat162float(__float2bfloat16(bias_bf16_f + res_bf16_f));
+            float acc_rounded = __bfloat162float(__float2bfloat16(gemm));
+            __nv_bfloat16 expected = __float2bfloat16(acc_rounded + combined_f);
+#else
             /* BF16 path: bf16(bf16(gemm) + bf16(bias)) + residual */
             float acc_rounded = __bfloat162float(__float2bfloat16(gemm));
             float after_bias = __bfloat162float(__float2bfloat16(acc_rounded + bias_bf16_f));
             __nv_bfloat16 expected = __float2bfloat16(after_bias + res_bf16_f);
+#endif
 #elif FP32_EPILOGUE == 1
             /* FP32 residual path: bf16(f32(acc) + f32(residual)) then bf16 bias add */
             float after_res = __bfloat162float(__float2bfloat16(gemm + res_bf16_f));
@@ -425,9 +463,15 @@ int main() {
         float b_r = __bfloat162float(__float2bfloat16((float)(c + 1)));
         float r = __bfloat162float(__float2bfloat16((float)c * 0.125f));
 #if FP32_EPILOGUE == 0
+#if PRE_COMBINE
+        float cmb = __bfloat162float(__float2bfloat16(b_r + r));
+        float g_r = __bfloat162float(__float2bfloat16(gemm_f));
+        printf("%.1f ", __bfloat162float(__float2bfloat16(g_r + cmb)));
+#else
         float g_r = __bfloat162float(__float2bfloat16(gemm_f));
         float ab = __bfloat162float(__float2bfloat16(g_r + b_r));
         printf("%.1f ", __bfloat162float(__float2bfloat16(ab + r)));
+#endif
 #elif FP32_EPILOGUE == 1
         float ar = __bfloat162float(__float2bfloat16(gemm_f + r));
         printf("%.1f ", __bfloat162float(__float2bfloat16(ar + b_r)));

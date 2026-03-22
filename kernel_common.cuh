@@ -27,6 +27,9 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef TMEM_LOAD_WIDTH
 #define TMEM_LOAD_WIDTH 32   // 32=1×x32 per 32-col chunk (default), 16=2×x16, 64=1×x64
 #endif
+#ifndef EPI_NOINLINE
+#define EPI_NOINLINE 0       // 1=__noinline__ on epilogue_store (halves code duplication)
+#endif
 #ifndef INTERLEAVE_STRATEGY
 #define INTERLEAVE_STRATEGY 2  // 0=all-at-end(CUTLASS-style), 1=per-region, 2=half-batch, 3=three-plus-one
 #endif
@@ -78,6 +81,12 @@ Usage: #define N_DIM and K_DIM before including this header.
 #if EPI_LOAD_WARP && (W0_RES_FULL || W0_RES_PREFETCH)
 #error "EPI_LOAD_WARP mutually exclusive with W0_RES_FULL/W0_RES_PREFETCH"
 #endif
+#if STAGES_C && !TMA_RESIDUAL
+#error "STAGES_C requires TMA_RESIDUAL >= 1"
+#endif
+#if STAGES_C && (W0_RES_FULL || W0_RES_PREFETCH || EPI_LOAD_WARP)
+#error "STAGES_C mutually exclusive with W0_RES_FULL/W0_RES_PREFETCH/EPI_LOAD_WARP"
+#endif
 #ifndef SUB_MMA_UNROLL
 #define SUB_MMA_UNROLL  0    // Sub-MMA inner loop: 0=no pragma, 1=no unroll, N=unroll by N
 #endif
@@ -128,6 +137,15 @@ Usage: #define N_DIM and K_DIM before including this header.
 #endif
 #ifndef FP32_EPILOGUE
 #define FP32_EPILOGUE 0          // 0=BF16 path, 1=FP32 residual+late CVT, 2=full FP32
+#endif
+#ifndef PRE_COMBINE
+#define PRE_COMBINE 0            // 1=pre-add bias+residual before TMEM_WAIT, reduces BF16/STS from 12→8
+#endif
+#ifndef STAGES_C
+#define STAGES_C 0               // 0=off, 2=2-stage residual pipeline (W0 pre-loads, requires TMA_RESIDUAL)
+#endif
+#ifndef BRANCHLESS_EPI
+#define BRANCHLESS_EPI 0         // 1=predicated TMA + deferred stores + full unroll (requires STAGES_C>=2, BIAS_BF16)
 #endif
 #if EPILOGUE_LOOP
 #undef PHASE1_UNROLL
@@ -196,7 +214,14 @@ Problem dimensions — N_DIM must be defined before including this header
 #endif
 #if TMA_RESIDUAL
 #define OFF_RES_MBAR       (OFF_EPILOGUE_MBAR + 16)
-#if W0_RES_FULL || EPI_LOAD_WARP
+#if STAGES_C >= 2
+/* StagesC pipeline: per-(warp,stage) load mbar + per-stage release mbar.
+   Load mbar: W0 arrives with expect_tx, consumer waits. One per (warp, stage).
+   Release mbar: all consumer warps arrive, W0 waits. One per stage. */
+#define OFF_SC_LOAD_MBAR   (OFF_RES_MBAR + NUM_EPI_WARPS * 8)
+#define OFF_SC_REL_MBAR    (OFF_SC_LOAD_MBAR + NUM_EPI_WARPS * STAGES_C * 8)
+#define _MBAR_END          (OFF_SC_REL_MBAR + STAGES_C * 8)
+#elif W0_RES_FULL || EPI_LOAD_WARP
 #define OFF_RES_CONSUMED_MBAR  (OFF_RES_MBAR + NUM_EPI_WARPS * 8)
 #define OFF_RES_PASS_MBAR      (OFF_RES_CONSUMED_MBAR + 8)
 #define _MBAR_END              (OFF_RES_PASS_MBAR + 8)
@@ -218,7 +243,12 @@ Problem dimensions — N_DIM must be defined before including this header
 #endif
 #define STAGING_REGION_ROW_BYTES  128                                               // 64 BF16 cols = 128 bytes (SWIZZLE_128B)
 #define STAGING_REGION_BYTES      (32 * STAGING_REGION_ROW_BYTES)                   // 4096 bytes per region (32 rows x 128B)
-#define STAGING_WARP_BYTES        (4 * STAGING_REGION_BYTES)                         // 16384 bytes per warp (4 regions x 4096)
+#if STAGES_C >= 2
+#define STAGING_REGIONS_PER_WARP  (2 + STAGES_C * 2)                               // 2 output + 2 residual per stage
+#else
+#define STAGING_REGIONS_PER_WARP  4                                                 // 2 output + 2 residual (shared)
+#endif
+#define STAGING_WARP_BYTES        (STAGING_REGIONS_PER_WARP * STAGING_REGION_BYTES)  // bytes per warp
 #define STAGING_EPI_WARPS         NUM_EPI_WARPS
 #define SMEM_BYTES                ((OFF_STAGING + STAGING_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
 
@@ -327,6 +357,46 @@ void tma_load_2d_cta(uint32_t smem_dst, const void* tma_desc,
         " [%0], [%1, {%2, %3}], [%4];"
         :: "r"(smem_dst), "l"(tma_desc), "r"(c0), "r"(c1), "r"(mbar)
         : "memory");
+}
+
+/*
+Predicated TMA helpers — lane-0-only operations without divergent branches.
+All lanes execute but only lane 0's predicate is true, so the TMA/mbar
+instruction is a no-op on other lanes. Eliminates BSSY/BSYNC + most R2UR.
+*/
+static __device__ __forceinline__
+void pred_tma_store_2d(const void* tma_desc, int32_t col, int32_t row,
+                       uint32_t smem_src, uint32_t is_lane0) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %4, 0;\n\t"
+        "@p cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];\n\t"
+        "}"
+        :: "l"(tma_desc), "r"(col), "r"(row), "r"(smem_src), "r"(is_lane0)
+        : "memory");
+}
+
+static __device__ __forceinline__
+void pred_commit_group(uint32_t is_lane0) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %0, 0;\n\t"
+        "@p cp.async.bulk.commit_group;\n\t"
+        "}"
+        :: "r"(is_lane0) : "memory");
+}
+
+static __device__ __forceinline__
+void pred_mbar_arrive(uint32_t addr, uint32_t is_lane0) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %1, 0;\n\t"
+        "@p mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];\n\t"
+        "}"
+        :: "r"(addr), "r"(is_lane0) : "memory");
 }
 
 static __device__ __forceinline__

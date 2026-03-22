@@ -28,19 +28,28 @@ Cycle breakdown (NS5.IS1.base, timing build):
 - epi_wait: 107 cycles (balanced producer-consumer)
 - tma0_wait: 721 cycles
 
-Per-tile: our 20,743 cyc vs CUTLASS 17,500 cyc. K-loop alone = 17,426 cyc. The 3,317 cyc gap is Phase 1 SMEM contention — W2-W5 running Phase 1 competes with W0/W1 K-loop for shared memory bandwidth and dispatch slots. A faster Phase 1 reduces contention for ALL 147 tiles, not just the last tile.
+Per-tile: our 20,743 cyc vs CUTLASS 17,500 cyc. K-loop alone = 17,426 cyc. The 3,317 cyc gap is Phase 1 overhead — W2-W5 running Phase 1 competes with W0/W1 K-loop for dispatch slots. A faster Phase 1 reduces contention for ALL 147 tiles, not just the last tile.
 
-**Root cause — architectural difference with CUTLASS:**
-- CUTLASS loads residual (C matrix) via **TMA into SMEM** (async engine, zero LSU pressure)
-- We load residual via **LDS.128 from SMEM** (7 loads per group, shares LSU with STS)
-- Our epilogue: 7× LDS.128 + 4× STS.128 = **11 LSU ops/group** on the SMEM port
-- CUTLASS epilogue: 4× STS.128 only = **4 LSU ops/group** (C arrived via TMA, not LSU)
-- 2.75× more LSU pressure → saturates SMEM bandwidth → contention with K-loop
-- CUTLASS epilogue source: `third_party/cutlass/.../sm100_epilogue_tma_warpspecialized.hpp`
+**Root cause — instruction-level scheduling (corrected by TMA bench 2026-03-21):**
+
+TMA bench proved TMA and LSU have **separate SMEM ports** on SM100a (zero contention). The original "SMEM port contention" hypothesis was wrong. The real problem is 5 structural PTX mistakes:
+
+1. **Monolithic asm blocks**: each `BIAS_RES_CVT_STS_V4` = 12 BF16/CVT + 1 STS in one `asm volatile`. STS shadow fits only 4 BF16 free (section P); 12 overflows at ~+100% cost. **~216 wasted cyc/group.**
+2. **16 LDS at ILP=16**: 8 bias + 8 residual LDS back-to-back. ILP=16 regresses to 10 cyc/op (section O); sweet spot is ILP=7 at 3.54 cyc/op. **~104 wasted cyc.**
+3. **No LDS↔STS temporal overlap**: all LDS before all STS. Section E shows LDS+STS interleaved = 82.3% faster than sequential.
+4. **Bias+residual not pre-combined**: two separate HADD2 rounds. Pre-adding reduces BF16/STS from 12→8.
+5. **ptxas clustering**: source-level STS scheduling is a dead end (5 approaches tried, identical SASS).
 
 **Two attack vectors:**
-1. **SASS scheduling** (built): CP-SAT optimal scheduler spreads STS at 32-cycle intervals. 287-insn: 686 cyc (was 1417, -51.6%). Ready for B200 via fatbin-patch.
-2. **TMA residual pipeline** (architectural): restructure epilogue to separate LDS reads from STS stores temporally, or route residual through TMA more like CUTLASS.
+1. **SASS scheduling** (built): CP-SAT optimal scheduler spreads STS at 27-32 cyc intervals, packs ≤4 BF16 per window, clusters LDS at ILP=7. 287-insn: 686 cyc (was 1417, -51.6%). Ready for B200 via fatbin-patch.
+2. **Pre-combine bias+residual** (source change): `add.bf16x2(bias, residual)` before TMEM_WAIT reduces BF16/STS from 12 to 8. Makes SASS scheduling more effective.
+
+**SM100a hardware data** (from `bench/tma_bench.cu`, raw: `data/tma2.txt`):
+- STS.128 throughput: 27 cyc | LDS.128: 25 cyc @ILP=1, 3.5 cyc @ILP=7
+- STS shadow: ≤4 BF16 free, 8=+55%, 15=+161% | LDS+STS overlap: 82.3%
+- TMA load: 419 cyc (L2-warm) | TMA store: 197 cyc | TMA↔LSU: independent
+- mbarrier arrive: 2 cyc | wait: 47 cyc | fence.proxy.async: 10 cyc
+- CUTLASS epilogue source: `third_party/cutlass/.../sm100_epilogue_tma_warpspecialized.hpp`
 
 ## Grid search (FC2 only)
 

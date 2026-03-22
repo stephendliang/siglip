@@ -68,6 +68,9 @@ DEFAULTS = {
     'NUM_PASSES_PARAM': 0,
     'BIAS_SMEM': 0,
     'FP32_EPILOGUE': 0,
+    'PRE_COMBINE': 0,
+    'EPI_NOINLINE': 0,
+    'STAGES_C': 0,
 }
 
 # ── Parameter ranges ──
@@ -104,6 +107,9 @@ RANGES = {
     'BIAS_SMEM': [0, 1],
     'DEFERRED_WAIT': [0, 1],
     'FP32_EPILOGUE': [0, 1, 2],
+    'PRE_COMBINE': [0, 1],
+    'EPI_NOINLINE': [0, 1],
+    'STAGES_C': [0, 2],
 }
 
 # ── Tier definitions (generic, used by --tier 1/2/3/4/5) ──
@@ -130,7 +136,7 @@ KERNEL_TIERS = {
         3: ['EPILOGUE_LOOP', 'STS_WIDTH', 'EPI_SYNC', 'GELU_VECTOR_WIDTH'],
     },
     'fc2': {
-        1: ['N_STAGES', 'K_LOOP_UNROLL', 'TMA_RESIDUAL', 'W0_RES_PREFETCH', 'W0_RES_FULL', 'BATCH_MMA', 'FP32_EPILOGUE'],
+        1: ['N_STAGES', 'K_LOOP_UNROLL', 'TMA_RESIDUAL', 'W0_RES_PREFETCH', 'W0_RES_FULL', 'BATCH_MMA', 'FP32_EPILOGUE', 'PRE_COMBINE', 'EPI_NOINLINE'],
         2: ['INTERLEAVE_STRATEGY', 'PHASE1_UNROLL', 'BIAS_SMEM', 'TMEM_LOAD_WIDTH'],
         3: ['BATCH_EPILOGUE', 'STORE_TIMING', 'STS_WIDTH', 'PRELOAD_MODE', 'DEFERRED_WAIT'],
         4: ['EPILOGUE_LOOP', 'EPI_SYNC', 'NUM_PASSES_PARAM'],
@@ -150,7 +156,7 @@ KERNEL_CROSS_PARAMS = {
         'PHASE1_UNROLL', 'STORE_TIMING', 'PRELOAD_MODE', 'BATCH_EPILOGUE',  # tier 2
     ],
     'fc2': [
-        'N_STAGES', 'TMA_RESIDUAL', 'W0_RES_PREFETCH', 'W0_RES_FULL', 'BATCH_MMA', 'FP32_EPILOGUE',  # tier 1
+        'N_STAGES', 'TMA_RESIDUAL', 'W0_RES_PREFETCH', 'W0_RES_FULL', 'BATCH_MMA', 'FP32_EPILOGUE', 'PRE_COMBINE',  # tier 1
         'INTERLEAVE_STRATEGY', 'PHASE1_UNROLL', 'BIAS_SMEM', 'BATCH_EPILOGUE',       # tier 2
         'STORE_TIMING', 'DEFERRED_WAIT',                                               # tier 3
     ],
@@ -164,7 +170,7 @@ KERNEL_CROSS_PARAMS = {
 # These change pipeline depth or fundamental kernel structure — later tiers
 # may interact differently with each value, so both must survive.
 BRANCH_PARAMS = {
-    'fc2': {'N_STAGES', 'BATCH_MMA', 'FP32_EPILOGUE'},
+    'fc2': {'N_STAGES', 'BATCH_MMA', 'FP32_EPILOGUE', 'PRE_COMBINE'},
 }
 
 # Best-known configs per kernel (pin non-swept params here).

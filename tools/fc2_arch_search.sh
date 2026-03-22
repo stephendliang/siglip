@@ -53,6 +53,23 @@ add "fp32_full_is2"  "$BASE -DFP32_EPILOGUE=2 -DINTERLEAVE_STRATEGY=2"
 add "fp32_res_x64"   "$BASE -DFP32_EPILOGUE=1 -DTMEM_LOAD_WIDTH=64"
 add "fp32_full_x64"  "$BASE -DFP32_EPILOGUE=2 -DTMEM_LOAD_WIDTH=64"
 
+# ── Pre-combine bias+residual (9 ops/STS instead of 13, -15 regs) ──
+add "precombine"     "$BASE -DPRE_COMBINE=1"
+add "precombine_is2" "$BASE -DPRE_COMBINE=1 -DINTERLEAVE_STRATEGY=2"
+add "precombine_x64" "$BASE -DPRE_COMBINE=1 -DTMEM_LOAD_WIDTH=64"
+
+# ── EPI_NOINLINE (prevents double-inlining of epilogue_store, -480 insns) ──
+add "noinline"             "$BASE -DEPI_NOINLINE=1"
+add "noinline_precombine"  "$BASE -DEPI_NOINLINE=1 -DPRE_COMBINE=1"
+add "noinline_x64"         "$BASE -DEPI_NOINLINE=1 -DTMEM_LOAD_WIDTH=64"
+add "noinline_x64_pc"      "$BASE -DEPI_NOINLINE=1 -DTMEM_LOAD_WIDTH=64 -DPRE_COMBINE=1"
+
+# ── StagesC=2 (W0 pre-loads residual, CUTLASS-style pipeline, requires NS4 for SMEM) ──
+SC_BASE="-DN_STAGES=4 -DINTERLEAVE_STRATEGY=1 -DBIAS_SMEM=1 -DPHASE1_UNROLL=1 -DPRELOAD_MODE=0 -DSTAGGER_CYCLES=0 -DTMA_RESIDUAL=1 -DSTAGES_C=2 -DEPI_NOINLINE=1"
+add "stages_c"             "$SC_BASE"
+add "stages_c_pc"          "$SC_BASE -DPRE_COMBINE=1"
+add "stages_c_x64"         "$SC_BASE -DTMEM_LOAD_WIDTH=64"
+add "stages_c_x64_pc"      "$SC_BASE -DTMEM_LOAD_WIDTH=64 -DPRE_COMBINE=1"
 
 # ── Filter ──
 if [ -n "$ONLY" ]; then

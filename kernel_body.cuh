@@ -57,7 +57,12 @@ Transform selected by Op: BIAS_ADD (combined table), BIAS_GELU (bias+GELU), BIAS
 */
 
 template<int NC_START, int NC_END, EpilogueOp Op, bool FIRST_PASS_PRELOADED = false>
-static __device__ __forceinline__
+static __device__
+#if EPI_NOINLINE
+__noinline__
+#else
+__forceinline__
+#endif
 void epilogue_store(
     uint32_t tmem_addr,
     int row_group,
@@ -75,6 +80,9 @@ void epilogue_store(
     , const CUtensorMap* tma_res_desc
     , uint32_t res_mbar_addr
     , uint32_t res_staging_saddr
+#endif
+#if STAGES_C >= 2
+    , uint32_t sc_release_mbar_base
 #endif
 #if W0_RES_PREFETCH || W0_RES_FULL || EPI_LOAD_WARP
     , uint32_t res_consumed_mbar_addr
@@ -300,6 +308,50 @@ void epilogue_store(
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv6.x),"=r"(rv6.y),"=r"(rv6.z),"=r"(rv6.w) : "r"(rs + sw6));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv7.x),"=r"(rv7.y),"=r"(rv7.z),"=r"(rv7.w) : "r"(rs + sw7));
 
+#if PRE_COMBINE && BIAS_BF16
+                /*
+                Pre-add bias+residual before TMEM_WAIT: 32 HADD2 ops (all independent,
+                ~16 cyc throughput at full ILP). Executes during TMEM stall — essentially free.
+                Reduces BF16/STS from 12→8, moving closer to the 4-BF16 free zone (section P).
+                */
+                uint32_t cv0x, cv0y, cv0z, cv0w, cv1x, cv1y, cv1z, cv1w;
+                uint32_t cv2x, cv2y, cv2z, cv2w, cv3x, cv3y, cv3z, cv3w;
+                uint32_t cv4x, cv4y, cv4z, cv4w, cv5x, cv5y, cv5z, cv5w;
+                uint32_t cv6x, cv6y, cv6z, cv6w, cv7x, cv7y, cv7z, cv7w;
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv0x) : "r"(bv0.x), "r"(rv0.x));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv0y) : "r"(bv0.y), "r"(rv0.y));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv0z) : "r"(bv0.z), "r"(rv0.z));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv0w) : "r"(bv0.w), "r"(rv0.w));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv1x) : "r"(bv1.x), "r"(rv1.x));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv1y) : "r"(bv1.y), "r"(rv1.y));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv1z) : "r"(bv1.z), "r"(rv1.z));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv1w) : "r"(bv1.w), "r"(rv1.w));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv2x) : "r"(bv2.x), "r"(rv2.x));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv2y) : "r"(bv2.y), "r"(rv2.y));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv2z) : "r"(bv2.z), "r"(rv2.z));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv2w) : "r"(bv2.w), "r"(rv2.w));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv3x) : "r"(bv3.x), "r"(rv3.x));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv3y) : "r"(bv3.y), "r"(rv3.y));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv3z) : "r"(bv3.z), "r"(rv3.z));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv3w) : "r"(bv3.w), "r"(rv3.w));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv4x) : "r"(bv4.x), "r"(rv4.x));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv4y) : "r"(bv4.y), "r"(rv4.y));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv4z) : "r"(bv4.z), "r"(rv4.z));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv4w) : "r"(bv4.w), "r"(rv4.w));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv5x) : "r"(bv5.x), "r"(rv5.x));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv5y) : "r"(bv5.y), "r"(rv5.y));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv5z) : "r"(bv5.z), "r"(rv5.z));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv5w) : "r"(bv5.w), "r"(rv5.w));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv6x) : "r"(bv6.x), "r"(rv6.x));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv6y) : "r"(bv6.y), "r"(rv6.y));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv6z) : "r"(bv6.z), "r"(rv6.z));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv6w) : "r"(bv6.w), "r"(rv6.w));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv7x) : "r"(bv7.x), "r"(rv7.x));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv7y) : "r"(bv7.y), "r"(rv7.y));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv7z) : "r"(bv7.z), "r"(rv7.z));
+                asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(cv7w) : "r"(bv7.w), "r"(rv7.w));
+#endif
+
                 TMEM_WAIT();
 
                 if (MBAR_EARLY && pass == LOCAL_PASSES - 1 && nc + 64 >= pnc_e) {
@@ -307,6 +359,24 @@ void epilogue_store(
                 }
 
 #if BIAS_BF16
+#if PRE_COMBINE
+                COMBINED_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                    cv0x,cv0y,cv0z,cv0w, srow + sw0);
+                COMBINED_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                    cv1x,cv1y,cv1z,cv1w, srow + sw1);
+                COMBINED_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                    cv2x,cv2y,cv2z,cv2w, srow + sw2);
+                COMBINED_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                    cv3x,cv3y,cv3z,cv3w, srow + sw3);
+                COMBINED_CVT_STS_V4(a32,a33,a34,a35,a36,a37,a38,a39,
+                    cv4x,cv4y,cv4z,cv4w, srow + sw4);
+                COMBINED_CVT_STS_V4(a40,a41,a42,a43,a44,a45,a46,a47,
+                    cv5x,cv5y,cv5z,cv5w, srow + sw5);
+                COMBINED_CVT_STS_V4(a48,a49,a50,a51,a52,a53,a54,a55,
+                    cv6x,cv6y,cv6z,cv6w, srow + sw6);
+                COMBINED_CVT_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63,
+                    cv7x,cv7y,cv7z,cv7w, srow + sw7);
+#else
                 BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                     bv0.x,bv0.y,bv0.z,bv0.w,
                     rv0.x,rv0.y,rv0.z,rv0.w, srow + sw0);
@@ -331,6 +401,7 @@ void epilogue_store(
                 BIAS_RES_CVT_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63,
                     bv7.x,bv7.y,bv7.z,bv7.w,
                     rv7.x,rv7.y,rv7.z,rv7.w, srow + sw7);
+#endif
 #else
                 /* 8× BIAS_RES_CVT_STS_V4 — one full 64-col region */
                 BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
@@ -445,6 +516,11 @@ void epilogue_store(
             const int pnc_s = NC_START + pass * PASS_COLS;
             const int pnc_e = pnc_s + PASS_COLS;
 
+#if STAGES_C >= 2
+            /* W0 already loaded residual into stage[pass] — just compute staging addr */
+            const uint32_t pass_res_staging = res_staging_saddr + pass * 2 * STAGING_REGION_BYTES;
+#else
+            const uint32_t pass_res_staging = res_staging_saddr;
 #if !W0_RES_FULL && !EPI_LOAD_WARP
             if (!(FIRST_PASS_PRELOADED && pass == 0)) {
                 if (lane == 0) {
@@ -457,6 +533,7 @@ void epilogue_store(
                     }
                 }
             }
+#endif
 #endif
 
 #if !DEFERRED_WAIT
@@ -472,7 +549,12 @@ void epilogue_store(
                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                          taddr_base + pnc_s);
 
+#if STAGES_C >= 2
+            /* Wait for W0's TMA load to complete — per-(warp,stage) mbar */
+            mbar_wait(res_mbar_addr + pass * 8, res_phase);
+#else
             mbar_wait(res_mbar_addr, res_phase);
+#endif
             res_phase ^= 1;
 
 #if DEFERRED_WAIT
@@ -484,6 +566,78 @@ void epilogue_store(
             }
 #endif
 
+#if BRANCHLESS_EPI && STAGES_C >= 2 && BIAS_BF16
+            /*
+            Branchless epilogue: predicated TMA + deferred stores + full unroll.
+            All TMA/mbar ops use predicated execution (no divergent branches,
+            no BSSY/BSYNC, minimal R2UR). Inner loop fully unrolled (no back-edge BRA).
+            TMA stores deferred to after all compute (no interleaved IS1 branches).
+            Only remaining branches: TMEM_WAIT (unavoidable, one per 32-col chunk).
+            */
+            const uint32_t is_lane0 = (lane == 0) ? 1u : 0u;
+
+#pragma unroll
+            for (int nc = pnc_s; nc < pnc_e; nc += 32) {
+                const int chunk_in_pass = nc - pnc_s;
+                const int res_ri = chunk_in_pass >> 6;
+                const int half = (chunk_in_pass >> 5) & 1;
+
+                const uint32_t bs = bias_smem_base + nc * 2;
+                uint4 bv0, bv1, bv2, bv3;
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv0.x),"=r"(bv0.y),"=r"(bv0.z),"=r"(bv0.w) : "r"(bs));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv1.x),"=r"(bv1.y),"=r"(bv1.z),"=r"(bv1.w) : "r"(bs + 16));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv2.x),"=r"(bv2.y),"=r"(bv2.z),"=r"(bv2.w) : "r"(bs + 32));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
+
+                const uint32_t rs = pass_res_staging
+                    + res_ri * STAGING_REGION_BYTES + lane * STAGING_REGION_ROW_BYTES;
+                const uint32_t rsw0 = half ? sw4 : sw0;
+                const uint32_t rsw1 = half ? sw5 : sw1;
+                const uint32_t rsw2 = half ? sw6 : sw2;
+                const uint32_t rsw3 = half ? sw7 : sw3;
+                uint4 rv0, rv1, rv2, rv3;
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(rs + rsw0));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv1.x),"=r"(rv1.y),"=r"(rv1.z),"=r"(rv1.w) : "r"(rs + rsw1));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w) : "r"(rs + rsw2));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w) : "r"(rs + rsw3));
+
+                TMEM_WAIT();
+
+                const uint32_t srow = srow_base + res_ri * STAGING_REGION_BYTES;
+
+                BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                    bv0.x,bv0.y,bv0.z,bv0.w,
+                    rv0.x,rv0.y,rv0.z,rv0.w, srow + rsw0);
+                BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                    bv1.x,bv1.y,bv1.z,bv1.w,
+                    rv1.x,rv1.y,rv1.z,rv1.w, srow + rsw1);
+                BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                    bv2.x,bv2.y,bv2.z,bv2.w,
+                    rv2.x,rv2.y,rv2.z,rv2.w, srow + rsw2);
+                BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                    bv3.x,bv3.y,bv3.z,bv3.w,
+                    rv3.x,rv3.y,rv3.z,rv3.w, srow + rsw3);
+
+                if (nc + 32 < pnc_e) {
+                    LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                                 a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                                 taddr_base + nc + 32);
+                }
+            }
+
+            /* Deferred TMA stores — all regions at once, predicated (no branches) */
+            __syncwarp();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            for (int r = 0; r < PASS_REGIONS; r++) {
+                uint32_t src = staging_saddr + r * STAGING_REGION_BYTES;
+                pred_tma_store_2d(tma_c_desc, n_start + pnc_s + r * 64,
+                                  gm_base, src, is_lane0);
+            }
+            pred_commit_group(is_lane0);
+
+            /* Signal W0 that this stage's buffer is free — predicated */
+            pred_mbar_arrive(sc_release_mbar_base + pass * 8, is_lane0);
+#else /* original branched path */
 #if EPILOGUE_LOOP
 #pragma unroll 1
 #else
@@ -533,7 +687,7 @@ void epilogue_store(
 #endif /* BIAS_BF16 */
 
                 /* Residual from SMEM — use precomputed swizzle offsets */
-                const uint32_t rs = res_staging_saddr
+                const uint32_t rs = pass_res_staging
                     + res_ri * STAGING_REGION_BYTES + lane * STAGING_REGION_ROW_BYTES;
                 const uint32_t rsw0 = half ? sw4 : sw0;
                 const uint32_t rsw1 = half ? sw5 : sw1;
@@ -649,12 +803,16 @@ void epilogue_store(
                     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                 }
             }
-#if W0_RES_FULL || EPI_LOAD_WARP
+#if STAGES_C >= 2
+            /* Signal W0 that this stage's buffer is free */
+            if (lane == 0) mbar_arrive(sc_release_mbar_base + pass * 8);
+#elif W0_RES_FULL || EPI_LOAD_WARP
             /* Signal pass consumed so loader warp can load next pass */
             if (pass < LOCAL_PASSES - 1) {
                 if (res_pass_mbar_addr && lane == 0) mbar_arrive(res_pass_mbar_addr);
             }
 #endif
+#endif /* BRANCHLESS_EPI */
         }
 #endif  /* TMEM_LOAD_WIDTH == 64 */
 
@@ -820,6 +978,9 @@ void epilogue_store(
                 GELU_CVT_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63, bv14.x,bv14.y,bv14.z,bv14.w,bv15.x,bv15.y,bv15.z,bv15.w, srow + (112 ^ xor_val));
             }
         } else if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+#if !TMA_RESIDUAL
+            /* Non-TMA_RESIDUAL x64 path: load bias+residual via __ldg.
+               When TMA_RESIDUAL=1 this entire branch is dead (early return above). */
             static_assert(HAS_BIAS_RES_CVT, "BIAS_RESIDUAL requires BIAS_RES_CVT_STS_V4 macro — define before #include \"kernel_body.cuh\"");
 #if BIAS_BF16
             {
@@ -884,6 +1045,7 @@ void epilogue_store(
                 BIAS_RES_CVT_STS_V4(a56,a57,a58,a59,a60,a61,a62,a63, bv14.x,bv14.y,bv14.z,bv14.w,bv15.x,bv15.y,bv15.z,bv15.w, rv7.x,rv7.y,rv7.z,rv7.w, srow + (112 ^ xor_val));
             }
 #endif
+#endif /* !TMA_RESIDUAL */
         }
 
 #if PREFETCH_BEFORE_STORE
@@ -1441,7 +1603,14 @@ persistent_gemm(
 #if TMA_RESIDUAL
         for (int w = 0; w < NUM_EPI_WARPS; w++)
             mbar_init(smem_to_uint(smem + OFF_RES_MBAR + w * 8), 1);
-#if W0_RES_FULL || EPI_LOAD_WARP
+#if STAGES_C >= 2
+        /* StagesC load mbar: one per (warp, stage). W0 arrives with TMA expect_tx. */
+        for (int i = 0; i < NUM_EPI_WARPS * STAGES_C; i++)
+            mbar_init(smem_to_uint(smem + OFF_SC_LOAD_MBAR + i * 8), 1);
+        /* StagesC release mbar: one per stage. All consumer warps arrive when done. */
+        for (int s = 0; s < STAGES_C; s++)
+            mbar_init(smem_to_uint(smem + OFF_SC_REL_MBAR + s * 8), NUM_EPI_WARPS);
+#elif W0_RES_FULL || EPI_LOAD_WARP
         mbar_init(smem_to_uint(smem + OFF_RES_CONSUMED_MBAR), NUM_EPI_WARPS);
         mbar_init(smem_to_uint(smem + OFF_RES_PASS_MBAR), NUM_EPI_WARPS);
 #elif W0_RES_PREFETCH
@@ -1485,7 +1654,10 @@ persistent_gemm(
     const int start_buf = tile_start & 1;
     int epi_phase[2] = {1, 1};
     int ml_phase[2]  = {start_buf, 1 - start_buf};
-#if W0_RES_FULL
+#if STAGES_C >= 2
+    int sc_rel_phase[STAGES_C] = {0};
+    int sc_load_phase[STAGES_C] = {0};
+#elif W0_RES_FULL
     int res_consumed_phase = 0;
     int res_pass_phase = 0;
 #elif W0_RES_PREFETCH
@@ -1555,7 +1727,48 @@ persistent_gemm(
                         : "memory");
                 }
             }
-#if W0_RES_FULL
+#if STAGES_C >= 2
+            /*
+            StagesC: W0 pre-loads ALL residual passes for the CURRENT tile.
+            The epilogue for this tile runs in the NEXT iteration, so the data
+            will be ready by then. No waiting for consumer here — just issue
+            TMA loads. Backpressure via release_mbar prevents overwriting a
+            buffer the consumer is still reading (only needed from tile_start+2).
+            */
+            if (lane == 0) {
+                if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+                    for (int pass = 0; pass < 2; pass++) {
+                        /* Wait for consumer to release this stage (skip first 2 tiles) */
+                        if (tile_idx > tile_start + 1) {
+                            mbar_wait(smem_base + OFF_SC_REL_MBAR + pass * 8,
+                                      sc_rel_phase[pass]);
+                            sc_rel_phase[pass] ^= 1;
+                        }
+                        /* Issue TMA loads for all epilogue warps into stage[pass] */
+                        for (int ew = 0; ew < NUM_EPI_WARPS; ew++) {
+                            const int gm = m_start + ew * 32;
+                            const uint32_t load_mbar = smem_base + OFF_SC_LOAD_MBAR
+                                + (ew * STAGES_C + pass) * 8;
+                            const uint32_t rstg = smem_base + OFF_STAGING
+                                + ew * STAGING_WARP_BYTES
+                                + RES_STAGING_OFFSET + pass * 2 * STAGING_REGION_BYTES;
+                            asm volatile(
+                                "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;\n\t"
+                                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                                " [%2], [%3, {%4, %5}], [%0];\n\t"
+                                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                                " [%6], [%3, {%7, %5}], [%0];"
+                                :: "r"(load_mbar), "r"(2 * STAGING_REGION_BYTES),
+                                   "r"(rstg), "l"(&tma_res),
+                                   "r"(n_start + pass * 128), "r"(gm),
+                                   "r"(rstg + STAGING_REGION_BYTES),
+                                   "r"(n_start + pass * 128 + 64)
+                                : "memory");
+                        }
+                    }
+                }
+            }
+#elif W0_RES_FULL
             if (lane == 0) {
                 if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                     /*
@@ -1936,7 +2149,14 @@ persistent_gemm(
                     if (col_rank == 0)
                         epilogue_store<0, TN/2, Op, EPI_PRELOADED>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #if TMA_RESIDUAL
+                            #if STAGES_C >= 2
+                            , &tma_res, smem_to_uint(smem + OFF_SC_LOAD_MBAR + ew * STAGES_C * 8), staging_saddr + RES_STAGING_OFFSET
+#else
                             , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
+#endif
+#if STAGES_C >= 2
+                            , smem_to_uint(smem + OFF_SC_REL_MBAR)
 #endif
 #if W0_RES_FULL || W0_RES_PREFETCH || EPI_LOAD_WARP
                             , smem_to_uint(smem + OFF_RES_CONSUMED_MBAR)
@@ -1951,7 +2171,14 @@ persistent_gemm(
                     else
                         epilogue_store<TN/2, TN, Op, EPI_PRELOADED>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #if TMA_RESIDUAL
+                            #if STAGES_C >= 2
+                            , &tma_res, smem_to_uint(smem + OFF_SC_LOAD_MBAR + ew * STAGES_C * 8), staging_saddr + RES_STAGING_OFFSET
+#else
                             , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
+#endif
+#if STAGES_C >= 2
+                            , smem_to_uint(smem + OFF_SC_REL_MBAR)
 #endif
 #if W0_RES_FULL || W0_RES_PREFETCH || EPI_LOAD_WARP
                             , smem_to_uint(smem + OFF_RES_CONSUMED_MBAR)
@@ -1968,7 +2195,14 @@ persistent_gemm(
                 {
                     epilogue_store<0, TN, Op, EPI_PRELOADED>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #if TMA_RESIDUAL
-                        , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+                        #if STAGES_C >= 2
+                            , &tma_res, smem_to_uint(smem + OFF_SC_LOAD_MBAR + ew * STAGES_C * 8), staging_saddr + RES_STAGING_OFFSET
+#else
+                            , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
+#endif
+#if STAGES_C >= 2
+                            , smem_to_uint(smem + OFF_SC_REL_MBAR)
 #endif
 #if W0_RES_FULL || W0_RES_PREFETCH || EPI_LOAD_WARP
                         , smem_to_uint(smem + OFF_RES_CONSUMED_MBAR)
@@ -2155,7 +2389,14 @@ persistent_gemm(
             if (col_rank == 0)
                 epilogue_store<0, TN/2, Op, EPI_PRELOADED>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #if TMA_RESIDUAL
+#if STAGES_C >= 2
+                    , &tma_res, smem_to_uint(smem + OFF_SC_LOAD_MBAR + ew * STAGES_C * 8), staging_saddr + RES_STAGING_OFFSET
+#else
                     , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
+#endif
+#if STAGES_C >= 2
+                    , smem_to_uint(smem + OFF_SC_REL_MBAR)
 #endif
 #if W0_RES_FULL || EPI_LOAD_WARP
                     , 0
@@ -2170,7 +2411,14 @@ persistent_gemm(
             else
                 epilogue_store<TN/2, TN, Op, EPI_PRELOADED>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #if TMA_RESIDUAL
+#if STAGES_C >= 2
+                    , &tma_res, smem_to_uint(smem + OFF_SC_LOAD_MBAR + ew * STAGES_C * 8), staging_saddr + RES_STAGING_OFFSET
+#else
                     , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
+#endif
+#if STAGES_C >= 2
+                    , smem_to_uint(smem + OFF_SC_REL_MBAR)
 #endif
 #if W0_RES_FULL || EPI_LOAD_WARP
                     , 0
@@ -2187,7 +2435,14 @@ persistent_gemm(
         {
             epilogue_store<0, TN, Op, EPI_PRELOADED>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #if TMA_RESIDUAL
+#if STAGES_C >= 2
+                , &tma_res, smem_to_uint(smem + OFF_SC_LOAD_MBAR + ew * STAGES_C * 8), staging_saddr + RES_STAGING_OFFSET
+#else
                 , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+#endif
+#endif
+#if STAGES_C >= 2
+                , smem_to_uint(smem + OFF_SC_REL_MBAR)
 #endif
 #if W0_RES_FULL || EPI_LOAD_WARP
                 , 0
