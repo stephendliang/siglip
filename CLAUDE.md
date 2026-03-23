@@ -15,34 +15,59 @@ Three fused GEMM kernels for the vision encoder MLP. **Only FC2 is being activel
 
 Batch = 4736 images × 196 patches = 928256 rows. BF16 output, FP8 inputs.
 
-### FC2 gap analysis (session 2026-03-19, updated 2026-03-21)
+### FC2 gap analysis (SASS-verified 2026-03-22)
 
-Best: **1.452ms / 3016 TFLOPS** (NS5, IS1, base config). CUTLASS: 1.225ms. Gap = **227μs (19%)**.
+Best: **1.452ms / 3016 TFLOPS** (NS5, IS1, base config). CUTLASS: 1.225ms fused. Gap = **227μs (19%)**.
+At identical locked 1770 MHz: 1.482ms vs 1.263ms = **17.3% gap = ~1,940 cycles/tile**.
+Clock throttling disproved — both kernels run at ~1.85 GHz unlocked on the same Verda B200.
 
-**CUTLASS uses identical tile/cluster config**: 256×256×128, 2×1 cluster, cta_group::2. Same 96 UTCQMMA per tile. K-loop compute is byte-identical — the **entire 19% gap is from Phase 1 epilogue contention**, not compute throughput. CUTLASS achieves **99.6% of the K-loop throughput bound** (1.225ms vs 1.220ms theoretical) — its epilogue is invisible.
+**CUTLASS uses identical tile/cluster config**: 256×256×128, 2×1 cluster, cta_group::2. But has 2,864 SASS instructions vs our 2,248 (27% MORE code, 17% FASTER). **The entire gap is epilogue scheduling quality.**
 
-Cycle breakdown (NS5.IS1.base, timing build):
-- **K-loop: 16705 cycles** — identical MMA work to CUTLASS
-- **Epilogue Phase 1: 8430 cycles** — creates SMEM contention that slows K-loop by ~3300 cyc/tile
-- Epilogue Phase 2: 63 cycles (trivial)
-- epi_wait: 107 cycles (balanced producer-consumer)
-- tma0_wait: 721 cycles
+### CUTLASS vs our architecture (SASS-verified)
 
-Per-tile: our 20,743 cyc vs CUTLASS 17,500 cyc. K-loop alone = 17,426 cyc. The 3,317 cyc gap is Phase 1 overhead — W2-W5 running Phase 1 competes with W0/W1 K-loop for dispatch slots. A faster Phase 1 reduces contention for ALL 147 tiles, not just the last tile.
+**CUTLASS uses 8 warps (256 threads) — 2 extra warps we don't have:**
+- **Warp 3: Dedicated EpilogueLoad** — pre-loads residual+bias into SMEM via TMA, independently from compute. Epilogue warps just LDS from SMEM. **This is the single biggest architectural difference. DO NOT FORGET THIS.**
+- Warp 0: Tile scheduler via `UTCBAR.2CTA.MULTICAST` (NOT CLC — no CLCX/SETCTAID in SASS)
+- Warp 1: MMA, Warp 2: MainloopLoad, Warps 4-7: Epilogue (128 threads)
 
-**Root cause — instruction-level scheduling (corrected by TMA bench 2026-03-21):**
+**Our 6 warps (192 threads) — epilogue warps must self-load:**
+- W0: TMA A/B loads. W1: MMA. W2-W5: Epilogue.
+- **No dedicated epilogue load warp. Epilogue warps issue 16× LDG.E.128.CONSTANT (global loads) themselves.**
 
-TMA bench proved TMA and LSU have **separate SMEM ports** on SM100a (zero contention). The original "SMEM port contention" hypothesis was wrong. The real problem is 5 structural PTX mistakes:
+### SASS-verified epilogue differences
 
-1. **Monolithic asm blocks**: each `BIAS_RES_CVT_STS_V4` = 12 BF16/CVT + 1 STS in one `asm volatile`. STS shadow fits only 4 BF16 free (section P); 12 overflows at ~+100% cost. **~216 wasted cyc/group.**
-2. **16 LDS at ILP=16**: 8 bias + 8 residual LDS back-to-back. ILP=16 regresses to 10 cyc/op (section O); sweet spot is ILP=7 at 3.54 cyc/op. **~104 wasted cyc.**
-3. **No LDS↔STS temporal overlap**: all LDS before all STS. Section E shows LDS+STS interleaved = 82.3% faster than sequential.
-4. **Bias+residual not pre-combined**: two separate HADD2 rounds. Pre-adding reduces BF16/STS from 12→8.
-5. **ptxas clustering**: source-level STS scheduling is a dead end (5 approaches tried, identical SASS).
+| | **Our FC2** | **CUTLASS** |
+|---|---|---|
+| Epilogue math | **BF16** (HFMA2/HADD2 after F2FP) | **FP32** (FFMA, F2FP only at end) |
+| Bias/res source | LDG from global IN epilogue warps | LDS from SMEM (**W3 pre-loaded**) |
+| STS placement | **4 consecutive** at block end (serialized) | **Interleaved** with FFMA/F2FP, 2-4 ops/shadow |
+| Intra-epi pipeline | None — sequential | **2× BAR.SYNC + DEPBAR** per sub-iter |
+| Sub-iterations | 3 (×64 cols, 8 STS each) | 4 (×64 cols, 4 STS each) |
+| Instruction flow | 16 LDG → 16 F2FP → 64 BF16 → 8 STS | 12 LDS → LDTM → 64 FFMA ↔ F2FP ↔ STS |
 
-**Two attack vectors:**
-1. **SASS scheduling** (built): CP-SAT optimal scheduler spreads STS at 27-32 cyc intervals, packs ≤4 BF16 per window, clusters LDS at ILP=7. 287-insn: 686 cyc (was 1417, -51.6%). Ready for B200 via fatbin-patch.
-2. **Pre-combine bias+residual** (source change): `add.bf16x2(bias, residual)` before TMEM_WAIT reduces BF16/STS from 12 to 8. Makes SASS scheduling more effective.
+### What's actually wrong — honest postmortem
+
+**The epilogue is fully overlapped with the K-loop** (ml_wait > ph1 in all configs). This means:
+- Making Phase 1 faster does NOT help wall time — it just increases idle time.
+- Changing instruction mix (FP32 vs BF16, precombine, noinline) does NOT help — benchmarked, all ≤14μs.
+- The gap must be from **warp scheduling contention**: epilogue warps running Phase 1 steal dispatch slots from K-loop warps, inflating the K-loop across ALL 147 tiles.
+
+**Confirmed dead ends (benchmarked on B200, do NOT retry):**
+- FP32_EPILOGUE=1/2: 1.448ms vs 1.450ms baseline = 2μs noise (commit e4d8741, newest.csv)
+- PRE_COMBINE: -825 ph1 cycles, 0μs wall time change
+- EPI_NOINLINE: -538 ph1 cycles, 0μs wall time change
+- Source-level STS scheduling: 5 approaches, all byte-identical SASS (ptxas immutable)
+- CUTLASS uses FP32 FFMA but that is NOT why it's faster — same overlap argument applies
+
+**What CUTLASS does differently that we haven't successfully tried:**
+1. **Dedicated EpilogueLoad warp (W3)** — removes ALL load instructions from epilogue warps. Not "faster epilogue" — fundamentally different contention pattern. Code exists (kernel_body.cuh:2033, `EPI_LOAD_WARP=1`) but hung from mbarrier phase bug. Needs debugging.
+2. **Intra-epilogue sub-iteration BAR.SYNC pipelining** — CUTLASS sequence per 64-col sub-iter: STS.128 → FENCE → **BAR.SYNC** (128 epi threads confirm STS done) → UTMASTG.3D (TMA reads staging SMEM, writes global) → **DEPBAR.LE** (wait for TMA to finish reading SMEM) → **BAR.SYNC** (staging SMEM now free) → next sub-iter overwrites same staging buffer. **Zero extra SMEM** — same staging region reused, serialized by barriers. **We have NEVER tried this.** Our "StagesC" (STAGES_C=2) was cross-tile SMEM pipelining needing EXTRA SMEM stages → NS4 (killed kloop) or borrowing (added stalls). Completely different concept despite the name.
+
+### Remaining attack vectors (priority order)
+
+1. **Debug EPI_LOAD_WARP** — fix the mbarrier hang. This is the only untested structural change that removes work from epilogue warps (vs making existing work faster, which is proven dead).
+2. **Intra-epilogue BAR.SYNC pipelining** — new code, never attempted. Pipeline the 3-4 sub-iterations within each tile's epilogue using barriers, matching CUTLASS's pattern.
+3. **SASS binary patching** — spread STS, interleave with compute. CP-SAT: 686 cyc (was 1417). Only worth testing after structural changes, or as an independent experiment to quantify how much scheduling alone can do.
 
 **SM100a hardware data** (from `bench/tma_bench.cu`, raw: `data/tma2.txt`):
 - STS.128 throughput: 27 cyc | LDS.128: 25 cyc @ILP=1, 3.5 cyc @ILP=7
@@ -89,8 +114,9 @@ Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1
 - **W0**: TMA async bulk loads (A + B tiles, all threads compute addrs, lane 0 issues TMA). FC2: optionally prefetches (`W0_RES_PREFETCH`) or fully loads (`W0_RES_FULL`) residual via TMA after K-loop.
 - **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
 - **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols through 4 SWIZZLE_128B regions: x32 `tcgen05.ld` → epilogue op → CVT → `st.shared`, with **interleaved TMA stores** hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1.
+- **No dedicated EpilogueLoad warp** — epilogue warps (W2-W5) load bias/residual themselves via LDG from global memory. CUTLASS has a dedicated W3 that pre-loads into SMEM via TMA.
 
-Epilogue ops: bias+pos_embed (PE), bias+GELU (FC1), bias+residual (FC2). FC2's residual loads a full [M,N] matrix — heaviest epilogue, memory-bound. FC1's GELU is compute-bound. PE's add is trivial.
+Epilogue ops: bias+pos_embed (PE), bias+GELU (FC1), bias+residual (FC2). FC2's residual loads a full [M,N] matrix — heaviest epilogue, memory-bound. FC1's GELU is compute-bound. PE's add is trivial. **FC2 epilogue uses BF16 math (HFMA2/HADD2); CUTLASS uses FP32 (FFMA) and converts at the end.**
 
 The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile N (double-buffered TMEM, mbarrier-protected).
 

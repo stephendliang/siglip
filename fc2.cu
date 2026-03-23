@@ -214,7 +214,7 @@ __global__ void init_residual(__nv_bfloat16* __restrict__ res, int n_dim, long l
 int main() {
     setbuf(stdout, NULL);
     printf("FC2 GEMM — tcgen05 cta_group::2 (%d warps [%d epi], cluster of 2)\n",
-           2 + NUM_EPI_WARPS, NUM_EPI_WARPS);
+           2 + EPI_LOAD_WARP + NUM_EPI_WARPS, NUM_EPI_WARPS);
     printf("  GEMM: [%d,%d] x [%d,%d]^T  %d-stage pipeline  bias+residual  SMEM-staged stores  idesc: 0x%08X\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, N_STAGES, IDESC);
 
