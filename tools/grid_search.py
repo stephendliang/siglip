@@ -57,6 +57,7 @@ DEFAULTS = {
     'W0_RES_FULL': 0,
     'PREFETCH_MBAR': 0,
     'EPI_LOAD_WARP': 0,
+    'EPI_PIPELINE': 0,
     'OVERLAP_EPI_WAIT': 0,
     'BATCH_MMA': 0,
     'BATCH_EPILOGUE': 0,
@@ -95,6 +96,7 @@ RANGES = {
     'W0_RES_FULL': [0, 1],
     'PREFETCH_MBAR': [0, 1],
     'EPI_LOAD_WARP': [0, 1],
+    'EPI_PIPELINE': [0, 1],
     'OVERLAP_EPI_WAIT': [0, 1],
     'BATCH_MMA': [0, 1],
     'BATCH_EPILOGUE': [0, 1],
@@ -357,6 +359,23 @@ def is_valid(cfg, kernel='patch_embed'):
         if cfg.get('W0_RES_FULL', 0) == 1 or cfg.get('W0_RES_PREFETCH', 0) == 1:
             return False, 'EPI_LOAD_WARP mutually exclusive with W0_RES_FULL/W0_RES_PREFETCH'
 
+    # EPI_PIPELINE: fc2 only, requires TMA_RESIDUAL=1, exclusive with many flags
+    if cfg.get('EPI_PIPELINE', 0) == 1:
+        if kernel != 'fc2':
+            return False, 'EPI_PIPELINE only for fc2'
+        if cfg.get('TMA_RESIDUAL', 0) < 1:
+            return False, 'EPI_PIPELINE requires TMA_RESIDUAL>=1'
+        if cfg.get('W0_RES_FULL', 0) or cfg.get('W0_RES_PREFETCH', 0):
+            return False, 'EPI_PIPELINE mutually exclusive with W0_RES_*'
+        if cfg.get('EPI_LOAD_WARP', 0) and not cfg.get('EPI_PIPELINE', 0):
+            return False, 'EPI_PIPELINE sets EPI_LOAD_WARP implicitly'
+        if cfg.get('STAGES_C', 0) >= 2:
+            return False, 'EPI_PIPELINE incompatible with STAGES_C'
+        if cfg.get('EPI_REUSE_SMEM', 0):
+            return False, 'EPI_PIPELINE incompatible with EPI_REUSE_SMEM'
+        if cfg.get('BRANCHLESS_EPI', 0):
+            return False, 'EPI_PIPELINE incompatible with BRANCHLESS_EPI'
+
     # CVT_ADD_FUSED only meaningful for patch_embed (dead code on fc1/fc2)
     if cfg.get('CVT_ADD_FUSED', 1) != 1 and kernel != 'patch_embed':
         return False, 'CVT_ADD_FUSED only for patch_embed'
@@ -429,6 +448,8 @@ def is_valid(cfg, kernel='patch_embed'):
             return False, 'W0_RES_FULL hardcodes 2 passes, deadlocks with NUM_PASSES_PARAM=4'
         if npp == 4 and cfg.get('EPI_LOAD_WARP', 0) == 1:
             return False, 'EPI_LOAD_WARP hardcodes 2 passes, deadlocks with NUM_PASSES_PARAM=4'
+        if cfg.get('EPI_PIPELINE', 0) == 1:
+            return False, 'EPI_PIPELINE overrides pass count internally'
 
     # DEFERRED_WAIT only for fc2, requires TMA_RESIDUAL>=1
     if cfg.get('DEFERRED_WAIT', 0) == 1:

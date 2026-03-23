@@ -72,6 +72,14 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef EPI_LOAD_WARP
 #define EPI_LOAD_WARP 0          // 0=off, 1=dedicated warp for residual TMA loading (fc2 only)
 #endif
+#ifndef EPI_PIPELINE
+#define EPI_PIPELINE 0           // 0=off, 1=pipelined epilogue staging (4 stages, dedicated W2 loader)
+#endif
+#if EPI_PIPELINE
+/* EPI_PIPELINE implies EPI_LOAD_WARP (W2 = dedicated loader) */
+#undef EPI_LOAD_WARP
+#define EPI_LOAD_WARP 1
+#endif
 #ifndef OVERLAP_EPI_WAIT
 #define OVERLAP_EPI_WAIT 0       // 0=off, 1=prefetch epilogue mbar at end of K-loop
 #endif
@@ -80,6 +88,15 @@ Usage: #define N_DIM and K_DIM before including this header.
 #endif
 #if EPI_LOAD_WARP && (W0_RES_FULL || W0_RES_PREFETCH)
 #error "EPI_LOAD_WARP mutually exclusive with W0_RES_FULL/W0_RES_PREFETCH"
+#endif
+#if EPI_PIPELINE && STAGES_C >= 2
+#error "EPI_PIPELINE is incompatible with STAGES_C"
+#endif
+#if EPI_PIPELINE && EPI_REUSE_SMEM
+#error "EPI_PIPELINE is incompatible with EPI_REUSE_SMEM"
+#endif
+#if EPI_PIPELINE && BRANCHLESS_EPI
+#error "EPI_PIPELINE is incompatible with BRANCHLESS_EPI"
 #endif
 #if STAGES_C && !TMA_RESIDUAL
 #error "STAGES_C requires TMA_RESIDUAL >= 1"
@@ -223,7 +240,14 @@ Problem dimensions — N_DIM must be defined before including this header
 #endif
 #if TMA_RESIDUAL
 #define OFF_RES_MBAR       (OFF_EPILOGUE_MBAR + 16)
-#if STAGES_C >= 2
+#if EPI_PIPELINE
+/* Pipelined epilogue: 4 per-stage load mbars + 1 tile-free mbar.
+   Load mbar: W2 arrives with expect_tx, 4 TMA loads auto-arrive. One per stage.
+   Free mbar: all epilogue warps arrive after TMA stores. W2 waits before next tile. */
+#define OFF_PIPE_LOAD_MBAR   (OFF_EPILOGUE_MBAR + 16)
+#define OFF_PIPE_FREE_MBAR   (OFF_PIPE_LOAD_MBAR + (TN / 64) * 8)
+#define _MBAR_END            (OFF_PIPE_FREE_MBAR + 8)
+#elif STAGES_C >= 2
 /* StagesC pipeline: per-(warp,stage) load mbar + per-stage release mbar.
    Load mbar: W0 arrives with expect_tx, consumer waits. One per (warp, stage).
    Release mbar: all consumer warps arrive, W0 waits. One per stage. */
@@ -240,7 +264,9 @@ Problem dimensions — N_DIM must be defined before including this header
 #else
 #define _MBAR_END          (OFF_RES_MBAR + NUM_EPI_WARPS * 8)
 #endif
+#if !EPI_PIPELINE
 #define RES_STAGING_OFFSET (2 * STAGING_REGION_BYTES)   // residual regions start after 2 output regions per warp
+#endif
 #else
 #define _MBAR_END          (OFF_EPILOGUE_MBAR + 16)
 #endif
@@ -258,14 +284,24 @@ Problem dimensions — N_DIM must be defined before including this header
 #endif
 #define STAGING_REGION_ROW_BYTES  128                                               // 64 BF16 cols = 128 bytes (SWIZZLE_128B)
 #define STAGING_REGION_BYTES      (32 * STAGING_REGION_ROW_BYTES)                   // 4096 bytes per region (32 rows x 128B)
-#if STAGES_C >= 2
+#if EPI_PIPELINE
+/* Pipelined staging: 4 stages × NUM_EPI_WARPS regions. Each warp gets 1 region per stage.
+   ReuseSmemC: residual TMA loads and output STS share the same region (sequential use). */
+#define EPI_PIPELINE_STAGES       (TN / 64)                                        // 4 sub-iterations for FC2
+#define STAGE_C_BYTES             (NUM_EPI_WARPS * STAGING_REGION_BYTES)            // 16,384 per stage
+#define STAGING_REGIONS_PER_WARP  1                                                 // per stage (vs 4 in base case)
+#elif STAGES_C >= 2
 #define STAGING_REGIONS_PER_WARP  (2 + STAGES_C * 2)                               // 2 output + 2 residual per stage
 #else
 #define STAGING_REGIONS_PER_WARP  4                                                 // 2 output + 2 residual (shared)
 #endif
 #define STAGING_WARP_BYTES        (STAGING_REGIONS_PER_WARP * STAGING_REGION_BYTES)  // bytes per warp
 #define STAGING_EPI_WARPS         NUM_EPI_WARPS
+#if EPI_PIPELINE
+#define SMEM_BYTES                ((OFF_STAGING + EPI_PIPELINE_STAGES * STAGE_C_BYTES + 127) & ~127)
+#else
 #define SMEM_BYTES                ((OFF_STAGING + STAGING_EPI_WARPS * STAGING_WARP_BYTES + 127) & ~127)
+#endif
 
 #if EPI_REUSE_SMEM
 /*

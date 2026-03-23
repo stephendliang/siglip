@@ -88,8 +88,11 @@ void epilogue_store(
 #if W0_RES_PREFETCH || W0_RES_FULL || EPI_LOAD_WARP
     , uint32_t res_consumed_mbar_addr
 #endif
-#if W0_RES_FULL || EPI_LOAD_WARP
+#if !EPI_PIPELINE && (W0_RES_FULL || EPI_LOAD_WARP)
     , uint32_t res_pass_mbar_addr
+#endif
+#if EPI_PIPELINE
+    , int pipe_load_phase
 #endif
 #ifdef TIMING
     , long long& t_phase1_end
@@ -137,7 +140,11 @@ void epilogue_store(
     (2 passes) so mbarrier phase is consistent across calls.
     */
     if constexpr (Op == EpilogueOp::BIAS_RESIDUAL && (NC_END - NC_START) >= 256) {
-#if NUM_PASSES_PARAM == 0
+#if EPI_PIPELINE
+        /* Pipelined epilogue: 4 sub-iterations of 64 cols, one per pipeline stage */
+        constexpr int LOCAL_PASSES = EPI_PIPELINE_STAGES;
+        constexpr int PASS_COLS = 64;
+#elif NUM_PASSES_PARAM == 0
         constexpr int PASS_COLS = 128;
         constexpr int LOCAL_PASSES = (NC_END - NC_START) / PASS_COLS;
 #else
@@ -145,8 +152,11 @@ void epilogue_store(
         constexpr int PASS_COLS = (NC_END - NC_START) / LOCAL_PASSES;
 #endif
         constexpr int PASS_REGIONS = PASS_COLS / 64;
+        (void)PASS_REGIONS;  /* suppress unused warning for EPI_PIPELINE (uses pipe_stg directly) */
         const int taddr_base = tmem_addr + ((cta_rank * 128 + row_group * 32) << 16);
+#if !EPI_PIPELINE
         int res_phase = 0;
+#endif
 
 #if BIAS_SMEM
 #if BIAS_BF16
@@ -517,7 +527,13 @@ void epilogue_store(
             const int pnc_s = NC_START + pass * PASS_COLS;
             const int pnc_e = pnc_s + PASS_COLS;
 
-#if STAGES_C >= 2
+#if EPI_PIPELINE
+            /* Per-stage addressing: stage buffer = pipeline base + stage * STAGE_C_BYTES + warp * region.
+               ReuseSmemC: residual LDS and output STS use the same region (sequential). */
+            const uint32_t pipe_stg = staging_saddr + pass * STAGE_C_BYTES + row_group * STAGING_REGION_BYTES;
+            const uint32_t pass_res_staging = pipe_stg;
+            const uint32_t srow_base = pipe_stg + lane * STAGING_REGION_ROW_BYTES;
+#elif STAGES_C >= 2
             /* W0 already loaded residual into stage[pass] — just compute staging addr */
             const uint32_t pass_res_staging = res_staging_saddr + pass * 2 * STAGING_REGION_BYTES;
 #else
@@ -537,7 +553,9 @@ void epilogue_store(
 #endif
 #endif
 
-#if !DEFERRED_WAIT
+#if EPI_PIPELINE
+            /* No inter-pass wait_group — each sub-iter has its own stage buffer */
+#elif !DEFERRED_WAIT
             if (pass > 0) {
                 if (lane == 0) {
                     asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
@@ -550,7 +568,11 @@ void epilogue_store(
                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                          taddr_base + pnc_s);
 
-#if STAGES_C >= 2
+#if EPI_PIPELINE
+            /* Wait for W2's TMA loads for this pipeline stage.
+               Phase alternates per tile — all 4 stages use the same phase. */
+            mbar_wait(res_mbar_addr + pass * 8, pipe_load_phase);
+#elif STAGES_C >= 2
             /* Wait for W0's TMA load to complete — per-(warp,stage) mbar.
                Per-pass mbars all share the same phase (W0 arrives once per tile per mbar),
                so use sc_phase (tracked per-tile in persistent_gemm), not res_phase. */
@@ -560,7 +582,7 @@ void epilogue_store(
             res_phase ^= 1;
 #endif
 
-#if DEFERRED_WAIT
+#if !EPI_PIPELINE && DEFERRED_WAIT
             if (pass > 0) {
                 if (lane == 0) {
                     asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
@@ -748,7 +770,7 @@ void epilogue_store(
 #endif
 
                 /* Interleaved TMA stores within 128-col pass (2 output regions) */
-#if !STORE_TIMING
+#if !STORE_TIMING && !EPI_PIPELINE
                 if (INTERLEAVE_STRATEGY == 1 && half == 1) {
                     __syncwarp();
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -786,6 +808,18 @@ void epilogue_store(
 #endif
             }
 
+#if EPI_PIPELINE
+            /* EPI_PIPELINE: one TMA store per sub-iter from the stage buffer */
+            __syncwarp();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            if (lane == 0) {
+                asm volatile(
+                    "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                    :: "l"(tma_c_desc), "r"(n_start + pnc_s),
+                       "r"(gm_base), "r"(pipe_stg) : "memory");
+                asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+            }
+#else
             /* Commit this pass's TMA output stores */
             if (STORE_TIMING || INTERLEAVE_STRATEGY == 0
                 || (INTERLEAVE_STRATEGY >= 2 && PASS_REGIONS < 2)) {
@@ -815,11 +849,20 @@ void epilogue_store(
                 if (res_pass_mbar_addr && lane == 0) mbar_arrive(res_pass_mbar_addr);
             }
 #endif
+#endif /* EPI_PIPELINE */
 #endif /* BRANCHLESS_EPI */
         }
 #endif  /* TMEM_LOAD_WIDTH == 64 */
 
-#if W0_RES_PREFETCH || W0_RES_FULL || EPI_LOAD_WARP
+#if EPI_PIPELINE
+        /* Wait for all TMA stores to complete, then signal stages free for W2 */
+        if (lane == 0) {
+            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+        }
+        __syncwarp();
+        if (res_consumed_mbar_addr && lane == 0)
+            mbar_arrive(res_consumed_mbar_addr);
+#elif W0_RES_PREFETCH || W0_RES_FULL || EPI_LOAD_WARP
         if (res_consumed_mbar_addr && lane == 0)
             mbar_arrive(res_consumed_mbar_addr);
 #endif
@@ -1552,7 +1595,7 @@ void epilogue_store(
 #endif
 }
 
-#if TMA_RESIDUAL >= 2 || W0_RES_PREFETCH || W0_RES_FULL
+#if (TMA_RESIDUAL >= 2 || W0_RES_PREFETCH || W0_RES_FULL) && !EPI_PIPELINE
 #define EPI_PRELOADED true
 #else
 #define EPI_PRELOADED false
@@ -1604,6 +1647,12 @@ persistent_gemm(
             mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR + i * 8), NUM_EPI_WARPS * 2 * 32);
         }
 #if TMA_RESIDUAL
+#if EPI_PIPELINE
+        /* Pipeline epilogue mbars: per-stage load + tile-free */
+        for (int s = 0; s < EPI_PIPELINE_STAGES; s++)
+            mbar_init(smem_to_uint(smem + OFF_PIPE_LOAD_MBAR + s * 8), 1);
+        mbar_init(smem_to_uint(smem + OFF_PIPE_FREE_MBAR), NUM_EPI_WARPS);
+#else
         for (int w = 0; w < NUM_EPI_WARPS; w++)
             mbar_init(smem_to_uint(smem + OFF_RES_MBAR + w * 8), 1);
 #if STAGES_C >= 2
@@ -1619,6 +1668,7 @@ persistent_gemm(
 #elif W0_RES_PREFETCH
         mbar_init(smem_to_uint(smem + OFF_RES_CONSUMED_MBAR), NUM_EPI_WARPS);
 #endif
+#endif /* EPI_PIPELINE */
 #endif
 #if EPI_REUSE_SMEM
         mbar_init(smem_to_uint(smem + OFF_EPI_DONE_MBAR), NUM_EPI_WARPS);
@@ -1663,7 +1713,9 @@ persistent_gemm(
     const int start_buf = tile_start & 1;
     int epi_phase[2] = {1, 1};
     int ml_phase[2]  = {start_buf, 1 - start_buf};
-#if STAGES_C >= 2
+#if EPI_PIPELINE
+    int pipe_free_phase = 0;
+#elif STAGES_C >= 2
     int sc_rel_phase[STAGES_C] = {0};
     int sc_consumer_phase = 0;
 #elif W0_RES_FULL || EPI_LOAD_WARP
@@ -2030,15 +2082,48 @@ persistent_gemm(
 #endif
             }
         }
-#if EPI_LOAD_WARP
+#if EPI_PIPELINE
         else if (warp == 2) {
             /*
-            EPI_LOAD_WARP (W2) — dedicated residual TMA loader.
-            Same protocol as W0_RES_FULL but on a separate warp so W0
-            is free to start next tile's A/B loads immediately.
-            Loads residual for the PREVIOUS tile (matching epilogue timing).
-            Per-iteration: one tile per outer loop cycle. Drain is post-loop.
+            EPI_PIPELINE (W2) — fire-and-forget residual TMA loader.
+            Loads residual for the PREVIOUS tile into 4 pipeline stages (one per 64-col
+            sub-iteration). All 16 TMA loads (4 stages × 4 warps) issued at once.
+            W2 is idle for the rest of the tile — no spinning, no dispatch contention.
             */
+            if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+                if (lane == 0) {
+                    const uint32_t smem_base = warp_uniform(smem_to_uint(smem));
+                    if (tile_idx > tile_start) {
+                        /* Wait for previous tile's stages to be free (skip first tile) */
+                        if (tile_idx > tile_start + 1) {
+                            mbar_wait(smem_base + OFF_PIPE_FREE_MBAR, pipe_free_phase);
+                            pipe_free_phase ^= 1;
+                        }
+                        const int prev_idx = tile_idx - 1;
+                        const int ptm = prev_idx / TILES_N;
+                        int ptn = prev_idx % TILES_N;
+                        if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
+                        const int prev_m = ptm * TM * 2 + cta_rank * TM;
+                        const int prev_n = ptn * TN;
+
+                        /* Fire all stages × warps TMA loads (fire-and-forget) */
+                        for (int si = 0; si < EPI_PIPELINE_STAGES; si++) {
+                            const uint32_t stage_mbar = smem_base + OFF_PIPE_LOAD_MBAR + si * 8;
+                            mbar_arrive_expect_tx(stage_mbar, NUM_EPI_WARPS * STAGING_REGION_BYTES);
+                            for (int ew = 0; ew < NUM_EPI_WARPS; ew++) {
+                                const int gm = prev_m + (ew % 4) * 32;
+                                const uint32_t rstg = smem_base + OFF_STAGING
+                                    + si * STAGE_C_BYTES + ew * STAGING_REGION_BYTES;
+                                tma_load_2d_cta(rstg, &tma_res, prev_n + si * 64, gm, stage_mbar);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+#elif EPI_LOAD_WARP
+        else if (warp == 2) {
+            /* Legacy serial EPI_LOAD_WARP — kept for reference, dead path with EPI_PIPELINE */
             if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                 if (lane == 0) {
                     const uint32_t smem_base = warp_uniform(smem_to_uint(smem));
@@ -2099,7 +2184,11 @@ persistent_gemm(
             const int is_split = (row_group < (NUM_EPI_WARPS - 4)) ? 1 : 0;
             const int col_rank = ew / 4;
 #endif
+#if EPI_PIPELINE
+            const uint32_t staging_saddr = smem_to_uint(smem + OFF_STAGING);
+#else
             const uint32_t staging_saddr = smem_to_uint(smem + OFF_STAGING + ew * STAGING_WARP_BYTES);
+#endif
 
             const int prev_buf = buf ^ 1;
 
@@ -2116,7 +2205,7 @@ persistent_gemm(
                 gm_base = prev_m + row_group * 32;
             }
 
-#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH && !W0_RES_FULL
+#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH && !W0_RES_FULL && !EPI_PIPELINE
             /* Preload first-pass residual before mainloop wait — TMA flies during idle */
             if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                 if (tile_idx > tile_start && lane == 0) {
@@ -2214,20 +2303,25 @@ persistent_gemm(
                 {
                     epilogue_store<0, TN, Op, EPI_PRELOADED>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
 #if TMA_RESIDUAL
-                        #if STAGES_C >= 2
-                            , &tma_res, smem_to_uint(smem + OFF_SC_LOAD_MBAR + ew * STAGES_C * 8), staging_saddr + RES_STAGING_OFFSET
+#if EPI_PIPELINE
+                        , &tma_res, smem_to_uint(smem + OFF_PIPE_LOAD_MBAR), 0
+#elif STAGES_C >= 2
+                        , &tma_res, smem_to_uint(smem + OFF_SC_LOAD_MBAR + ew * STAGES_C * 8), staging_saddr + RES_STAGING_OFFSET
 #else
-                            , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
+                        , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
 #endif
 #endif
 #if STAGES_C >= 2
-                            , smem_to_uint(smem + OFF_SC_REL_MBAR)
-                            , sc_consumer_phase
+                        , smem_to_uint(smem + OFF_SC_REL_MBAR)
+                        , sc_consumer_phase
 #endif
-#if W0_RES_FULL || W0_RES_PREFETCH || EPI_LOAD_WARP
+#if EPI_PIPELINE
+                        , smem_to_uint(smem + OFF_PIPE_FREE_MBAR)
+                        , (tile_idx - tile_start - 1) & 1
+#elif W0_RES_FULL || W0_RES_PREFETCH || EPI_LOAD_WARP
                         , smem_to_uint(smem + OFF_RES_CONSUMED_MBAR)
 #endif
-#if W0_RES_FULL || EPI_LOAD_WARP
+#if !EPI_PIPELINE && (W0_RES_FULL || EPI_LOAD_WARP)
                         , smem_to_uint(smem + OFF_RES_PASS_MBAR)
 #endif
 #ifdef TIMING
@@ -2356,7 +2450,36 @@ persistent_gemm(
     }
 #endif
 
-#if EPI_LOAD_WARP
+#if EPI_PIPELINE
+    /*
+    W2 drain: fire-and-forget load for the last tile into pipeline stages.
+    */
+    if (warp == 2 && tile_end > tile_start && lane == 0) {
+        if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
+            const uint32_t smem_base = smem_to_uint(smem);
+            if (tile_end - tile_start > 1) {
+                mbar_wait(smem_base + OFF_PIPE_FREE_MBAR, pipe_free_phase);
+            }
+            const int last_idx = tile_end - 1;
+            const int ltm = last_idx / TILES_N;
+            int ltn = last_idx % TILES_N;
+            if (SNAKE_ORDER && (ltm & 1)) ltn = TILES_N - 1 - ltn;
+            const int drain_m = ltm * TM * 2 + cta_rank * TM;
+            const int drain_n = ltn * TN;
+
+            for (int si = 0; si < EPI_PIPELINE_STAGES; si++) {
+                const uint32_t stage_mbar = smem_base + OFF_PIPE_LOAD_MBAR + si * 8;
+                mbar_arrive_expect_tx(stage_mbar, NUM_EPI_WARPS * STAGING_REGION_BYTES);
+                for (int ew = 0; ew < NUM_EPI_WARPS; ew++) {
+                    const int gm = drain_m + (ew % 4) * 32;
+                    const uint32_t rstg = smem_base + OFF_STAGING
+                        + si * STAGE_C_BYTES + ew * STAGING_REGION_BYTES;
+                    tma_load_2d_cta(rstg, &tma_res, drain_n + si * 64, gm, stage_mbar);
+                }
+            }
+        }
+    }
+#elif EPI_LOAD_WARP
     /*
     W2 drain: load residual for the last tile. Runs concurrently with
     the drain epilogue. Same pass handshake as the tile loop.
@@ -2417,7 +2540,11 @@ persistent_gemm(
         const int is_split = (row_group < (NUM_EPI_WARPS - 4)) ? 1 : 0;
         const int col_rank = ew / 4;
 #endif
+#if EPI_PIPELINE
+        const uint32_t staging_saddr = smem_to_uint(smem + OFF_STAGING);
+#else
         const uint32_t staging_saddr = smem_to_uint(smem + OFF_STAGING + ew * STAGING_WARP_BYTES);
+#endif
 
         const int last_buf = (tile_end - 1) & 1;
 
@@ -2520,7 +2647,9 @@ persistent_gemm(
         {
             epilogue_store<0, TN, Op, EPI_PRELOADED>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #if TMA_RESIDUAL
-#if STAGES_C >= 2
+#if EPI_PIPELINE
+                , &tma_res, smem_to_uint(smem + OFF_PIPE_LOAD_MBAR), 0
+#elif STAGES_C >= 2
                 , &tma_res, smem_to_uint(smem + OFF_SC_LOAD_MBAR + ew * STAGES_C * 8), staging_saddr + RES_STAGING_OFFSET
 #else
                 , &tma_res, smem_to_uint(smem + OFF_RES_MBAR + ew * 8), staging_saddr + RES_STAGING_OFFSET
@@ -2530,9 +2659,14 @@ persistent_gemm(
                 , smem_to_uint(smem + OFF_SC_REL_MBAR)
                 , sc_consumer_phase
 #endif
-#if W0_RES_FULL || EPI_LOAD_WARP
+#if EPI_PIPELINE
+                , (uint32_t)0
+                , (tile_end - tile_start - 1) & 1
+#elif W0_RES_FULL || EPI_LOAD_WARP
                 , 0
+#if !EPI_PIPELINE
                 , smem_to_uint(smem + OFF_RES_PASS_MBAR)
+#endif
 #elif W0_RES_PREFETCH
                 , 0
 #endif
