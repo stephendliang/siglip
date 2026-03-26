@@ -103,7 +103,7 @@ PIPE_WORKLOADS = {
     },
     'LDS': {
         'desc': 'LDS.128 (ld.shared.v4.b32)',
-        'smem_per_warp': 1024,
+        'smem_per_warp': 2048,  # reads up to _base+768+16=1520 bytes; 1024 was too small
         'setup': (
             '    uint32_t _base = _smem_base + {lane} * 16;\n'
             '    unsigned _r0=0, _r1=0, _r2=0, _r3=0;\n'
@@ -398,6 +398,14 @@ def gen_header():
 #define REPS {REPS}
 #define WARMUP {WARMUP}
 #define MAX_WARPS {MAX_WARPS}
+
+#define CUDA_CHECK(call) do {{ \\
+    cudaError_t _e = (call); \\
+    if (_e != cudaSuccess) {{ \\
+        fprintf(stderr, "CUDA error at %s:%d: %s (%d)\\n", __FILE__, __LINE__, cudaGetErrorString(_e), _e); \\
+        exit(1); \\
+    }} \\
+}} while(0)
 
 __device__ __forceinline__ long long asm_clock64() {{
     long long r;
@@ -817,7 +825,7 @@ def gen_prodcons_kernel(name, n_epi, load_mode, n_kloop, has_load_warp):
         lines.append(f'                "ld.global.v4.b32 {{%0,%1,%2,%3}}, [%4+32];\\n\\t"')
         lines.append(f'                "ld.global.v4.b32 {{%0,%1,%2,%3}}, [%4+48];\\n\\t"')
         lines.append(f'                : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)')
-        lines.append(f'                : "l"(_gptr + (_i & 0xf))')
+        lines.append(f'                : "l"(_gptr + ((_i & 0x3) << 2))')
         lines.append(f'                : "memory"')
         lines.append(f'            );')
         lines.append(f'            _lda0 += _ld0;')
@@ -990,7 +998,7 @@ def gen_ldgmix_epi_kernel(name, n_epi_warps, n_compute_warps, l2=False):
         lines.append(f'                "ld.global.v4.b32 {{%0,%1,%2,%3}}, [%4+32];\\n\\t"')
         lines.append(f'                "ld.global.v4.b32 {{%0,%1,%2,%3}}, [%4+48];\\n\\t"')
         lines.append(f'                : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)')
-        lines.append(f'                : "l"(_gptr + (_i & 0xf))')
+        lines.append(f'                : "l"(_gptr + ((_i & 0x3) << 2))')
         lines.append(f'                : "memory"')
         lines.append(f'            );')
         lines.append(f'            _lda0 += _ld0;')
@@ -1117,7 +1125,7 @@ def gen_fc2_exact_kernel(name):
     lines.append(f'                "ld.global.v4.b32 {{%0,%1,%2,%3}}, [%4+32];\\n\\t"')
     lines.append(f'                "ld.global.v4.b32 {{%0,%1,%2,%3}}, [%4+48];\\n\\t"')
     lines.append(f'                : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)')
-    lines.append(f'                : "l"(_gptr + (_i & 0xf))')
+    lines.append(f'                : "l"(_gptr + ((_i & 0x3) << 2))')
     lines.append(f'                : "memory"')
     lines.append(f'            );')
     lines.append(f'            _lda0 += _ld0;')
@@ -1152,7 +1160,7 @@ def gen_fc2_exact_kernel(name):
     lines.append(f'                "ld.global.v4.b32 {{%0,%1,%2,%3}}, [%4+32];\\n\\t"')
     lines.append(f'                "ld.global.v4.b32 {{%0,%1,%2,%3}}, [%4+48];\\n\\t"')
     lines.append(f'                : "+r"(_g0), "+r"(_g1), "+r"(_g2), "+r"(_g3)')
-    lines.append(f'                : "l"(_gptr + (_i & 0xf))')
+    lines.append(f'                : "l"(_gptr + ((_i & 0x3) << 2))')
     lines.append(f'                : "memory"')
     lines.append(f'            );')
     lines.append(f'        }}')
@@ -1235,7 +1243,7 @@ def gen_asymmetric_kernel(name, n_epi, n_compute, epi_divisor):
     lines.append(f'                "ld.global.v4.b32 {{%0,%1,%2,%3}}, [%4+32];\\n\\t"')
     lines.append(f'                "ld.global.v4.b32 {{%0,%1,%2,%3}}, [%4+48];\\n\\t"')
     lines.append(f'                : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)')
-    lines.append(f'                : "l"(_gptr + (_i & 0xf))')
+    lines.append(f'                : "l"(_gptr + ((_i & 0x3) << 2))')
     lines.append(f'                : "memory"')
     lines.append(f'            );')
     lines.append(f'            _lda0 += _ld0;')
@@ -1338,7 +1346,7 @@ def gen_barsync_mixed_kernel(name, n_bar_warps, n_compute_warps, bar_interval):
         f'                    "ld.global.v4.b32 {{%0,%1,%2,%3}}, [%4+32];\\n\\t"',
         f'                    "ld.global.v4.b32 {{%0,%1,%2,%3}}, [%4+48];\\n\\t"',
         f'                    : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)',
-        f'                    : "l"(_gptr + (_inner & 0xf))',
+        f'                    : "l"(_gptr + ((_inner & 0x3) << 2))',
         f'                    : "memory"',
         f'                );',
         f'                _lda0 += _ld0;',
@@ -1405,7 +1413,10 @@ def gen_barsync_mixed_kernel(name, n_bar_warps, n_compute_warps, bar_interval):
 
 
 def gen_main(all_tests):
-    """Generate main() with multi-run measurement (min CPI across launches)."""
+    """Generate main() with dual measurement:
+    - S-tests: per-warp clock64 CPI (accurate for same-pipe scaling)
+    - X/F/P/B/N/A tests: cudaEvent wall time (avoids broken per-warp clocks)
+    """
     lines = []
     lines.append('')
     lines.append(f'#define WARMUP_LAUNCHES {WARMUP_LAUNCHES}')
@@ -1417,13 +1428,15 @@ def gen_main(all_tests):
     lines.append('    int n_warps;')
     lines.append('    int insns_per_iter;')
     lines.append('    int smem_bytes;')
+    lines.append('    int use_events;  /* 0=per-warp clock64, 1=cudaEvent wall time */')
     lines.append('    void (*fn)(WarpResult*);')
     lines.append('};')
     lines.append('')
 
     lines.append('Test tests[] = {')
     for name, category, n_warps, insns_per_iter, smem_bytes in all_tests:
-        lines.append(f'    {{"{name}", "{category}", {n_warps}, {insns_per_iter}, {smem_bytes}, {name}}},')
+        use_events = 0 if category.startswith('S:') else 1
+        lines.append(f'    {{"{name}", "{category}", {n_warps}, {insns_per_iter}, {smem_bytes}, {use_events}, {name}}},')
     lines.append('};')
     lines.append('')
 
@@ -1438,24 +1451,35 @@ def gen_main(all_tests):
     lines.append('    cudaMemset(h_large_buf, 0x42, LARGE_BUF_SIZE);')
     lines.append('    cudaMemcpyToSymbol(g_large_buf, &h_large_buf, sizeof(char*));')
     lines.append('')
+    lines.append('    /* cudaEvent for wall-time measurement */')
+    lines.append('    cudaEvent_t ev_start, ev_stop;')
+    lines.append('    cudaEventCreate(&ev_start);')
+    lines.append('    cudaEventCreate(&ev_stop);')
+    lines.append('')
     lines.append('    /* Per-warp min elapsed across all measured launches */')
     lines.append('    long long min_elapsed[MAX_WARPS];')
-    lines.append('    /* Per-warp all elapsed for median */')
-    lines.append('    long long all_elapsed[MEASURE_LAUNCHES][MAX_WARPS];')
+    lines.append('    /* Wall-time measurements (us) */')
+    lines.append('    float wall_times[MEASURE_LAUNCHES];')
     lines.append('')
     lines.append('    int n = sizeof(tests) / sizeof(tests[0]);')
     lines.append(f'    printf("Warp Scaling Calibration — SM100a\\n");')
-    lines.append(f'    printf("REPS=%d, %d warmup + %d measured launches, per-warp clock64()\\n\\n",')
+    lines.append(f'    printf("REPS=%d, %d warmup + %d measured launches\\n",')
     lines.append(f'           REPS, WARMUP_LAUNCHES, MEASURE_LAUNCHES);')
+    lines.append(f'    printf("S-tests: per-warp clock64 CPI | X/F/P/B/N/A: cudaEvent wall time (us)\\n\\n");')
     lines.append('')
     lines.append('    const char* prev_cat = "";')
     lines.append('    for (int t = 0; t < n; t++) {')
     lines.append('        if (strcmp(tests[t].category, prev_cat) != 0) {')
     lines.append('            printf("\\n=== %s ===\\n", tests[t].category);')
-    lines.append('            printf("%-30s %6s", "Test", "Warps");')
-    lines.append(f'            for (int w = 0; w < MAX_WARPS; w++)')
-    lines.append(f'                printf("  W%d_cyc/i", w);')
-    lines.append(f'            printf("  Max_cyc/i  Min_cyc/i\\n");')
+    lines.append('            if (!tests[t].use_events) {')
+    lines.append('                printf("%-30s %6s", "Test", "Warps");')
+    lines.append(f'                for (int w = 0; w < MAX_WARPS; w++)')
+    lines.append(f'                    printf("  W%d_cyc/i", w);')
+    lines.append(f'                printf("  Max_cyc/i  Min_cyc/i\\n");')
+    lines.append('            } else {')
+    lines.append('                printf("%-30s %6s  %10s  %10s  %10s\\n",')
+    lines.append('                       "Test", "Warps", "min_us", "med_us", "max_us");')
+    lines.append('            }')
     lines.append('            prev_cat = tests[t].category;')
     lines.append('        }')
     lines.append('')
@@ -1463,41 +1487,80 @@ def gen_main(all_tests):
     lines.append('            cudaFuncSetAttribute(tests[t].fn, cudaFuncAttributeMaxDynamicSharedMemorySize, tests[t].smem_bytes);')
     lines.append('')
     lines.append('        /* Warmup launches */')
+    lines.append('        fflush(stdout);')
     lines.append('        for (int r = 0; r < WARMUP_LAUNCHES; r++) {')
     lines.append('            cudaMemset(d_results, 0, MAX_WARPS * sizeof(WarpResult) + 65536);')
     lines.append('            tests[t].fn<<<1, tests[t].n_warps * 32, tests[t].smem_bytes>>>(d_results);')
-    lines.append('            cudaDeviceSynchronize();')
+    lines.append('            CUDA_CHECK(cudaGetLastError());')
+    lines.append('            CUDA_CHECK(cudaDeviceSynchronize());')
     lines.append('        }')
     lines.append('')
-    lines.append('        /* Measured launches — keep min elapsed per warp */')
-    lines.append('        for (int w = 0; w < MAX_WARPS; w++) min_elapsed[w] = 0x7FFFFFFFFFFFFFFFLL;')
-    lines.append('        for (int r = 0; r < MEASURE_LAUNCHES; r++) {')
-    lines.append('            cudaMemset(d_results, 0, MAX_WARPS * sizeof(WarpResult) + 65536);')
-    lines.append('            tests[t].fn<<<1, tests[t].n_warps * 32, tests[t].smem_bytes>>>(d_results);')
-    lines.append('            cudaDeviceSynchronize();')
-    lines.append('            cudaMemcpy(h_results, d_results, MAX_WARPS * sizeof(WarpResult), cudaMemcpyDeviceToHost);')
-    lines.append('            for (int w = 0; w < tests[t].n_warps; w++) {')
-    lines.append('                long long e = h_results[w].end - h_results[w].start;')
-    lines.append('                all_elapsed[r][w] = e;')
-    lines.append('                if (e < min_elapsed[w]) min_elapsed[w] = e;')
+    lines.append('        if (!tests[t].use_events) {')
+    lines.append('            /* ── S-tests: per-warp clock64 measurement ── */')
+    lines.append('            for (int w = 0; w < MAX_WARPS; w++) min_elapsed[w] = 0x7FFFFFFFFFFFFFFFLL;')
+    lines.append('            for (int r = 0; r < MEASURE_LAUNCHES; r++) {')
+    lines.append('                cudaMemset(d_results, 0, MAX_WARPS * sizeof(WarpResult) + 65536);')
+    lines.append('                tests[t].fn<<<1, tests[t].n_warps * 32, tests[t].smem_bytes>>>(d_results);')
+    lines.append('                CUDA_CHECK(cudaGetLastError());')
+    lines.append('                CUDA_CHECK(cudaDeviceSynchronize());')
+    lines.append('                cudaMemcpy(h_results, d_results, MAX_WARPS * sizeof(WarpResult), cudaMemcpyDeviceToHost);')
+    lines.append('                for (int w = 0; w < tests[t].n_warps; w++) {')
+    lines.append('                    long long e = h_results[w].end - h_results[w].start;')
+    lines.append('                    if (e < min_elapsed[w]) min_elapsed[w] = e;')
+    lines.append('                }')
     lines.append('            }')
-    lines.append('        }')
+    lines.append('            printf("%-30s %6d", tests[t].name, tests[t].n_warps);')
+    lines.append('            double max_cpi = 0, min_cpi_all = 1e18;')
+    lines.append('            for (int w = 0; w < tests[t].n_warps; w++) {')
+    lines.append(f'                double cpi = (double)min_elapsed[w] / (REPS * tests[t].insns_per_iter);')
+    lines.append('                printf("  %9.2f", cpi);')
+    lines.append('                if (cpi > max_cpi) max_cpi = cpi;')
+    lines.append('                if (cpi < min_cpi_all) min_cpi_all = cpi;')
+    lines.append('            }')
+    lines.append('            for (int w = tests[t].n_warps; w < MAX_WARPS; w++)')
+    lines.append('                printf("          -");')
+    lines.append('            printf("  %9.2f  %9.2f\\n", max_cpi, min_cpi_all);')
     lines.append('')
-    lines.append('        /* Report min CPI per warp */')
-    lines.append('        printf("%-30s %6d", tests[t].name, tests[t].n_warps);')
-    lines.append('        double max_cpi = 0, min_cpi_all = 1e18;')
-    lines.append('        for (int w = 0; w < tests[t].n_warps; w++) {')
-    lines.append(f'            double cpi = (double)min_elapsed[w] / (REPS * tests[t].insns_per_iter);')
-    lines.append('            printf("  %9.2f", cpi);')
-    lines.append('            if (cpi > max_cpi) max_cpi = cpi;')
-    lines.append('            if (cpi < min_cpi_all) min_cpi_all = cpi;')
+    lines.append('        } else {')
+    lines.append('            /* ── X/F/P/B/N/A tests: cudaEvent wall-time measurement ── */')
+    lines.append('            const int BATCH = 100; /* launches per event pair for resolution */')
+    lines.append('            for (int r = 0; r < MEASURE_LAUNCHES; r++) {')
+    lines.append('                cudaEventRecord(ev_start);')
+    lines.append('                for (int b = 0; b < BATCH; b++)')
+    lines.append('                    tests[t].fn<<<1, tests[t].n_warps * 32, tests[t].smem_bytes>>>(d_results);')
+    lines.append('                cudaEventRecord(ev_stop);')
+    lines.append('                cudaEventSynchronize(ev_stop);')
+    lines.append('                float ms = 0;')
+    lines.append('                cudaEventElapsedTime(&ms, ev_start, ev_stop);')
+    lines.append('                wall_times[r] = ms * 1000.0f / BATCH; /* per-launch us */')
+    lines.append('            }')
+    lines.append('            /* Sort for min/median/max */')
+    lines.append('            std::sort(wall_times, wall_times + MEASURE_LAUNCHES);')
+    lines.append('            float min_us = wall_times[0];')
+    lines.append('            float med_us = wall_times[MEASURE_LAUNCHES / 2];')
+    lines.append('            float max_us = wall_times[MEASURE_LAUNCHES - 1];')
+    lines.append('            printf("%-30s %6d  %10.3f  %10.3f  %10.3f",')
+    lines.append('                   tests[t].name, tests[t].n_warps, min_us, med_us, max_us);')
+    lines.append('            /* Debug: verify events work on first event-based test */')
+    lines.append('            if (t < n && strcmp(tests[t].name, "X_4pipe") == 0) {')
+    lines.append('                cudaError_t e1 = cudaEventRecord(ev_start);')
+    lines.append('                for (int b = 0; b < 1000; b++)')
+    lines.append('                    tests[t].fn<<<1, tests[t].n_warps * 32, tests[t].smem_bytes>>>(d_results);')
+    lines.append('                cudaError_t e2 = cudaGetLastError();')
+    lines.append('                cudaError_t e3 = cudaEventRecord(ev_stop);')
+    lines.append('                cudaError_t e4 = cudaEventSynchronize(ev_stop);')
+    lines.append('                float raw_ms = 0;')
+    lines.append('                cudaError_t e5 = cudaEventElapsedTime(&raw_ms, ev_start, ev_stop);')
+    lines.append('                printf("  [evRec=%d kern=%d evStop=%d sync=%d elapsed=%d ms=%.6f]",')
+    lines.append('                       e1, e2, e3, e4, e5, raw_ms);')
+    lines.append('            }')
+    lines.append('            printf("\\n");')
     lines.append('        }')
-    lines.append('        for (int w = tests[t].n_warps; w < MAX_WARPS; w++)')
-    lines.append('            printf("          -");')
-    lines.append('        printf("  %9.2f  %9.2f\\n", max_cpi, min_cpi_all);')
     lines.append('    }')
     lines.append('')
     lines.append('    printf("\\n@@WARP_SCALING\\n");')
+    lines.append('    cudaEventDestroy(ev_start);')
+    lines.append('    cudaEventDestroy(ev_stop);')
     lines.append('    cudaFree(h_large_buf);')
     lines.append('    cudaFree(d_results);')
     lines.append('    return 0;')

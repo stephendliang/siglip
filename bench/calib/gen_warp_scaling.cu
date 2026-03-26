@@ -9,6 +9,14 @@
 #define WARMUP 32
 #define MAX_WARPS 8
 
+#define CUDA_CHECK(call) do { \
+    cudaError_t _e = (call); \
+    if (_e != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s (%d)\n", __FILE__, __LINE__, cudaGetErrorString(_e), _e); \
+        exit(1); \
+    } \
+} while(0)
+
 __device__ __forceinline__ long long asm_clock64() {
     long long r;
     asm volatile("mov.u64 %0, %%clock64;" : "=l"(r) :: "memory");
@@ -1184,7 +1192,7 @@ extern "C" __global__ void S_LDS_w1(WarpResult* results) {
     const int _warp = threadIdx.x / 32;
     const int _lane = threadIdx.x % 32;
     const int _tid = threadIdx.x;
-    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 1024);
+    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 2048);
     (void)_tid;
 
     uint32_t _base = _smem_base + _lane * 16;
@@ -1247,7 +1255,7 @@ extern "C" __global__ void S_LDS_w2(WarpResult* results) {
     const int _warp = threadIdx.x / 32;
     const int _lane = threadIdx.x % 32;
     const int _tid = threadIdx.x;
-    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 1024);
+    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 2048);
     (void)_tid;
 
     uint32_t _base = _smem_base + _lane * 16;
@@ -1310,7 +1318,7 @@ extern "C" __global__ void S_LDS_w3(WarpResult* results) {
     const int _warp = threadIdx.x / 32;
     const int _lane = threadIdx.x % 32;
     const int _tid = threadIdx.x;
-    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 1024);
+    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 2048);
     (void)_tid;
 
     uint32_t _base = _smem_base + _lane * 16;
@@ -1373,7 +1381,7 @@ extern "C" __global__ void S_LDS_w4(WarpResult* results) {
     const int _warp = threadIdx.x / 32;
     const int _lane = threadIdx.x % 32;
     const int _tid = threadIdx.x;
-    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 1024);
+    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 2048);
     (void)_tid;
 
     uint32_t _base = _smem_base + _lane * 16;
@@ -1436,7 +1444,7 @@ extern "C" __global__ void S_LDS_w5(WarpResult* results) {
     const int _warp = threadIdx.x / 32;
     const int _lane = threadIdx.x % 32;
     const int _tid = threadIdx.x;
-    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 1024);
+    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 2048);
     (void)_tid;
 
     uint32_t _base = _smem_base + _lane * 16;
@@ -1499,7 +1507,7 @@ extern "C" __global__ void S_LDS_w6(WarpResult* results) {
     const int _warp = threadIdx.x / 32;
     const int _lane = threadIdx.x % 32;
     const int _tid = threadIdx.x;
-    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 1024);
+    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 2048);
     (void)_tid;
 
     uint32_t _base = _smem_base + _lane * 16;
@@ -1562,7 +1570,7 @@ extern "C" __global__ void S_LDS_w7(WarpResult* results) {
     const int _warp = threadIdx.x / 32;
     const int _lane = threadIdx.x % 32;
     const int _tid = threadIdx.x;
-    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 1024);
+    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 2048);
     (void)_tid;
 
     uint32_t _base = _smem_base + _lane * 16;
@@ -1625,7 +1633,7 @@ extern "C" __global__ void S_LDS_w8(WarpResult* results) {
     const int _warp = threadIdx.x / 32;
     const int _lane = threadIdx.x % 32;
     const int _tid = threadIdx.x;
-    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 1024);
+    uint32_t _smem_base = (uint32_t)(uint64_t)(_dyn_smem + _warp * 2048);
     (void)_tid;
 
     uint32_t _base = _smem_base + _lane * 16;
@@ -7708,7 +7716,7 @@ extern "C" __global__ void F_4ldgmix_0ffma(WarpResult* results) {
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+32];\n\t"
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+48];\n\t"
                 : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)
-                : "l"(_gptr + (_i & 0xf))
+                : "l"(_gptr + ((_i & 0x3) << 2))
                 : "memory"
             );
             _lda0 += _ld0;
@@ -7769,7 +7777,7 @@ extern "C" __global__ void F_4ldgmix_1ffma(WarpResult* results) {
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+32];\n\t"
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+48];\n\t"
                 : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)
-                : "l"(_gptr + (_i & 0xf))
+                : "l"(_gptr + ((_i & 0x3) << 2))
                 : "memory"
             );
             _lda0 += _ld0;
@@ -7849,7 +7857,7 @@ extern "C" __global__ void F_4ldgmix_2ffma(WarpResult* results) {
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+32];\n\t"
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+48];\n\t"
                 : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)
-                : "l"(_gptr + (_i & 0xf))
+                : "l"(_gptr + ((_i & 0x3) << 2))
                 : "memory"
             );
             _lda0 += _ld0;
@@ -7929,7 +7937,7 @@ extern "C" __global__ void F_fc2_exact_6w(WarpResult* results) {
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+32];\n\t"
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+48];\n\t"
                 : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)
-                : "l"(_gptr + (_i & 0xf))
+                : "l"(_gptr + ((_i & 0x3) << 2))
                 : "memory"
             );
             _lda0 += _ld0;
@@ -7962,7 +7970,7 @@ extern "C" __global__ void F_fc2_exact_6w(WarpResult* results) {
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+32];\n\t"
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+48];\n\t"
                 : "+r"(_g0), "+r"(_g1), "+r"(_g2), "+r"(_g3)
-                : "l"(_gptr + (_i & 0xf))
+                : "l"(_gptr + ((_i & 0x3) << 2))
                 : "memory"
             );
         }
@@ -8179,7 +8187,7 @@ extern "C" __global__ void P_4epi_ldg(WarpResult* results) {
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+32];\n\t"
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+48];\n\t"
                 : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)
-                : "l"(_gptr + (_i & 0xf))
+                : "l"(_gptr + ((_i & 0x3) << 2))
                 : "memory"
             );
             _lda0 += _ld0;
@@ -8405,7 +8413,7 @@ extern "C" __global__ void P_4epi_ldg_2kl(WarpResult* results) {
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+32];\n\t"
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+48];\n\t"
                 : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)
-                : "l"(_gptr + (_i & 0xf))
+                : "l"(_gptr + ((_i & 0x3) << 2))
                 : "memory"
             );
             _lda0 += _ld0;
@@ -8697,7 +8705,7 @@ extern "C" __global__ void P_4epi_ldg_1kl(WarpResult* results) {
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+32];\n\t"
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+48];\n\t"
                 : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)
-                : "l"(_gptr + (_i & 0xf))
+                : "l"(_gptr + ((_i & 0x3) << 2))
                 : "memory"
             );
             _lda0 += _ld0;
@@ -8989,7 +8997,7 @@ extern "C" __global__ void P_3epi_ldg_2kl(WarpResult* results) {
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+32];\n\t"
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+48];\n\t"
                 : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)
-                : "l"(_gptr + (_i & 0xf))
+                : "l"(_gptr + ((_i & 0x3) << 2))
                 : "memory"
             );
             _lda0 += _ld0;
@@ -9784,7 +9792,7 @@ extern "C" __global__ void A_4ldgmix_2ffma_half(WarpResult* results) {
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+32];\n\t"
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+48];\n\t"
                 : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)
-                : "l"(_gptr + (_i & 0xf))
+                : "l"(_gptr + ((_i & 0x3) << 2))
                 : "memory"
             );
             _lda0 += _ld0;
@@ -9868,7 +9876,7 @@ extern "C" __global__ void A_4ldgmix_2ffma_quarter(WarpResult* results) {
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+32];\n\t"
                 "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+48];\n\t"
                 : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)
-                : "l"(_gptr + (_i & 0xf))
+                : "l"(_gptr + ((_i & 0x3) << 2))
                 : "memory"
             );
             _lda0 += _ld0;
@@ -9953,7 +9961,7 @@ extern "C" __global__ void B_4mixbar_2cmp_i8(WarpResult* results) {
                     "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+32];\n\t"
                     "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+48];\n\t"
                     : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)
-                    : "l"(_gptr + (_inner & 0xf))
+                    : "l"(_gptr + ((_inner & 0x3) << 2))
                     : "memory"
                 );
                 _lda0 += _ld0;
@@ -10036,7 +10044,7 @@ extern "C" __global__ void B_4mixbar_2cmp_nobar(WarpResult* results) {
                     "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+32];\n\t"
                     "ld.global.v4.b32 {%0,%1,%2,%3}, [%4+48];\n\t"
                     : "+r"(_ld0), "+r"(_ld1), "+r"(_ld2), "+r"(_ld3)
-                    : "l"(_gptr + (_inner & 0xf))
+                    : "l"(_gptr + ((_inner & 0x3) << 2))
                     : "memory"
                 );
                 _lda0 += _ld0;
@@ -10094,144 +10102,145 @@ struct Test {
     int n_warps;
     int insns_per_iter;
     int smem_bytes;
+    int use_events;  /* 0=per-warp clock64, 1=cudaEvent wall time */
     void (*fn)(WarpResult*);
 };
 
 Test tests[] = {
-    {"S_STS_w1", "S: STS.128 (st.shared.v4.b32) scaling", 1, 4, 1024, S_STS_w1},
-    {"S_STS_w2", "S: STS.128 (st.shared.v4.b32) scaling", 2, 4, 2048, S_STS_w2},
-    {"S_STS_w3", "S: STS.128 (st.shared.v4.b32) scaling", 3, 4, 3072, S_STS_w3},
-    {"S_STS_w4", "S: STS.128 (st.shared.v4.b32) scaling", 4, 4, 4096, S_STS_w4},
-    {"S_STS_w5", "S: STS.128 (st.shared.v4.b32) scaling", 5, 4, 5120, S_STS_w5},
-    {"S_STS_w6", "S: STS.128 (st.shared.v4.b32) scaling", 6, 4, 6144, S_STS_w6},
-    {"S_STS_w7", "S: STS.128 (st.shared.v4.b32) scaling", 7, 4, 7168, S_STS_w7},
-    {"S_STS_w8", "S: STS.128 (st.shared.v4.b32) scaling", 8, 4, 8192, S_STS_w8},
-    {"S_FFMA_w1", "S: FFMA (fma.rn.f32) scaling", 1, 4, 0, S_FFMA_w1},
-    {"S_FFMA_w2", "S: FFMA (fma.rn.f32) scaling", 2, 4, 0, S_FFMA_w2},
-    {"S_FFMA_w3", "S: FFMA (fma.rn.f32) scaling", 3, 4, 0, S_FFMA_w3},
-    {"S_FFMA_w4", "S: FFMA (fma.rn.f32) scaling", 4, 4, 0, S_FFMA_w4},
-    {"S_FFMA_w5", "S: FFMA (fma.rn.f32) scaling", 5, 4, 0, S_FFMA_w5},
-    {"S_FFMA_w6", "S: FFMA (fma.rn.f32) scaling", 6, 4, 0, S_FFMA_w6},
-    {"S_FFMA_w7", "S: FFMA (fma.rn.f32) scaling", 7, 4, 0, S_FFMA_w7},
-    {"S_FFMA_w8", "S: FFMA (fma.rn.f32) scaling", 8, 4, 0, S_FFMA_w8},
-    {"S_HFMA2_w1", "S: HFMA2 (fma.rn.bf16x2) scaling", 1, 4, 0, S_HFMA2_w1},
-    {"S_HFMA2_w2", "S: HFMA2 (fma.rn.bf16x2) scaling", 2, 4, 0, S_HFMA2_w2},
-    {"S_HFMA2_w3", "S: HFMA2 (fma.rn.bf16x2) scaling", 3, 4, 0, S_HFMA2_w3},
-    {"S_HFMA2_w4", "S: HFMA2 (fma.rn.bf16x2) scaling", 4, 4, 0, S_HFMA2_w4},
-    {"S_HFMA2_w5", "S: HFMA2 (fma.rn.bf16x2) scaling", 5, 4, 0, S_HFMA2_w5},
-    {"S_HFMA2_w6", "S: HFMA2 (fma.rn.bf16x2) scaling", 6, 4, 0, S_HFMA2_w6},
-    {"S_HFMA2_w7", "S: HFMA2 (fma.rn.bf16x2) scaling", 7, 4, 0, S_HFMA2_w7},
-    {"S_HFMA2_w8", "S: HFMA2 (fma.rn.bf16x2) scaling", 8, 4, 0, S_HFMA2_w8},
-    {"S_LDS_w1", "S: LDS.128 (ld.shared.v4.b32) scaling", 1, 4, 1024, S_LDS_w1},
-    {"S_LDS_w2", "S: LDS.128 (ld.shared.v4.b32) scaling", 2, 4, 2048, S_LDS_w2},
-    {"S_LDS_w3", "S: LDS.128 (ld.shared.v4.b32) scaling", 3, 4, 3072, S_LDS_w3},
-    {"S_LDS_w4", "S: LDS.128 (ld.shared.v4.b32) scaling", 4, 4, 4096, S_LDS_w4},
-    {"S_LDS_w5", "S: LDS.128 (ld.shared.v4.b32) scaling", 5, 4, 5120, S_LDS_w5},
-    {"S_LDS_w6", "S: LDS.128 (ld.shared.v4.b32) scaling", 6, 4, 6144, S_LDS_w6},
-    {"S_LDS_w7", "S: LDS.128 (ld.shared.v4.b32) scaling", 7, 4, 7168, S_LDS_w7},
-    {"S_LDS_w8", "S: LDS.128 (ld.shared.v4.b32) scaling", 8, 4, 8192, S_LDS_w8},
-    {"S_F2FP_w1", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 1, 4, 0, S_F2FP_w1},
-    {"S_F2FP_w2", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 2, 4, 0, S_F2FP_w2},
-    {"S_F2FP_w3", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 3, 4, 0, S_F2FP_w3},
-    {"S_F2FP_w4", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 4, 4, 0, S_F2FP_w4},
-    {"S_F2FP_w5", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 5, 4, 0, S_F2FP_w5},
-    {"S_F2FP_w6", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 6, 4, 0, S_F2FP_w6},
-    {"S_F2FP_w7", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 7, 4, 0, S_F2FP_w7},
-    {"S_F2FP_w8", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 8, 4, 0, S_F2FP_w8},
-    {"S_HADD2_w1", "S: HADD2 (add.rn.bf16x2) scaling", 1, 4, 0, S_HADD2_w1},
-    {"S_HADD2_w2", "S: HADD2 (add.rn.bf16x2) scaling", 2, 4, 0, S_HADD2_w2},
-    {"S_HADD2_w3", "S: HADD2 (add.rn.bf16x2) scaling", 3, 4, 0, S_HADD2_w3},
-    {"S_HADD2_w4", "S: HADD2 (add.rn.bf16x2) scaling", 4, 4, 0, S_HADD2_w4},
-    {"S_HADD2_w5", "S: HADD2 (add.rn.bf16x2) scaling", 5, 4, 0, S_HADD2_w5},
-    {"S_HADD2_w6", "S: HADD2 (add.rn.bf16x2) scaling", 6, 4, 0, S_HADD2_w6},
-    {"S_HADD2_w7", "S: HADD2 (add.rn.bf16x2) scaling", 7, 4, 0, S_HADD2_w7},
-    {"S_HADD2_w8", "S: HADD2 (add.rn.bf16x2) scaling", 8, 4, 0, S_HADD2_w8},
-    {"S_NOP_w1", "S: NOP (baseline — scheduler overhead only) scaling", 1, 4, 0, S_NOP_w1},
-    {"S_NOP_w2", "S: NOP (baseline — scheduler overhead only) scaling", 2, 4, 0, S_NOP_w2},
-    {"S_NOP_w3", "S: NOP (baseline — scheduler overhead only) scaling", 3, 4, 0, S_NOP_w3},
-    {"S_NOP_w4", "S: NOP (baseline — scheduler overhead only) scaling", 4, 4, 0, S_NOP_w4},
-    {"S_NOP_w5", "S: NOP (baseline — scheduler overhead only) scaling", 5, 4, 0, S_NOP_w5},
-    {"S_NOP_w6", "S: NOP (baseline — scheduler overhead only) scaling", 6, 4, 0, S_NOP_w6},
-    {"S_NOP_w7", "S: NOP (baseline — scheduler overhead only) scaling", 7, 4, 0, S_NOP_w7},
-    {"S_NOP_w8", "S: NOP (baseline — scheduler overhead only) scaling", 8, 4, 0, S_NOP_w8},
-    {"S_LDG_w1", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 1, 4, 0, S_LDG_w1},
-    {"S_LDG_w2", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 2, 4, 0, S_LDG_w2},
-    {"S_LDG_w3", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 3, 4, 0, S_LDG_w3},
-    {"S_LDG_w4", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 4, 4, 0, S_LDG_w4},
-    {"S_LDG_w5", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 5, 4, 0, S_LDG_w5},
-    {"S_LDG_w6", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 6, 4, 0, S_LDG_w6},
-    {"S_LDG_w7", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 7, 4, 0, S_LDG_w7},
-    {"S_LDG_w8", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 8, 4, 0, S_LDG_w8},
-    {"S_STS_ILP1_w1", "S: STS.128 ILP=1 (sub-partition probe) scaling", 1, 1, 1024, S_STS_ILP1_w1},
-    {"S_STS_ILP1_w2", "S: STS.128 ILP=1 (sub-partition probe) scaling", 2, 1, 2048, S_STS_ILP1_w2},
-    {"S_STS_ILP1_w3", "S: STS.128 ILP=1 (sub-partition probe) scaling", 3, 1, 3072, S_STS_ILP1_w3},
-    {"S_STS_ILP1_w4", "S: STS.128 ILP=1 (sub-partition probe) scaling", 4, 1, 4096, S_STS_ILP1_w4},
-    {"S_STS_ILP1_w5", "S: STS.128 ILP=1 (sub-partition probe) scaling", 5, 1, 5120, S_STS_ILP1_w5},
-    {"S_STS_ILP1_w6", "S: STS.128 ILP=1 (sub-partition probe) scaling", 6, 1, 6144, S_STS_ILP1_w6},
-    {"S_STS_ILP1_w7", "S: STS.128 ILP=1 (sub-partition probe) scaling", 7, 1, 7168, S_STS_ILP1_w7},
-    {"S_STS_ILP1_w8", "S: STS.128 ILP=1 (sub-partition probe) scaling", 8, 1, 8192, S_STS_ILP1_w8},
-    {"S_LDG_L2_w1", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 1, 4, 0, S_LDG_L2_w1},
-    {"S_LDG_L2_w2", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 2, 4, 0, S_LDG_L2_w2},
-    {"S_LDG_L2_w3", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 3, 4, 0, S_LDG_L2_w3},
-    {"S_LDG_L2_w4", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 4, 4, 0, S_LDG_L2_w4},
-    {"S_LDG_L2_w5", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 5, 4, 0, S_LDG_L2_w5},
-    {"S_LDG_L2_w6", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 6, 4, 0, S_LDG_L2_w6},
-    {"S_LDG_L2_w7", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 7, 4, 0, S_LDG_L2_w7},
-    {"S_LDG_L2_w8", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 8, 4, 0, S_LDG_L2_w8},
-    {"X_4pipe", "X: Cross-pipe independence", 4, 4, 4096, X_4pipe},
-    {"X_sts_ffma", "X: Cross-pipe independence", 2, 4, 2048, X_sts_ffma},
-    {"X_sts_hfma2", "X: Cross-pipe independence", 2, 4, 2048, X_sts_hfma2},
-    {"X_sts_lds", "X: Cross-pipe independence", 2, 4, 2048, X_sts_lds},
-    {"X_ffma_hfma2", "X: Cross-pipe independence", 2, 4, 2048, X_ffma_hfma2},
-    {"X_sts_f2fp", "X: Cross-pipe independence", 2, 4, 2048, X_sts_f2fp},
-    {"X_2sts_2lds", "X: Cross-pipe independence", 4, 4, 4096, X_2sts_2lds},
-    {"X_3sts_3lds", "X: Cross-pipe independence", 6, 4, 6144, X_3sts_3lds},
-    {"X_4sts_4lds", "X: Cross-pipe independence", 8, 4, 8192, X_4sts_4lds},
-    {"X_sts_ldg", "X: Cross-pipe independence", 2, 4, 2048, X_sts_ldg},
-    {"X_2sts_2ldg", "X: Cross-pipe independence", 4, 4, 4096, X_2sts_2ldg},
-    {"F_4sts_1ffma", "F: FG/BG interference", 5, 4, 5120, F_4sts_1ffma},
-    {"F_4sts_2ffma", "F: FG/BG interference", 6, 4, 6144, F_4sts_2ffma},
-    {"F_4sts_3ffma", "F: FG/BG interference", 7, 4, 7168, F_4sts_3ffma},
-    {"F_4sts_4ffma", "F: FG/BG interference", 8, 4, 8192, F_4sts_4ffma},
-    {"F_2ffma_1sts", "F: FG/BG interference", 3, 4, 3072, F_2ffma_1sts},
-    {"F_2ffma_2sts", "F: FG/BG interference", 4, 4, 4096, F_2ffma_2sts},
-    {"F_2ffma_4sts", "F: FG/BG interference", 6, 4, 6144, F_2ffma_4sts},
-    {"F_4hfma_2ffma", "F: FG/BG interference", 6, 4, 6144, F_4hfma_2ffma},
-    {"F_4mix_2ffma", "F: FG/BG interference", 6, 4, 6144, F_4mix_2ffma},
-    {"F_4ldgmix_0ffma", "F: FG/BG interference", 4, 8, 4096, F_4ldgmix_0ffma},
-    {"F_4ldgmix_1ffma", "F: FG/BG interference", 5, 8, 5120, F_4ldgmix_1ffma},
-    {"F_4ldgmix_2ffma", "F: FG/BG interference", 6, 8, 6144, F_4ldgmix_2ffma},
-    {"F_fc2_exact_6w", "F: FG/BG interference", 6, 8, 6144, F_fc2_exact_6w},
-    {"F_4ldg_l2_0ffma", "F: FG/BG interference", 4, 8, 4096, F_4ldg_l2_0ffma},
-    {"F_4ldg_l2_2ffma", "F: FG/BG interference", 6, 8, 6144, F_4ldg_l2_2ffma},
-    {"P_4epi_ldg", "P: Producer-consumer (W3)", 4, 8, 8192, P_4epi_ldg},
-    {"P_4epi_lds", "P: Producer-consumer (W3)", 4, 8, 8192, P_4epi_lds},
-    {"P_4epi_lds_1lw", "P: Producer-consumer (W3)", 5, 8, 10240, P_4epi_lds_1lw},
-    {"P_4epi_ldg_2kl", "P: Producer-consumer (W3)", 6, 8, 12288, P_4epi_ldg_2kl},
-    {"P_4epi_lds_2kl", "P: Producer-consumer (W3)", 6, 8, 12288, P_4epi_lds_2kl},
-    {"P_4epi_lds_1lw_2kl", "P: Producer-consumer (W3)", 7, 8, 14336, P_4epi_lds_1lw_2kl},
-    {"P_4epi_ldg_1kl", "P: Producer-consumer (W3)", 5, 8, 10240, P_4epi_ldg_1kl},
-    {"P_4epi_lds_1kl", "P: Producer-consumer (W3)", 5, 8, 10240, P_4epi_lds_1kl},
-    {"P_4epi_lds_1lw_1kl", "P: Producer-consumer (W3)", 6, 8, 12288, P_4epi_lds_1lw_1kl},
-    {"P_3epi_ldg_2kl", "P: Producer-consumer (W3)", 5, 8, 10240, P_3epi_ldg_2kl},
-    {"P_3epi_lds_1lw_2kl", "P: Producer-consumer (W3)", 6, 8, 12288, P_3epi_lds_1lw_2kl},
-    {"B_4bar_2cmp_i4", "B: BAR.SYNC effect", 6, 4, 6144, B_4bar_2cmp_i4},
-    {"B_4bar_2cmp_i8", "B: BAR.SYNC effect", 6, 4, 6144, B_4bar_2cmp_i8},
-    {"B_4bar_2cmp_i16", "B: BAR.SYNC effect", 6, 4, 6144, B_4bar_2cmp_i16},
-    {"B_4bar_2cmp_i32", "B: BAR.SYNC effect", 6, 4, 6144, B_4bar_2cmp_i32},
-    {"B_4nobar_2cmp", "B: BAR.SYNC effect", 6, 4, 6144, B_4nobar_2cmp},
-    {"B_2bar_2cmp_i8", "B: BAR.SYNC effect", 4, 4, 4096, B_2bar_2cmp_i8},
-    {"B_6bar_2cmp_i8", "B: BAR.SYNC effect", 8, 4, 8192, B_6bar_2cmp_i8},
-    {"N_sleep_10", "N: Nanosleep calibration", 1, 1, 0, N_sleep_10},
-    {"N_sleep_50", "N: Nanosleep calibration", 1, 1, 0, N_sleep_50},
-    {"N_sleep_100", "N: Nanosleep calibration", 1, 1, 0, N_sleep_100},
-    {"N_sleep_500", "N: Nanosleep calibration", 1, 1, 0, N_sleep_500},
-    {"N_sleep_1000", "N: Nanosleep calibration", 1, 1, 0, N_sleep_1000},
-    {"N_sleep_5000", "N: Nanosleep calibration", 1, 1, 0, N_sleep_5000},
-    {"A_4ldgmix_2ffma_half", "A: Asymmetric duration", 6, 8, 6144, A_4ldgmix_2ffma_half},
-    {"A_4ldgmix_2ffma_quarter", "A: Asymmetric duration", 6, 8, 6144, A_4ldgmix_2ffma_quarter},
-    {"B_4mixbar_2cmp_i8", "B: BAR.SYNC mixed-epi", 6, 8, 6144, B_4mixbar_2cmp_i8},
-    {"B_4mixbar_2cmp_nobar", "B: BAR.SYNC mixed-epi", 6, 8, 6144, B_4mixbar_2cmp_nobar},
+    {"S_STS_w1", "S: STS.128 (st.shared.v4.b32) scaling", 1, 4, 1024, 0, S_STS_w1},
+    {"S_STS_w2", "S: STS.128 (st.shared.v4.b32) scaling", 2, 4, 2048, 0, S_STS_w2},
+    {"S_STS_w3", "S: STS.128 (st.shared.v4.b32) scaling", 3, 4, 3072, 0, S_STS_w3},
+    {"S_STS_w4", "S: STS.128 (st.shared.v4.b32) scaling", 4, 4, 4096, 0, S_STS_w4},
+    {"S_STS_w5", "S: STS.128 (st.shared.v4.b32) scaling", 5, 4, 5120, 0, S_STS_w5},
+    {"S_STS_w6", "S: STS.128 (st.shared.v4.b32) scaling", 6, 4, 6144, 0, S_STS_w6},
+    {"S_STS_w7", "S: STS.128 (st.shared.v4.b32) scaling", 7, 4, 7168, 0, S_STS_w7},
+    {"S_STS_w8", "S: STS.128 (st.shared.v4.b32) scaling", 8, 4, 8192, 0, S_STS_w8},
+    {"S_FFMA_w1", "S: FFMA (fma.rn.f32) scaling", 1, 4, 0, 0, S_FFMA_w1},
+    {"S_FFMA_w2", "S: FFMA (fma.rn.f32) scaling", 2, 4, 0, 0, S_FFMA_w2},
+    {"S_FFMA_w3", "S: FFMA (fma.rn.f32) scaling", 3, 4, 0, 0, S_FFMA_w3},
+    {"S_FFMA_w4", "S: FFMA (fma.rn.f32) scaling", 4, 4, 0, 0, S_FFMA_w4},
+    {"S_FFMA_w5", "S: FFMA (fma.rn.f32) scaling", 5, 4, 0, 0, S_FFMA_w5},
+    {"S_FFMA_w6", "S: FFMA (fma.rn.f32) scaling", 6, 4, 0, 0, S_FFMA_w6},
+    {"S_FFMA_w7", "S: FFMA (fma.rn.f32) scaling", 7, 4, 0, 0, S_FFMA_w7},
+    {"S_FFMA_w8", "S: FFMA (fma.rn.f32) scaling", 8, 4, 0, 0, S_FFMA_w8},
+    {"S_HFMA2_w1", "S: HFMA2 (fma.rn.bf16x2) scaling", 1, 4, 0, 0, S_HFMA2_w1},
+    {"S_HFMA2_w2", "S: HFMA2 (fma.rn.bf16x2) scaling", 2, 4, 0, 0, S_HFMA2_w2},
+    {"S_HFMA2_w3", "S: HFMA2 (fma.rn.bf16x2) scaling", 3, 4, 0, 0, S_HFMA2_w3},
+    {"S_HFMA2_w4", "S: HFMA2 (fma.rn.bf16x2) scaling", 4, 4, 0, 0, S_HFMA2_w4},
+    {"S_HFMA2_w5", "S: HFMA2 (fma.rn.bf16x2) scaling", 5, 4, 0, 0, S_HFMA2_w5},
+    {"S_HFMA2_w6", "S: HFMA2 (fma.rn.bf16x2) scaling", 6, 4, 0, 0, S_HFMA2_w6},
+    {"S_HFMA2_w7", "S: HFMA2 (fma.rn.bf16x2) scaling", 7, 4, 0, 0, S_HFMA2_w7},
+    {"S_HFMA2_w8", "S: HFMA2 (fma.rn.bf16x2) scaling", 8, 4, 0, 0, S_HFMA2_w8},
+    {"S_LDS_w1", "S: LDS.128 (ld.shared.v4.b32) scaling", 1, 4, 2048, 0, S_LDS_w1},
+    {"S_LDS_w2", "S: LDS.128 (ld.shared.v4.b32) scaling", 2, 4, 4096, 0, S_LDS_w2},
+    {"S_LDS_w3", "S: LDS.128 (ld.shared.v4.b32) scaling", 3, 4, 6144, 0, S_LDS_w3},
+    {"S_LDS_w4", "S: LDS.128 (ld.shared.v4.b32) scaling", 4, 4, 8192, 0, S_LDS_w4},
+    {"S_LDS_w5", "S: LDS.128 (ld.shared.v4.b32) scaling", 5, 4, 10240, 0, S_LDS_w5},
+    {"S_LDS_w6", "S: LDS.128 (ld.shared.v4.b32) scaling", 6, 4, 12288, 0, S_LDS_w6},
+    {"S_LDS_w7", "S: LDS.128 (ld.shared.v4.b32) scaling", 7, 4, 14336, 0, S_LDS_w7},
+    {"S_LDS_w8", "S: LDS.128 (ld.shared.v4.b32) scaling", 8, 4, 16384, 0, S_LDS_w8},
+    {"S_F2FP_w1", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 1, 4, 0, 0, S_F2FP_w1},
+    {"S_F2FP_w2", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 2, 4, 0, 0, S_F2FP_w2},
+    {"S_F2FP_w3", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 3, 4, 0, 0, S_F2FP_w3},
+    {"S_F2FP_w4", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 4, 4, 0, 0, S_F2FP_w4},
+    {"S_F2FP_w5", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 5, 4, 0, 0, S_F2FP_w5},
+    {"S_F2FP_w6", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 6, 4, 0, 0, S_F2FP_w6},
+    {"S_F2FP_w7", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 7, 4, 0, 0, S_F2FP_w7},
+    {"S_F2FP_w8", "S: F2FP (cvt.rn.bf16x2.f32) scaling", 8, 4, 0, 0, S_F2FP_w8},
+    {"S_HADD2_w1", "S: HADD2 (add.rn.bf16x2) scaling", 1, 4, 0, 0, S_HADD2_w1},
+    {"S_HADD2_w2", "S: HADD2 (add.rn.bf16x2) scaling", 2, 4, 0, 0, S_HADD2_w2},
+    {"S_HADD2_w3", "S: HADD2 (add.rn.bf16x2) scaling", 3, 4, 0, 0, S_HADD2_w3},
+    {"S_HADD2_w4", "S: HADD2 (add.rn.bf16x2) scaling", 4, 4, 0, 0, S_HADD2_w4},
+    {"S_HADD2_w5", "S: HADD2 (add.rn.bf16x2) scaling", 5, 4, 0, 0, S_HADD2_w5},
+    {"S_HADD2_w6", "S: HADD2 (add.rn.bf16x2) scaling", 6, 4, 0, 0, S_HADD2_w6},
+    {"S_HADD2_w7", "S: HADD2 (add.rn.bf16x2) scaling", 7, 4, 0, 0, S_HADD2_w7},
+    {"S_HADD2_w8", "S: HADD2 (add.rn.bf16x2) scaling", 8, 4, 0, 0, S_HADD2_w8},
+    {"S_NOP_w1", "S: NOP (baseline — scheduler overhead only) scaling", 1, 4, 0, 0, S_NOP_w1},
+    {"S_NOP_w2", "S: NOP (baseline — scheduler overhead only) scaling", 2, 4, 0, 0, S_NOP_w2},
+    {"S_NOP_w3", "S: NOP (baseline — scheduler overhead only) scaling", 3, 4, 0, 0, S_NOP_w3},
+    {"S_NOP_w4", "S: NOP (baseline — scheduler overhead only) scaling", 4, 4, 0, 0, S_NOP_w4},
+    {"S_NOP_w5", "S: NOP (baseline — scheduler overhead only) scaling", 5, 4, 0, 0, S_NOP_w5},
+    {"S_NOP_w6", "S: NOP (baseline — scheduler overhead only) scaling", 6, 4, 0, 0, S_NOP_w6},
+    {"S_NOP_w7", "S: NOP (baseline — scheduler overhead only) scaling", 7, 4, 0, 0, S_NOP_w7},
+    {"S_NOP_w8", "S: NOP (baseline — scheduler overhead only) scaling", 8, 4, 0, 0, S_NOP_w8},
+    {"S_LDG_w1", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 1, 4, 0, 0, S_LDG_w1},
+    {"S_LDG_w2", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 2, 4, 0, 0, S_LDG_w2},
+    {"S_LDG_w3", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 3, 4, 0, 0, S_LDG_w3},
+    {"S_LDG_w4", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 4, 4, 0, 0, S_LDG_w4},
+    {"S_LDG_w5", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 5, 4, 0, 0, S_LDG_w5},
+    {"S_LDG_w6", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 6, 4, 0, 0, S_LDG_w6},
+    {"S_LDG_w7", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 7, 4, 0, 0, S_LDG_w7},
+    {"S_LDG_w8", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 8, 4, 0, 0, S_LDG_w8},
+    {"S_STS_ILP1_w1", "S: STS.128 ILP=1 (sub-partition probe) scaling", 1, 1, 1024, 0, S_STS_ILP1_w1},
+    {"S_STS_ILP1_w2", "S: STS.128 ILP=1 (sub-partition probe) scaling", 2, 1, 2048, 0, S_STS_ILP1_w2},
+    {"S_STS_ILP1_w3", "S: STS.128 ILP=1 (sub-partition probe) scaling", 3, 1, 3072, 0, S_STS_ILP1_w3},
+    {"S_STS_ILP1_w4", "S: STS.128 ILP=1 (sub-partition probe) scaling", 4, 1, 4096, 0, S_STS_ILP1_w4},
+    {"S_STS_ILP1_w5", "S: STS.128 ILP=1 (sub-partition probe) scaling", 5, 1, 5120, 0, S_STS_ILP1_w5},
+    {"S_STS_ILP1_w6", "S: STS.128 ILP=1 (sub-partition probe) scaling", 6, 1, 6144, 0, S_STS_ILP1_w6},
+    {"S_STS_ILP1_w7", "S: STS.128 ILP=1 (sub-partition probe) scaling", 7, 1, 7168, 0, S_STS_ILP1_w7},
+    {"S_STS_ILP1_w8", "S: STS.128 ILP=1 (sub-partition probe) scaling", 8, 1, 8192, 0, S_STS_ILP1_w8},
+    {"S_LDG_L2_w1", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 1, 4, 0, 0, S_LDG_L2_w1},
+    {"S_LDG_L2_w2", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 2, 4, 0, 0, S_LDG_L2_w2},
+    {"S_LDG_L2_w3", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 3, 4, 0, 0, S_LDG_L2_w3},
+    {"S_LDG_L2_w4", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 4, 4, 0, 0, S_LDG_L2_w4},
+    {"S_LDG_L2_w5", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 5, 4, 0, 0, S_LDG_L2_w5},
+    {"S_LDG_L2_w6", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 6, 4, 0, 0, S_LDG_L2_w6},
+    {"S_LDG_L2_w7", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 7, 4, 0, 0, S_LDG_L2_w7},
+    {"S_LDG_L2_w8", "S: LDG.128 (ld.global.v4.b32) — forced L2 miss scaling", 8, 4, 0, 0, S_LDG_L2_w8},
+    {"X_4pipe", "X: Cross-pipe independence", 4, 4, 8192, 1, X_4pipe},
+    {"X_sts_ffma", "X: Cross-pipe independence", 2, 4, 2048, 1, X_sts_ffma},
+    {"X_sts_hfma2", "X: Cross-pipe independence", 2, 4, 2048, 1, X_sts_hfma2},
+    {"X_sts_lds", "X: Cross-pipe independence", 2, 4, 4096, 1, X_sts_lds},
+    {"X_ffma_hfma2", "X: Cross-pipe independence", 2, 4, 2048, 1, X_ffma_hfma2},
+    {"X_sts_f2fp", "X: Cross-pipe independence", 2, 4, 2048, 1, X_sts_f2fp},
+    {"X_2sts_2lds", "X: Cross-pipe independence", 4, 4, 8192, 1, X_2sts_2lds},
+    {"X_3sts_3lds", "X: Cross-pipe independence", 6, 4, 12288, 1, X_3sts_3lds},
+    {"X_4sts_4lds", "X: Cross-pipe independence", 8, 4, 16384, 1, X_4sts_4lds},
+    {"X_sts_ldg", "X: Cross-pipe independence", 2, 4, 2048, 1, X_sts_ldg},
+    {"X_2sts_2ldg", "X: Cross-pipe independence", 4, 4, 4096, 1, X_2sts_2ldg},
+    {"F_4sts_1ffma", "F: FG/BG interference", 5, 4, 5120, 1, F_4sts_1ffma},
+    {"F_4sts_2ffma", "F: FG/BG interference", 6, 4, 6144, 1, F_4sts_2ffma},
+    {"F_4sts_3ffma", "F: FG/BG interference", 7, 4, 7168, 1, F_4sts_3ffma},
+    {"F_4sts_4ffma", "F: FG/BG interference", 8, 4, 8192, 1, F_4sts_4ffma},
+    {"F_2ffma_1sts", "F: FG/BG interference", 3, 4, 3072, 1, F_2ffma_1sts},
+    {"F_2ffma_2sts", "F: FG/BG interference", 4, 4, 4096, 1, F_2ffma_2sts},
+    {"F_2ffma_4sts", "F: FG/BG interference", 6, 4, 6144, 1, F_2ffma_4sts},
+    {"F_4hfma_2ffma", "F: FG/BG interference", 6, 4, 6144, 1, F_4hfma_2ffma},
+    {"F_4mix_2ffma", "F: FG/BG interference", 6, 4, 6144, 1, F_4mix_2ffma},
+    {"F_4ldgmix_0ffma", "F: FG/BG interference", 4, 8, 4096, 1, F_4ldgmix_0ffma},
+    {"F_4ldgmix_1ffma", "F: FG/BG interference", 5, 8, 5120, 1, F_4ldgmix_1ffma},
+    {"F_4ldgmix_2ffma", "F: FG/BG interference", 6, 8, 6144, 1, F_4ldgmix_2ffma},
+    {"F_fc2_exact_6w", "F: FG/BG interference", 6, 8, 6144, 1, F_fc2_exact_6w},
+    {"F_4ldg_l2_0ffma", "F: FG/BG interference", 4, 8, 4096, 1, F_4ldg_l2_0ffma},
+    {"F_4ldg_l2_2ffma", "F: FG/BG interference", 6, 8, 6144, 1, F_4ldg_l2_2ffma},
+    {"P_4epi_ldg", "P: Producer-consumer (W3)", 4, 8, 8192, 1, P_4epi_ldg},
+    {"P_4epi_lds", "P: Producer-consumer (W3)", 4, 8, 8192, 1, P_4epi_lds},
+    {"P_4epi_lds_1lw", "P: Producer-consumer (W3)", 5, 8, 10240, 1, P_4epi_lds_1lw},
+    {"P_4epi_ldg_2kl", "P: Producer-consumer (W3)", 6, 8, 12288, 1, P_4epi_ldg_2kl},
+    {"P_4epi_lds_2kl", "P: Producer-consumer (W3)", 6, 8, 12288, 1, P_4epi_lds_2kl},
+    {"P_4epi_lds_1lw_2kl", "P: Producer-consumer (W3)", 7, 8, 14336, 1, P_4epi_lds_1lw_2kl},
+    {"P_4epi_ldg_1kl", "P: Producer-consumer (W3)", 5, 8, 10240, 1, P_4epi_ldg_1kl},
+    {"P_4epi_lds_1kl", "P: Producer-consumer (W3)", 5, 8, 10240, 1, P_4epi_lds_1kl},
+    {"P_4epi_lds_1lw_1kl", "P: Producer-consumer (W3)", 6, 8, 12288, 1, P_4epi_lds_1lw_1kl},
+    {"P_3epi_ldg_2kl", "P: Producer-consumer (W3)", 5, 8, 10240, 1, P_3epi_ldg_2kl},
+    {"P_3epi_lds_1lw_2kl", "P: Producer-consumer (W3)", 6, 8, 12288, 1, P_3epi_lds_1lw_2kl},
+    {"B_4bar_2cmp_i4", "B: BAR.SYNC effect", 6, 4, 6144, 1, B_4bar_2cmp_i4},
+    {"B_4bar_2cmp_i8", "B: BAR.SYNC effect", 6, 4, 6144, 1, B_4bar_2cmp_i8},
+    {"B_4bar_2cmp_i16", "B: BAR.SYNC effect", 6, 4, 6144, 1, B_4bar_2cmp_i16},
+    {"B_4bar_2cmp_i32", "B: BAR.SYNC effect", 6, 4, 6144, 1, B_4bar_2cmp_i32},
+    {"B_4nobar_2cmp", "B: BAR.SYNC effect", 6, 4, 6144, 1, B_4nobar_2cmp},
+    {"B_2bar_2cmp_i8", "B: BAR.SYNC effect", 4, 4, 4096, 1, B_2bar_2cmp_i8},
+    {"B_6bar_2cmp_i8", "B: BAR.SYNC effect", 8, 4, 8192, 1, B_6bar_2cmp_i8},
+    {"N_sleep_10", "N: Nanosleep calibration", 1, 1, 0, 1, N_sleep_10},
+    {"N_sleep_50", "N: Nanosleep calibration", 1, 1, 0, 1, N_sleep_50},
+    {"N_sleep_100", "N: Nanosleep calibration", 1, 1, 0, 1, N_sleep_100},
+    {"N_sleep_500", "N: Nanosleep calibration", 1, 1, 0, 1, N_sleep_500},
+    {"N_sleep_1000", "N: Nanosleep calibration", 1, 1, 0, 1, N_sleep_1000},
+    {"N_sleep_5000", "N: Nanosleep calibration", 1, 1, 0, 1, N_sleep_5000},
+    {"A_4ldgmix_2ffma_half", "A: Asymmetric duration", 6, 8, 6144, 1, A_4ldgmix_2ffma_half},
+    {"A_4ldgmix_2ffma_quarter", "A: Asymmetric duration", 6, 8, 6144, 1, A_4ldgmix_2ffma_quarter},
+    {"B_4mixbar_2cmp_i8", "B: BAR.SYNC mixed-epi", 6, 8, 6144, 1, B_4mixbar_2cmp_i8},
+    {"B_4mixbar_2cmp_nobar", "B: BAR.SYNC mixed-epi", 6, 8, 6144, 1, B_4mixbar_2cmp_nobar},
 };
 
 int main() {
@@ -10245,24 +10254,35 @@ int main() {
     cudaMemset(h_large_buf, 0x42, LARGE_BUF_SIZE);
     cudaMemcpyToSymbol(g_large_buf, &h_large_buf, sizeof(char*));
 
+    /* cudaEvent for wall-time measurement */
+    cudaEvent_t ev_start, ev_stop;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+
     /* Per-warp min elapsed across all measured launches */
     long long min_elapsed[MAX_WARPS];
-    /* Per-warp all elapsed for median */
-    long long all_elapsed[MEASURE_LAUNCHES][MAX_WARPS];
+    /* Wall-time measurements (us) */
+    float wall_times[MEASURE_LAUNCHES];
 
     int n = sizeof(tests) / sizeof(tests[0]);
     printf("Warp Scaling Calibration — SM100a\n");
-    printf("REPS=%d, %d warmup + %d measured launches, per-warp clock64()\n\n",
+    printf("REPS=%d, %d warmup + %d measured launches\n",
            REPS, WARMUP_LAUNCHES, MEASURE_LAUNCHES);
+    printf("S-tests: per-warp clock64 CPI | X/F/P/B/N/A: cudaEvent wall time (us)\n\n");
 
     const char* prev_cat = "";
     for (int t = 0; t < n; t++) {
         if (strcmp(tests[t].category, prev_cat) != 0) {
             printf("\n=== %s ===\n", tests[t].category);
-            printf("%-30s %6s", "Test", "Warps");
-            for (int w = 0; w < MAX_WARPS; w++)
-                printf("  W%d_cyc/i", w);
-            printf("  Max_cyc/i  Min_cyc/i\n");
+            if (!tests[t].use_events) {
+                printf("%-30s %6s", "Test", "Warps");
+                for (int w = 0; w < MAX_WARPS; w++)
+                    printf("  W%d_cyc/i", w);
+                printf("  Max_cyc/i  Min_cyc/i\n");
+            } else {
+                printf("%-30s %6s  %10s  %10s  %10s\n",
+                       "Test", "Warps", "min_us", "med_us", "max_us");
+            }
             prev_cat = tests[t].category;
         }
 
@@ -10270,41 +10290,80 @@ int main() {
             cudaFuncSetAttribute(tests[t].fn, cudaFuncAttributeMaxDynamicSharedMemorySize, tests[t].smem_bytes);
 
         /* Warmup launches */
+        fflush(stdout);
         for (int r = 0; r < WARMUP_LAUNCHES; r++) {
             cudaMemset(d_results, 0, MAX_WARPS * sizeof(WarpResult) + 65536);
             tests[t].fn<<<1, tests[t].n_warps * 32, tests[t].smem_bytes>>>(d_results);
-            cudaDeviceSynchronize();
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
         }
 
-        /* Measured launches — keep min elapsed per warp */
-        for (int w = 0; w < MAX_WARPS; w++) min_elapsed[w] = 0x7FFFFFFFFFFFFFFFLL;
-        for (int r = 0; r < MEASURE_LAUNCHES; r++) {
-            cudaMemset(d_results, 0, MAX_WARPS * sizeof(WarpResult) + 65536);
-            tests[t].fn<<<1, tests[t].n_warps * 32, tests[t].smem_bytes>>>(d_results);
-            cudaDeviceSynchronize();
-            cudaMemcpy(h_results, d_results, MAX_WARPS * sizeof(WarpResult), cudaMemcpyDeviceToHost);
-            for (int w = 0; w < tests[t].n_warps; w++) {
-                long long e = h_results[w].end - h_results[w].start;
-                all_elapsed[r][w] = e;
-                if (e < min_elapsed[w]) min_elapsed[w] = e;
+        if (!tests[t].use_events) {
+            /* ── S-tests: per-warp clock64 measurement ── */
+            for (int w = 0; w < MAX_WARPS; w++) min_elapsed[w] = 0x7FFFFFFFFFFFFFFFLL;
+            for (int r = 0; r < MEASURE_LAUNCHES; r++) {
+                cudaMemset(d_results, 0, MAX_WARPS * sizeof(WarpResult) + 65536);
+                tests[t].fn<<<1, tests[t].n_warps * 32, tests[t].smem_bytes>>>(d_results);
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+                cudaMemcpy(h_results, d_results, MAX_WARPS * sizeof(WarpResult), cudaMemcpyDeviceToHost);
+                for (int w = 0; w < tests[t].n_warps; w++) {
+                    long long e = h_results[w].end - h_results[w].start;
+                    if (e < min_elapsed[w]) min_elapsed[w] = e;
+                }
             }
-        }
+            printf("%-30s %6d", tests[t].name, tests[t].n_warps);
+            double max_cpi = 0, min_cpi_all = 1e18;
+            for (int w = 0; w < tests[t].n_warps; w++) {
+                double cpi = (double)min_elapsed[w] / (REPS * tests[t].insns_per_iter);
+                printf("  %9.2f", cpi);
+                if (cpi > max_cpi) max_cpi = cpi;
+                if (cpi < min_cpi_all) min_cpi_all = cpi;
+            }
+            for (int w = tests[t].n_warps; w < MAX_WARPS; w++)
+                printf("          -");
+            printf("  %9.2f  %9.2f\n", max_cpi, min_cpi_all);
 
-        /* Report min CPI per warp */
-        printf("%-30s %6d", tests[t].name, tests[t].n_warps);
-        double max_cpi = 0, min_cpi_all = 1e18;
-        for (int w = 0; w < tests[t].n_warps; w++) {
-            double cpi = (double)min_elapsed[w] / (REPS * tests[t].insns_per_iter);
-            printf("  %9.2f", cpi);
-            if (cpi > max_cpi) max_cpi = cpi;
-            if (cpi < min_cpi_all) min_cpi_all = cpi;
+        } else {
+            /* ── X/F/P/B/N/A tests: cudaEvent wall-time measurement ── */
+            const int BATCH = 100; /* launches per event pair for resolution */
+            for (int r = 0; r < MEASURE_LAUNCHES; r++) {
+                cudaEventRecord(ev_start);
+                for (int b = 0; b < BATCH; b++)
+                    tests[t].fn<<<1, tests[t].n_warps * 32, tests[t].smem_bytes>>>(d_results);
+                cudaEventRecord(ev_stop);
+                cudaEventSynchronize(ev_stop);
+                float ms = 0;
+                cudaEventElapsedTime(&ms, ev_start, ev_stop);
+                wall_times[r] = ms * 1000.0f / BATCH; /* per-launch us */
+            }
+            /* Sort for min/median/max */
+            std::sort(wall_times, wall_times + MEASURE_LAUNCHES);
+            float min_us = wall_times[0];
+            float med_us = wall_times[MEASURE_LAUNCHES / 2];
+            float max_us = wall_times[MEASURE_LAUNCHES - 1];
+            printf("%-30s %6d  %10.3f  %10.3f  %10.3f",
+                   tests[t].name, tests[t].n_warps, min_us, med_us, max_us);
+            /* Debug: verify events work on first event-based test */
+            if (t < n && strcmp(tests[t].name, "X_4pipe") == 0) {
+                cudaError_t e1 = cudaEventRecord(ev_start);
+                for (int b = 0; b < 1000; b++)
+                    tests[t].fn<<<1, tests[t].n_warps * 32, tests[t].smem_bytes>>>(d_results);
+                cudaError_t e2 = cudaGetLastError();
+                cudaError_t e3 = cudaEventRecord(ev_stop);
+                cudaError_t e4 = cudaEventSynchronize(ev_stop);
+                float raw_ms = 0;
+                cudaError_t e5 = cudaEventElapsedTime(&raw_ms, ev_start, ev_stop);
+                printf("  [evRec=%d kern=%d evStop=%d sync=%d elapsed=%d ms=%.6f]",
+                       e1, e2, e3, e4, e5, raw_ms);
+            }
+            printf("\n");
         }
-        for (int w = tests[t].n_warps; w < MAX_WARPS; w++)
-            printf("          -");
-        printf("  %9.2f  %9.2f\n", max_cpi, min_cpi_all);
     }
 
     printf("\n@@WARP_SCALING\n");
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
     cudaFree(h_large_buf);
     cudaFree(d_results);
     return 0;
