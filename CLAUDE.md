@@ -45,12 +45,15 @@ Clock throttling disproved — both kernels run at ~1.85 GHz unlocked on the sam
 | Sub-iterations | 3 (×64 cols, 8 STS each) | 4 (×64 cols, 4 STS each) |
 | Instruction flow | 16 LDG → 16 F2FP → 64 BF16 → 8 STS | 12 LDS → LDTM → 64 FFMA ↔ F2FP ↔ STS |
 
-### What's actually wrong — honest postmortem
+### What's actually wrong — honest postmortem (updated 2026-03-26)
 
 **The epilogue is fully overlapped with the K-loop** (ml_wait > ph1 in all configs). This means:
 - Making Phase 1 faster does NOT help wall time — it just increases idle time.
 - Changing instruction mix (FP32 vs BF16, precombine, noinline) does NOT help — benchmarked, all ≤14μs.
-- The gap must be from **warp scheduling contention**: epilogue warps running Phase 1 steal dispatch slots from K-loop warps, inflating the K-loop across ALL 147 tiles.
+
+**The "warp dispatch contention" hypothesis is DEAD.** MMA microbenchmarks (`bench/mma_bench.cu`, raw: `data/mma0.txt`) prove that 4 epilogue warps running the FULL epilogue (TMEM_LD+F2FP+HADD2+STS+fence) add **+0.7 cyc (0.1%)** to a 665 cyc K-iteration. STS, LDS, TMA loads, TMA stores, barriers — nothing touches MMA throughput in isolation. The warp-scaling calibration confirms: adding FFMA compute warps to any epilogue workload costs zero.
+
+**The gap is NOT from any measured contention mechanism.** It must come from something only present in the real persistent kernel but absent from isolated benchmarks — likely persistent tile scheduling overhead, cross-tile mbarrier handoff latency (725 cyc cross-warp vs 665 same-warp), or control flow interaction across 10,878 tiles.
 
 **Confirmed dead ends (benchmarked on B200, do NOT retry):**
 - FP32_EPILOGUE=1/2: 1.448ms vs 1.450ms baseline = 2μs noise (commit e4d8741, newest.csv)
@@ -60,32 +63,48 @@ Clock throttling disproved — both kernels run at ~1.85 GHz unlocked on the sam
 - CUTLASS uses FP32 FFMA but that is NOT why it's faster — same overlap argument applies
 
 **What CUTLASS does differently that we haven't successfully tried:**
-1. **Dedicated EpilogueLoad warp (W3)** — removes ALL load instructions from epilogue warps. Not "faster epilogue" — fundamentally different contention pattern. Code exists (kernel_body.cuh:2033, `EPI_LOAD_WARP=1`) but hung from mbarrier phase bug. Needs debugging.
-2. **Intra-epilogue sub-iteration BAR.SYNC pipelining** — CUTLASS sequence per 64-col sub-iter: STS.128 → FENCE → **BAR.SYNC** (128 epi threads confirm STS done) → UTMASTG.3D (TMA reads staging SMEM, writes global) → **DEPBAR.LE** (wait for TMA to finish reading SMEM) → **BAR.SYNC** (staging SMEM now free) → next sub-iter overwrites same staging buffer. **Zero extra SMEM** — same staging region reused, serialized by barriers. **We have NEVER tried this.** Our "StagesC" (STAGES_C=2) was cross-tile SMEM pipelining needing EXTRA SMEM stages → NS4 (killed kloop) or borrowing (added stalls). Completely different concept despite the name.
+1. **Dedicated EpilogueLoad warp (W3)** — TESTED, +13% regression. Our implementation serializes on prev tile consumption instead of pre-loading ahead. Dead as implemented (no SMEM budget for double-buffered residual staging).
+2. **Intra-epilogue sub-iteration BAR.SYNC pipelining** — CUTLASS sequence per 64-col sub-iter: STS.128 → FENCE → **BAR.SYNC** → UTMASTG.3D → **DEPBAR.LE** → **BAR.SYNC** → next sub-iter. Warp-scaling data shows **BAR.SYNC adds +25% penalty on mixed-epi workloads** (B_4mixbar 10.3 vs nobar 8.25 us). May still be worth testing for correctness-based SMEM reuse, but unlikely to improve throughput.
 
 ### Remaining attack vectors (priority order)
 
-1. **Debug EPI_LOAD_WARP** — fix the mbarrier hang. This is the only untested structural change that removes work from epilogue warps (vs making existing work faster, which is proven dead).
-2. **Intra-epilogue BAR.SYNC pipelining** — new code, never attempted. Pipeline the 3-4 sub-iterations within each tile's epilogue using barriers, matching CUTLASS's pattern.
-3. **SASS binary patching** — spread STS, interleave with compute. CP-SAT: 686 cyc (was 1417). Only worth testing after structural changes, or as an independent experiment to quantify how much scheduling alone can do.
+Since isolated benchmarks show zero contention between epilogue and K-loop, the gap likely comes from the persistent scheduling loop or cross-tile handoff overhead. Remaining vectors:
 
-**SM100a hardware data** (from `bench/tma_bench.cu`, raw: `data/tma2.txt`):
+1. **Tile scheduling overhead** — CUTLASS uses UTCBAR.2CTA.MULTICAST, we use CLC. Cross-warp handoff adds +60 cyc (725 vs 665, mma_bench section K). Over 10,878 tiles this compounds.
+2. **SASS binary patching** — spread STS, interleave with compute. CP-SAT: 686 cyc (was 1417). Independent of structural changes — tests whether instruction scheduling alone matters in the real persistent kernel.
+3. **Intra-epilogue BAR.SYNC pipelining** — may help via SMEM staging reuse (zero extra SMEM), even though BAR.SYNC itself adds overhead.
+
+**SM100a hardware data** (from `bench/tma_bench.cu` raw: `data/tma0-3.txt`, `bench/mma_bench.cu` raw: `data/mma0-1.txt`):
 - STS.128 throughput: 27 cyc | LDS.128: 25 cyc @ILP=1, 3.5 cyc @ILP=7
 - STS shadow: ≤4 BF16 free, 8=+55%, 15=+161% | LDS+STS overlap: 82.3%
 - TMA load: 419 cyc (L2-warm) | TMA store: 197 cyc | TMA↔LSU: independent
 - mbarrier arrive: 2 cyc | wait: 47 cyc | fence.proxy.async: 10 cyc
-- All above from **single-warp** measurements. Multi-warp pipe contention is UNKNOWN — see warp scaling tests below.
+- **TMEM load (tcgen05.ld.sync): 2 cyc total** regardless of x16/x32/x64 width or ILP (bandwidth-limited)
+- **TMEM double-buffer: zero contention** — read buf0 while MMA writes buf1 = +0.0 cyc
+- **MMA K-iteration: 665 cyc** (fence + 4×MMA + commit + wait). Pipelined K=24: **525.6 cyc/iter**
+- **MMA shadow budget: HUGE** — 16 STS or 64 BF16 or 8 full epilogue chunks = 100% hidden
+- **Epilogue warps add +0.7 cyc (0.1%) to K-iter** — TMEM_LD+F2FP+HADD2+STS+fence on W2-W5 during W1 MMA
+- **Cross-warp handoff: 725 cyc** (W1 commit → W2 mbar_wait + TMEM_LD). +60 cyc vs same-warp K-iter.
+- **Multi-SM spread: 0.2%** — perfectly uniform across 74 clusters
 - CUTLASS epilogue source: `third_party/cutlass/.../sm100_epilogue_tma_warpspecialized.hpp`
+
+**Multi-warp pipe scaling** (from `bench/calib/gen_warp_scaling.py`, raw: `data/warp_scaling.txt`):
+- **4 sub-partitions**: warp i → sub-partition i%4. Visible in STS bimodal per-warp data.
+- **STS**: 10→37 cyc (3.65× at 8 warps) — heaviest contention, SMEM store port shared
+- **LDS**: 4.5→16 cyc (3.56×) — nearly as bad as STS
+- **HFMA2/HADD2**: flat 2 cyc for 1-4 warps, doubles to 4 cyc at 5+ (2-partition BF16 ALU)
+- **FFMA**: 1.5→2.0 cyc (1.36×) — nearly free
+- **F2FP**: flat 2.0 cyc for ALL warp counts — zero contention, dedicated units
+- **LDG L1**: 2→5.5 cyc (2.77×) | **LDG L2**: 23.6→35.6 cyc (1.50× — latency-dominated)
+- **FFMA compute is free alongside any epilogue**: F_4ldgmix_0ffma = F_4ldgmix_2ffma = 8.25 us
+- **BAR.SYNC hurts mixed epilogue by +25%**: B_4mixbar_i8=10.3 vs nobar=8.25 us
+- **Dedicated load warp always adds overhead** in P-tests
 
 ### Multi-warp scheduling calibration (`bench/calib/gen_warp_scaling.py`)
 
-All single-warp calibration data (throughput, latency, conflict matrix) measures one warp in isolation. The FC2 gap is from **multi-warp contention** — 4 epilogue warps + 2 K-loop warps fighting for dispatch slots. We lack data on:
-- Whether pipe throughput (e.g., STS.128 @ 32 cyc) is per-warp or per-SM
-- SM100a sub-partition structure (where throughput steps occur with 1→8 warps)
-- Whether BAR.SYNC synchronized idle gaps improve "background" warp throughput
-
 134 generated kernels across 8 test suites, all single-CTA with per-warp `clock64()` timing.
 3 warmup + 10 measured launches per kernel, reports min CPI across launches.
+**Data collected 2026-03-26**: `data/warp_scaling.txt`. Key findings integrated into hardware data above.
 
 | Suite | Count | What it measures |
 |-------|-------|-----------------|

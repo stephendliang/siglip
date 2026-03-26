@@ -1,0 +1,163 @@
+MMA Microbenchmark — SM100a (tcgen05.mma.cta_group::2.kind::f8f6f4)
+REPS=256, WARMUP=32, IDESC=0x10400010, SMEM=147968 bytes
+
+═══ A. MMA Issue Throughput (back-to-back, same descriptor, accumulating) ═══
+
+  ILP= 1:   120.6 cyc/MMA  (total 121 cyc for 1 ops)
+  ILP= 4:   126.2 cyc/MMA  (total 505 cyc for 4 ops)
+  ILP= 8:   126.9 cyc/MMA  (total 1015 cyc for 8 ops)
+  ILP=16:   127.4 cyc/MMA  (total 2039 cyc for 16 ops)
+
+═══ B. K-Iteration Decomposition ═══
+
+  fence only:                 2.3 cyc
+  commit only (dispatch):    46.0 cyc
+  fence+4×MMA+commit+wait:  665.0 cyc  (4 sub-MMAs = 1 K-iteration)
+  4×MMA dispatch only:      504.6 cyc
+  overhead (kiter - 4×MMA): 160.4 cyc  (fence + commit + wait)
+
+═══ C. MMA Latency (fence → 4×MMA → commit → mbar_wait → TMEM_LD) ═══
+
+  full pipeline latency:    681.0 cyc
+  verify TMEM[0,0]:        82944.0  (expect ~288.0 for A=B=1.5 FP8 K=128)
+
+═══ D. TMEM Load Throughput (tcgen05.ld.sync.aligned) ═══
+
+  x16 (16 regs, 32 cols):
+    ILP=1:     2.0 cyc/load  (2.0 cyc total for 1 loads)
+    ILP=2:     1.0 cyc/load  (2.0 cyc total for 2 loads)
+    ILP=4:     0.5 cyc/load  (2.0 cyc total for 4 loads)
+    ILP=8:     0.2 cyc/load  (2.0 cyc total for 8 loads)
+  x32 (32 regs, 64 cols):
+    ILP=1:     2.0 cyc/load  (2.0 cyc total for 1 loads)
+    ILP=2:     1.0 cyc/load  (2.0 cyc total for 2 loads)
+    ILP=4:     0.5 cyc/load  (2.0 cyc total for 4 loads)
+  x64 (2×x32 sequential, 64 cols):
+    ILP=1:     2.0 cyc/x64  (2.0 cyc total, 2×x32 each)
+    ILP=2:     1.0 cyc/x64  (2.0 cyc total, 2×x32 each)
+
+═══ E. MMA Shadow Budget (work between MMA dispatch and commit+wait) ═══
+
+  STS.128 between MMA and commit (32 cyc/STS throughput):
+    STS= 0:   665.0 cyc  (baseline)
+    STS= 1:   665.0 cyc  (+0.0 vs base, 100.0% hidden)
+    STS= 2:   665.0 cyc  (+0.0 vs base, 100.0% hidden)
+    STS= 4:   665.0 cyc  (+0.0 vs base, 100.0% hidden)
+    STS= 8:   665.0 cyc  (+0.0 vs base, 100.0% hidden)
+    STS=16:   665.0 cyc  (+0.0 vs base, 100.0% hidden)
+
+  BF16 HADD2 between MMA and commit (2 cyc/op throughput):
+    BF16= 0:   665.0 cyc  (baseline)
+    BF16= 4:   665.0 cyc  (+0.0 vs base, 100.0% hidden)
+    BF16= 8:   665.0 cyc  (+0.0 vs base, 100.0% hidden)
+    BF16=16:   665.0 cyc  (+0.0 vs base, 100.0% hidden)
+    BF16=32:   665.0 cyc  (+0.0 vs base, 100.0% hidden)
+    BF16=64:   665.0 cyc  (+0.0 vs base, 100.0% hidden)
+
+═══ F. MMA + TMA Overlap (concurrent TMA load during MMA) ═══
+
+  MMA only (K_ITER):        668.0 cyc
+  MMA + TMA concurrent:     772.0 cyc
+  overhead:                +104.0 cyc (15.6%)
+
+═══ G. Full K-Loop Pipeline (N_STAGES=4, amortized) ═══
+
+  K= 1:    704.0 cyc total   704.0 cyc/iter  (4 sub-MMAs/iter)
+  K= 4:   2381.0 cyc total   595.2 cyc/iter  (4 sub-MMAs/iter)
+  K= 8:   4422.0 cyc total   552.8 cyc/iter  (4 sub-MMAs/iter)
+  K=16:   8518.0 cyc total   532.4 cyc/iter  (4 sub-MMAs/iter)
+  K=24:  12614.0 cyc total   525.6 cyc/iter  (4 sub-MMAs/iter)
+
+═══ H. TMEM Double-Buffer (read buf0 while MMA writes buf1) ═══
+
+  MMA only (per K_ITER):    666.0 cyc
+  MMA + TMEM read:          666.0 cyc
+  overhead:                +0.0 cyc (0.0%)
+
+═══ I. STS + TMEM_LD Overlap (after MMA complete) ═══
+
+  STS=1:  TMEM_LD=2.0  STS=17.2  both=13.2  (-31.4% vs sequential)
+  STS=4:  TMEM_LD=2.1  STS=23.7  both=23.4  (-9.1% vs sequential)
+  STS=8:  TMEM_LD=2.0  STS=50.3  both=49.6  (-5.2% vs sequential)
+
+═══ J. MMA Compute Time (commit → mbar_wait, tensor core latency) ═══
+
+  commit + mbar_wait:       460.0 cyc  (MMA dispatched before timing)
+  cf. full K_ITER (B):      665.0 cyc  (includes fence + dispatch)
+
+═══ K. Cross-Warp Handoff (W1 MMA+commit → W2 mbar_wait+TMEM_LD) ═══
+
+  W2 mbar_wait (for W1):    725.1 cyc
+  W2 TMEM_LD (after wait):    2.0 cyc
+  total handoff:            727.1 cyc
+
+═══ L. Multi-Warp Contention (W1=MMA, W2-W5=epilogue STS) ═══
+
+  W1 K-iter time with N epilogue warps doing continuous STS:
+    EPI_STS= 0:   668.0 cyc/iter  (baseline — no epilogue work)
+    EPI_STS= 4:   668.0 cyc/iter
+    EPI_STS= 8:   668.3 cyc/iter
+    EPI_STS=16:   668.7 cyc/iter
+
+  Mixed epilogue (4× LDS+BF16+STS per warp, realistic FC2):
+    mixed:        668.6 cyc/iter
+
+═══ N. Full Epilogue Pipeline (TMEM_LD+F2FP+HADD2+STS+fence during MMA) ═══
+
+  W1 K-iter with full epilogue pipeline on W2-W5:
+    full_epi:     668.7 cyc/iter
+  cf. baseline (L, no epi):   668.7 cyc/iter
+    no_epi:       668.0 cyc/iter  (L baseline re-run)
+    overhead:     +0.7 cyc  (0.1%)
+
+═══ O. Combined MMA Shadow (TMEM_LD+F2FP+HADD2+STS+fence in shadow window) ═══
+
+  chunks=0:   668.0 cyc  (baseline)
+  chunks=1:   668.0 cyc  (+0.0 vs base, 100.0% hidden)
+  chunks=2:   668.0 cyc  (+0.0 vs base, 100.0% hidden)
+  chunks=4:   668.0 cyc  (+0.0 vs base, 100.0% hidden)
+  chunks=8:   668.0 cyc  (+0.0 vs base, 100.0% hidden)
+  (each chunk = TMEM_LD.x16 + 4×F2FP + 4×HADD2 + STS.128 + fence.proxy.async)
+
+═══ P. W0 TMA Dispatch During MMA (TMA contention test) ═══
+
+  W1 K-iter with W0 doing continuous TMA loads:
+    W0 TMA active:  668.0 cyc/iter
+    W0 idle:        668.0 cyc/iter  (baseline)
+    overhead:       +0.0 cyc  (0.0%)
+
+═══ Q. fence.proxy.async + mbar_arrive During MMA ═══
+
+  W1 K-iter with W2-W5 doing fence+mbar_arrive:
+    N_FENCE= 0:   668.0 cyc/iter  (baseline)
+    N_FENCE= 4:   668.0 cyc/iter
+    N_FENCE= 8:   668.0 cyc/iter
+    N_FENCE=16:   668.0 cyc/iter
+
+═══ R. Pipelined K-Loop (W0=TMA, W1=MMA, 24 iters, 4 stages) ═══
+
+  W0 TMA + W1 MMA pipelined K-loop:
+    total:       12498.0 cyc  (24 iters)
+    per-iter:      520.8 cyc/iter
+  cf. MMA-only K-loop (G, K=24):  per-iter=525.6 cyc
+  cf. single K-iter (B):           665.0 cyc
+  TMA overhead:  -4.9 cyc/iter (-0.9%)
+
+═══ S. TMA Store During MMA (cp.async.bulk.tensor.2d contention) ═══
+
+  W1 K-iter with W2-W5 doing TMA stores:
+    N_STORE=0:   668.0 cyc/iter  (baseline)
+    N_STORE=1:   668.2 cyc/iter
+    N_STORE=2:   668.3 cyc/iter
+    N_STORE=4:   668.3 cyc/iter
+  (each store = fence.proxy.async + TMA store 64×32 BF16 + commit + wait)
+
+═══ M. Multi-SM Scaling (74 clusters, K-iter throughput) ═══
+
+  74 clusters reporting:
+    avg:   665.1 cyc/iter
+    min:   665.0 cyc/iter
+    max:   666.0 cyc/iter
+    spread: 0.2%
+  single cluster (B):   665.0 cyc/iter
+
