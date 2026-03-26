@@ -59,7 +59,7 @@ PIPE_WORKLOADS = {
             '        );\n'
         ),
         'insns_per_iter': 4,
-        'sink': '    ((volatile unsigned*)_smem_base)[{lane}] = _v0;',
+        'sink': '    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[{lane}] = _v0;',
     },
     'FFMA': {
         'desc': 'FFMA (fma.rn.f32)',
@@ -231,7 +231,7 @@ PIPE_WORKLOADS = {
             '        );\n'
         ),
         'insns_per_iter': 1,
-        'sink': '    ((volatile unsigned*)_smem_base)[{lane}] = _v0;',
+        'sink': '    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[{lane}] = _v0;',
     },
     'LDG_L2': {
         'desc': 'LDG.128 (ld.global.v4.b32) — forced L2 miss',
@@ -524,15 +524,13 @@ def gen_cross_pipe_kernel(config_name, assignments):
         lines.append(f'        }}')
         lines.append(f'        _t1 = asm_clock64();')
         lines.append(w['sink'].format(lane='_lane', tid='_tid'))
+        lines.append(f'        if (_lane == 0) {{ results[_warp].start = _t0; results[_warp].end = _t1; }}')
         lines.append(f'        break;')
         lines.append(f'    }}')
 
-    lines.append(f'    default: __syncthreads(); _t0 = _t1 = 0; break;')
-    lines.append(f'    }}')
-    lines.append('')
-    lines.append(f'    if (_lane == 0) {{')
-    lines.append(f'        results[_warp].start = _t0;')
-    lines.append(f'        results[_warp].end = _t1;')
+    lines.append(f'    default: __syncthreads(); _t0 = _t1 = 0;')
+    lines.append(f'        if (_lane == 0) {{ results[_warp].start = _t0; results[_warp].end = _t1; }}')
+    lines.append(f'        break;')
     lines.append(f'    }}')
     lines.append(f'}}')
 
@@ -626,7 +624,7 @@ def gen_barsync_kernel(name, n_bar_warps, n_compute_warps, bar_interval):
         lines.append(f'        }}')
 
     lines.append(f'        _t1 = asm_clock64();')
-    lines.append(f'        ((volatile unsigned*)_smem_base)[_lane] = _v0;')
+    lines.append(f'        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;')
 
     # Compute warps: continuous FFMA
     lines.append(f'    }} else {{')
@@ -713,7 +711,7 @@ def gen_mixed_epi_kernel(name, n_epi_warps, n_compute_warps):
     lines.append(f'            );')
     lines.append(f'        }}')
     lines.append(f'        _t1 = asm_clock64();')
-    lines.append(f'        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0;')
+    lines.append(f'        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0;')
 
     # Compute warps: continuous FFMA
     lines.append(f'    }} else {{')
@@ -856,7 +854,7 @@ def gen_prodcons_kernel(name, n_epi, load_mode, n_kloop, has_load_warp):
 
     lines.append(f'        }}')
     lines.append(f'        _t1 = asm_clock64();')
-    lines.append(f'        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0 + _lda0;')
+    lines.append(f'        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0 + _lda0;')
 
     # --- Load warp (CUTLASS W3 simulation) ---
     if has_load_warp:
@@ -885,7 +883,7 @@ def gen_prodcons_kernel(name, n_epi, load_mode, n_kloop, has_load_warp):
         lines.append(f'            asm volatile("nanosleep.u32 100;" ::: "memory");')
         lines.append(f'        }}')
         lines.append(f'        _t1 = asm_clock64();')
-        lines.append(f'        ((volatile unsigned*)_smem_base)[_lane] = _lw_v;')
+        lines.append(f'        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _lw_v;')
 
     # --- K-loop warps ---
     if n_kloop > 0:
@@ -1013,7 +1011,7 @@ def gen_ldgmix_epi_kernel(name, n_epi_warps, n_compute_warps, l2=False):
     lines.append(f'            );')
     lines.append(f'        }}')
     lines.append(f'        _t1 = asm_clock64();')
-    lines.append(f'        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;')
+    lines.append(f'        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;')
 
     # Compute warps
     if n_compute_warps > 0:
@@ -1138,7 +1136,7 @@ def gen_fc2_exact_kernel(name):
     lines.append(f'            );')
     lines.append(f'        }}')
     lines.append(f'        _t1 = asm_clock64();')
-    lines.append(f'        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;')
+    lines.append(f'        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;')
 
     # Warp 4: pure LDG (W0 TMA load warp proxy)
     lines.append(f'    }} else if (_warp == 4) {{')
@@ -1256,7 +1254,7 @@ def gen_asymmetric_kernel(name, n_epi, n_compute, epi_divisor):
     lines.append(f'            );')
     lines.append(f'        }}')
     lines.append(f'        _t1 = asm_clock64();')
-    lines.append(f'        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;')
+    lines.append(f'        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;')
     lines.append(f'        /* Epi warp exits — frees dispatch slot for compute warps */')
 
     # Compute warps: full REPS FFMA
@@ -1372,7 +1370,7 @@ def gen_barsync_mixed_kernel(name, n_bar_warps, n_compute_warps, bar_interval):
         lines.append(f'        }}')
 
     lines.append(f'        _t1 = asm_clock64();')
-    lines.append(f'        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;')
+    lines.append(f'        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;')
 
     # Compute warps: continuous FFMA
     lines.append(f'    }} else {{')

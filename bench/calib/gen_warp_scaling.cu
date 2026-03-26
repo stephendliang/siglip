@@ -70,7 +70,7 @@ extern "C" __global__ void S_STS_w1(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -120,7 +120,7 @@ extern "C" __global__ void S_STS_w2(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -170,7 +170,7 @@ extern "C" __global__ void S_STS_w3(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -220,7 +220,7 @@ extern "C" __global__ void S_STS_w4(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -270,7 +270,7 @@ extern "C" __global__ void S_STS_w5(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -320,7 +320,7 @@ extern "C" __global__ void S_STS_w6(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -370,7 +370,7 @@ extern "C" __global__ void S_STS_w7(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -420,7 +420,7 @@ extern "C" __global__ void S_STS_w8(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -3352,7 +3352,7 @@ extern "C" __global__ void S_STS_ILP1_w1(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -3396,7 +3396,7 @@ extern "C" __global__ void S_STS_ILP1_w2(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -3440,7 +3440,7 @@ extern "C" __global__ void S_STS_ILP1_w3(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -3484,7 +3484,7 @@ extern "C" __global__ void S_STS_ILP1_w4(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -3528,7 +3528,7 @@ extern "C" __global__ void S_STS_ILP1_w5(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -3572,7 +3572,7 @@ extern "C" __global__ void S_STS_ILP1_w6(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -3616,7 +3616,7 @@ extern "C" __global__ void S_STS_ILP1_w7(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -3660,7 +3660,7 @@ extern "C" __global__ void S_STS_ILP1_w8(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -4247,7 +4247,8 @@ extern "C" __global__ void X_4pipe(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* FFMA */
@@ -4280,6 +4281,7 @@ extern "C" __global__ void X_4pipe(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 2: { /* HFMA2 */
@@ -4312,6 +4314,7 @@ extern "C" __global__ void X_4pipe(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_h0 + _h1 + _h2 + _h3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 3: { /* LDS */
@@ -4359,14 +4362,12 @@ extern "C" __global__ void X_4pipe(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ra0 + _ra1 + _ra2 + _ra3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -4414,7 +4415,8 @@ extern "C" __global__ void X_sts_ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* FFMA */
@@ -4447,14 +4449,12 @@ extern "C" __global__ void X_sts_ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -4502,7 +4502,8 @@ extern "C" __global__ void X_sts_hfma2(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* HFMA2 */
@@ -4535,14 +4536,12 @@ extern "C" __global__ void X_sts_hfma2(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_h0 + _h1 + _h2 + _h3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -4590,7 +4589,8 @@ extern "C" __global__ void X_sts_lds(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* LDS */
@@ -4638,14 +4638,12 @@ extern "C" __global__ void X_sts_lds(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ra0 + _ra1 + _ra2 + _ra3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -4692,6 +4690,7 @@ extern "C" __global__ void X_ffma_hfma2(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* HFMA2 */
@@ -4724,14 +4723,12 @@ extern "C" __global__ void X_ffma_hfma2(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_h0 + _h1 + _h2 + _h3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -4779,7 +4776,8 @@ extern "C" __global__ void X_sts_f2fp(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* F2FP */
@@ -4812,14 +4810,12 @@ extern "C" __global__ void X_sts_f2fp(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)_cv;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -4867,7 +4863,8 @@ extern "C" __global__ void X_2sts_2lds(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* STS */
@@ -4901,7 +4898,8 @@ extern "C" __global__ void X_2sts_2lds(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 2: { /* LDS */
@@ -4949,6 +4947,7 @@ extern "C" __global__ void X_2sts_2lds(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ra0 + _ra1 + _ra2 + _ra3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 3: { /* LDS */
@@ -4996,14 +4995,12 @@ extern "C" __global__ void X_2sts_2lds(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ra0 + _ra1 + _ra2 + _ra3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -5051,7 +5048,8 @@ extern "C" __global__ void X_3sts_3lds(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* STS */
@@ -5085,7 +5083,8 @@ extern "C" __global__ void X_3sts_3lds(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 2: { /* STS */
@@ -5119,7 +5118,8 @@ extern "C" __global__ void X_3sts_3lds(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 3: { /* LDS */
@@ -5167,6 +5167,7 @@ extern "C" __global__ void X_3sts_3lds(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ra0 + _ra1 + _ra2 + _ra3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 4: { /* LDS */
@@ -5214,6 +5215,7 @@ extern "C" __global__ void X_3sts_3lds(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ra0 + _ra1 + _ra2 + _ra3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 5: { /* LDS */
@@ -5261,14 +5263,12 @@ extern "C" __global__ void X_3sts_3lds(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ra0 + _ra1 + _ra2 + _ra3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -5316,7 +5316,8 @@ extern "C" __global__ void X_4sts_4lds(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* STS */
@@ -5350,7 +5351,8 @@ extern "C" __global__ void X_4sts_4lds(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 2: { /* STS */
@@ -5384,7 +5386,8 @@ extern "C" __global__ void X_4sts_4lds(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 3: { /* STS */
@@ -5418,7 +5421,8 @@ extern "C" __global__ void X_4sts_4lds(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 4: { /* LDS */
@@ -5466,6 +5470,7 @@ extern "C" __global__ void X_4sts_4lds(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ra0 + _ra1 + _ra2 + _ra3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 5: { /* LDS */
@@ -5513,6 +5518,7 @@ extern "C" __global__ void X_4sts_4lds(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ra0 + _ra1 + _ra2 + _ra3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 6: { /* LDS */
@@ -5560,6 +5566,7 @@ extern "C" __global__ void X_4sts_4lds(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ra0 + _ra1 + _ra2 + _ra3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 7: { /* LDS */
@@ -5607,14 +5614,12 @@ extern "C" __global__ void X_4sts_4lds(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ra0 + _ra1 + _ra2 + _ra3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -5662,7 +5667,8 @@ extern "C" __global__ void X_sts_ldg(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* LDG */
@@ -5714,14 +5720,12 @@ extern "C" __global__ void X_sts_ldg(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ga0 + _ga1 + _ga2 + _ga3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -5769,7 +5773,8 @@ extern "C" __global__ void X_2sts_2ldg(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* STS */
@@ -5803,7 +5808,8 @@ extern "C" __global__ void X_2sts_2ldg(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 2: { /* LDG */
@@ -5855,6 +5861,7 @@ extern "C" __global__ void X_2sts_2ldg(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ga0 + _ga1 + _ga2 + _ga3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 3: { /* LDG */
@@ -5906,14 +5913,12 @@ extern "C" __global__ void X_2sts_2ldg(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_ga0 + _ga1 + _ga2 + _ga3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -5961,7 +5966,8 @@ extern "C" __global__ void F_4sts_1ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* STS */
@@ -5995,7 +6001,8 @@ extern "C" __global__ void F_4sts_1ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 2: { /* STS */
@@ -6029,7 +6036,8 @@ extern "C" __global__ void F_4sts_1ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 3: { /* STS */
@@ -6063,7 +6071,8 @@ extern "C" __global__ void F_4sts_1ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 4: { /* FFMA */
@@ -6096,14 +6105,12 @@ extern "C" __global__ void F_4sts_1ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -6151,7 +6158,8 @@ extern "C" __global__ void F_4sts_2ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* STS */
@@ -6185,7 +6193,8 @@ extern "C" __global__ void F_4sts_2ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 2: { /* STS */
@@ -6219,7 +6228,8 @@ extern "C" __global__ void F_4sts_2ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 3: { /* STS */
@@ -6253,7 +6263,8 @@ extern "C" __global__ void F_4sts_2ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 4: { /* FFMA */
@@ -6286,6 +6297,7 @@ extern "C" __global__ void F_4sts_2ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 5: { /* FFMA */
@@ -6318,14 +6330,12 @@ extern "C" __global__ void F_4sts_2ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -6373,7 +6383,8 @@ extern "C" __global__ void F_4sts_3ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* STS */
@@ -6407,7 +6418,8 @@ extern "C" __global__ void F_4sts_3ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 2: { /* STS */
@@ -6441,7 +6453,8 @@ extern "C" __global__ void F_4sts_3ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 3: { /* STS */
@@ -6475,7 +6488,8 @@ extern "C" __global__ void F_4sts_3ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 4: { /* FFMA */
@@ -6508,6 +6522,7 @@ extern "C" __global__ void F_4sts_3ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 5: { /* FFMA */
@@ -6540,6 +6555,7 @@ extern "C" __global__ void F_4sts_3ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 6: { /* FFMA */
@@ -6572,14 +6588,12 @@ extern "C" __global__ void F_4sts_3ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -6627,7 +6641,8 @@ extern "C" __global__ void F_4sts_4ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* STS */
@@ -6661,7 +6676,8 @@ extern "C" __global__ void F_4sts_4ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 2: { /* STS */
@@ -6695,7 +6711,8 @@ extern "C" __global__ void F_4sts_4ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 3: { /* STS */
@@ -6729,7 +6746,8 @@ extern "C" __global__ void F_4sts_4ffma(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 4: { /* FFMA */
@@ -6762,6 +6780,7 @@ extern "C" __global__ void F_4sts_4ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 5: { /* FFMA */
@@ -6794,6 +6813,7 @@ extern "C" __global__ void F_4sts_4ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 6: { /* FFMA */
@@ -6826,6 +6846,7 @@ extern "C" __global__ void F_4sts_4ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 7: { /* FFMA */
@@ -6858,14 +6879,12 @@ extern "C" __global__ void F_4sts_4ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -6912,6 +6931,7 @@ extern "C" __global__ void F_2ffma_1sts(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* FFMA */
@@ -6944,6 +6964,7 @@ extern "C" __global__ void F_2ffma_1sts(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 2: { /* STS */
@@ -6977,15 +6998,13 @@ extern "C" __global__ void F_2ffma_1sts(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -7032,6 +7051,7 @@ extern "C" __global__ void F_2ffma_2sts(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* FFMA */
@@ -7064,6 +7084,7 @@ extern "C" __global__ void F_2ffma_2sts(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 2: { /* STS */
@@ -7097,7 +7118,8 @@ extern "C" __global__ void F_2ffma_2sts(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 3: { /* STS */
@@ -7131,15 +7153,13 @@ extern "C" __global__ void F_2ffma_2sts(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -7186,6 +7206,7 @@ extern "C" __global__ void F_2ffma_4sts(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* FFMA */
@@ -7218,6 +7239,7 @@ extern "C" __global__ void F_2ffma_4sts(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 2: { /* STS */
@@ -7251,7 +7273,8 @@ extern "C" __global__ void F_2ffma_4sts(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 3: { /* STS */
@@ -7285,7 +7308,8 @@ extern "C" __global__ void F_2ffma_4sts(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 4: { /* STS */
@@ -7319,7 +7343,8 @@ extern "C" __global__ void F_2ffma_4sts(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 5: { /* STS */
@@ -7353,15 +7378,13 @@ extern "C" __global__ void F_2ffma_4sts(WarpResult* results) {
 
         }
         _t1 = asm_clock64();
-    ((volatile unsigned*)_smem_base)[_lane] = _v0;
+    ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -7408,6 +7431,7 @@ extern "C" __global__ void F_4hfma_2ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_h0 + _h1 + _h2 + _h3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 1: { /* HFMA2 */
@@ -7440,6 +7464,7 @@ extern "C" __global__ void F_4hfma_2ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_h0 + _h1 + _h2 + _h3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 2: { /* HFMA2 */
@@ -7472,6 +7497,7 @@ extern "C" __global__ void F_4hfma_2ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_h0 + _h1 + _h2 + _h3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 3: { /* HFMA2 */
@@ -7504,6 +7530,7 @@ extern "C" __global__ void F_4hfma_2ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     out[64 + _tid] = (long long)(_h0 + _h1 + _h2 + _h3);
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 4: { /* FFMA */
@@ -7536,6 +7563,7 @@ extern "C" __global__ void F_4hfma_2ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
     case 5: { /* FFMA */
@@ -7568,14 +7596,12 @@ extern "C" __global__ void F_4hfma_2ffma(WarpResult* results) {
         }
         _t1 = asm_clock64();
     ((volatile float*)(out + 64))[_tid] = _a0 + _a1 + _a2 + _a3;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
-    default: __syncthreads(); _t0 = _t1 = 0; break;
-    }
-
-    if (_lane == 0) {
-        results[_warp].start = _t0;
-        results[_warp].end = _t1;
+    default: __syncthreads(); _t0 = _t1 = 0;
+        if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
+        break;
     }
 }
 
@@ -7621,7 +7647,7 @@ extern "C" __global__ void F_4mix_2ffma(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0;
     } else {
         float _a0=1.001f+_lane, _a1=1.002f+_lane, _a2=1.003f+_lane, _a3=1.004f+_lane;
         float _s0=1.0001f, _s1=0.9999f;
@@ -7701,7 +7727,7 @@ extern "C" __global__ void F_4ldgmix_0ffma(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;
     }
 
     if (_lane == 0) {
@@ -7762,7 +7788,7 @@ extern "C" __global__ void F_4ldgmix_1ffma(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;
     } else {
         float _a0=1.001f+_lane, _a1=1.002f+_lane, _a2=1.003f+_lane, _a3=1.004f+_lane;
         float _s0=1.0001f, _s1=0.9999f;
@@ -7842,7 +7868,7 @@ extern "C" __global__ void F_4ldgmix_2ffma(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;
     } else {
         float _a0=1.001f+_lane, _a1=1.002f+_lane, _a2=1.003f+_lane, _a3=1.004f+_lane;
         float _s0=1.0001f, _s1=0.9999f;
@@ -7922,7 +7948,7 @@ extern "C" __global__ void F_fc2_exact_6w(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;
     } else if (_warp == 4) {
         /* W0 proxy: continuous LDG (simulates TMA load warp) */
         const unsigned* _gptr = (const unsigned*)results + _lane * 4;
@@ -8024,7 +8050,7 @@ extern "C" __global__ void F_4ldg_l2_0ffma(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;
     }
 
     if (_lane == 0) {
@@ -8088,7 +8114,7 @@ extern "C" __global__ void F_4ldg_l2_2ffma(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;
     } else {
         float _a0=1.001f+_lane, _a1=1.002f+_lane, _a2=1.003f+_lane, _a3=1.004f+_lane;
         float _s0=1.0001f, _s1=0.9999f;
@@ -8172,7 +8198,7 @@ extern "C" __global__ void P_4epi_ldg(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0 + _lda0;
     } else {
         __syncthreads();
         _t0 = _t1 = 0;
@@ -8241,7 +8267,7 @@ extern "C" __global__ void P_4epi_lds(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0 + _lda0;
     } else {
         __syncthreads();
         _t0 = _t1 = 0;
@@ -8310,7 +8336,7 @@ extern "C" __global__ void P_4epi_lds_1lw(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0 + _lda0;
     } else if (_warp == 4) {
         /* Load warp (W3 sim): brief periodic work, mostly idle */
         /* Real W3: TMA issue (~1 cyc) + mbar arrive (~2 cyc) per sub-iter */
@@ -8330,7 +8356,7 @@ extern "C" __global__ void P_4epi_lds_1lw(WarpResult* results) {
             asm volatile("nanosleep.u32 100;" ::: "memory");
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _lw_v;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _lw_v;
     } else {
         __syncthreads();
         _t0 = _t1 = 0;
@@ -8398,7 +8424,7 @@ extern "C" __global__ void P_4epi_ldg_2kl(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0 + _lda0;
     } else if (_warp >= 4) {
         /* K-loop warp: continuous FFMA compute */
         float _a0=1.001f+_lane, _a1=1.002f+_lane;
@@ -8489,7 +8515,7 @@ extern "C" __global__ void P_4epi_lds_2kl(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0 + _lda0;
     } else if (_warp >= 4) {
         /* K-loop warp: continuous FFMA compute */
         float _a0=1.001f+_lane, _a1=1.002f+_lane;
@@ -8580,7 +8606,7 @@ extern "C" __global__ void P_4epi_lds_1lw_2kl(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0 + _lda0;
     } else if (_warp == 4) {
         /* Load warp (W3 sim): brief periodic work, mostly idle */
         /* Real W3: TMA issue (~1 cyc) + mbar arrive (~2 cyc) per sub-iter */
@@ -8600,7 +8626,7 @@ extern "C" __global__ void P_4epi_lds_1lw_2kl(WarpResult* results) {
             asm volatile("nanosleep.u32 100;" ::: "memory");
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _lw_v;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _lw_v;
     } else if (_warp >= 5) {
         /* K-loop warp: continuous FFMA compute */
         float _a0=1.001f+_lane, _a1=1.002f+_lane;
@@ -8690,7 +8716,7 @@ extern "C" __global__ void P_4epi_ldg_1kl(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0 + _lda0;
     } else if (_warp >= 4) {
         /* K-loop warp: continuous FFMA compute */
         float _a0=1.001f+_lane, _a1=1.002f+_lane;
@@ -8781,7 +8807,7 @@ extern "C" __global__ void P_4epi_lds_1kl(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0 + _lda0;
     } else if (_warp >= 4) {
         /* K-loop warp: continuous FFMA compute */
         float _a0=1.001f+_lane, _a1=1.002f+_lane;
@@ -8872,7 +8898,7 @@ extern "C" __global__ void P_4epi_lds_1lw_1kl(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0 + _lda0;
     } else if (_warp == 4) {
         /* Load warp (W3 sim): brief periodic work, mostly idle */
         /* Real W3: TMA issue (~1 cyc) + mbar arrive (~2 cyc) per sub-iter */
@@ -8892,7 +8918,7 @@ extern "C" __global__ void P_4epi_lds_1lw_1kl(WarpResult* results) {
             asm volatile("nanosleep.u32 100;" ::: "memory");
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _lw_v;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _lw_v;
     } else if (_warp >= 5) {
         /* K-loop warp: continuous FFMA compute */
         float _a0=1.001f+_lane, _a1=1.002f+_lane;
@@ -8982,7 +9008,7 @@ extern "C" __global__ void P_3epi_ldg_2kl(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0 + _lda0;
     } else if (_warp >= 3) {
         /* K-loop warp: continuous FFMA compute */
         float _a0=1.001f+_lane, _a1=1.002f+_lane;
@@ -9073,7 +9099,7 @@ extern "C" __global__ void P_3epi_lds_1lw_2kl(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0 + _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0 + _cv + _h0 + _lda0;
     } else if (_warp == 3) {
         /* Load warp (W3 sim): brief periodic work, mostly idle */
         /* Real W3: TMA issue (~1 cyc) + mbar arrive (~2 cyc) per sub-iter */
@@ -9093,7 +9119,7 @@ extern "C" __global__ void P_3epi_lds_1lw_2kl(WarpResult* results) {
             asm volatile("nanosleep.u32 100;" ::: "memory");
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _lw_v;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _lw_v;
     } else if (_warp >= 4) {
         /* K-loop warp: continuous FFMA compute */
         float _a0=1.001f+_lane, _a1=1.002f+_lane;
@@ -9165,7 +9191,7 @@ extern "C" __global__ void B_4bar_2cmp_i4(WarpResult* results) {
             asm volatile("bar.sync 1, 128;" ::: "memory");
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     } else {
         /* Compute warp: continuous FFMA */
         float _a0=1.001f+_lane, _a1=1.002f+_lane, _a2=1.003f+_lane, _a3=1.004f+_lane;
@@ -9232,7 +9258,7 @@ extern "C" __global__ void B_4bar_2cmp_i8(WarpResult* results) {
             asm volatile("bar.sync 1, 128;" ::: "memory");
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     } else {
         /* Compute warp: continuous FFMA */
         float _a0=1.001f+_lane, _a1=1.002f+_lane, _a2=1.003f+_lane, _a3=1.004f+_lane;
@@ -9299,7 +9325,7 @@ extern "C" __global__ void B_4bar_2cmp_i16(WarpResult* results) {
             asm volatile("bar.sync 1, 128;" ::: "memory");
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     } else {
         /* Compute warp: continuous FFMA */
         float _a0=1.001f+_lane, _a1=1.002f+_lane, _a2=1.003f+_lane, _a3=1.004f+_lane;
@@ -9366,7 +9392,7 @@ extern "C" __global__ void B_4bar_2cmp_i32(WarpResult* results) {
             asm volatile("bar.sync 1, 128;" ::: "memory");
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     } else {
         /* Compute warp: continuous FFMA */
         float _a0=1.001f+_lane, _a1=1.002f+_lane, _a2=1.003f+_lane, _a3=1.004f+_lane;
@@ -9430,7 +9456,7 @@ extern "C" __global__ void B_4nobar_2cmp(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     } else {
         /* Compute warp: continuous FFMA */
         float _a0=1.001f+_lane, _a1=1.002f+_lane, _a2=1.003f+_lane, _a3=1.004f+_lane;
@@ -9497,7 +9523,7 @@ extern "C" __global__ void B_2bar_2cmp_i8(WarpResult* results) {
             asm volatile("bar.sync 1, 64;" ::: "memory");
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     } else {
         /* Compute warp: continuous FFMA */
         float _a0=1.001f+_lane, _a1=1.002f+_lane, _a2=1.003f+_lane, _a3=1.004f+_lane;
@@ -9564,7 +9590,7 @@ extern "C" __global__ void B_6bar_2cmp_i8(WarpResult* results) {
             asm volatile("bar.sync 1, 192;" ::: "memory");
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _v0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _v0;
     } else {
         /* Compute warp: continuous FFMA */
         float _a0=1.001f+_lane, _a1=1.002f+_lane, _a2=1.003f+_lane, _a3=1.004f+_lane;
@@ -9777,7 +9803,7 @@ extern "C" __global__ void A_4ldgmix_2ffma_half(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;
         /* Epi warp exits — frees dispatch slot for compute warps */
     } else {
         /* Compute warp: FFMA for full 512 iters (measures dynamic recovery) */
@@ -9861,7 +9887,7 @@ extern "C" __global__ void A_4ldgmix_2ffma_quarter(WarpResult* results) {
             );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;
         /* Epi warp exits — frees dispatch slot for compute warps */
     } else {
         /* Compute warp: FFMA for full 512 iters (measures dynamic recovery) */
@@ -9948,7 +9974,7 @@ extern "C" __global__ void B_4mixbar_2cmp_i8(WarpResult* results) {
             asm volatile("bar.sync 1, 128;" ::: "memory");
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;
     } else {
         /* Compute warp: continuous FFMA */
         float _a0=1.001f+_lane, _a1=1.002f+_lane, _a2=1.003f+_lane, _a3=1.004f+_lane;
@@ -10029,7 +10055,7 @@ extern "C" __global__ void B_4mixbar_2cmp_nobar(WarpResult* results) {
                 );
         }
         _t1 = asm_clock64();
-        ((volatile unsigned*)_smem_base)[_lane] = _cv + _h0 + _lda0;
+        ((volatile unsigned*)(_dyn_smem + _warp * 1024))[_lane] = _cv + _h0 + _lda0;
     } else {
         /* Compute warp: continuous FFMA */
         float _a0=1.001f+_lane, _a1=1.002f+_lane, _a2=1.003f+_lane, _a3=1.004f+_lane;
