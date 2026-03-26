@@ -74,7 +74,28 @@ Clock throttling disproved — both kernels run at ~1.85 GHz unlocked on the sam
 - STS shadow: ≤4 BF16 free, 8=+55%, 15=+161% | LDS+STS overlap: 82.3%
 - TMA load: 419 cyc (L2-warm) | TMA store: 197 cyc | TMA↔LSU: independent
 - mbarrier arrive: 2 cyc | wait: 47 cyc | fence.proxy.async: 10 cyc
+- All above from **single-warp** measurements. Multi-warp pipe contention is UNKNOWN — see warp scaling tests below.
 - CUTLASS epilogue source: `third_party/cutlass/.../sm100_epilogue_tma_warpspecialized.hpp`
+
+### Multi-warp scheduling calibration (`bench/calib/gen_warp_scaling.py`)
+
+All single-warp calibration data (throughput, latency, conflict matrix) measures one warp in isolation. The FC2 gap is from **multi-warp contention** — 4 epilogue warps + 2 K-loop warps fighting for dispatch slots. We lack data on:
+- Whether pipe throughput (e.g., STS.128 @ 32 cyc) is per-warp or per-SM
+- SM100a sub-partition structure (where throughput steps occur with 1→8 warps)
+- Whether BAR.SYNC synchronized idle gaps improve "background" warp throughput
+
+134 generated kernels across 8 test suites, all single-CTA with per-warp `clock64()` timing.
+3 warmup + 10 measured launches per kernel, reports min CPI across launches.
+
+| Suite | Count | What it measures |
+|-------|-------|-----------------|
+| **S** | 80 | Same-pipe throughput scaling: 10 pipes (STS, FFMA, HFMA2, LDS, F2FP, HADD2, NOP, **LDG**, **STS_ILP1**, **LDG_L2**) × 8 warp counts (1–8). Key: is STS throughput per-warp or per-SM? LDG pipe (TEX/L1) scaling for FC2 epilogue. STS_ILP1 reveals sub-partition structure. **LDG_L2** uses 32 MB buffer to force L2 miss — real FC2 residual loads hit L2, not L1. |
+| **X** | 11 | Cross-pipe independence: different warps on different pipes simultaneously. STS+LDS scaling at 2+2, 3+3, 4+4 warps (SMEM port contention). **STS+LDG** cross-pipe (LSU vs TEX — FC2 epilogue does both). |
+| **F** | 15 | Foreground/background interference: FC2-like configs (4 STS warps + 1–4 FFMA warps, mixed epi, reverse). FC2-realistic LDG+BF16+STS epi mix. **6-warp FC2-exact** (4 ldgmix epi + 1 LDG W0 proxy + 1 FFMA W1 proxy). **L2-miss LDG** variants force realistic memory latency. |
+| **P** | 11 | Producer-consumer (CUTLASS W3 pattern): 4 epi warps self-loading via LDG (our arch) vs LDS from pre-loaded SMEM (CUTLASS result) vs with dedicated load warp (nanosleep-idle, like W3). With/without 1–2 K-loop FFMA warps. **Directly tests whether a dedicated idle load warp reduces dispatch contention.** |
+| **B** | 9 | BAR.SYNC contention effect: 4 STS warps with periodic BAR.SYNC (intervals 4/8/16/32) + 2 FFMA compute warps, plus no-BAR baseline. **Mixed-epi variants** (LDG+BF16+STS bar warps for realistic epilogue pipe mix). |
+| **N** | 6 | Nanosleep calibration: actual sleep duration for values 10/50/100/500/1000/5000. Validates P-test load warp idle simulation. |
+| **A** | 2 | Asymmetric duration: epi warps run REPS/2 or REPS/4 then exit, compute warps run full REPS. **Tests dynamic dispatch recovery** — does compute CPI improve after epi warps finish? |
 
 ## Grid search (FC2 only)
 
@@ -204,6 +225,7 @@ tools/                  # Analysis & sweep scripts
   sass_analysis.py      # SASS scheduling analyzer (control words, dep graphs, slack)
   sass_edit.py          # SASS binary editor + CP-SAT scheduler + fatbin patcher (see docs/sass_binary_editing.md)
   analyze_timing.py     # clock64 timing → equilibrium analysis
+  analyze_warp_scaling.py  # Warp-scaling benchmark analysis (scaling curves, BAR.SYNC effect)
   analyze_source_counters.py  # ncu SourceCounters CSV → stall breakdown
   simulate_lhs.py       # Bootstrap convergence simulation (no GPU)
   analyze_gelu_variants.py  # Static GELU variant scheduling analysis (no GPU)
@@ -222,6 +244,7 @@ bench/                  # Benchmark & calibration kernels
   calib/                # Generated calibration benchmarks (instruction DB + codegen)
     instruction_db.py   # 18 SM100a instruction families, resource class hypotheses
     gen_kernels.py      # Generates tput/lat/conflict .cu files from instruction_db.py
+    gen_warp_scaling.py # Multi-warp scheduling calibration (134 kernels: S/X/F/P/B/N/A tests)
     run.sh              # Generate → build → SASS verify → run all calibration suites
 
 data/                   # Sweep results, ncu profiles, session outputs (data/session_*/)
@@ -273,6 +296,11 @@ python3 tools/sass_edit.py diff fc2.cubin fc2_patched.cubin
 ./bench/calib/run.sh tput         # throughput ILP sweep only (90 kernels)
 ./bench/calib/run.sh conflict     # NxN conflict matrix (153 pairwise tests)
 make calib-all                    # just build (Makefile targets)
+
+# Multi-warp scheduling calibration (134 kernels, requires B200)
+make calib-warp                                              # build
+./calib-warp > data/warp_scaling.txt                         # run on B200
+python3 tools/analyze_warp_scaling.py data/warp_scaling.txt  # analyze
 
 # PE and FC1 (done — do NOT sweep or optimize)
 make                    # compile patch_embed.cu -> patch_embed
