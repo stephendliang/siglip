@@ -1699,16 +1699,20 @@ extern "C" __global__ void S_F2FP_w1(WarpResult* results) {
     (void)_tid;
 
     float _f0=1.0f+_lane, _f1=2.0f+_lane;
-    unsigned _cv=0;
+    unsigned _cv=0, _cva=0;
 
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -1718,11 +1722,15 @@ extern "C" __global__ void S_F2FP_w1(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -1731,7 +1739,7 @@ extern "C" __global__ void S_F2FP_w1(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    out[64 + _tid] = (long long)_cv;
+    out[64 + _tid] = (long long)(_cv + _cva);
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -1746,16 +1754,20 @@ extern "C" __global__ void S_F2FP_w2(WarpResult* results) {
     (void)_tid;
 
     float _f0=1.0f+_lane, _f1=2.0f+_lane;
-    unsigned _cv=0;
+    unsigned _cv=0, _cva=0;
 
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -1765,11 +1777,15 @@ extern "C" __global__ void S_F2FP_w2(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -1778,7 +1794,7 @@ extern "C" __global__ void S_F2FP_w2(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    out[64 + _tid] = (long long)_cv;
+    out[64 + _tid] = (long long)(_cv + _cva);
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -1793,16 +1809,20 @@ extern "C" __global__ void S_F2FP_w3(WarpResult* results) {
     (void)_tid;
 
     float _f0=1.0f+_lane, _f1=2.0f+_lane;
-    unsigned _cv=0;
+    unsigned _cv=0, _cva=0;
 
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -1812,11 +1832,15 @@ extern "C" __global__ void S_F2FP_w3(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -1825,7 +1849,7 @@ extern "C" __global__ void S_F2FP_w3(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    out[64 + _tid] = (long long)_cv;
+    out[64 + _tid] = (long long)(_cv + _cva);
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -1840,16 +1864,20 @@ extern "C" __global__ void S_F2FP_w4(WarpResult* results) {
     (void)_tid;
 
     float _f0=1.0f+_lane, _f1=2.0f+_lane;
-    unsigned _cv=0;
+    unsigned _cv=0, _cva=0;
 
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -1859,11 +1887,15 @@ extern "C" __global__ void S_F2FP_w4(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -1872,7 +1904,7 @@ extern "C" __global__ void S_F2FP_w4(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    out[64 + _tid] = (long long)_cv;
+    out[64 + _tid] = (long long)(_cv + _cva);
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -1887,16 +1919,20 @@ extern "C" __global__ void S_F2FP_w5(WarpResult* results) {
     (void)_tid;
 
     float _f0=1.0f+_lane, _f1=2.0f+_lane;
-    unsigned _cv=0;
+    unsigned _cv=0, _cva=0;
 
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -1906,11 +1942,15 @@ extern "C" __global__ void S_F2FP_w5(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -1919,7 +1959,7 @@ extern "C" __global__ void S_F2FP_w5(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    out[64 + _tid] = (long long)_cv;
+    out[64 + _tid] = (long long)(_cv + _cva);
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -1934,16 +1974,20 @@ extern "C" __global__ void S_F2FP_w6(WarpResult* results) {
     (void)_tid;
 
     float _f0=1.0f+_lane, _f1=2.0f+_lane;
-    unsigned _cv=0;
+    unsigned _cv=0, _cva=0;
 
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -1953,11 +1997,15 @@ extern "C" __global__ void S_F2FP_w6(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -1966,7 +2014,7 @@ extern "C" __global__ void S_F2FP_w6(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    out[64 + _tid] = (long long)_cv;
+    out[64 + _tid] = (long long)(_cv + _cva);
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -1981,16 +2029,20 @@ extern "C" __global__ void S_F2FP_w7(WarpResult* results) {
     (void)_tid;
 
     float _f0=1.0f+_lane, _f1=2.0f+_lane;
-    unsigned _cv=0;
+    unsigned _cv=0, _cva=0;
 
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -2000,11 +2052,15 @@ extern "C" __global__ void S_F2FP_w7(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -2013,7 +2069,7 @@ extern "C" __global__ void S_F2FP_w7(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    out[64 + _tid] = (long long)_cv;
+    out[64 + _tid] = (long long)(_cv + _cva);
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -2028,16 +2084,20 @@ extern "C" __global__ void S_F2FP_w8(WarpResult* results) {
     (void)_tid;
 
     float _f0=1.0f+_lane, _f1=2.0f+_lane;
-    unsigned _cv=0;
+    unsigned _cv=0, _cva=0;
 
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -2047,11 +2107,15 @@ extern "C" __global__ void S_F2FP_w8(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -2060,7 +2124,7 @@ extern "C" __global__ void S_F2FP_w8(WarpResult* results) {
     long long _t1 = asm_clock64();
 
     long long* out = (long long*)results;
-    out[64 + _tid] = (long long)_cv;
+    out[64 + _tid] = (long long)(_cv + _cva);
     if (_lane == 0) {
         results[_warp].start = _t0;
         results[_warp].end = _t1;
@@ -2455,10 +2519,10 @@ extern "C" __global__ void S_NOP_w1(WarpResult* results) {
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2468,10 +2532,10 @@ extern "C" __global__ void S_NOP_w1(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2499,10 +2563,10 @@ extern "C" __global__ void S_NOP_w2(WarpResult* results) {
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2512,10 +2576,10 @@ extern "C" __global__ void S_NOP_w2(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2543,10 +2607,10 @@ extern "C" __global__ void S_NOP_w3(WarpResult* results) {
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2556,10 +2620,10 @@ extern "C" __global__ void S_NOP_w3(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2587,10 +2651,10 @@ extern "C" __global__ void S_NOP_w4(WarpResult* results) {
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2600,10 +2664,10 @@ extern "C" __global__ void S_NOP_w4(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2631,10 +2695,10 @@ extern "C" __global__ void S_NOP_w5(WarpResult* results) {
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2644,10 +2708,10 @@ extern "C" __global__ void S_NOP_w5(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2675,10 +2739,10 @@ extern "C" __global__ void S_NOP_w6(WarpResult* results) {
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2688,10 +2752,10 @@ extern "C" __global__ void S_NOP_w6(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2719,10 +2783,10 @@ extern "C" __global__ void S_NOP_w7(WarpResult* results) {
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2732,10 +2796,10 @@ extern "C" __global__ void S_NOP_w7(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2763,10 +2827,10 @@ extern "C" __global__ void S_NOP_w8(WarpResult* results) {
     __syncthreads();
     for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -2776,10 +2840,10 @@ extern "C" __global__ void S_NOP_w8(WarpResult* results) {
 
     for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
-            "mov.b32 %0, %0;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
+            "add.u32 %0, %0, 1;\n\t"
             : "+r"(_nop)
         );
 
@@ -4790,15 +4854,19 @@ extern "C" __global__ void X_sts_f2fp(WarpResult* results) {
     }
     case 1: { /* F2FP */
     float _f0=1.0f+_lane, _f1=2.0f+_lane;
-    unsigned _cv=0;
+    unsigned _cv=0, _cva=0;
 
         for (int _i = 0; _i < WARMUP; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
@@ -4807,17 +4875,21 @@ extern "C" __global__ void X_sts_f2fp(WarpResult* results) {
         _t0 = asm_clock64();
         for (int _i = 0; _i < REPS; _i++) {
         asm volatile(
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %2, %1;\n\t"
-            "cvt.rn.bf16x2.f32 %0, %1, %2;\n\t"
-            : "+r"(_cv)
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %3, %2;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            "cvt.rn.bf16x2.f32 %0, %2, %3;\n\t"
+            "add.u32 %1, %1, %0;\n\t"
+            : "+r"(_cv), "+r"(_cva)
             : "f"(_f0), "f"(_f1)
         );
 
         }
         _t1 = asm_clock64();
-    out[64 + _tid] = (long long)_cv;
+    out[64 + _tid] = (long long)(_cv + _cva);
         if (_lane == 0) { results[_warp].start = _t0; results[_warp].end = _t1; }
         break;
     }
@@ -10155,14 +10227,14 @@ Test tests[] = {
     {"S_HADD2_w6", "S: HADD2 (add.rn.bf16x2) scaling", 6, 4, 0, 0, S_HADD2_w6},
     {"S_HADD2_w7", "S: HADD2 (add.rn.bf16x2) scaling", 7, 4, 0, 0, S_HADD2_w7},
     {"S_HADD2_w8", "S: HADD2 (add.rn.bf16x2) scaling", 8, 4, 0, 0, S_HADD2_w8},
-    {"S_NOP_w1", "S: NOP (baseline — scheduler overhead only) scaling", 1, 4, 0, 0, S_NOP_w1},
-    {"S_NOP_w2", "S: NOP (baseline — scheduler overhead only) scaling", 2, 4, 0, 0, S_NOP_w2},
-    {"S_NOP_w3", "S: NOP (baseline — scheduler overhead only) scaling", 3, 4, 0, 0, S_NOP_w3},
-    {"S_NOP_w4", "S: NOP (baseline — scheduler overhead only) scaling", 4, 4, 0, 0, S_NOP_w4},
-    {"S_NOP_w5", "S: NOP (baseline — scheduler overhead only) scaling", 5, 4, 0, 0, S_NOP_w5},
-    {"S_NOP_w6", "S: NOP (baseline — scheduler overhead only) scaling", 6, 4, 0, 0, S_NOP_w6},
-    {"S_NOP_w7", "S: NOP (baseline — scheduler overhead only) scaling", 7, 4, 0, 0, S_NOP_w7},
-    {"S_NOP_w8", "S: NOP (baseline — scheduler overhead only) scaling", 8, 4, 0, 0, S_NOP_w8},
+    {"S_NOP_w1", "S: NOP (IADD baseline — minimum dispatch overhead) scaling", 1, 4, 0, 0, S_NOP_w1},
+    {"S_NOP_w2", "S: NOP (IADD baseline — minimum dispatch overhead) scaling", 2, 4, 0, 0, S_NOP_w2},
+    {"S_NOP_w3", "S: NOP (IADD baseline — minimum dispatch overhead) scaling", 3, 4, 0, 0, S_NOP_w3},
+    {"S_NOP_w4", "S: NOP (IADD baseline — minimum dispatch overhead) scaling", 4, 4, 0, 0, S_NOP_w4},
+    {"S_NOP_w5", "S: NOP (IADD baseline — minimum dispatch overhead) scaling", 5, 4, 0, 0, S_NOP_w5},
+    {"S_NOP_w6", "S: NOP (IADD baseline — minimum dispatch overhead) scaling", 6, 4, 0, 0, S_NOP_w6},
+    {"S_NOP_w7", "S: NOP (IADD baseline — minimum dispatch overhead) scaling", 7, 4, 0, 0, S_NOP_w7},
+    {"S_NOP_w8", "S: NOP (IADD baseline — minimum dispatch overhead) scaling", 8, 4, 0, 0, S_NOP_w8},
     {"S_LDG_w1", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 1, 4, 0, 0, S_LDG_w1},
     {"S_LDG_w2", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 2, 4, 0, 0, S_LDG_w2},
     {"S_LDG_w3", "S: LDG.128 (ld.global.v4.b32) — TEX/L1 pipe scaling", 3, 4, 0, 0, S_LDG_w3},
@@ -10342,22 +10414,8 @@ int main() {
             float min_us = wall_times[0];
             float med_us = wall_times[MEASURE_LAUNCHES / 2];
             float max_us = wall_times[MEASURE_LAUNCHES - 1];
-            printf("%-30s %6d  %10.3f  %10.3f  %10.3f",
+            printf("%-30s %6d  %10.3f  %10.3f  %10.3f\n",
                    tests[t].name, tests[t].n_warps, min_us, med_us, max_us);
-            /* Debug: verify events work on first event-based test */
-            if (t < n && strcmp(tests[t].name, "X_4pipe") == 0) {
-                cudaError_t e1 = cudaEventRecord(ev_start);
-                for (int b = 0; b < 1000; b++)
-                    tests[t].fn<<<1, tests[t].n_warps * 32, tests[t].smem_bytes>>>(d_results);
-                cudaError_t e2 = cudaGetLastError();
-                cudaError_t e3 = cudaEventRecord(ev_stop);
-                cudaError_t e4 = cudaEventSynchronize(ev_stop);
-                float raw_ms = 0;
-                cudaError_t e5 = cudaEventElapsedTime(&raw_ms, ev_start, ev_stop);
-                printf("  [evRec=%d kern=%d evStop=%d sync=%d elapsed=%d ms=%.6f]",
-                       e1, e2, e3, e4, e5, raw_ms);
-            }
-            printf("\n");
         }
     }
 

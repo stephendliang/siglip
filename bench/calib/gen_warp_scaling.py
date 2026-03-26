@@ -134,20 +134,24 @@ PIPE_WORKLOADS = {
         'smem_per_warp': 0,
         'setup': (
             '    float _f0=1.0f+{lane}, _f1=2.0f+{lane};\n'
-            '    unsigned _cv=0;\n'
+            '    unsigned _cv=0, _cva=0;\n'
         ),
         'loop_body': (
             '        asm volatile(\n'
-            '            "cvt.rn.bf16x2.f32 %0, %2, %1;\\n\\t"\n'
-            '            "cvt.rn.bf16x2.f32 %0, %1, %2;\\n\\t"\n'
-            '            "cvt.rn.bf16x2.f32 %0, %2, %1;\\n\\t"\n'
-            '            "cvt.rn.bf16x2.f32 %0, %1, %2;\\n\\t"\n'
-            '            : "+r"(_cv)\n'
+            '            "cvt.rn.bf16x2.f32 %0, %3, %2;\\n\\t"\n'
+            '            "add.u32 %1, %1, %0;\\n\\t"\n'
+            '            "cvt.rn.bf16x2.f32 %0, %2, %3;\\n\\t"\n'
+            '            "add.u32 %1, %1, %0;\\n\\t"\n'
+            '            "cvt.rn.bf16x2.f32 %0, %3, %2;\\n\\t"\n'
+            '            "add.u32 %1, %1, %0;\\n\\t"\n'
+            '            "cvt.rn.bf16x2.f32 %0, %2, %3;\\n\\t"\n'
+            '            "add.u32 %1, %1, %0;\\n\\t"\n'
+            '            : "+r"(_cv), "+r"(_cva)\n'
             '            : "f"(_f0), "f"(_f1)\n'
             '        );\n'
         ),
-        'insns_per_iter': 4,
-        'sink': '    out[64 + {tid}] = (long long)_cv;',
+        'insns_per_iter': 4,  # 4 cvt instructions (add.u32 is anti-elimination overhead)
+        'sink': '    out[64 + {tid}] = (long long)(_cv + _cva);',
     },
     'HADD2': {
         'desc': 'HADD2 (add.rn.bf16x2)',
@@ -170,15 +174,15 @@ PIPE_WORKLOADS = {
         'sink': '    out[64 + {tid}] = (long long)(_h0 + _h1 + _h2 + _h3);',
     },
     'NOP': {
-        'desc': 'NOP (baseline — scheduler overhead only)',
+        'desc': 'NOP (IADD baseline — minimum dispatch overhead)',
         'smem_per_warp': 0,
         'setup': '    unsigned _nop = {lane};\n',
         'loop_body': (
             '        asm volatile(\n'
-            '            "mov.b32 %0, %0;\\n\\t"\n'
-            '            "mov.b32 %0, %0;\\n\\t"\n'
-            '            "mov.b32 %0, %0;\\n\\t"\n'
-            '            "mov.b32 %0, %0;\\n\\t"\n'
+            '            "add.u32 %0, %0, 1;\\n\\t"\n'
+            '            "add.u32 %0, %0, 1;\\n\\t"\n'
+            '            "add.u32 %0, %0, 1;\\n\\t"\n'
+            '            "add.u32 %0, %0, 1;\\n\\t"\n'
             '            : "+r"(_nop)\n'
             '        );\n'
         ),
@@ -1539,22 +1543,8 @@ def gen_main(all_tests):
     lines.append('            float min_us = wall_times[0];')
     lines.append('            float med_us = wall_times[MEASURE_LAUNCHES / 2];')
     lines.append('            float max_us = wall_times[MEASURE_LAUNCHES - 1];')
-    lines.append('            printf("%-30s %6d  %10.3f  %10.3f  %10.3f",')
+    lines.append('            printf("%-30s %6d  %10.3f  %10.3f  %10.3f\\n",')
     lines.append('                   tests[t].name, tests[t].n_warps, min_us, med_us, max_us);')
-    lines.append('            /* Debug: verify events work on first event-based test */')
-    lines.append('            if (t < n && strcmp(tests[t].name, "X_4pipe") == 0) {')
-    lines.append('                cudaError_t e1 = cudaEventRecord(ev_start);')
-    lines.append('                for (int b = 0; b < 1000; b++)')
-    lines.append('                    tests[t].fn<<<1, tests[t].n_warps * 32, tests[t].smem_bytes>>>(d_results);')
-    lines.append('                cudaError_t e2 = cudaGetLastError();')
-    lines.append('                cudaError_t e3 = cudaEventRecord(ev_stop);')
-    lines.append('                cudaError_t e4 = cudaEventSynchronize(ev_stop);')
-    lines.append('                float raw_ms = 0;')
-    lines.append('                cudaError_t e5 = cudaEventElapsedTime(&raw_ms, ev_start, ev_stop);')
-    lines.append('                printf("  [evRec=%d kern=%d evStop=%d sync=%d elapsed=%d ms=%.6f]",')
-    lines.append('                       e1, e2, e3, e4, e5, raw_ms);')
-    lines.append('            }')
-    lines.append('            printf("\\n");')
     lines.append('        }')
     lines.append('    }')
     lines.append('')
