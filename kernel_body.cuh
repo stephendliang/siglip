@@ -2092,7 +2092,7 @@ persistent_gemm(
             */
             if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                 if (lane == 0) {
-                    const uint32_t smem_base = warp_uniform(smem_to_uint(smem));
+                    const uint32_t smem_base = smem_to_uint(smem);
                     if (tile_idx > tile_start) {
                         /* Wait for previous tile's stages to be free (skip first tile) */
                         if (tile_idx > tile_start + 1) {
@@ -2126,7 +2126,7 @@ persistent_gemm(
             /* Legacy serial EPI_LOAD_WARP — kept for reference, dead path with EPI_PIPELINE */
             if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                 if (lane == 0) {
-                    const uint32_t smem_base = warp_uniform(smem_to_uint(smem));
+                    const uint32_t smem_base = smem_to_uint(smem);
                     if (tile_idx > tile_start) {
                         if (tile_idx > tile_start + 1) {
                             mbar_wait(smem_base + OFF_RES_CONSUMED_MBAR, res_consumed_phase);
