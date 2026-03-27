@@ -101,6 +101,34 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef STRIP_EPILOGUE
 #define STRIP_EPILOGUE 0         // 1=skip epilogue compute, just signal mbars (measures scheduling overhead)
 #endif
+#ifndef STRIP_EPI_TMA_LOAD
+#define STRIP_EPI_TMA_LOAD 0     // 1=skip TMA residual loads (keep compute+STS+TMA store)
+#endif
+#ifndef STRIP_EPI_TMA_STORE
+#define STRIP_EPI_TMA_STORE 0    // 1=skip TMA output stores (keep TMA load+compute+STS)
+#endif
+#ifndef STRIP_EPI_COMPUTE
+#define STRIP_EPI_COMPUTE 0      // 1=skip TMEM/bias/res/F2FP/STS (keep TMA load+TMA store)
+#endif
+#define STRIP_EPI_ANY (STRIP_EPI_TMA_LOAD || STRIP_EPI_TMA_STORE || STRIP_EPI_COMPUTE)
+#if STRIP_EPILOGUE && STRIP_EPI_ANY
+#error "STRIP_EPILOGUE is mutually exclusive with STRIP_EPI_* variants"
+#endif
+#if (STRIP_EPI_TMA_LOAD + STRIP_EPI_TMA_STORE + STRIP_EPI_COMPUTE) > 1
+#error "Only one STRIP_EPI_* variant at a time"
+#endif
+#if STRIP_EPI_ANY && TMEM_LOAD_WIDTH == 64
+#error "STRIP_EPI_* only implemented for x32 path (TMEM_LOAD_WIDTH != 64)"
+#endif
+#if STRIP_EPI_ANY && BRANCHLESS_EPI
+#error "STRIP_EPI_* not implemented for BRANCHLESS_EPI"
+#endif
+#if STRIP_EPI_TMA_LOAD && (W0_RES_FULL || W0_RES_PREFETCH || EPI_LOAD_WARP || EPI_PIPELINE)
+#error "STRIP_EPI_TMA_LOAD requires self-load path"
+#endif
+#if STRIP_EPI_COMPUTE && MBAR_EARLY
+#error "STRIP_EPI_COMPUTE not implemented with MBAR_EARLY"
+#endif
 #if STAGES_C && !TMA_RESIDUAL
 #error "STAGES_C requires TMA_RESIDUAL >= 1"
 #endif
@@ -148,6 +176,12 @@ Usage: #define N_DIM and K_DIM before including this header.
 #endif
 #ifndef EPI_SYNC
 #define EPI_SYNC 0               // 0=independent warp poll, 1=bar.sync before epilogue
+#endif
+#ifndef EPI_BAR_PASS
+#define EPI_BAR_PASS 0           // 1=bar.sync between passes within epilogue (CUTLASS-like serialization)
+#endif
+#ifndef EPI_BAR_CHUNK
+#define EPI_BAR_CHUNK 0          // 1=bar.sync after each 32-col chunk within epilogue (finest granularity)
 #endif
 #ifndef NUM_PASSES_PARAM
 #define NUM_PASSES_PARAM 0       // 0=auto (128 cols/pass), 4=4-pass (64 cols/pass), FC2 TMA_RESIDUAL only

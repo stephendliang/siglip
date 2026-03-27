@@ -541,6 +541,10 @@ void epilogue_store(
 #if !W0_RES_FULL && !EPI_LOAD_WARP
             if (!(FIRST_PASS_PRELOADED && pass == 0)) {
                 if (lane == 0) {
+#if STRIP_EPI_TMA_LOAD
+                    /* Arrive with 0 tx bytes — mbar_wait passes immediately, no TMA traffic */
+                    mbar_arrive_expect_tx(res_mbar_addr, 0);
+#else
                     mbar_arrive_expect_tx(res_mbar_addr, PASS_REGIONS * STAGING_REGION_BYTES);
                     tma_load_2d_cta(res_staging_saddr, tma_res_desc,
                                     n_start + pnc_s, gm_base, res_mbar_addr);
@@ -548,6 +552,7 @@ void epilogue_store(
                         tma_load_2d_cta(res_staging_saddr + STAGING_REGION_BYTES, tma_res_desc,
                                         n_start + pnc_s + 64, gm_base, res_mbar_addr);
                     }
+#endif
                 }
             }
 #endif
@@ -564,9 +569,11 @@ void epilogue_store(
             }
 #endif
 
+#if !STRIP_EPI_COMPUTE
             LOAD_32_COLS(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
                          a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                          taddr_base + pnc_s);
+#endif
 
 #if EPI_PIPELINE
             /* Wait for W2's TMA loads for this pipeline stage.
@@ -663,6 +670,24 @@ void epilogue_store(
             /* Signal W0 that this stage's buffer is free — predicated */
             pred_mbar_arrive(sc_release_mbar_base + pass * 8, is_lane0);
 #else /* original branched path */
+#if STRIP_EPI_COMPUTE
+            /* Skip all compute — just issue TMA stores with stale staging data.
+               Isolates TMA load+store bandwidth contention on K-loop. */
+            {
+                __syncwarp();
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                if (lane == 0) {
+                    for (int r = 0; r < PASS_REGIONS; r++) {
+                        uint32_t src = staging_saddr + r * STAGING_REGION_BYTES;
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                            :: "l"(tma_c_desc), "r"(n_start + pnc_s + r * 64),
+                               "r"(gm_base), "r"(src) : "memory");
+                    }
+                    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+                }
+            }
+#else /* !STRIP_EPI_COMPUTE */
 #if EPILOGUE_LOOP
 #pragma unroll 1
 #else
@@ -770,7 +795,7 @@ void epilogue_store(
 #endif
 
                 /* Interleaved TMA stores within 128-col pass (2 output regions) */
-#if !STORE_TIMING && !EPI_PIPELINE
+#if !STORE_TIMING && !EPI_PIPELINE && !STRIP_EPI_TMA_STORE
                 if (INTERLEAVE_STRATEGY == 1 && half == 1) {
                     __syncwarp();
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -797,7 +822,7 @@ void epilogue_store(
                                "r"(gm_base), "r"(src1) : "memory");
                     }
                 }
-#endif /* !STORE_TIMING */
+#endif /* !STORE_TIMING && !STRIP_EPI_TMA_STORE */
 
 #if !PREFETCH_BEFORE_STORE
                 if (nc + 32 < pnc_e) {
@@ -805,6 +830,10 @@ void epilogue_store(
                                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
                                  taddr_base + nc + 32);
                 }
+#endif
+#if EPI_BAR_CHUNK
+                /* Sync all epilogue warps after each 32-col chunk — serializes concurrent STS/compute */
+                asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 #endif
             }
 
@@ -820,6 +849,7 @@ void epilogue_store(
                 asm volatile("cp.async.bulk.commit_group;" ::: "memory");
             }
 #else
+#if !STRIP_EPI_TMA_STORE
             /* Commit this pass's TMA output stores */
             if (STORE_TIMING || INTERLEAVE_STRATEGY == 0
                 || (INTERLEAVE_STRATEGY >= 2 && PASS_REGIONS < 2)) {
@@ -840,6 +870,7 @@ void epilogue_store(
                     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                 }
             }
+#endif /* !STRIP_EPI_TMA_STORE */
 #if STAGES_C >= 2
             /* Signal W0 that this stage's buffer is free */
             if (lane == 0) mbar_arrive(sc_release_mbar_base + pass * 8);
@@ -850,7 +881,12 @@ void epilogue_store(
             }
 #endif
 #endif /* EPI_PIPELINE */
+#endif /* !STRIP_EPI_COMPUTE */
 #endif /* BRANCHLESS_EPI */
+#if EPI_BAR_PASS
+            /* Sync all epilogue warps between passes — reduces concurrent activity during K-loop */
+            asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
+#endif
         }
 #endif  /* TMEM_LOAD_WIDTH == 64 */
 
