@@ -45,34 +45,39 @@ Clock throttling disproved — both kernels run at ~1.85 GHz unlocked on the sam
 | Sub-iterations | 3 (×64 cols, 8 STS each) | 4 (×64 cols, 4 STS each) |
 | Instruction flow | 16 LDG → 16 F2FP → 64 BF16 → 8 STS | 12 LDS → LDTM → 64 FFMA ↔ F2FP ↔ STS |
 
-### What's actually wrong — honest postmortem (updated 2026-03-26)
+### What's actually wrong — STRIP_EPILOGUE breakthrough (2026-03-26)
 
-**The epilogue is fully overlapped with the K-loop** (ml_wait > ph1 in all configs). This means:
-- Making Phase 1 faster does NOT help wall time — it just increases idle time.
-- Changing instruction mix (FP32 vs BF16, precombine, noinline) does NOT help — benchmarked, all ≤14μs.
+**The epilogue is NOT overlapped. It inflates the K-loop by 36%.** STRIP_EPILOGUE (commit 33a13eb) proves this definitively:
 
-**The "warp dispatch contention" hypothesis is DEAD.** MMA microbenchmarks (`bench/mma_bench.cu`, raw: `data/mma0.txt`) prove that 4 epilogue warps running the FULL epilogue (TMEM_LD+F2FP+HADD2+STS+fence) add **+0.7 cyc (0.1%)** to a 665 cyc K-iteration. STS, LDS, TMA loads, TMA stores, barriers — nothing touches MMA throughput in isolation. The warp-scaling calibration confirms: adding FFMA compute warps to any epilogue workload costs zero.
+| | GEMM-only | Fused | Epilogue overhead |
+|---|-----------|-------|-------------------|
+| **Ours** | 1.161ms | 1.636ms | **+475μs (+41%)** |
+| **CUTLASS** | 1.147ms | 1.225ms | **+78μs (+6.8%)** |
 
-**The gap is NOT from any measured contention mechanism.** It must come from something only present in the real persistent kernel but absent from isolated benchmarks — likely persistent tile scheduling overhead, cross-tile mbarrier handoff latency (725 cyc cross-warp vs 665 same-warp), or control flow interaction across 10,878 tiles.
+K-loops are identical (1.161 vs 1.147ms = 1.2% difference). **The entire gap is epilogue-induced K-loop inflation.** Our epilogue causes **6x more K-loop overhead** than CUTLASS's.
+
+Per-tile W1 timing confirms this is uniform across all tiles, not outlier tiles:
+- Stripped: kloop avg=13,773 cyc, total p50=13,645
+- Full: kloop avg=18,714 cyc, total p50=19,944
+- **K-loop inflates +4,941 cyc (+36%) with epilogue running**
+
+**Why microbenchmarks (mma_bench, warp_scaling) were misleading:** They tested single tiles in isolation. The contention only manifests in the persistent kernel with 10,878 tiles, cross-tile mbarrier handoffs, and sustained concurrent memory traffic from all 74 clusters.
 
 **Confirmed dead ends (benchmarked on B200, do NOT retry):**
-- FP32_EPILOGUE=1/2: 1.448ms vs 1.450ms baseline = 2μs noise (commit e4d8741, newest.csv)
-- PRE_COMBINE: -825 ph1 cycles, 0μs wall time change
-- EPI_NOINLINE: -538 ph1 cycles, 0μs wall time change
-- Source-level STS scheduling: 5 approaches, all byte-identical SASS (ptxas immutable)
-- CUTLASS uses FP32 FFMA but that is NOT why it's faster — same overlap argument applies
-
-**What CUTLASS does differently that we haven't successfully tried:**
-1. **Dedicated EpilogueLoad warp (W3)** — TESTED, +13% regression. Our implementation serializes on prev tile consumption instead of pre-loading ahead. Dead as implemented (no SMEM budget for double-buffered residual staging).
-2. **Intra-epilogue sub-iteration BAR.SYNC pipelining** — CUTLASS sequence per 64-col sub-iter: STS.128 → FENCE → **BAR.SYNC** → UTMASTG.3D → **DEPBAR.LE** → **BAR.SYNC** → next sub-iter. Warp-scaling data shows **BAR.SYNC adds +25% penalty on mixed-epi workloads** (B_4mixbar 10.3 vs nobar 8.25 us). May still be worth testing for correctness-based SMEM reuse, but unlikely to improve throughput.
+- FP32_EPILOGUE=1/2: 2μs noise — instruction-level changes cannot fix structural contention
+- PRE_COMBINE, EPI_NOINLINE: reduced ph1 cycles but 0μs wall time
+- Source-level STS scheduling: ptxas immutable (5 approaches, byte-identical SASS)
+- EPI_LOAD_WARP (serial): +13% regression (added more contention)
+- EPI_PIPELINE (fire-and-forget): +0.8% noise (same total epilogue work, same contention)
+- The "epilogue is fully overlapped" conclusion was WRONG — based on avg ml_wait > avg ph1, which masked the K-loop inflation
 
 ### Remaining attack vectors (priority order)
 
-Since isolated benchmarks show zero contention between epilogue and K-loop, the gap likely comes from the persistent scheduling loop or cross-tile handoff overhead. Remaining vectors:
+The question is: what specific epilogue operations cause 6x more K-loop inflation than CUTLASS? CUTLASS adds 78μs, we add 475μs. Both load residual via TMA. Candidates:
 
-1. **Tile scheduling overhead** — CUTLASS uses UTCBAR.2CTA.MULTICAST, we use CLC. Cross-warp handoff adds +60 cyc (725 vs 665, mma_bench section K). Over 10,878 tiles this compounds.
-2. **SASS binary patching** — spread STS, interleave with compute. CP-SAT: 686 cyc (was 1417). Independent of structural changes — tests whether instruction scheduling alone matters in the real persistent kernel.
-3. **Intra-epilogue BAR.SYNC pipelining** — may help via SMEM staging reuse (zero extra SMEM), even though BAR.SYNC itself adds overhead.
+1. **Isolate the contention source** — Create intermediate strip variants: strip TMA loads only, strip STS only, strip TMA stores only. Identifies which epilogue operation inflates the K-loop most.
+2. **Intra-epilogue BAR.SYNC pipelining** — CUTLASS serializes epilogue warps per sub-iteration via BAR.SYNC. This REDUCES concurrent warp activity during epilogue, which may reduce K-loop inflation. Our epilogue runs all 4 warps simultaneously. **This is now the #1 structural hypothesis** — BAR.SYNC trades epilogue throughput for lower K-loop contention.
+3. **SASS binary patching** — spread STS, interleave with compute. Still relevant since instruction scheduling affects contention pattern.
 
 **SM100a hardware data** (from `bench/tma_bench.cu` raw: `data/tma0-3.txt`, `bench/mma_bench.cu` raw: `data/mma0-1.txt`):
 - STS.128 throughput: 27 cyc | LDS.128: 25 cyc @ILP=1, 3.5 cyc @ILP=7
@@ -83,7 +88,7 @@ Since isolated benchmarks show zero contention between epilogue and K-loop, the 
 - **TMEM double-buffer: zero contention** — read buf0 while MMA writes buf1 = +0.0 cyc
 - **MMA K-iteration: 665 cyc** (fence + 4×MMA + commit + wait). Pipelined K=24: **525.6 cyc/iter**
 - **MMA shadow budget: HUGE** — 16 STS or 64 BF16 or 8 full epilogue chunks = 100% hidden
-- **Epilogue warps add +0.7 cyc (0.1%) to K-iter** — TMEM_LD+F2FP+HADD2+STS+fence on W2-W5 during W1 MMA
+- **Epilogue warps add +0.7 cyc (0.1%) to K-iter IN ISOLATION** — single-tile microbenchmark only. Real persistent kernel: **+36% K-loop inflation** (STRIP_EPILOGUE proof). Microbenchmarks miss cross-tile/cross-cluster contention.
 - **Cross-warp handoff: 725 cyc** (W1 commit → W2 mbar_wait + TMEM_LD). +60 cyc vs same-warp K-iter.
 - **Multi-SM spread: 0.2%** — perfectly uniform across 74 clusters
 - CUTLASS epilogue source: `third_party/cutlass/.../sm100_epilogue_tma_warpspecialized.hpp`

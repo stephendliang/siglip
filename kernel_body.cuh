@@ -1839,7 +1839,7 @@ persistent_gemm(
                     }
                 }
             }
-#elif W0_RES_FULL
+#elif W0_RES_FULL && !STRIP_EPILOGUE
             if (lane == 0) {
                 if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                     /*
@@ -1899,7 +1899,7 @@ persistent_gemm(
                     }
                 }
             }
-#elif W0_RES_PREFETCH
+#elif W0_RES_PREFETCH && !STRIP_EPILOGUE
             if (lane == 0) {
                 if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                     /* Wait for prev tile's epilogue to finish reading residual */
@@ -2076,13 +2076,14 @@ persistent_gemm(
                 if (dt_kloop > max_kloop) max_kloop = dt_kloop;
                 if (dt_total < min_total) min_total = dt_total;
                 if (dt_total > max_total) max_total = dt_total;
+                timing_buf[cluster_id * TIMING_CLUSTER_STRIDE + 32 + tile_count] = dt_total;
                 tile_count++;
                 t_tile_start = clock64();
                 asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gt_tile_start));
 #endif
             }
         }
-#if EPI_PIPELINE
+#if EPI_PIPELINE && !STRIP_EPILOGUE
         else if (warp == 2) {
             /*
             EPI_PIPELINE (W2) — fire-and-forget residual TMA loader.
@@ -2121,7 +2122,7 @@ persistent_gemm(
                 }
             }
         }
-#elif EPI_LOAD_WARP
+#elif EPI_LOAD_WARP && !STRIP_EPILOGUE
         else if (warp == 2) {
             /* Legacy serial EPI_LOAD_WARP — kept for reference, dead path with EPI_PIPELINE */
             if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
@@ -2205,7 +2206,7 @@ persistent_gemm(
                 gm_base = prev_m + row_group * 32;
             }
 
-#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH && !W0_RES_FULL && !EPI_PIPELINE
+#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH && !W0_RES_FULL && !EPI_PIPELINE && !STRIP_EPILOGUE
             /* Preload first-pass residual before mainloop wait — TMA flies during idle */
             if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                 if (tile_idx > tile_start && lane == 0) {
@@ -2248,6 +2249,12 @@ persistent_gemm(
                 epi_t0 = clock64();
 #endif
 
+#if STRIP_EPILOGUE
+            if (tile_idx > tile_start) {
+                const uint32_t epi_mbar_masked = (epilogue_mbar_addr + prev_buf * 8) & 0xFEFFFFFF;
+                mbar_arrive(epi_mbar_masked);
+            }
+#else
             if (tile_idx > tile_start) {
                 const uint32_t epi_mbar_masked = (epilogue_mbar_addr + prev_buf * 8) & 0xFEFFFFFF;
 #if NUM_EPI_WARPS > 4
@@ -2361,6 +2368,7 @@ persistent_gemm(
                On subsequent tiles: signals after Phase 1 completes. */
             if (lane == 0) mbar_arrive(smem_to_uint(smem + OFF_EPI_DONE_MBAR));
 #endif
+#endif /* !STRIP_EPILOGUE */
         }
     }  // tile loop
 
@@ -2396,7 +2404,7 @@ persistent_gemm(
     }
 #endif
 
-#if W0_RES_FULL
+#if W0_RES_FULL && !STRIP_EPILOGUE
     /*
     W0 drain: load residual for the last tile. Runs concurrently with
     the drain epilogue (W2+). Same pass handshake as the tile loop.
@@ -2450,7 +2458,7 @@ persistent_gemm(
     }
 #endif
 
-#if EPI_PIPELINE
+#if EPI_PIPELINE && !STRIP_EPILOGUE
     /*
     W2 drain: fire-and-forget load for the last tile into pipeline stages.
     */
@@ -2479,7 +2487,7 @@ persistent_gemm(
             }
         }
     }
-#elif EPI_LOAD_WARP
+#elif EPI_LOAD_WARP && !STRIP_EPILOGUE
     /*
     W2 drain: load residual for the last tile. Runs concurrently with
     the drain epilogue. Same pass handshake as the tile loop.
@@ -2532,6 +2540,7 @@ persistent_gemm(
     }
 #endif
 
+#if !STRIP_EPILOGUE
     // DRAIN (epilogue warps only): epilogue for the last tile
     if (warp >= 2 + EPI_LOAD_WARP) {
         const int ew = warp - 2 - EPI_LOAD_WARP;
@@ -2681,6 +2690,7 @@ persistent_gemm(
         }
         __syncwarp();
     }
+#endif /* !STRIP_EPILOGUE */
 
     // Cluster sync + TMEM dealloc
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
@@ -2874,6 +2884,58 @@ static void print_timing(long long* d_timing, long long* d_spread, size_t spread
                gw_min_p1[1] > 0 ? (double)gw_max_p1[1] / gw_min_p1[1] : 0.0);
         printf("  Phase 2 range: min=%lld max=%lld (%.1fx spread)\n", g_min_p2, g_max_p2,
                g_min_p2 > 0 ? (double)g_max_p2 / g_min_p2 : 0.0);
+    }
+
+    /* Per-tile W1 total cycle histogram */
+    printf("\n=== W1 PER-TILE TOTAL CYCLE DISTRIBUTION (%d tiles across 74 clusters) ===\n", total_tiles);
+    {
+        long long* all_totals = (long long*)malloc(total_tiles * sizeof(long long));
+        int aidx = 0;
+        for (int c = 0; c < 74; c++) {
+            long long* d = h_timing + c * TIMING_CLUSTER_STRIDE;
+            int tiles_c = (int)((long long)(c + 1) * TOTAL_TILES / 74) - (int)((long long)c * TOTAL_TILES / 74);
+            for (int t = 0; t < tiles_c && aidx < total_tiles; t++)
+                all_totals[aidx++] = d[32 + t];
+        }
+        qsort(all_totals, aidx, sizeof(long long), cmp_ll);
+        if (aidx > 0) {
+            long long p1v = all_totals[(int)(aidx * 0.01)];
+            long long p5v = all_totals[(int)(aidx * 0.05)];
+            long long p25v = all_totals[(int)(aidx * 0.25)];
+            long long p50v = all_totals[aidx / 2];
+            long long p75v = all_totals[(int)(aidx * 0.75)];
+            long long p95v = all_totals[(int)(aidx * 0.95)];
+            long long p99v = all_totals[(int)(aidx * 0.99)];
+            printf("  Percentiles (cycles):  p1=%lld  p5=%lld  p25=%lld  p50=%lld  p75=%lld  p95=%lld  p99=%lld\n",
+                   p1v, p5v, p25v, p50v, p75v, p95v, p99v);
+            printf("  Range: min=%lld  max=%lld  (%.2fx spread)\n",
+                   all_totals[0], all_totals[aidx - 1],
+                   all_totals[0] > 0 ? (double)all_totals[aidx - 1] / all_totals[0] : 0.0);
+            /* 10-bin histogram */
+            long long bin_lo = all_totals[0];
+            long long bin_hi = all_totals[aidx - 1];
+            if (bin_hi > bin_lo) {
+                const int NBINS = 10;
+                int bins[10] = {0};
+                double bin_width = (double)(bin_hi - bin_lo) / NBINS;
+                for (int i = 0; i < aidx; i++) {
+                    int b = (int)((all_totals[i] - bin_lo) / bin_width);
+                    if (b >= NBINS) b = NBINS - 1;
+                    bins[b]++;
+                }
+                printf("  Histogram (%lld - %lld, bin=%.0f cyc):\n", bin_lo, bin_hi, bin_width);
+                for (int b = 0; b < NBINS; b++) {
+                    long long lo = bin_lo + (long long)(b * bin_width);
+                    long long hi = bin_lo + (long long)((b + 1) * bin_width);
+                    int bar_len = bins[b] * 40 / (aidx > 0 ? aidx : 1);
+                    if (bins[b] > 0 && bar_len == 0) bar_len = 1;
+                    printf("    [%6lld-%6lld] %5d ", lo, hi, bins[b]);
+                    for (int x = 0; x < bar_len; x++) printf("#");
+                    printf("\n");
+                }
+            }
+        }
+        free(all_totals);
     }
 
     for (int w = 0; w < NUM_EPI_WARPS; w++) free(warp_p1_all[w]);

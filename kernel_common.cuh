@@ -98,6 +98,9 @@ Usage: #define N_DIM and K_DIM before including this header.
 #if EPI_PIPELINE && BRANCHLESS_EPI
 #error "EPI_PIPELINE is incompatible with BRANCHLESS_EPI"
 #endif
+#ifndef STRIP_EPILOGUE
+#define STRIP_EPILOGUE 0         // 1=skip epilogue compute, just signal mbars (measures scheduling overhead)
+#endif
 #if STAGES_C && !TMA_RESIDUAL
 #error "STAGES_C requires TMA_RESIDUAL >= 1"
 #endif
@@ -329,7 +332,7 @@ W0 waits on epi_done_mbar before loading borrowed stages each tile.
 
 // Timing instrumentation
 #ifdef TIMING
-#define TIMING_CLUSTER_STRIDE 32
+#define TIMING_CLUSTER_STRIDE (32 + MAX_SPREAD_TILES)
 #define MAX_SPREAD_TILES 148
 #endif
 
