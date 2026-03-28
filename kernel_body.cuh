@@ -6,6 +6,10 @@ Each .cu file: #define N_DIM → #include "kernel_common.cuh" → define transfo
 
 #pragma once
 
+#if REG_PAD
+static __device__ volatile int d_regpad_skip = 1;
+#endif
+
 // Epilogue operation selector
 enum class EpilogueOp : int { BIAS_ADD = 0, BIAS_GELU = 1, BIAS_RESIDUAL = 2 };
 
@@ -2309,6 +2313,14 @@ persistent_gemm(
 #else
             if (tile_idx > tile_start) {
                 const uint32_t epi_mbar_masked = (epilogue_mbar_addr + prev_buf * 8) & 0xFEFFFFFF;
+#if REG_PAD
+                /* Runtime skip: full epilogue compiled (186 regs) but not executed — tests RF occupancy */
+                int __rp;
+                asm volatile("ld.global.s32 %0, [%1];" : "=r"(__rp) : "l"(&d_regpad_skip));
+                if (__rp) {
+                    mbar_arrive(epi_mbar_masked);
+                } else {
+#endif
 #if NUM_EPI_WARPS > 4
                 if (is_split) {
                     if (col_rank == 0)
@@ -2388,6 +2400,9 @@ persistent_gemm(
 #endif
                     );
                 }
+#if REG_PAD
+                }
+#endif
 #if STAGES_C >= 2
                 sc_consumer_phase ^= 1;
 #endif
@@ -2655,6 +2670,12 @@ persistent_gemm(
 #ifdef TIMING
         long long drain_t1 = 0;
 #endif
+#if REG_PAD
+        {
+            int __rp;
+            asm volatile("ld.global.s32 %0, [%1];" : "=r"(__rp) : "l"(&d_regpad_skip));
+            if (!__rp) {
+#endif
 #if NUM_EPI_WARPS > 4
         if (is_split) {
             if (col_rank == 0)
@@ -2736,6 +2757,10 @@ persistent_gemm(
 #endif
             );
         }
+#if REG_PAD
+            }
+        }
+#endif
 
         if (lane == 0) {
             asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");

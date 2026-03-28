@@ -83,7 +83,7 @@ See "Confirmed dead" and "Strip bench decomposition" sections below for full dea
 
 **SASS diff (base 186-reg vs strip 78-reg):** K-loop is 347 structurally identical opcodes. Only register indices differ (base R104-R169, strip R2-R61). The compiler eliminates all dead epilogue code when STRIP_EPILOGUE=1, reducing regs from 186→78. Register file occupancy: 54.5% (base) vs 22.9% (strip).
 
-### Confirmed dead — do NOT retry (updated 2026-03-27)
+### Confirmed dead — do NOT retry (updated 2026-03-28)
 
 ALL of these have been benchmarked on B200 with zero effect on the 477μs gap:
 - **BAR.SYNC serialization** (EPI_SYNC, EPI_BAR_PASS, EPI_BAR_CHUNK): ≈1.635ms. Does not help.
@@ -100,28 +100,30 @@ ALL of these have been benchmarked on B200 with zero effect on the 477μs gap:
 - W0_RES_FULL: +15% catastrophic
 - **NOP_EPILOGUE** (dispatch pressure): 1.160ms at 3k/5k/10k cycles. Dispatch alone doesn't cause gap.
 - **EPI_DELAY** (TMEM timing): 1.162ms at 3k/5k/10k cycles. Late TMEM release doesn't cause gap.
+- **REG_PAD** (register file occupancy): 1.161ms at 186 regs (54.5% RF). RF allocation alone doesn't cause gap.
 
-### Hypothesis isolation (2026-03-28) — dispatch and TMEM ruled out, register file remains
+### Hypothesis isolation (2026-03-28) — ALL individual hypotheses ruled out
 
 NOP_EPILOGUE=N: arrive first (free TMEM), busy-wait N cycles after (dispatch pressure only).
 EPI_DELAY=N: busy-wait N cycles, then arrive (dispatch + TMEM timing).
+REG_PAD: full epilogue compiled (186 regs allocated) but skipped at runtime via volatile __device__ flag.
 
-| Variant | ms | Regs | Dispatch active | TMEM delayed |
+| Variant | ms | Regs | RF occupancy | Epilogue runs |
 |---|---|---|---|---|
-| strip_all | 1.160 | 78 | no | no |
-| nop_3000 | 1.161 | 80 | 3k cyc | no |
-| nop_5000 | 1.160 | 80 | 5k cyc | no |
-| nop_10000 | 1.160 | 80 | 10k cyc | no |
-| delay_3000 | 1.162 | 80 | 3k cyc | yes |
-| delay_5000 | 1.162 | 80 | 5k cyc | yes |
-| delay_10000 | 1.162 | 80 | 10k cyc | yes |
-| **baseline** | **1.637** | **186** | yes | yes |
-
-**Every 80-reg build = 1.160ms. Every 186-reg build = 1.637ms.**
+| strip_all | 1.160 | 78 | 22.9% | no |
+| nop_3000 | 1.161 | 80 | 23.5% | no (busy-wait) |
+| nop_5000 | 1.160 | 80 | 23.5% | no (busy-wait) |
+| nop_10000 | 1.160 | 80 | 23.5% | no (busy-wait) |
+| delay_3000 | 1.162 | 80 | 23.5% | no (busy-wait) |
+| delay_5000 | 1.162 | 80 | 23.5% | no (busy-wait) |
+| delay_10000 | 1.162 | 80 | 23.5% | no (busy-wait) |
+| **regpad** | **1.161** | **186** | **54.5%** | **no** |
+| **baseline** | **1.637** | **186** | **54.5%** | **yes** |
 
 - **Warp scheduler dispatch pressure**: RULED OUT. Epilogue warps actively issuing clock64 loops for 10k cycles = zero effect.
 - **TMEM release timing**: RULED OUT. Delaying mbar_arrive by 10k cycles = zero effect.
-- **Register file occupancy**: ONLY REMAINING VARIABLE. 186 regs (54.5% RF) vs 80 regs (22.9% RF). **Test: REG_PAD — force strip build to allocate ~186 regs.**
+- **Register file occupancy**: RULED OUT. REG_PAD allocates 186 regs (54.5% RF) but runs at 1.161ms = strip speed.
+- **The overhead is from epilogue warps actively executing memory/compute instructions** — aggregate pressure on shared hardware resources (SMEM ports, L2 bandwidth, TMA units) across 74 clusters sustained over 10,878 tiles. No single resource is the bottleneck — it's the combined load.
 
 **SM100a hardware data** (from `bench/tma_bench.cu` raw: `data/tma0-3.txt`, `bench/mma_bench.cu` raw: `data/mma0-1.txt`):
 - STS.128 throughput: 27 cyc | LDS.128: 25 cyc @ILP=1, 3.5 cyc @ILP=7
