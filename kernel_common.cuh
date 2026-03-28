@@ -114,8 +114,8 @@ Usage: #define N_DIM and K_DIM before including this header.
 #if STRIP_EPILOGUE && STRIP_EPI_ANY
 #error "STRIP_EPILOGUE is mutually exclusive with STRIP_EPI_* variants"
 #endif
-#if (STRIP_EPI_TMA_LOAD + STRIP_EPI_TMA_STORE + STRIP_EPI_COMPUTE) > 1
-#error "Only one STRIP_EPI_* variant at a time"
+#if (STRIP_EPI_TMA_LOAD + STRIP_EPI_TMA_STORE + STRIP_EPI_COMPUTE) > 2
+#error "Use STRIP_EPILOGUE instead of all three STRIP_EPI_* flags"
 #endif
 #if STRIP_EPI_ANY && TMEM_LOAD_WIDTH == 64
 #error "STRIP_EPI_* only implemented for x32 path (TMEM_LOAD_WIDTH != 64)"

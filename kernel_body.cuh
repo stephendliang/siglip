@@ -674,6 +674,7 @@ void epilogue_store(
             /* Skip all compute — just issue TMA stores with stale staging data.
                Isolates TMA load+store bandwidth contention on K-loop. */
             {
+#if !STRIP_EPI_TMA_STORE
                 __syncwarp();
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 if (lane == 0) {
@@ -686,6 +687,7 @@ void epilogue_store(
                     }
                     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                 }
+#endif /* !STRIP_EPI_TMA_STORE */
             }
 #else /* !STRIP_EPI_COMPUTE */
 #if EPILOGUE_LOOP

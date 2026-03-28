@@ -1,6 +1,6 @@
 #!/bin/bash
 # FC2 epilogue contention decomposition — full persistent-kernel scale benchmarks.
-# Requires B200. Runs ~24 experiments in ~7 minutes.
+# Requires B200. Runs ~30 experiments in ~10 minutes.
 #
 # Usage:
 #   ./tools/fc2_strip_bench.sh              # run everything
@@ -39,8 +39,10 @@ log "  Output: $OUTDIR"
 log "========================================"
 
 # Preflight
-nvidia-smi > /dev/null 2>&1 || { log "FATAL: no GPU"; exit 1; }
-nvidia-smi --query-gpu=gpu_name,clocks.sm --format=csv,noheader | tee -a "$OUTDIR/session.log"
+if [ "$DRY_RUN" = "0" ]; then
+    nvidia-smi > /dev/null 2>&1 || { log "FATAL: no GPU"; exit 1; }
+    nvidia-smi --query-gpu=gpu_name,clocks.sm --format=csv,noheader | tee -a "$OUTDIR/session.log"
+fi
 
 # ── Experiment definitions ──
 # Format: "label|dflags|timing"
@@ -80,6 +82,20 @@ BATCH4_EXPERIMENTS=(
     "T_bar_pass|-DEPI_BAR_PASS=1|1"
     "T_bar_chunk|-DEPI_BAR_CHUNK=1|1"
     "T_fp32_epi|-DFP32_EPILOGUE=1|1"
+)
+
+# Batch 5: Combinatorial strips — isolate SINGLE operations
+# (pairs of strips = keep only the third operation)
+BATCH5_EXPERIMENTS=(
+    "only_tma_load|-DSTRIP_EPI_TMA_STORE=1 -DSTRIP_EPI_COMPUTE=1|0"
+    "only_tma_store|-DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_COMPUTE=1|0"
+    "only_compute|-DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_TMA_STORE=1|0"
+)
+
+# Batch 6: BAR.SYNC + strip — which operation does BAR.SYNC help?
+BATCH6_EXPERIMENTS=(
+    "bar_chunk_no_load|-DEPI_BAR_CHUNK=1 -DSTRIP_EPI_TMA_LOAD=1|0"
+    "bar_chunk_no_store|-DEPI_BAR_CHUNK=1 -DSTRIP_EPI_TMA_STORE=1|0"
 )
 
 run_experiment() {
@@ -163,6 +179,34 @@ run_batch 1 "STRIP VARIANTS (decompose 475us)"   "${BATCH1_EXPERIMENTS[@]}"
 run_batch 2 "BAR.SYNC SERIALIZATION"              "${BATCH2_EXPERIMENTS[@]}"
 run_batch 3 "STRUCTURAL VARIANTS"                 "${BATCH3_EXPERIMENTS[@]}"
 run_batch 4 "TIMING BUILDS (cycle distributions)" "${BATCH4_EXPERIMENTS[@]}"
+run_batch 5 "COMBINATORIAL STRIP (isolate single ops)" "${BATCH5_EXPERIMENTS[@]}"
+run_batch 6 "BAR.SYNC + STRIP (which op does BAR help?)" "${BATCH6_EXPERIMENTS[@]}"
+
+# ── CUTLASS reference (same thermal session) ──
+if should_run 7; then
+    log ""
+    log "==== BATCH 7: CUTLASS REFERENCE + THERMAL DRIFT ===="
+
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "  make cutlass-bench-fc2 && ./cutlass-bench-fc2"
+        echo "  make fc2 && ./fc2  (baseline repeat)"
+    else
+        # CUTLASS FC2
+        log "  [cutlass_fc2] Building cutlass-bench-fc2..."
+        if make cutlass-bench-fc2 > "$OUTDIR/cutlass_fc2_build.log" 2>&1; then
+            cutlass_out=$(./cutlass-bench-fc2 2>&1) || true
+            echo "$cutlass_out" > "$OUTDIR/timing/cutlass_fc2.txt"
+            cutlass_ms=$(echo "$cutlass_out" | grep -o 'Best:.*ms' | grep -o '[0-9.]*' | head -1)
+            log "  [cutlass_fc2] Best: ${cutlass_ms:-ERR}ms"
+            echo "@@RESULT ms=${cutlass_ms:-ERR} label=cutlass_fc2" >> "$OUTDIR/results.txt"
+        else
+            log "  [cutlass_fc2] BUILD FAILED"
+        fi
+
+        # End-of-session baseline repeat (thermal drift check)
+        run_experiment "baseline_end" "" "0"
+    fi
+fi
 
 # ── Summary table ──
 log ""
@@ -200,7 +244,7 @@ if [ -f "$OUTDIR/results.txt" ] && [ "$DRY_RUN" = "0" ]; then
 
         printf "%-25s %8s %8s %8s\n" "VARIANT" "MS" "DELTA" "% OF OVERHEAD" | tee -a "$OUTDIR/summary.txt"
         printf "%-25s %8s %8s %8s\n" "-------------------------" "--------" "--------" "-------------" | tee -a "$OUTDIR/summary.txt"
-        for exp in "${BATCH1_EXPERIMENTS[@]}" "${BATCH2_EXPERIMENTS[@]}" "${BATCH3_EXPERIMENTS[@]}"; do
+        for exp in "${BATCH1_EXPERIMENTS[@]}" "${BATCH2_EXPERIMENTS[@]}" "${BATCH3_EXPERIMENTS[@]}" "${BATCH5_EXPERIMENTS[@]}" "${BATCH6_EXPERIMENTS[@]}"; do
             IFS='|' read -r label dflags use_timing <<< "$exp"
             [ "$use_timing" = "1" ] && continue
             vms=$(grep "label=${label} " "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
