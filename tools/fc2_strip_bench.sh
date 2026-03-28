@@ -98,6 +98,18 @@ BATCH6_EXPERIMENTS=(
     "bar_chunk_no_store|-DEPI_BAR_CHUNK=1 -DSTRIP_EPI_TMA_STORE=1|0"
 )
 
+# Batch 8: Hypothesis isolation — dispatch pressure vs TMEM timing
+# NOP_EPILOGUE=N: arrive first (free TMEM), then busy-wait N cycles (dispatch pressure only)
+# EPI_DELAY=N: busy-wait N cycles, then arrive (dispatch + TMEM timing)
+BATCH8_EXPERIMENTS=(
+    "nop_3000|-DNOP_EPILOGUE=3000|0"
+    "nop_5000|-DNOP_EPILOGUE=5000|0"
+    "nop_10000|-DNOP_EPILOGUE=10000|0"
+    "delay_3000|-DEPI_DELAY=3000|0"
+    "delay_5000|-DEPI_DELAY=5000|0"
+    "delay_10000|-DEPI_DELAY=10000|0"
+)
+
 run_experiment() {
     local label="$1" dflags="$2" use_timing="$3"
     local target binary
@@ -181,6 +193,7 @@ run_batch 3 "STRUCTURAL VARIANTS"                 "${BATCH3_EXPERIMENTS[@]}"
 run_batch 4 "TIMING BUILDS (cycle distributions)" "${BATCH4_EXPERIMENTS[@]}"
 run_batch 5 "COMBINATORIAL STRIP (isolate single ops)" "${BATCH5_EXPERIMENTS[@]}"
 run_batch 6 "BAR.SYNC + STRIP (which op does BAR help?)" "${BATCH6_EXPERIMENTS[@]}"
+run_batch 8 "HYPOTHESIS ISOLATION (dispatch vs TMEM)" "${BATCH8_EXPERIMENTS[@]}"
 
 # ── CUTLASS reference (same thermal session) ──
 if should_run 7; then
@@ -244,7 +257,7 @@ if [ -f "$OUTDIR/results.txt" ] && [ "$DRY_RUN" = "0" ]; then
 
         printf "%-25s %8s %8s %8s\n" "VARIANT" "MS" "DELTA" "% OF OVERHEAD" | tee -a "$OUTDIR/summary.txt"
         printf "%-25s %8s %8s %8s\n" "-------------------------" "--------" "--------" "-------------" | tee -a "$OUTDIR/summary.txt"
-        for exp in "${BATCH1_EXPERIMENTS[@]}" "${BATCH2_EXPERIMENTS[@]}" "${BATCH3_EXPERIMENTS[@]}" "${BATCH5_EXPERIMENTS[@]}" "${BATCH6_EXPERIMENTS[@]}"; do
+        for exp in "${BATCH1_EXPERIMENTS[@]}" "${BATCH2_EXPERIMENTS[@]}" "${BATCH3_EXPERIMENTS[@]}" "${BATCH5_EXPERIMENTS[@]}" "${BATCH6_EXPERIMENTS[@]}" "${BATCH8_EXPERIMENTS[@]}"; do
             IFS='|' read -r label dflags use_timing <<< "$exp"
             [ "$use_timing" = "1" ] && continue
             vms=$(grep "label=${label} " "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)

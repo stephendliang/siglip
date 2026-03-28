@@ -2290,7 +2290,21 @@ persistent_gemm(
 #if STRIP_EPILOGUE
             if (tile_idx > tile_start) {
                 const uint32_t epi_mbar_masked = (epilogue_mbar_addr + prev_buf * 8) & 0xFEFFFFFF;
+#if EPI_DELAY
+                /* Busy-wait BEFORE arrive — tests dispatch + TMEM release timing */
+                {
+                    long long __delay_end = clock64() + EPI_DELAY;
+                    while (clock64() < __delay_end) {}
+                }
+#endif
                 mbar_arrive(epi_mbar_masked);
+#if NOP_EPILOGUE
+                /* Busy-wait AFTER arrive — tests dispatch pressure only (TMEM already free) */
+                {
+                    long long __nop_end = clock64() + NOP_EPILOGUE;
+                    while (clock64() < __nop_end) {}
+                }
+#endif
             }
 #else
             if (tile_idx > tile_start) {

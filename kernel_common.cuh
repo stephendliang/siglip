@@ -98,8 +98,18 @@ Usage: #define N_DIM and K_DIM before including this header.
 #if EPI_PIPELINE && BRANCHLESS_EPI
 #error "EPI_PIPELINE is incompatible with BRANCHLESS_EPI"
 #endif
+#ifndef NOP_EPILOGUE
+#define NOP_EPILOGUE 0           // cycles to busy-wait AFTER mbar_arrive (tests dispatch pressure, TMEM free early)
+#endif
+#ifndef EPI_DELAY
+#define EPI_DELAY 0              // cycles to busy-wait BEFORE mbar_arrive (tests dispatch + TMEM release timing)
+#endif
 #ifndef STRIP_EPILOGUE
-#define STRIP_EPILOGUE 0         // 1=skip epilogue compute, just signal mbars (measures scheduling overhead)
+#define STRIP_EPILOGUE 0
+#endif
+#if (NOP_EPILOGUE || EPI_DELAY) && !STRIP_EPILOGUE
+#undef STRIP_EPILOGUE
+#define STRIP_EPILOGUE 1
 #endif
 #ifndef STRIP_EPI_TMA_LOAD
 #define STRIP_EPI_TMA_LOAD 0     // 1=skip TMA residual loads (keep compute+STS+TMA store)

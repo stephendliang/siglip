@@ -98,14 +98,30 @@ ALL of these have been benchmarked on B200 with zero effect on the 477μs gap:
 - PRE_COMBINE, EPI_NOINLINE: 0μs wall time
 - Source-level STS scheduling: ptxas immutable (byte-identical SASS)
 - W0_RES_FULL: +15% catastrophic
+- **NOP_EPILOGUE** (dispatch pressure): 1.160ms at 3k/5k/10k cycles. Dispatch alone doesn't cause gap.
+- **EPI_DELAY** (TMEM timing): 1.162ms at 3k/5k/10k cycles. Late TMEM release doesn't cause gap.
 
-### Remaining hypotheses (priority order)
+### Hypothesis isolation (2026-03-28) — dispatch and TMEM ruled out, register file remains
 
-The gap is NOT from specific epilogue operations. It's from epilogue warps being active at all. Three mechanisms:
+NOP_EPILOGUE=N: arrive first (free TMEM), busy-wait N cycles after (dispatch pressure only).
+EPI_DELAY=N: busy-wait N cycles, then arrive (dispatch + TMEM timing).
 
-1. **Register file hardware contention** — 186 regs × 192 threads = 54.5% RF occupancy vs 78 regs × 22.9%. RF bank conflicts may slow MMA warp's R2UR/UTCQMMA. **Test: REG_PAD flag — force STRIP_EPILOGUE to allocate 186 regs via dummy asm volatile declarations.**
-2. **TMEM release timing** — Epilogue warps delay mbar_arrive that frees TMEM for W1 by ~400 instructions. Strip arrives almost immediately. **Test: EPI_DELAY flag — add nanosleep before arrive in strip path.**
-3. **Warp scheduler pressure** — 6 active warps vs 2 effectively-active. MMA warp (sub-partition 1) shares with W5. **If A and B both fail, this is the mechanism — and CUTLASS solves it with 8 warps (more sub-partition parallelism, not less).**
+| Variant | ms | Regs | Dispatch active | TMEM delayed |
+|---|---|---|---|---|
+| strip_all | 1.160 | 78 | no | no |
+| nop_3000 | 1.161 | 80 | 3k cyc | no |
+| nop_5000 | 1.160 | 80 | 5k cyc | no |
+| nop_10000 | 1.160 | 80 | 10k cyc | no |
+| delay_3000 | 1.162 | 80 | 3k cyc | yes |
+| delay_5000 | 1.162 | 80 | 5k cyc | yes |
+| delay_10000 | 1.162 | 80 | 10k cyc | yes |
+| **baseline** | **1.637** | **186** | yes | yes |
+
+**Every 80-reg build = 1.160ms. Every 186-reg build = 1.637ms.**
+
+- **Warp scheduler dispatch pressure**: RULED OUT. Epilogue warps actively issuing clock64 loops for 10k cycles = zero effect.
+- **TMEM release timing**: RULED OUT. Delaying mbar_arrive by 10k cycles = zero effect.
+- **Register file occupancy**: ONLY REMAINING VARIABLE. 186 regs (54.5% RF) vs 80 regs (22.9% RF). **Test: REG_PAD — force strip build to allocate ~186 regs.**
 
 **SM100a hardware data** (from `bench/tma_bench.cu` raw: `data/tma0-3.txt`, `bench/mma_bench.cu` raw: `data/mma0-1.txt`):
 - STS.128 throughput: 27 cyc | LDS.128: 25 cyc @ILP=1, 3.5 cyc @ILP=7
