@@ -2321,6 +2321,12 @@ persistent_gemm(
                     mbar_arrive(epi_mbar_masked);
                 } else {
 #endif
+#if EPI_WARP_LIMIT
+                if (ew >= EPI_WARP_LIMIT) {
+                    mbar_arrive(epi_mbar_masked);
+                } else
+#endif
+                {
 #if NUM_EPI_WARPS > 4
                 if (is_split) {
                     if (col_rank == 0)
@@ -2400,6 +2406,7 @@ persistent_gemm(
 #endif
                     );
                 }
+                } /* EPI_WARP_LIMIT else / unconditional */
 #if REG_PAD
                 }
 #endif
@@ -2676,6 +2683,10 @@ persistent_gemm(
             asm volatile("ld.global.s32 %0, [%1];" : "=r"(__rp) : "l"(&d_regpad_skip));
             if (!__rp) {
 #endif
+#if EPI_WARP_LIMIT
+        if (ew < EPI_WARP_LIMIT)
+#endif
+        {
 #if NUM_EPI_WARPS > 4
         if (is_split) {
             if (col_rank == 0)
@@ -2757,6 +2768,7 @@ persistent_gemm(
 #endif
             );
         }
+        } /* EPI_WARP_LIMIT / unconditional */
 #if REG_PAD
             }
         }

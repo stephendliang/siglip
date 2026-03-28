@@ -115,6 +115,13 @@ BATCH9_EXPERIMENTS=(
     "regpad|-DREG_PAD=1|0"
 )
 
+# Batch 10: Warp limit — how does overhead scale with number of active epilogue warps?
+BATCH10_EXPERIMENTS=(
+    "wlimit_1|-DEPI_WARP_LIMIT=1|0"
+    "wlimit_2|-DEPI_WARP_LIMIT=2|0"
+    "wlimit_3|-DEPI_WARP_LIMIT=3|0"
+)
+
 run_experiment() {
     local label="$1" dflags="$2" use_timing="$3"
     local target binary
@@ -200,6 +207,7 @@ run_batch 5 "COMBINATORIAL STRIP (isolate single ops)" "${BATCH5_EXPERIMENTS[@]}
 run_batch 6 "BAR.SYNC + STRIP (which op does BAR help?)" "${BATCH6_EXPERIMENTS[@]}"
 run_batch 8 "HYPOTHESIS ISOLATION (dispatch vs TMEM)" "${BATCH8_EXPERIMENTS[@]}"
 run_batch 9 "REGISTER FILE OCCUPANCY (REG_PAD)" "${BATCH9_EXPERIMENTS[@]}"
+run_batch 10 "WARP LIMIT (scaling with active warps)" "${BATCH10_EXPERIMENTS[@]}"
 
 # ── CUTLASS reference (same thermal session) ──
 if should_run 7; then
@@ -263,7 +271,7 @@ if [ -f "$OUTDIR/results.txt" ] && [ "$DRY_RUN" = "0" ]; then
 
         printf "%-25s %8s %8s %8s\n" "VARIANT" "MS" "DELTA" "% OF OVERHEAD" | tee -a "$OUTDIR/summary.txt"
         printf "%-25s %8s %8s %8s\n" "-------------------------" "--------" "--------" "-------------" | tee -a "$OUTDIR/summary.txt"
-        for exp in "${BATCH1_EXPERIMENTS[@]}" "${BATCH2_EXPERIMENTS[@]}" "${BATCH3_EXPERIMENTS[@]}" "${BATCH5_EXPERIMENTS[@]}" "${BATCH6_EXPERIMENTS[@]}" "${BATCH8_EXPERIMENTS[@]}" "${BATCH9_EXPERIMENTS[@]}"; do
+        for exp in "${BATCH1_EXPERIMENTS[@]}" "${BATCH2_EXPERIMENTS[@]}" "${BATCH3_EXPERIMENTS[@]}" "${BATCH5_EXPERIMENTS[@]}" "${BATCH6_EXPERIMENTS[@]}" "${BATCH8_EXPERIMENTS[@]}" "${BATCH9_EXPERIMENTS[@]}" "${BATCH10_EXPERIMENTS[@]}"; do
             IFS='|' read -r label dflags use_timing <<< "$exp"
             [ "$use_timing" = "1" ] && continue
             vms=$(grep "label=${label} " "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)

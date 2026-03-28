@@ -101,6 +101,9 @@ Usage: #define N_DIM and K_DIM before including this header.
 #ifndef REG_PAD
 #define REG_PAD 0                // 1=compile full epilogue (186 regs) but skip at runtime (tests RF occupancy)
 #endif
+#ifndef EPI_WARP_LIMIT
+#define EPI_WARP_LIMIT 0         // 0=all warps run epilogue, N=only first N warps run epilogue (rest strip)
+#endif
 #ifndef NOP_EPILOGUE
 #define NOP_EPILOGUE 0           // cycles to busy-wait AFTER mbar_arrive (tests dispatch pressure, TMEM free early)
 #endif
