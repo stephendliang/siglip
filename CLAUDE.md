@@ -125,6 +125,27 @@ REG_PAD: full epilogue compiled (186 regs allocated) but skipped at runtime via 
 - **Register file occupancy**: RULED OUT. REG_PAD allocates 186 regs (54.5% RF) but runs at 1.161ms = strip speed.
 - **The overhead is from epilogue warps actively executing memory/compute instructions** — aggregate pressure on shared hardware resources (SMEM ports, L2 bandwidth, TMA units) across 74 clusters sustained over 10,878 tiles. No single resource is the bottleneck — it's the combined load.
 
+### EPI_WARP_LIMIT scaling (2026-03-28) — overhead is LINEAR at ~120μs/warp
+
+EPI_WARP_LIMIT=N: only first N epilogue warps run full epilogue, rest just mbar_arrive.
+
+| Active warps | ms | Overhead | Per-warp |
+|---|---|---|---|
+| 0 (strip_all) | 1.160 | 0 | — |
+| 1 | 1.280 | 120μs | 120μs |
+| 2 | 1.396 | 236μs | 118μs |
+| 3 | 1.517 | 357μs | 119μs |
+| 4 (baseline) | 1.637 | 477μs | 120μs |
+
+**Almost perfectly linear.** No threshold, no saturation. Each warp contributes ~120μs regardless of how many others are active. This means the strip decomposition (all variants ≈1.635ms at 4 warps) was seeing SATURATION — at 4 warps, any single operation's overhead was hidden by the 3 other warps' full overhead.
+
+**CUTLASS comparison:** CUTLASS has 4 epilogue warps with 78μs total overhead = ~20μs/warp. Our per-warp cost is **6× higher**. The gap isn't warp count — it's per-warp memory activity duration. CUTLASS's epilogue warps are active for fewer cycles per tile because:
+1. W3 pre-loads residual into SMEM → no TMA stall in epilogue warps
+2. Interleaved STS in SASS → epilogue finishes faster
+3. LDS from pre-loaded SMEM → no global memory latency in epilogue path
+
+**Implication:** Reducing to 2 warps would give ~236μs overhead (vs 477μs). To match CUTLASS (78μs), we need per-warp overhead down from 120μs to ~40μs = 3× faster epilogue per warp. Path: fewer warps + SASS-patched scheduling + architectural pre-load.
+
 **SM100a hardware data** (from `bench/tma_bench.cu` raw: `data/tma0-3.txt`, `bench/mma_bench.cu` raw: `data/mma0-1.txt`):
 - STS.128 throughput: 27 cyc | LDS.128: 25 cyc @ILP=1, 3.5 cyc @ILP=7
 - STS shadow: ≤4 BF16 free, 8=+55%, 15=+161% | LDS+STS overlap: 82.3%

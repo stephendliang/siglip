@@ -1,0 +1,20 @@
+[07:36:53] ========================================
+[07:36:53]   FC2 STRIP BENCH  20260328_073653
+[07:36:53]   Output: data/strip_bench_20260328_073653
+[07:36:53] ========================================
+NVIDIA B200, 120 MHz
+[07:36:53] 
+[07:36:53] ==== BATCH 10: WARP LIMIT (scaling with active warps) (3 experiments) ====
+[07:36:53]   [wlimit_1] DFLAGS='-DEPI_WARP_LIMIT=1' (wall)
+[07:36:56]   [wlimit_1] 1.280ms  valid=0  regs=186
+[07:36:56]   [wlimit_2] DFLAGS='-DEPI_WARP_LIMIT=2' (wall)
+[07:36:59]   [wlimit_2] 1.396ms  valid=0  regs=186
+[07:36:59]   [wlimit_3] DFLAGS='-DEPI_WARP_LIMIT=3' (wall)
+[07:37:02]   [wlimit_3] 1.517ms  valid=0  regs=186
+[07:37:02] 
+[07:37:02] ==== SUMMARY ====
+[07:37:02] 
+[07:37:02] Done in 9s. Results: data/strip_bench_20260328_073653/
+[07:37:02]   summary.txt    — comparison table
+[07:37:02]   results.txt    — raw @@RESULT lines
+[07:37:02]   timing/        — full per-variant output
