@@ -1,0 +1,86 @@
+[05:57:25] ========================================
+[05:57:25]   FC2 STRIP BENCH  20260328_055725
+[05:57:25]   Output: data/strip_bench_20260328_055725
+[05:57:25] ========================================
+NVIDIA B200, 120 MHz
+[05:57:25] 
+[05:57:25] ==== BATCH 1: STRIP VARIANTS (decompose 475us) (5 experiments) ====
+[05:57:25]   [baseline] DFLAGS='' (wall)
+[05:57:28]   [baseline] 1.637ms  valid=1  regs=186
+[05:57:28]   [strip_all] DFLAGS='-DSTRIP_EPILOGUE=1' (wall)
+[05:57:31]   [strip_all] 1.160ms  valid=0  regs=78
+[05:57:31]   [strip_tma_load] DFLAGS='-DSTRIP_EPI_TMA_LOAD=1' (wall)
+[05:57:34]   [strip_tma_load] 1.631ms  valid=1  regs=186
+[05:57:34]   [strip_tma_store] DFLAGS='-DSTRIP_EPI_TMA_STORE=1' (wall)
+[05:57:37]   [strip_tma_store] 1.634ms  valid=1  regs=186
+[05:57:37]   [strip_compute] DFLAGS='-DSTRIP_EPI_COMPUTE=1' (wall)
+[05:57:39]   [strip_compute] 1.638ms  valid=1  regs=186
+[05:57:39] 
+[05:57:39] ==== BATCH 2: BAR.SYNC SERIALIZATION (5 experiments) ====
+[05:57:39]   [epi_sync] DFLAGS='-DEPI_SYNC=1' (wall)
+[05:57:42]   [epi_sync] 1.635ms  valid=1  regs=186
+[05:57:42]   [bar_pass] DFLAGS='-DEPI_BAR_PASS=1' (wall)
+[05:57:45]   [bar_pass] 1.634ms  valid=1  regs=186
+[05:57:45]   [bar_chunk] DFLAGS='-DEPI_BAR_CHUNK=1' (wall)
+[05:57:48]   [bar_chunk] 1.635ms  valid=1  regs=186
+[05:57:48]   [sync_bar_pass] DFLAGS='-DEPI_SYNC=1 -DEPI_BAR_PASS=1' (wall)
+[05:57:51]   [sync_bar_pass] 1.634ms  valid=1  regs=186
+[05:57:51]   [sync_bar_chunk] DFLAGS='-DEPI_SYNC=1 -DEPI_BAR_CHUNK=1' (wall)
+[05:57:53]   [sync_bar_chunk] 1.637ms  valid=1  regs=186
+[05:57:53] 
+[05:57:53] ==== BATCH 3: STRUCTURAL VARIANTS (5 experiments) ====
+[05:57:53]   [fp32_epi] DFLAGS='-DFP32_EPILOGUE=1' (wall)
+[05:57:56]   [fp32_epi] 1.638ms  valid=1  regs=190
+[05:57:56]   [stagger_500] DFLAGS='-DSTAGGER_CYCLES=500' (wall)
+[05:57:59]   [stagger_500] 1.633ms  valid=1  regs=186
+[05:57:59]   [stagger_2000] DFLAGS='-DSTAGGER_CYCLES=2000' (wall)
+[05:58:02]   [stagger_2000] 1.633ms  valid=1  regs=186
+[05:58:02]   [passes_4] DFLAGS='-DNUM_PASSES_PARAM=4' (wall)
+[05:58:05]   [passes_4] 1.635ms  valid=1  regs=186
+[05:58:05]   [store_deferred] DFLAGS='-DSTORE_TIMING=1' (wall)
+[05:58:07]   [store_deferred] 1.642ms  valid=1  regs=186
+[05:58:07] 
+[05:58:07] ==== BATCH 4: TIMING BUILDS (cycle distributions) (8 experiments) ====
+[05:58:07]   [T_baseline] DFLAGS='' (timing)
+[05:58:10]   [T_baseline] 1.640ms  valid=1  regs=232
+[05:58:10]   [T_strip_all] DFLAGS='-DSTRIP_EPILOGUE=1' (timing)
+[05:58:13]   [T_strip_all] 1.164ms  valid=0  regs=100
+[05:58:13]   [T_strip_tma_load] DFLAGS='-DSTRIP_EPI_TMA_LOAD=1' (timing)
+[05:58:16]   [T_strip_tma_load] 1.642ms  valid=1  regs=232
+[05:58:16]   [T_strip_tma_store] DFLAGS='-DSTRIP_EPI_TMA_STORE=1' (timing)
+[05:58:19]   [T_strip_tma_store] 1.641ms  valid=1  regs=232
+[05:58:19]   [T_strip_compute] DFLAGS='-DSTRIP_EPI_COMPUTE=1' (timing)
+[05:58:22]   [T_strip_compute] 1.643ms  valid=1  regs=232
+[05:58:22]   [T_bar_pass] DFLAGS='-DEPI_BAR_PASS=1' (timing)
+[05:58:25]   [T_bar_pass] 1.644ms  valid=1  regs=232
+[05:58:25]   [T_bar_chunk] DFLAGS='-DEPI_BAR_CHUNK=1' (timing)
+[05:58:27]   [T_bar_chunk] 1.641ms  valid=1  regs=232
+[05:58:27]   [T_fp32_epi] DFLAGS='-DFP32_EPILOGUE=1' (timing)
+[05:58:30]   [T_fp32_epi] 1.640ms  valid=1  regs=236
+[05:58:30] 
+[05:58:30] ==== BATCH 5: COMBINATORIAL STRIP (isolate single ops) (3 experiments) ====
+[05:58:30]   [only_tma_load] DFLAGS='-DSTRIP_EPI_TMA_STORE=1 -DSTRIP_EPI_COMPUTE=1' (wall)
+[05:58:33]   [only_tma_load] 1.634ms  valid=1  regs=186
+[05:58:33]   [only_tma_store] DFLAGS='-DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_COMPUTE=1' (wall)
+[05:58:36]   [only_tma_store] 1.636ms  valid=1  regs=186
+[05:58:36]   [only_compute] DFLAGS='-DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_TMA_STORE=1' (wall)
+[05:58:38]   [only_compute] 1.633ms  valid=1  regs=186
+[05:58:38] 
+[05:58:38] ==== BATCH 6: BAR.SYNC + STRIP (which op does BAR help?) (2 experiments) ====
+[05:58:38]   [bar_chunk_no_load] DFLAGS='-DEPI_BAR_CHUNK=1 -DSTRIP_EPI_TMA_LOAD=1' (wall)
+[05:58:41]   [bar_chunk_no_load] 1.635ms  valid=1  regs=186
+[05:58:41]   [bar_chunk_no_store] DFLAGS='-DEPI_BAR_CHUNK=1 -DSTRIP_EPI_TMA_STORE=1' (wall)
+[05:58:44]   [bar_chunk_no_store] 1.637ms  valid=1  regs=186
+[05:58:44] 
+[05:58:44] ==== BATCH 7: CUTLASS REFERENCE + THERMAL DRIFT ====
+[05:58:44]   [cutlass_fc2] Building cutlass-bench-fc2...
+[05:58:44]   [cutlass_fc2] BUILD FAILED
+[05:58:44]   [baseline_end] DFLAGS='' (wall)
+[05:58:47]   [baseline_end] 1.637ms  valid=1  regs=186
+[05:58:47] 
+[05:58:47] ==== SUMMARY ====
+[05:58:48] 
+[05:58:48] Done in 83s. Results: data/strip_bench_20260328_055725/
+[05:58:48]   summary.txt    — comparison table
+[05:58:48]   results.txt    — raw @@RESULT lines
+[05:58:48]   timing/        — full per-variant output

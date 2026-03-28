@@ -63,21 +63,49 @@ Per-tile W1 timing confirms this is uniform across all tiles, not outlier tiles:
 
 **Why microbenchmarks (mma_bench, warp_scaling) were misleading:** They tested single tiles in isolation. The contention only manifests in the persistent kernel with 10,878 tiles, cross-tile mbarrier handoffs, and sustained concurrent memory traffic from all 74 clusters.
 
-**Confirmed dead ends (benchmarked on B200, do NOT retry):**
-- FP32_EPILOGUE=1/2: 2μs noise — instruction-level changes cannot fix structural contention
-- PRE_COMBINE, EPI_NOINLINE: reduced ph1 cycles but 0μs wall time
-- Source-level STS scheduling: ptxas immutable (5 approaches, byte-identical SASS)
-- EPI_LOAD_WARP (serial): +13% regression (added more contention)
-- EPI_PIPELINE (fire-and-forget): +0.8% noise (same total epilogue work, same contention)
-- The "epilogue is fully overlapped" conclusion was WRONG — based on avg ml_wait > avg ph1, which masked the K-loop inflation
+See "Confirmed dead" and "Strip bench decomposition" sections below for full dead-end list.
 
-### Remaining attack vectors (priority order)
+### Strip bench decomposition (2026-03-27) — NO single operation is the cause
 
-The question is: what specific epilogue operations cause 6x more K-loop inflation than CUTLASS? CUTLASS adds 78μs, we add 475μs. Both load residual via TMA. Candidates:
+30-experiment sweep (`tools/fc2_strip_bench.sh`, data: `data/strip_bench_20260328_055725/`). **Devastating result: ALL variants ≈ 1.635ms regardless of which epilogue operation is active.** Only STRIP_EPILOGUE (no epilogue at all) is fast at 1.160ms.
 
-1. **Isolate the contention source** — Create intermediate strip variants: strip TMA loads only, strip STS only, strip TMA stores only. Identifies which epilogue operation inflates the K-loop most.
-2. **Intra-epilogue BAR.SYNC pipelining** — CUTLASS serializes epilogue warps per sub-iteration via BAR.SYNC. This REDUCES concurrent warp activity during epilogue, which may reduce K-loop inflation. Our epilogue runs all 4 warps simultaneously. **This is now the #1 structural hypothesis** — BAR.SYNC trades epilogue throughput for lower K-loop contention.
-3. **SASS binary patching** — spread STS, interleave with compute. Still relevant since instruction scheduling affects contention pattern.
+| Variant | ms | Delta | What it keeps |
+|---|---|---|---|
+| baseline | 1.637 | +477μs | Full epilogue |
+| strip_all | 1.160 | 0 | Nothing (STRIP_EPILOGUE) |
+| only_tma_load | 1.634 | +474μs | TMA loads only |
+| only_tma_store | 1.636 | +476μs | TMA stores only |
+| only_compute | 1.633 | +473μs | STS/BF16 only |
+| bar_chunk | 1.635 | +475μs | BAR.SYNC serialization |
+| fp32_epi | 1.638 | +478μs | FP32 epilogue math |
+
+**Conclusion: the overhead is from epilogue warps BEING ACTIVE, not from what they do.** Even the lightest possible epilogue (a single TMA load per pass) causes the full 477μs.
+
+**SASS diff (base 186-reg vs strip 78-reg):** K-loop is 347 structurally identical opcodes. Only register indices differ (base R104-R169, strip R2-R61). The compiler eliminates all dead epilogue code when STRIP_EPILOGUE=1, reducing regs from 186→78. Register file occupancy: 54.5% (base) vs 22.9% (strip).
+
+### Confirmed dead — do NOT retry (updated 2026-03-27)
+
+ALL of these have been benchmarked on B200 with zero effect on the 477μs gap:
+- **BAR.SYNC serialization** (EPI_SYNC, EPI_BAR_PASS, EPI_BAR_CHUNK): ≈1.635ms. Does not help.
+- **Combinatorial strips** (only_tma_load, only_tma_store, only_compute): ≈1.635ms. No single operation is the cause.
+- **BAR.SYNC + strip combos** (bar_chunk_no_load, bar_chunk_no_store): ≈1.635ms.
+- **FP32_EPILOGUE**: 1.638ms. ALU type doesn't matter.
+- **Stagger** (500/2000 cycles): ≈1.633ms. Temporal offset doesn't help.
+- **Pass count** (NUM_PASSES_PARAM=4): 1.635ms.
+- **Store deferred** (STORE_TIMING=1): 1.642ms.
+- EPI_LOAD_WARP (serial): +13% regression
+- EPI_PIPELINE (fire-and-forget): +0.8% noise
+- PRE_COMBINE, EPI_NOINLINE: 0μs wall time
+- Source-level STS scheduling: ptxas immutable (byte-identical SASS)
+- W0_RES_FULL: +15% catastrophic
+
+### Remaining hypotheses (priority order)
+
+The gap is NOT from specific epilogue operations. It's from epilogue warps being active at all. Three mechanisms:
+
+1. **Register file hardware contention** — 186 regs × 192 threads = 54.5% RF occupancy vs 78 regs × 22.9%. RF bank conflicts may slow MMA warp's R2UR/UTCQMMA. **Test: REG_PAD flag — force STRIP_EPILOGUE to allocate 186 regs via dummy asm volatile declarations.**
+2. **TMEM release timing** — Epilogue warps delay mbar_arrive that frees TMEM for W1 by ~400 instructions. Strip arrives almost immediately. **Test: EPI_DELAY flag — add nanosleep before arrive in strip path.**
+3. **Warp scheduler pressure** — 6 active warps vs 2 effectively-active. MMA warp (sub-partition 1) shares with W5. **If A and B both fail, this is the mechanism — and CUTLASS solves it with 8 warps (more sub-partition parallelism, not less).**
 
 **SM100a hardware data** (from `bench/tma_bench.cu` raw: `data/tma0-3.txt`, `bench/mma_bench.cu` raw: `data/mma0-1.txt`):
 - STS.128 throughput: 27 cyc | LDS.128: 25 cyc @ILP=1, 3.5 cyc @ILP=7
@@ -249,6 +277,7 @@ tools/                  # Analysis & sweep scripts
   sass_analysis.py      # SASS scheduling analyzer (control words, dep graphs, slack)
   sass_edit.py          # SASS binary editor + CP-SAT scheduler + fatbin patcher (see docs/sass_binary_editing.md)
   analyze_timing.py     # clock64 timing → equilibrium analysis
+  fc2_strip_bench.sh     # Epilogue contention decomposition (30 experiments, ~10 min on B200)
   analyze_warp_scaling.py  # Warp-scaling benchmark analysis (scaling curves, BAR.SYNC effect)
   analyze_source_counters.py  # ncu SourceCounters CSV → stall breakdown
   simulate_lhs.py       # Bootstrap convergence simulation (no GPU)
@@ -284,6 +313,11 @@ docs/                   # Experiments (F1-F40), proposals, grid search, SASS not
 make fc2                # compile fc2.cu -> fc2
 ./fc2                   # run on B200, prints timing + TFLOPS + checksum
 make fc2-timing         # compile with -DTIMING for cycle breakdown
+
+# FC2 strip bench (epilogue contention decomposition, ~30 experiments)
+bash tools/fc2_strip_bench.sh              # run everything (~10 min)
+bash tools/fc2_strip_bench.sh --batch 1    # run only batch 1
+bash tools/fc2_strip_bench.sh --dry-run    # print commands without running
 
 # FC2 architecture search (combinatorial sweep on B200)
 ./tools/fc2_arch_search.sh              # full: 48 configs (32 combinatorial + 16 W0_RES)

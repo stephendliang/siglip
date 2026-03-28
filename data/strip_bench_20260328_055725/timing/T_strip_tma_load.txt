@@ -1,0 +1,65 @@
+FC2 GEMM — tcgen05 cta_group::2 (6 warps [4 epi], cluster of 2)
+  GEMM: [928256,3072] x [768,3072]^T  4-stage pipeline  bias+residual  SMEM-staged stores  idesc: 0x10400010
+  Alloc + init done
+  TMA descriptors + func attr done
+Launching warmup (2 iters)...
+  Waiting for warmup sync...
+  Warmup done.
+Timing: 10 iterations...
+FC2 kernel: 1.642 ms  2667.05 TFLOPS
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 7315328.000000
+C[0,0..3] = 6912.0 4608.0 6912.0 4608.0
+DIAG row0 actual:   6912.0 4608.0 6912.0 4608.0 6912.0 4608.0 6912.0 4608.0 
+DIAG row0 expected: 6912.0 4608.0 6912.0 4608.0 6912.0 4608.0 6912.0 4608.0 
+@@RESULT ms=1.642 tflops=2667.05 checksum=7315328.000000 valid=1 c0=6912.0
+
+=== W1 TIMING (clock64, 10878 tiles across 74 clusters) ===
+  SM clock (measured): 1.844 GHz  (clock64/globaltimer)
+  Per-tile averages (cycles / ns at 1.844 GHz):
+    Epilogue mbar wait:      861 cycles /  467.3 ns
+    TMA stage-0 wait:        181 cycles /   98.4 ns
+    K-loop (6 ki × 4 MMA):   18660 cycles / 10117.3 ns
+    Total tile:            19704 cycles / 10683.0 ns
+    Overhead (epi+tma0):    1043 cycles /  565.7 ns  (5.3% of tile)
+  K-loop range: min=11936 max=26829 (2.2x spread)
+  Total tile range: min=12553 max=27651 (2.2x spread)
+  Predicted wall from tile cycles: 1.570 ms  (actual: 1.642 ms)
+
+=== EPILOGUE PER-WARP PHASE 1 TIMING (W2-W5, 10804 tiles across 74 clusters) ===
+  Per-warp Phase 1 (cycles):
+    W2 (ew=0, rg=0):  avg=11080  min=7642  max=18233  p95=13082
+    W3 (ew=1, rg=1):  avg=11510  min=7969  max=17701  p95=13454
+    W4 (ew=2, rg=2):  avg=11987  min=8625  max=18134  p95=13709
+    W5 (ew=3, rg=3):  avg=11954  min=8635  max=18641  p95=13666
+  Spread of per-warp averages: 907 cycles (max_avg - min_avg)
+  Inter-warp spread per tile (max-min Phase 1 across warps):
+    Average: 1656 cycles
+    Min: 193  Max: 4964  P95: 2623 cycles
+  => ASYMMETRIC (avg spread 907 >= 200 cyc): port-queued or bank-conflict bias, F27 has a target
+
+=== EPILOGUE PHASE TIMING (W3/ew=1, 10804 tiles across 74 clusters) ===
+  Per-tile averages (cycles / ns at 1.8 GHz):
+    Mainloop mbar wait:       8217 cycles / 4455.1 ns  (41.4%)
+    Phase 1 (TMEM->SMEM):    11510 cycles / 6240.4 ns  (58.0%)
+    Phase 2 (SMEM->global):     104 cycles /   56.4 ns  (0.5%)
+    Total (wait+work):       19831 cycles / 10751.9 ns
+    Work only (P1+P2):       11614 cycles / 6296.8 ns
+  Mainloop wait range: min=499 max=27245 (54.6x spread)
+  Phase 1 range: min=7969 max=17701 (2.2x spread)
+  Phase 2 range: min=104 max=131 (1.3x spread)
+
+=== W1 PER-TILE TOTAL CYCLE DISTRIBUTION (10878 tiles across 74 clusters) ===
+  Percentiles (cycles):  p1=14205  p5=16129  p25=18657  p50=19872  p75=20859  p95=22559  p99=25153
+  Range: min=12553  max=27651  (2.20x spread)
+  Histogram (12553 - 27651, bin=1510 cyc):
+    [ 12553- 14062]    87 #
+    [ 14062- 15572]   280 #
+    [ 15572- 17082]   638 ##
+    [ 17082- 18592]  1587 #####
+    [ 18592- 20102]  3515 ############
+    [ 20102- 21611]  3489 ############
+    [ 21611- 23121]   916 ###
+    [ 23121- 24631]   207 #
+    [ 24631- 26141]   117 #
+    [ 26141- 27651]    42 #
