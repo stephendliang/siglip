@@ -1,0 +1,82 @@
+[22:20:52] ========================================
+[22:20:52]   FC2 CONTENTION BENCH  20260330_222052
+[22:20:52]   Output: data/contention_20260330_222052
+[22:20:52] ========================================
+NVIDIA B200, 120 MHz
+[22:20:52] 
+[22:20:52] ==== PART A: WALL TIME — WARP SCALING ====
+[22:20:52]   [wall] strip  DFLAGS='-DSTRIP_EPILOGUE=1'
+[22:20:55]   [strip] 1.159ms  valid=0  regs=79
+[22:20:55]   [wall] w1  DFLAGS='-DEPI_WARP_LIMIT=1'
+[22:20:56]   [w1] 1.283ms  valid=0  regs=187
+[22:20:56]   [wall] w2  DFLAGS='-DEPI_WARP_LIMIT=2'
+[22:20:58]   [w2] 1.395ms  valid=0  regs=187
+[22:20:58]   [wall] w3  DFLAGS='-DEPI_WARP_LIMIT=3'
+[22:21:00]   [w3] 1.523ms  valid=0  regs=187
+[22:21:00]   [wall] baseline  DFLAGS=''
+[22:21:01]   [baseline] 1.639ms  valid=1  regs=187
+[22:21:01] 
+[22:21:01] ==== PART A: WALL TIME — PER-OPERATION @ 1 WARP ====
+[22:21:01]   [wall] w1_full  DFLAGS='-DEPI_WARP_LIMIT=1'
+[22:21:03]   [w1_full] 1.284ms  valid=0  regs=187
+[22:21:03]   [wall] w1_only_tma_load  DFLAGS='-DEPI_WARP_LIMIT=1 -DSTRIP_EPI_TMA_STORE=1 -DSTRIP_EPI_COMPUTE=1'
+[22:21:05]   [w1_only_tma_load] 1.285ms  valid=0  regs=187
+[22:21:05]   [wall] w1_only_tma_store  DFLAGS='-DEPI_WARP_LIMIT=1 -DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_COMPUTE=1'
+[22:21:06]   [w1_only_tma_store] 1.284ms  valid=0  regs=187
+[22:21:06]   [wall] w1_only_compute  DFLAGS='-DEPI_WARP_LIMIT=1 -DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_TMA_STORE=1'
+[22:21:08]   [w1_only_compute] 1.284ms  valid=0  regs=187
+[22:21:08]   [wall] w1_no_tma_load  DFLAGS='-DEPI_WARP_LIMIT=1 -DSTRIP_EPI_TMA_LOAD=1'
+[22:21:09]   [w1_no_tma_load] 1.280ms  valid=0  regs=187
+[22:21:09]   [wall] w1_no_tma_store  DFLAGS='-DEPI_WARP_LIMIT=1 -DSTRIP_EPI_TMA_STORE=1'
+[22:21:11]   [w1_no_tma_store] 1.282ms  valid=0  regs=187
+[22:21:11]   [wall] w1_no_compute  DFLAGS='-DEPI_WARP_LIMIT=1 -DSTRIP_EPI_COMPUTE=1'
+[22:21:13]   [w1_no_compute] 1.284ms  valid=0  regs=187
+[22:21:13] 
+[22:21:13] ==== PART A: WALL TIME — PER-OPERATION @ 2 WARPS ====
+[22:21:13]   [wall] w2_full  DFLAGS='-DEPI_WARP_LIMIT=2'
+[22:21:14]   [w2_full] 1.395ms  valid=0  regs=187
+[22:21:14]   [wall] w2_only_tma_load  DFLAGS='-DEPI_WARP_LIMIT=2 -DSTRIP_EPI_TMA_STORE=1 -DSTRIP_EPI_COMPUTE=1'
+[22:21:16]   [w2_only_tma_load] 1.396ms  valid=0  regs=187
+[22:21:16]   [wall] w2_only_tma_store  DFLAGS='-DEPI_WARP_LIMIT=2 -DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_COMPUTE=1'
+[22:21:18]   [w2_only_tma_store] 1.397ms  valid=0  regs=187
+[22:21:18]   [wall] w2_only_compute  DFLAGS='-DEPI_WARP_LIMIT=2 -DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_TMA_STORE=1'
+[22:21:19]   [w2_only_compute] 1.400ms  valid=0  regs=187
+[22:21:19] 
+[22:21:19] ==== PART A: THERMAL DRIFT CHECK ====
+[22:21:19]   [wall] strip_end  DFLAGS='-DSTRIP_EPILOGUE=1'
+[22:21:21]   [strip_end] 1.161ms  valid=0  regs=79
+[22:21:21] 
+[22:21:21] ==== WALL TIME SUMMARY ====
+[22:21:21] 
+[22:21:21] ==== PART B: NCU — WARP SCALING (0,1,2,3,4 warps) ====
+[22:21:21]   [ncu] ncu_strip  DFLAGS='-DSTRIP_EPILOGUE=1'
+[22:21:22]   [ncu_strip] regs=79, collecting ncu metrics...
+[22:21:33]   [ncu_strip] ncu: 38 CSV lines
+[22:21:33]   [ncu] ncu_w1  DFLAGS='-DEPI_WARP_LIMIT=1'
+[22:21:34]   [ncu_w1] regs=187, collecting ncu metrics...
+[22:21:45]   [ncu_w1] ncu: 38 CSV lines
+[22:21:45]   [ncu] ncu_w2  DFLAGS='-DEPI_WARP_LIMIT=2'
+[22:21:46]   [ncu_w2] regs=187, collecting ncu metrics...
+[22:21:57]   [ncu_w2] ncu: 38 CSV lines
+[22:21:57]   [ncu] ncu_w3  DFLAGS='-DEPI_WARP_LIMIT=3'
+[22:21:58]   [ncu_w3] regs=187, collecting ncu metrics...
+[22:22:09]   [ncu_w3] ncu: 38 CSV lines
+[22:22:09]   [ncu] ncu_baseline  DFLAGS=''
+[22:22:09]   [ncu_baseline] regs=187, collecting ncu metrics...
+[22:22:20]   [ncu_baseline] ncu: 33 CSV lines
+[22:22:20] 
+[22:22:20] ==== PART B: NCU — PER-OPERATION @ 1 WARP ====
+[22:22:20]   [ncu] ncu_w1_only_tma_load  DFLAGS='-DEPI_WARP_LIMIT=1 -DSTRIP_EPI_TMA_STORE=1 -DSTRIP_EPI_COMPUTE=1'
+[22:22:21]   [ncu_w1_only_tma_load] regs=187, collecting ncu metrics...
+[22:22:32]   [ncu_w1_only_tma_load] ncu: 38 CSV lines
+[22:22:32]   [ncu] ncu_w1_only_tma_store  DFLAGS='-DEPI_WARP_LIMIT=1 -DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_COMPUTE=1'
+[22:22:33]   [ncu_w1_only_tma_store] regs=187, collecting ncu metrics...
+[22:22:44]   [ncu_w1_only_tma_store] ncu: 38 CSV lines
+[22:22:44]   [ncu] ncu_w1_only_compute  DFLAGS='-DEPI_WARP_LIMIT=1 -DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_TMA_STORE=1'
+[22:22:45]   [ncu_w1_only_compute] regs=187, collecting ncu metrics...
+[22:22:55]   [ncu_w1_only_compute] ncu: 38 CSV lines
+[22:22:55] 
+[22:22:55] Done in 123s. Results: data/contention_20260330_222052/
+[22:22:55]   wall_summary.txt  — wall time decomposition
+[22:22:55]   ncu/              — per-variant ncu CSV
+[22:22:55]   session.log       — full log
