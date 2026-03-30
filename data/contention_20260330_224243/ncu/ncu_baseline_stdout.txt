@@ -1,0 +1,32 @@
+FC2 GEMM — tcgen05 cta_group::2 (6 warps [4 epi], cluster of 2)
+  GEMM: [928256,3072] x [768,3072]^T  4-stage pipeline  bias+residual  SMEM-staged stores  idesc: 0x10400010
+==PROF== Connected to process 8905 (/root/siglip/fc2)
+==PROF== Profiling "init_residual" - 0: 0%....50%....100% - 13 passes
+  Alloc + init done
+  TMA descriptors + func attr done
+Launching warmup (2 iters)...
+==PROF== Profiling "persistent_gemm" - 1: 0%....50%....100% - 13 passes
+==PROF== Profiling "persistent_gemm" - 2: 0%....50%....100% - 13 passes
+  Waiting for warmup sync...
+  Warmup done.
+Timing: 10 iterations...
+==PROF== Profiling "persistent_gemm" - 3: 0%....50%....100% - 13 passes
+==PROF== Profiling "persistent_gemm" - 4: 0%....50%....100% - 13 passes
+==PROF== Profiling "persistent_gemm" - 5: 0%....50%....100% - 13 passes
+==PROF== Profiling "persistent_gemm" - 6: 0%....50%....100% - 13 passes
+==PROF== Profiling "persistent_gemm" - 7: 0%....50%....100% - 13 passes
+==PROF== Profiling "persistent_gemm" - 8: 0%....50%....100% - 13 passes
+==PROF== Profiling "persistent_gemm" - 9: 0%....50%....100% - 13 passes
+==PROF== Profiling "persistent_gemm" - 10: 0%....50%....100% - 13 passes
+==PROF== Profiling "persistent_gemm" - 11: 0%....50%....100% - 13 passes
+==PROF== Profiling "persistent_gemm" - 12: 0%....50%....100% - 13 passes
+FC2 kernel: 722.942 ms  6.06 TFLOPS
+==PROF== Profiling "persistent_gemm" - 13: 0%....50%....100% - 13 passes
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 7315328.000000
+C[0,0..3] = 6912.0 4608.0 6912.0 4608.0
+DIAG row0 actual:   6912.0 4608.0 6912.0 4608.0 6912.0 4608.0 6912.0 4608.0 
+DIAG row0 expected: 6912.0 4608.0 6912.0 4608.0 6912.0 4608.0 6912.0 4608.0 
+@@RESULT ms=722.942 tflops=6.06 checksum=7315328.000000 valid=1 c0=6912.0
+==PROF== Disconnected from process 8905
+==PROF== Report: /root/siglip/data/contention_20260330_224243/ncu/ncu_baseline.ncu-rep

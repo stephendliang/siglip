@@ -1,0 +1,38 @@
+LABEL                           MS    DELTA     REGS  DFLAGS
+------------------------- -------- -------- --------  ------
+strip                        1.160        0    79  -DSTRIP_EPILOGUE=1 INVALID
+w1                           1.282     .122   187  -DEPI_WARP_LIMIT=1 INVALID
+w2                           1.397     .237   187  -DEPI_WARP_LIMIT=2 INVALID
+w3                           1.523     .363   187  -DEPI_WARP_LIMIT=3 INVALID
+baseline                     1.641     .481   187  
+w1_full                      1.284     .124   187  -DEPI_WARP_LIMIT=1 INVALID
+w1_only_tma_load             1.281     .121   187  -DEPI_WARP_LIMIT=1 -DSTRIP_EPI_TMA_STORE=1 -DSTRIP_EPI_COMPUTE=1 INVALID
+w1_only_tma_store            1.284     .124   187  -DEPI_WARP_LIMIT=1 -DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_COMPUTE=1 INVALID
+w1_only_compute              1.283     .123   187  -DEPI_WARP_LIMIT=1 -DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_TMA_STORE=1 INVALID
+w1_no_tma_load               1.284     .124   187  -DEPI_WARP_LIMIT=1 -DSTRIP_EPI_TMA_LOAD=1 INVALID
+w1_no_tma_store              1.282     .122   187  -DEPI_WARP_LIMIT=1 -DSTRIP_EPI_TMA_STORE=1 INVALID
+w1_no_compute                1.282     .122   187  -DEPI_WARP_LIMIT=1 -DSTRIP_EPI_COMPUTE=1 INVALID
+w2_full                      1.400     .240   187  -DEPI_WARP_LIMIT=2 INVALID
+w2_only_tma_load             1.399     .239   187  -DEPI_WARP_LIMIT=2 -DSTRIP_EPI_TMA_STORE=1 -DSTRIP_EPI_COMPUTE=1 INVALID
+w2_only_tma_store            1.398     .238   187  -DEPI_WARP_LIMIT=2 -DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_COMPUTE=1 INVALID
+w2_only_compute              1.398     .238   187  -DEPI_WARP_LIMIT=2 -DSTRIP_EPI_TMA_LOAD=1 -DSTRIP_EPI_TMA_STORE=1 INVALID
+strip_end                    1.161     .001    79  -DSTRIP_EPILOGUE=1 INVALID
+
+=== 1-WARP DECOMPOSITION (overhead=.124ms) ===
+OPERATION                       MS    DELTA % OF 1W OVERHEAD
+------------------------- -------- -------- ----------------
+w1_full                      1.284    0.124   100.0%
+w1_only_tma_load             1.281    0.121    90.0%
+w1_only_tma_store            1.284    0.124   100.0%
+w1_only_compute              1.283    0.123    90.0%
+w1_no_tma_load               1.284    0.124   100.0%
+w1_no_tma_store              1.282    0.122    90.0%
+w1_no_compute                1.282    0.122    90.0%
+
+=== 2-WARP DECOMPOSITION (overhead=.240ms) ===
+OPERATION                       MS    DELTA % OF 2W OVERHEAD
+------------------------- -------- -------- ----------------
+w2_full                      1.400    0.240   100.0%
+w2_only_tma_load             1.399    0.239    90.0%
+w2_only_tma_store            1.398    0.238    90.0%
+w2_only_compute              1.398    0.238    90.0%
