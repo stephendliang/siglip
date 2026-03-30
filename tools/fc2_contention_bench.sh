@@ -48,19 +48,33 @@ if [ "$DRY_RUN" = "0" ]; then
 fi
 
 # ── ncu metric list ──
-# Warp stall reasons (where W1 cycles go)
+# Warp stall reasons — both naming conventions (ncu version-dependent)
 STALL_METRICS=(
+    # Standard stall cycle counts (absolute, per-SM)
+    "smsp__warps_issue_stalled_long_scoreboard.avg"
+    "smsp__warps_issue_stalled_short_scoreboard.avg"
+    "smsp__warps_issue_stalled_mio_throttle.avg"
+    "smsp__warps_issue_stalled_math_pipe_throttle.avg"
+    "smsp__warps_issue_stalled_not_selected.avg"
+    "smsp__warps_issue_stalled_barrier.avg"
+    "smsp__warps_issue_stalled_membar.avg"
+    "smsp__warps_issue_stalled_wait.avg"
+    "smsp__warps_issue_stalled_drain.avg"
+    "smsp__warps_issue_stalled_sleeping.avg"
+    "smsp__warps_issue_stalled_misc.avg"
+    # Percentage variants
     "smsp__warps_issue_stalled_long_scoreboard_per_warp_active.pct"
     "smsp__warps_issue_stalled_short_scoreboard_per_warp_active.pct"
     "smsp__warps_issue_stalled_mio_throttle_per_warp_active.pct"
     "smsp__warps_issue_stalled_math_pipe_throttle_per_warp_active.pct"
     "smsp__warps_issue_stalled_not_selected_per_warp_active.pct"
     "smsp__warps_issue_stalled_barrier_per_warp_active.pct"
-    "smsp__warps_issue_stalled_membar_per_warp_active.pct"
     "smsp__warps_issue_stalled_wait_per_warp_active.pct"
-    "smsp__warps_issue_stalled_drain_per_warp_active.pct"
-    "smsp__warps_issue_stalled_sleeping_per_warp_active.pct"
-    "smsp__warps_issue_stalled_misc_per_warp_active.pct"
+    # Active cycle counts
+    "smsp__cycles_active.avg"
+    "smsp__warps_active.avg.per_cycle_active"
+    "sm__warps_active.avg.per_cycle_active"
+    "sm__cycles_active.avg"
 )
 
 # Memory throughput and utilization
@@ -73,6 +87,9 @@ MEM_METRICS=(
     "dram__bytes_read.sum"
     "dram__bytes_write.sum"
     "lts__t_sectors.sum"
+    "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum"
+    "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum"
+    "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum"
 )
 
 # SM pipe utilization
@@ -84,9 +101,10 @@ PIPE_METRICS=(
     "sm__pipe_shared_cycles_active.avg.pct_of_peak_sustained_elapsed"
     "smsp__inst_executed.sum"
     "sm__throughput.avg.pct_of_peak_sustained_elapsed"
+    "sm__inst_executed.avg.per_cycle_active"
 )
 
-# TMA-specific (if available — ncu may not expose these on all configs)
+# TMA / MIO (if available)
 TMA_METRICS=(
     "sm__mio_pq_read_cycles_active.avg.pct_of_peak_sustained_elapsed"
     "sm__mio_pq_write_cycles_active.avg.pct_of_peak_sustained_elapsed"
@@ -194,31 +212,23 @@ run_ncu() {
     regs=$(grep -o '[0-9]* registers' "$OUTDIR/${label}_build.log" | head -1 | grep -o '[0-9]*')
     log "  [$label] regs=${regs}, collecting ncu metrics..."
 
-    # Collect ncu metrics as CSV
-    # --target-processes all to handle multi-process
-    # --kernel-name to filter to our kernel only
-    # Use --csv for machine-readable output
+    # Collect ncu metrics as CSV.
+    # --csv gives machine-readable output. Do NOT use --page raw (overrides --metrics).
+    # ncu-rep first, then export CSV (separates kernel stdout from metric data).
     if ncu --metrics "$METRICS_CSV" \
-           --csv \
-           --page raw \
+           -o "$OUTDIR/ncu/${label}" \
            ./fc2 \
-           > "$OUTDIR/ncu/${label}.csv" 2>"$OUTDIR/ncu/${label}_stderr.txt"; then
+           > "$OUTDIR/ncu/${label}_stdout.txt" 2>"$OUTDIR/ncu/${label}_stderr.txt"; then
+        # Export clean CSV from the .ncu-rep (no kernel stdout contamination)
+        ncu --import "$OUTDIR/ncu/${label}.ncu-rep" \
+            --csv \
+            > "$OUTDIR/ncu/${label}.csv" 2>/dev/null
+        rm -f "$OUTDIR/ncu/${label}.ncu-rep"
         local lines
         lines=$(wc -l < "$OUTDIR/ncu/${label}.csv")
         log "  [$label] ncu: ${lines} CSV lines"
     else
         log "  [$label] NCU FAILED (see ncu/${label}_stderr.txt)"
-        # Try fallback with --set full (collects everything, slower)
-        log "  [$label] Trying --set full fallback..."
-        if ncu --set full \
-               --csv \
-               --page raw \
-               ./fc2 \
-               > "$OUTDIR/ncu/${label}_full.csv" 2>"$OUTDIR/ncu/${label}_full_stderr.txt"; then
-            log "  [$label] ncu full fallback OK"
-        else
-            log "  [$label] NCU FULL ALSO FAILED"
-        fi
     fi
 }
 
