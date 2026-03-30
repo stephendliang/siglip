@@ -1,0 +1,19 @@
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DN_STAGES=5 -DTMA_RESIDUAL=1 -DNUM_EPI_WARPS=3 -DW0_RES_PREFETCH=1 fc2.cu -o fc2 -lcurand_static -lculibos -lcuda
+kernel_body.cuh(1216): warning #177-D: variable "rv0" was declared but never referenced
+          uint4 rv0 = {};
+                ^
+          detected during instantiation of "void persistent_gemm<Op>(CUtensorMap, CUtensorMap, CUtensorMap, SideDataPtr<Op>, __nv_bfloat16 *, const __nv_bfloat16 *, CUtensorMap) [with Op=EpilogueOp::BIAS_RESIDUAL]" at line 323 of fc2.cu
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z15persistent_gemmIL10EpilogueOp2EEv14CUtensorMap_stS1_S1_N16EpilogueSideDataIXT_EE4typeEP13__nv_bfloat16PKS5_S1_' for 'sm_100a'
+ptxas info    : Function properties for _Z15persistent_gemmIL10EpilogueOp2EEv14CUtensorMap_stS1_S1_N16EpilogueSideDataIXT_EE4typeEP13__nv_bfloat16PKS5_S1_
+    16 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 201 registers, used 0 barriers, 16 bytes cumulative stack size
+ptxas info    : Compile time = 80.830 ms
+ptxas info    : Compiling entry function '_Z13init_residualP13__nv_bfloat16ix' for 'sm_100a'
+ptxas info    : Function properties for _Z13init_residualP13__nv_bfloat16ix
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 0 barriers
+ptxas info    : Compile time = 3.974 ms
