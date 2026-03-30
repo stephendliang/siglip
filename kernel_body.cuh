@@ -2324,6 +2324,11 @@ persistent_gemm(
 #if EPI_WARP_LIMIT
                 if (ew >= EPI_WARP_LIMIT) {
                     mbar_arrive(epi_mbar_masked);
+#if W0_RES_PREFETCH || W0_RES_FULL || EPI_LOAD_WARP
+                    /* Skipped warps must still signal res_consumed so W0 doesn't deadlock */
+                    if (lane == 0)
+                        mbar_arrive(smem_to_uint(smem + OFF_RES_CONSUMED_MBAR));
+#endif
                 } else
 #endif
                 {
