@@ -1841,6 +1841,17 @@ persistent_gemm(
                 }
             }
 #if STAGES_C >= 2
+#if EPI_REUSE_SMEM
+            /* Drain: W1 (MMA) may still be consuming A/B from pipeline stages
+               that overlap with staging. Without this, W0's residual TMA loads
+               overwrite stages W1 is still reading → wrong GEMM accumulation.
+               Wait on mma_mbar for each borrowed stage to confirm W1 is done. */
+            for (int s = EPI_FIRST_BORROW_KI; s < N_STAGES; s++) {
+                const uint32_t mma_mbar_s = smem_base + OFF_MMA_MBAR + s * 8;
+                mbar_wait(mma_mbar_s, mma_phase[s]);
+                mma_phase[s] ^= 1;
+            }
+#endif
             /*
             StagesC: W0 pre-loads ALL residual passes for the CURRENT tile.
             The epilogue for this tile runs in the NEXT iteration, so the data
