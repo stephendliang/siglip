@@ -1845,11 +1845,13 @@ persistent_gemm(
             /* Drain: W1 (MMA) may still be consuming A/B from pipeline stages
                that overlap with staging. Without this, W0's residual TMA loads
                overwrite stages W1 is still reading → wrong GEMM accumulation.
-               Wait on mma_mbar for each borrowed stage to confirm W1 is done. */
+               Wait on mma_mbar for each borrowed stage to confirm W1 is done.
+               DO NOT toggle mma_phase — this is a read-only check, not part of
+               the producer-consumer protocol. Toggling would cause the next tile's
+               K-loop to deadlock (W0 blocks before loading A/B). */
             for (int s = EPI_FIRST_BORROW_KI; s < N_STAGES; s++) {
                 const uint32_t mma_mbar_s = smem_base + OFF_MMA_MBAR + s * 8;
                 mbar_wait(mma_mbar_s, mma_phase[s]);
-                mma_phase[s] ^= 1;
             }
 #endif
             /*
