@@ -2329,6 +2329,14 @@ persistent_gemm(
                     if (lane == 0)
                         mbar_arrive(smem_to_uint(smem + OFF_RES_CONSUMED_MBAR));
 #endif
+#if STAGES_C >= 2
+                    /* Skipped warps must arrive on sc_release_mbar for each pass,
+                       otherwise W0 deadlocks waiting for NUM_EPI_WARPS arrivals */
+                    if (lane == 0) {
+                        for (int p = 0; p < STAGES_C; p++)
+                            mbar_arrive(smem_to_uint(smem + OFF_SC_REL_MBAR + p * 8));
+                    }
+#endif
                 } else
 #endif
                 {
