@@ -353,6 +353,14 @@ Problem dimensions — N_DIM must be defined before including this header
 #endif
 #define STAGING_WARP_BYTES        (STAGING_REGIONS_PER_WARP * STAGING_REGION_BYTES)  // bytes per warp
 #define STAGING_EPI_WARPS         NUM_EPI_WARPS
+#if NUM_EPI_WARPS <= 4
+#define ROW_GROUPS_PER_WARP       (4 / NUM_EPI_WARPS)
+#if (4 % NUM_EPI_WARPS) != 0
+#error "NUM_EPI_WARPS must divide 4 (valid: 1, 2, 4)"
+#endif
+#else
+#define ROW_GROUPS_PER_WARP       1
+#endif
 #if EPI_PIPELINE
 #define SMEM_BYTES                ((OFF_STAGING + EPI_PIPELINE_STAGES * STAGE_C_BYTES + 127) & ~127)
 #else

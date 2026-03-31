@@ -2795,17 +2795,21 @@ def schedule_to_recipe(instructions, ordered_addrs, stall_counts):
 
     # Check if reorder is needed (any instruction moved)
     orig_addrs = [insn.offset for insn in instructions]
-    if ordered_addrs != orig_addrs:
+    reordered = (ordered_addrs != orig_addrs)
+    if reordered:
         addr_str = ','.join('0x%04x' % a for a in ordered_addrs)
         recipe.append('reorder 0x%04x 0x%04x %s' % (start_addr, end_addr, addr_str))
         recipe.append('')
 
-    # Stall patches
+    # Stall patches — after reorder, instruction originally at ordered_addrs[p]
+    # is now at address start_addr + p * INSN_SIZE.  Stall commands must target
+    # the NEW address, not the original.
     recipe.append('# Stall count patches')
-    for addr in ordered_addrs:
-        stall = stall_counts.get(addr)
+    for p, orig_addr in enumerate(ordered_addrs):
+        stall = stall_counts.get(orig_addr)
         if stall is not None:
-            recipe.append('stall 0x%04x %d' % (addr, stall))
+            new_addr = (start_addr + p * INSN_SIZE) if reordered else orig_addr
+            recipe.append('stall 0x%04x %d' % (new_addr, stall))
 
     recipe.append('')
     recipe.append('# Post-schedule audit')
@@ -4168,12 +4172,17 @@ def cmd_schedule(args):
     if args.output:
         # Apply reorder
         orig_addrs = [insn.offset for insn in region]
-        if ordered_addrs != orig_addrs:
+        reordered = (ordered_addrs != orig_addrs)
+        if reordered:
             ed.reorder(k, start, end, ordered_addrs, force=True)
 
-        # Apply stall counts
-        for addr, stall in stall_counts.items():
-            ed.patch_stall(k, addr, stall)
+        # Apply stall counts — after reorder, instruction originally at
+        # ordered_addrs[p] is now at start + p * INSN_SIZE.
+        for p, orig_addr in enumerate(ordered_addrs):
+            stall = stall_counts.get(orig_addr)
+            if stall is not None:
+                new_addr = (start + p * INSN_SIZE) if reordered else orig_addr
+                ed.patch_stall(k, new_addr, stall)
 
         ed.save(args.output)
         print('Patched cubin written to %s' % args.output)

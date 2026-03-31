@@ -132,8 +132,8 @@ START_TIME=$(date +%s)
 log ""
 log "==== TEST 1: REFERENCE BASELINES ===="
 
-# NOTE: WL<4 and NEPI<4 produce valid=0 — only 32*N rows per CTA rank are written
-# (row_group = ew % 4, fewer warps = incomplete row coverage). Timing-only configs.
+# NOTE: NEPI<4 now produces valid output (multi-row-group loop).
+# WL<4 still produces valid=0 (skipped warps don't loop over extra row_groups).
 BASELINES=(
     "strip|$BASE -DSTRIP_EPILOGUE=1"
     "base_4w|$BASE"
@@ -172,17 +172,37 @@ if [ "$QUICK" = "0" ]; then
 fi
 
 # ════════════════════════════════════════
-# TEST 2: SKIPPED — SC2+EPI_REUSE_SMEM is fundamentally broken
-# (pre-loaded residual in borrowed stages overwritten by A/B at ki=2)
+# TEST 2: NEPI=2 valid + x64 combos
+# Multi-row-group loop makes NEPI<4 produce valid=1.
+# Tests whether overhead is warp-COUNT based (~1.25ms) or active-TIME based (~1.47ms).
+# x64 TMEM loads halve inner-loop iterations — may shorten per-warp active time.
 # ════════════════════════════════════════
 log ""
-log "==== TEST 2: SKIPPED (SC2+EPI_REUSE_SMEM broken — see kernel_common.cuh #error) ===="
+log "==== TEST 2: NEPI=2 VALID + x64 COMBOS ===="
+
+NEPI2_COMBOS=(
+    "nepi2_valid|$BASE -DNUM_EPI_WARPS=2"
+    "nepi2_bs|$BASE -DNUM_EPI_WARPS=2 -DBIAS_SMEM=1"
+    "nepi2_x64|$BASE -DNUM_EPI_WARPS=2 -DTMEM_LOAD_WIDTH=64"
+    "nepi2_x64_bs|$BASE -DNUM_EPI_WARPS=2 -DTMEM_LOAD_WIDTH=64 -DBIAS_SMEM=1"
+    "nepi1_valid|$BASE -DNUM_EPI_WARPS=1"
+    "nepi1_x64|$BASE -DNUM_EPI_WARPS=1 -DTMEM_LOAD_WIDTH=64"
+)
+
+for exp in "${NEPI2_COMBOS[@]}"; do
+    IFS='|' read -r label dflags <<< "$exp"
+    run_wall "$label" "$dflags"
+done
 
 # ════════════════════════════════════════
-# TEST 3: SKIPPED — same root cause as TEST 2
+# TEST 3: NEPI=2 timing (cycle breakdown for best combos)
 # ════════════════════════════════════════
 log ""
-log "==== TEST 3: SKIPPED (SC2+EPI_REUSE_SMEM broken) ===="
+log "==== TEST 3: NEPI=2 TIMING ===="
+
+run_wall_timing "t_nepi2_valid" "$BASE -DNUM_EPI_WARPS=2"
+run_wall_timing "t_nepi2_x64" "$BASE -DNUM_EPI_WARPS=2 -DTMEM_LOAD_WIDTH=64"
+run_wall_timing "t_nepi2_x64_bs" "$BASE -DNUM_EPI_WARPS=2 -DTMEM_LOAD_WIDTH=64 -DBIAS_SMEM=1"
 
 # ════════════════════════════════════════
 # TEST 4: SC2 without EPI_REUSE_SMEM (2 warps, fits naturally)
@@ -411,6 +431,22 @@ if [ -f "$OUTDIR/wall_results.txt" ] && [ "$DRY_RUN" = "0" ]; then
             printf "%-20s %8s %8s %5s  %s%s\n" "$label" "$ms" "$delta" "$regs" "$dflags" "$mark"
         done < "$OUTDIR/wall_results.txt"
     } | tee "$OUTDIR/wall_summary.txt"
+
+    # NEPI=2 valid configs vs baselines
+    echo "" | tee -a "$OUTDIR/wall_summary.txt"
+    echo "=== NEPI=2 VALID vs BASELINES ===" | tee -a "$OUTDIR/wall_summary.txt"
+    base4w_ms=$(grep 'label=base_4w ' "$OUTDIR/wall_results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
+    cutlass_ms2=$(grep 'label=cutlass ' "$OUTDIR/wall_results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
+    for label in nepi2_valid nepi2_bs nepi2_x64 nepi2_x64_bs nepi1_valid nepi1_x64; do
+        ms=$(grep "label=${label} " "$OUTDIR/wall_results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
+        valid=$(grep "label=${label} " "$OUTDIR/wall_results.txt" | grep -o 'valid=[01]' | cut -d= -f2)
+        if [ -n "$ms" ]; then
+            d4w="—"; dcut="—"
+            [ -n "$base4w_ms" ] && d4w=$(echo "($ms - $base4w_ms) * 1000" | bc -l 2>/dev/null | sed 's/^\./0./' | cut -c1-7 || echo "?")
+            [ -n "$cutlass_ms2" ] && dcut=$(echo "($ms - $cutlass_ms2) * 1000" | bc -l 2>/dev/null | sed 's/^\./0./' | cut -c1-7 || echo "?")
+            printf "  %-18s %sms  v=%s  Δ4w=%sμs  Δcut=%sμs\n" "$label" "$ms" "${valid:-?}" "$d4w" "$dcut" | tee -a "$OUTDIR/wall_summary.txt"
+        fi
+    done
 
     # SC2 no-reuse vs baseline (2 warps only — the only valid SC2 config with NS5)
     echo "" | tee -a "$OUTDIR/wall_summary.txt"

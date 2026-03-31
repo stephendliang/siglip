@@ -2261,8 +2261,9 @@ persistent_gemm(
                 gm_base = prev_m + row_group * 32;
             }
 
-#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH && !W0_RES_FULL && !EPI_PIPELINE && !STRIP_EPILOGUE
-            /* Preload first-pass residual before mainloop wait — TMA flies during idle */
+#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH && !W0_RES_FULL && !EPI_PIPELINE && !STRIP_EPILOGUE && ROW_GROUPS_PER_WARP == 1
+            /* Preload first-pass residual before mainloop wait — TMA flies during idle.
+               Disabled for multi-row-group (preload only covers rg_iter=0). */
             if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
                 if (tile_idx > tile_start && lane == 0) {
                     const uint32_t res_mbar = smem_to_uint(smem + OFF_RES_MBAR + ew * 8);
@@ -2404,7 +2405,12 @@ persistent_gemm(
                 } else
 #endif
                 {
-                    epilogue_store<0, TN, Op, EPI_PRELOADED>(prev_buf * TN, row_group, lane, gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, epi_mbar_masked, &tma_c
+                    for (int rg_iter = 0; rg_iter < ROW_GROUPS_PER_WARP; rg_iter++) {
+                        const int rg = ew + rg_iter * NUM_EPI_WARPS;
+                        const int rg_gm_base = gm_base + rg_iter * NUM_EPI_WARPS * 32;
+                        const uint32_t rg_epi_mbar = (rg_iter == ROW_GROUPS_PER_WARP - 1) ? epi_mbar_masked : 0;
+
+                    epilogue_store<0, TN, Op, (EPI_PRELOADED && ROW_GROUPS_PER_WARP == 1)>(prev_buf * TN, rg, lane, rg_gm_base, prev_n, side_data, C, residual, cta_rank, staging_saddr, rg_epi_mbar, &tma_c
 #if TMA_RESIDUAL
 #if EPI_PIPELINE
                         , &tma_res, smem_to_uint(smem + OFF_PIPE_LOAD_MBAR), 0
@@ -2431,6 +2437,7 @@ persistent_gemm(
                         , epi_t1
 #endif
                     );
+                    }
                 }
                 } /* EPI_WARP_LIMIT else / unconditional */
 #if REG_PAD
@@ -2671,8 +2678,9 @@ persistent_gemm(
         const int last_n = ltn * TN;
         const int gm_base = last_m + row_group * 32;
 
-#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH && !W0_RES_FULL && !EPI_LOAD_WARP
-        /* Preload first-pass residual before mainloop wait — TMA flies during idle */
+#if TMA_RESIDUAL >= 2 && !W0_RES_PREFETCH && !W0_RES_FULL && !EPI_LOAD_WARP && ROW_GROUPS_PER_WARP == 1
+        /* Preload first-pass residual before mainloop wait — TMA flies during idle.
+           Disabled for multi-row-group (preload only covers rg_iter=0). */
         if constexpr (Op == EpilogueOp::BIAS_RESIDUAL) {
             if (lane == 0) {
                 const uint32_t res_mbar = smem_to_uint(smem + OFF_RES_MBAR + ew * 8);
@@ -2769,7 +2777,11 @@ persistent_gemm(
         } else
 #endif
         {
-            epilogue_store<0, TN, Op, EPI_PRELOADED>(last_buf * TN, row_group, lane, gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
+            for (int rg_iter = 0; rg_iter < ROW_GROUPS_PER_WARP; rg_iter++) {
+                const int rg = ew + rg_iter * NUM_EPI_WARPS;
+                const int rg_gm_base = gm_base + rg_iter * NUM_EPI_WARPS * 32;
+
+            epilogue_store<0, TN, Op, (EPI_PRELOADED && ROW_GROUPS_PER_WARP == 1)>(last_buf * TN, rg, lane, rg_gm_base, last_n, side_data, C, residual, cta_rank, staging_saddr, 0, &tma_c
 #if TMA_RESIDUAL
 #if EPI_PIPELINE
                 , &tma_res, smem_to_uint(smem + OFF_PIPE_LOAD_MBAR), 0
@@ -2798,6 +2810,7 @@ persistent_gemm(
                 , drain_t1
 #endif
             );
+            }
         }
         } /* EPI_WARP_LIMIT / unconditional */
 #if REG_PAD
