@@ -172,54 +172,17 @@ if [ "$QUICK" = "0" ]; then
 fi
 
 # ════════════════════════════════════════
-# TEST 2: SC2 + EPI_REUSE_SMEM (4/3/2 warps)
+# TEST 2: SKIPPED — SC2+EPI_REUSE_SMEM is fundamentally broken
+# (pre-loaded residual in borrowed stages overwritten by A/B at ki=2)
 # ════════════════════════════════════════
 log ""
-log "==== TEST 2: STAGES_C=2 + EPI_REUSE_SMEM ===="
-
-SC2_EXPERIMENTS=(
-    "sc2_4w|$SC2"
-    "sc2_wl2|$SC2 -DEPI_WARP_LIMIT=2"
-    "sc2_wl1|$SC2 -DEPI_WARP_LIMIT=1"
-    "sc2_nepi2|$SC2 -DNUM_EPI_WARPS=2"
-)
-
-if [ "$QUICK" = "0" ]; then
-    SC2_EXPERIMENTS+=(
-        "sc2_wl3|$SC2 -DEPI_WARP_LIMIT=3"
-        "sc2_nepi3|$SC2 -DNUM_EPI_WARPS=3"
-    )
-fi
-
-for exp in "${SC2_EXPERIMENTS[@]}"; do
-    IFS='|' read -r label dflags <<< "$exp"
-    run_wall "$label" "$dflags"
-done
+log "==== TEST 2: SKIPPED (SC2+EPI_REUSE_SMEM broken — see kernel_common.cuh #error) ===="
 
 # ════════════════════════════════════════
-# TEST 3: SC2 + EPI_REUSE_SMEM + BIAS_SMEM (zero global loads)
+# TEST 3: SKIPPED — same root cause as TEST 2
 # ════════════════════════════════════════
 log ""
-log "==== TEST 3: SC2 + BIAS_SMEM (zero LDG in epilogue) ===="
-
-SC2_BS_EXPERIMENTS=(
-    "sc2bs_4w|$SC2 -DBIAS_SMEM=1"
-    "sc2bs_wl2|$SC2 -DBIAS_SMEM=1 -DEPI_WARP_LIMIT=2"
-    "sc2bs_wl1|$SC2 -DBIAS_SMEM=1 -DEPI_WARP_LIMIT=1"
-    "sc2bs_nepi2|$SC2 -DBIAS_SMEM=1 -DNUM_EPI_WARPS=2"
-)
-
-if [ "$QUICK" = "0" ]; then
-    SC2_BS_EXPERIMENTS+=(
-        "sc2bs_wl3|$SC2 -DBIAS_SMEM=1 -DEPI_WARP_LIMIT=3"
-        "sc2bs_nepi3|$SC2 -DBIAS_SMEM=1 -DNUM_EPI_WARPS=3"
-    )
-fi
-
-for exp in "${SC2_BS_EXPERIMENTS[@]}"; do
-    IFS='|' read -r label dflags <<< "$exp"
-    run_wall "$label" "$dflags"
-done
+log "==== TEST 3: SKIPPED (SC2+EPI_REUSE_SMEM broken) ===="
 
 # ════════════════════════════════════════
 # TEST 4: SC2 without EPI_REUSE_SMEM (2 warps, fits naturally)
@@ -238,15 +201,23 @@ log "==== TEST 5: TIMING (kloop/ph1/epi_wait breakdown) ===="
 
 run_wall_timing "t_strip" "$BASE -DSTRIP_EPILOGUE=1"
 run_wall_timing "t_base" "$BASE"
-run_wall_timing "t_sc2_4w" "$SC2"
-run_wall_timing "t_sc2bs_nepi2" "$SC2 -DBIAS_SMEM=1 -DNUM_EPI_WARPS=2"
 run_wall_timing "t_base_nepi2" "$BASE -DNUM_EPI_WARPS=2"
+run_wall_timing "t_sc2nr_nepi2" "$BASE -DSTAGES_C=2 -DNUM_EPI_WARPS=2"
 
 # ════════════════════════════════════════
 # TEST 6: SASS-patched binaries (build + CP-SAT schedule + patch on target)
 # ════════════════════════════════════════
 log ""
 log "==== TEST 6: SASS-PATCHED BINARIES ===="
+
+# Pre-check: ortools required for CP-SAT scheduler
+if ! python3 -c "from ortools.sat.python import cp_model" 2>/dev/null; then
+    log "  [sass] ortools not found, installing..."
+    pip install ortools 2>&1 | tail -1 | tee -a "$OUTDIR/session.log"
+fi
+if ! python3 -c "from ortools.sat.python import cp_model" 2>/dev/null; then
+    log "  [sass] SKIPPED: ortools install failed"
+else
 
 CPSAT_TIME=120  # seconds per chunk
 
@@ -305,7 +276,7 @@ build_and_patch() {
         recipes+=("$recipe")
         python3 tools/sass_edit.py schedule "$cubin" --sass "$sass" \
             -s "$s" -e "$e" --recipe "$recipe" --time-limit "$CPSAT_TIME" --quiet \
-            > /dev/null 2>&1 &
+            > "$OUTDIR/${label}_chunk${i}.log" 2>&1 &
         pids+=($!)
     done
 
@@ -324,7 +295,7 @@ build_and_patch() {
     done
 
     local nops
-    nops=$(grep -c '^reorder\|^stall' "$merged" 2>/dev/null || echo 0)
+    nops=$(grep -c -E '^(reorder|stall)' "$merged" 2>/dev/null) || nops=0
     if [ "$nops" -lt 5 ]; then
         log "  [$label] only $nops recipe ops, skipping patch"
         return 1
@@ -383,20 +354,16 @@ run_binary() {
     fi
 }
 
-# Build + schedule + patch both variants
-build_and_patch "sc2_nepi2" "$BASE -DSTAGES_C=2 -DNUM_EPI_WARPS=2"
-build_and_patch "sc2bs_nepi2" "$BASE -DSTAGES_C=2 -DNUM_EPI_WARPS=2 -DBIAS_SMEM=1"
+# Build + schedule + patch: baseline 4w (the config that matters)
+build_and_patch "base_4w" "$BASE"
+build_and_patch "base_bs" "$BASE -DBIAS_SMEM=1"
 
 # Tight A/B: unpatched → patched → CUTLASS (minimal thermal drift between comparisons)
 log "  --- A/B comparison (tight) ---"
-run_binary "sc2_nepi2_unp" "$OUTDIR/sc2_nepi2_unpatched" "unpatched"
-run_binary "sc2_nepi2_pat" "sc2_nepi2_patched" "patched"
-run_binary "sc2bs_nepi2_unp" "$OUTDIR/sc2bs_nepi2_unpatched" "unpatched"
-run_binary "sc2bs_nepi2_pat" "sc2bs_nepi2_patched" "patched"
-
-# Also run baseline fc2 + CUTLASS in the same window for direct comparison
-run_wall "base_4w_ab" "$BASE"
-run_wall "base_nepi2_ab" "$BASE -DNUM_EPI_WARPS=2"
+run_binary "base_4w_unp" "$OUTDIR/base_4w_unpatched" "unpatched"
+run_binary "base_4w_pat" "base_4w_patched" "patched"
+run_binary "base_bs_unp" "$OUTDIR/base_bs_unpatched" "unpatched"
+run_binary "base_bs_pat" "base_bs_patched" "patched"
 if [ -x "./cutlass-bench-fc2-max" ] && [ "$DRY_RUN" = "0" ]; then
     log "  [cutlass_ab] running..."
     cutlass_out=$(./cutlass-bench-fc2-max 2>&1)
@@ -405,6 +372,8 @@ if [ -x "./cutlass-bench-fc2-max" ] && [ "$DRY_RUN" = "0" ]; then
     log "  [cutlass_ab] ${cutlass_ms:-ERR}ms"
     [ -n "$cutlass_ms" ] && echo "@@RESULT ms=${cutlass_ms} valid=1 label=cutlass_ab" >> "$OUTDIR/wall_results.txt"
 fi
+
+fi  # ortools check
 
 # ════════════════════════════════════════
 # Thermal drift check
@@ -443,35 +412,23 @@ if [ -f "$OUTDIR/wall_results.txt" ] && [ "$DRY_RUN" = "0" ]; then
         done < "$OUTDIR/wall_results.txt"
     } | tee "$OUTDIR/wall_summary.txt"
 
-    # SC2 vs baseline comparison
+    # SC2 no-reuse vs baseline (2 warps only — the only valid SC2 config with NS5)
     echo "" | tee -a "$OUTDIR/wall_summary.txt"
-    echo "=== SC2 vs BASELINE (same warp count) ===" | tee -a "$OUTDIR/wall_summary.txt"
-    for pair in "4w:base_4w:sc2_4w" "wl2:base_wl2:sc2_wl2" "wl1:base_wl1:sc2_wl1" "nepi2:base_nepi2:sc2_nepi2"; do
+    echo "=== SC2 no-reuse vs BASELINE (2 warps) ===" | tee -a "$OUTDIR/wall_summary.txt"
+    for pair in "nepi2:base_nepi2:sc2nr_nepi2" "nepi2_bs:base_nepi2:sc2nr_nepi2_bs"; do
         IFS=: read -r plabel blab slab <<< "$pair"
         bms=$(grep "label=${blab} " "$OUTDIR/wall_results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
         sms=$(grep "label=${slab} " "$OUTDIR/wall_results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
         if [ -n "$bms" ] && [ -n "$sms" ]; then
             diff_us=$(echo "($sms - $bms) * 1000" | bc -l 2>/dev/null | sed 's/^\./0./' | cut -c1-7 || echo "?")
-            printf "  %-8s base=%sms  sc2=%sms  Δ=%sμs\n" "$plabel" "$bms" "$sms" "$diff_us" | tee -a "$OUTDIR/wall_summary.txt"
+            printf "  %-12s base=%sms  sc2nr=%sms  Δ=%sμs\n" "$plabel" "$bms" "$sms" "$diff_us" | tee -a "$OUTDIR/wall_summary.txt"
         fi
     done
 
-    # BIAS_SMEM effect within SC2
-    echo "" | tee -a "$OUTDIR/wall_summary.txt"
-    echo "=== BIAS_SMEM EFFECT (within SC2) ===" | tee -a "$OUTDIR/wall_summary.txt"
-    for pair in "4w:sc2_4w:sc2bs_4w" "wl2:sc2_wl2:sc2bs_wl2" "wl1:sc2_wl1:sc2bs_wl1" "nepi2:sc2_nepi2:sc2bs_nepi2"; do
-        IFS=: read -r plabel blab slab <<< "$pair"
-        bms=$(grep "label=${blab} " "$OUTDIR/wall_results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
-        sms=$(grep "label=${slab} " "$OUTDIR/wall_results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
-        if [ -n "$bms" ] && [ -n "$sms" ]; then
-            diff_us=$(echo "($sms - $bms) * 1000" | bc -l 2>/dev/null | sed 's/^\./0./' | cut -c1-7 || echo "?")
-            printf "  %-8s sc2=%sms  sc2+bs=%sms  Δ=%sμs\n" "$plabel" "$bms" "$sms" "$diff_us" | tee -a "$OUTDIR/wall_summary.txt"
-        fi
-    done
     # SASS-patched A/B comparison (tight — same thermal window)
     echo "" | tee -a "$OUTDIR/wall_summary.txt"
     echo "=== SASS-PATCHED vs UNPATCHED (tight A/B) ===" | tee -a "$OUTDIR/wall_summary.txt"
-    for pair in "sc2_nepi2:sc2_nepi2_unp:sc2_nepi2_pat" "sc2bs_nepi2:sc2bs_nepi2_unp:sc2bs_nepi2_pat"; do
+    for pair in "base_4w:base_4w_unp:base_4w_pat" "base_bs:base_bs_unp:base_bs_pat"; do
         IFS=: read -r plabel blab slab <<< "$pair"
         bms=$(grep "label=${blab} " "$OUTDIR/wall_results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
         sms=$(grep "label=${slab} " "$OUTDIR/wall_results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)

@@ -148,6 +148,9 @@ Usage: #define N_DIM and K_DIM before including this header.
 #if STAGES_C && !TMA_RESIDUAL
 #error "STAGES_C requires TMA_RESIDUAL >= 1"
 #endif
+#if STAGES_C && EPI_REUSE_SMEM
+#error "STAGES_C incompatible with EPI_REUSE_SMEM: pre-loaded residual in borrowed stages gets overwritten by A/B at ki=EPI_FIRST_BORROW_KI before epilogue can read it"
+#endif
 #if STAGES_C && (W0_RES_FULL || W0_RES_PREFETCH || EPI_LOAD_WARP)
 #error "STAGES_C mutually exclusive with W0_RES_FULL/W0_RES_PREFETCH/EPI_LOAD_WARP"
 #endif
