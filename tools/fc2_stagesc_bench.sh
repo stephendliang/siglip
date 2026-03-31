@@ -164,8 +164,9 @@ if [ "$QUICK" = "0" ]; then
         if [ "$DRY_RUN" = "0" ]; then
             cutlass_out=$(./cutlass-bench-fc2-max 2>&1)
             echo "$cutlass_out" > "$OUTDIR/cutlass_output.txt"
-            cutlass_ms=$(echo "$cutlass_out" | grep -oP '[0-9]+\.[0-9]+' | head -1)
+            cutlass_ms=$(echo "$cutlass_out" | grep 'Best Fused:' | grep -oP '\d+\.\d+(?=\s+ms)')
             log "  [cutlass] ${cutlass_ms:-ERR}ms"
+            [ -n "$cutlass_ms" ] && echo "@@RESULT ms=${cutlass_ms} valid=1 label=cutlass" >> "$OUTDIR/wall_results.txt"
         fi
     fi
 fi
@@ -282,10 +283,9 @@ build_and_patch() {
     fi
     log "  [$label] cubin extracted ($(wc -c < "$cubin") bytes)"
 
-    # 3. Find epilogue LDTM boundaries
+    # 3. Find epilogue LDTM boundaries (grep cuobjdump SASS directly)
     local ldtm_addrs
-    ldtm_addrs=($(python3 tools/sass_edit.py dump "$cubin" --sass "$sass" 2>/dev/null \
-        | grep 'LDTM' | sed -n 's/^\[\([0-9a-f]*\)\].*/\1/p'))
+    ldtm_addrs=($(grep -oP '/\*\K[0-9a-f]+(?=\*/\s+LDTM)' "$sass"))
 
     if [ ${#ldtm_addrs[@]} -lt 6 ]; then
         log "  [$label] only ${#ldtm_addrs[@]} LDTM found, skipping patch"
@@ -401,8 +401,9 @@ if [ -x "./cutlass-bench-fc2-max" ] && [ "$DRY_RUN" = "0" ]; then
     log "  [cutlass_ab] running..."
     cutlass_out=$(./cutlass-bench-fc2-max 2>&1)
     echo "$cutlass_out" > "$OUTDIR/cutlass_ab_output.txt"
-    cutlass_ms=$(echo "$cutlass_out" | grep -oP '[0-9]+\.[0-9]+' | head -1)
+    cutlass_ms=$(echo "$cutlass_out" | grep 'Best Fused:' | grep -oP '\d+\.\d+(?=\s+ms)')
     log "  [cutlass_ab] ${cutlass_ms:-ERR}ms"
+    [ -n "$cutlass_ms" ] && echo "@@RESULT ms=${cutlass_ms} valid=1 label=cutlass_ab" >> "$OUTDIR/wall_results.txt"
 fi
 
 # ════════════════════════════════════════
