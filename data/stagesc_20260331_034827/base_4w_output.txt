@@ -1,0 +1,15 @@
+FC2 GEMM — tcgen05 cta_group::2 (6 warps [4 epi], cluster of 2)
+  GEMM: [928256,3072] x [768,3072]^T  5-stage pipeline  bias+residual  SMEM-staged stores  idesc: 0x10400010
+  Alloc + init done
+  TMA descriptors + func attr done
+Launching warmup (2 iters)...
+  Waiting for warmup sync...
+  Warmup done.
+Timing: 10 iterations...
+FC2 kernel: 1.471 ms  2977.71 TFLOPS
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 7315328.000000
+C[0,0..3] = 6912.0 4608.0 6912.0 4608.0
+DIAG row0 actual:   6912.0 4608.0 6912.0 4608.0 6912.0 4608.0 6912.0 4608.0 
+DIAG row0 expected: 6912.0 4608.0 6912.0 4608.0 6912.0 4608.0 6912.0 4608.0 
+@@RESULT ms=1.471 tflops=2977.71 checksum=7315328.000000 valid=1 c0=6912.0

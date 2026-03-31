@@ -1,0 +1,244 @@
+Found 1 embedded cubin(s):
+  [0] offset=0x9f320  size=188880 bytes
+Kernel: persistent_gemmIL10EpilogueOp2EEv14CUtensorMap_stS1_S1_N16Ep (2920 insns)
+Cross-referenced 2909/2920 instructions
+  restall [4bc0] 0 -> 4  (lat=4 from [4b90] SYNCS.PHASECHK.TRANS64.TRYWAIT via P2)
+  restall [4c00] 15 -> 4  (lat=4 from [4bf0] IMAD.MOV.U32 via R123)
+  restall [4c30] 15 -> 2  (lat=2 from [4c00] IADD3 via R76)
+  restall [4c40] 0 -> 2  (lat=2 from [4c30] LEA via R120)
+  restall [4c60] 0 -> 4  (lat=4 from [4c50] R2UR via UR12)
+  restall [4c90] 13 -> 4  (lat=4 from [4c80] IMAD.X via R77)
+  restall [4f20] 0 -> 4  (lat=4 from [4f10] R2UR via UR10)
+  restall [4f70] 0 -> 4  (lat=4 from [4f60] R2UR via UR10)
+  restall [50a0] 0 -> 4  (lat=4 from [5080] HADD2.BF16_V2 via R26)
+  restall [50d0] 2 -> 4  (lat=4 from [50b0] HFMA2.BF16_V2 via R16)
+  restall [50e0] 0 -> 2  (lat=4 from [50c0] HADD2.BF16_V2 via R91)
+  STALL WARNING: [4c00] IADD3 needs 4 cycles after [4bf0] IMAD.MOV.U32 (via R123), has 0
+  STALL WARNING: [4c40] LDG.E.128.CONSTANT needs 2 cycles after [4c30] LEA (via R120), has 0
+  STALL WARNING: [4c60] LDG.E.128.CONSTANT needs 4 cycles after [4c50] R2UR (via UR12), has 0
+  STALL WARNING: [4c90] LEA.HI.X needs 4 cycles after [4c80] IMAD.X (via R77), has 0
+  STALL WARNING: [4d10] IMAD.IADD needs 4 cycles after [4cf0] IMAD (via R153), has 2
+  STALL WARNING: [4dd0] LDG.E.128.CONSTANT needs 4 cycles after [4db0] R2UR (via UR8), has 2
+  STALL WARNING: [4f20] LDG.E.128.CONSTANT needs 4 cycles after [4f10] R2UR (via UR10), has 0
+  STALL WARNING: [4f70] LDG.E.128.CONSTANT needs 4 cycles after [4f60] R2UR (via UR10), has 0
+  STALL WARNING: [4fe0] HADD2.BF16_V2 needs 4 cycles after [4fc0] HADD2.BF16_V2 (via R89), has 1
+  STALL WARNING: [5060] HFMA2.BF16_V2 needs 4 cycles after [5040] HFMA2.BF16_V2 (via R24), has 1
+  STALL WARNING: [50a0] HADD2.BF16_V2 needs 4 cycles after [5080] HADD2.BF16_V2 (via R26), has 2
+  STALL WARNING: [50d0] HFMA2.BF16_V2 needs 4 cycles after [50b0] HFMA2.BF16_V2 (via R16), has 2
+  STALL WARNING: [50e0] HADD2.BF16_V2 needs 4 cycles after [50c0] HADD2.BF16_V2 (via R91), has 2
+  STALL WARNING: [5120] HFMA2.BF16_V2 needs 4 cycles after [5100] HFMA2.BF16_V2 (via R8), has 2
+  STALL WARNING: [5160] LOP3.LUT needs 4 cycles after [5130] IMAD.SHL.U32 (via R8), has 2
+  STALL WARNING: [5170] HADD2.BF16_V2 needs 4 cycles after [5140] HADD2.BF16_V2 (via R174), has 3
+  restall [5270] 15 -> 4  (lat=20 from [5210] LDTM.x32 via R8)
+  restall [5370] 6 -> 4  (lat=4 from [5350] HFMA2.BF16_V2 via R94)
+  restall [5440] 0 -> 4  (lat=4 from [5430] HADD2.BF16_V2 via R93)
+  restall [5530] 0 -> 4  (lat=4 from [5520] F2FP.BF16.F32.PACK_AB via R93)
+  restall [5550] 8 -> 5  (lat=20 from [5510] LDS.128 via R88)
+  restall [5590] 10 -> 4  (lat=4 from [5580] HFMA2.BF16_V2 via R94)
+  restall [55c0] 0 -> 4  (lat=4 from [55b0] HADD2.BF16_V2 via R96)
+  restall [55d0] 0 -> 4  (lat=4 from [55a0] HADD2.BF16_V2 via R95)
+  restall [55e0] 0 -> 4  (lat=4 from [55c0] HADD2.BF16_V2 via R87)
+  restall [55f0] 0 -> 4  (lat=4 from [55d0] HADD2.BF16_V2 via R91)
+  restall [5630] 0 -> 2  (lat=2 from [5610] UMOV via UR8)
+  restall [5640] 0 -> 4  (lat=4 from [5620] ISETP.NE.U32.AND via P4)
+  restall [5680] 0 -> 4  (lat=4 from [5620] ISETP.NE.U32.AND via P4)
+  restall [56a0] 0 -> 2  (lat=2 from [5690] @!P4 IADD3 via R78)
+  restall [56b0] 13 -> 5  (lat=20 from [5640] @!P4 LDC.64 via R77)
+  restall [56e0] 2 -> 4  (lat=4 from [56d0] PLOP3.LUT via P2)
+  restall [5700] 0 -> 2  (lat=4 from [56b0] @!P4 IMAD.X via R76)
+  restall [5710] 15 -> 4  (lat=4 from [5700] @!P4 R2UR via UR9)
+  restall [5730] 0 -> 4  (lat=4 from [5720] IMAD.U32 via R76)
+  restall [5780] 2 -> 4  (lat=4 from [5770] @P5 R2UR.OR via P2)
+  restall [5790] 0 -> 8  (lat=10 from [5760] @!P4 VIADD via R76)
+  restall [57a0] 0 -> 4  (lat=4 from [5790] @P5 R2UR.OR via P2)
+  restall [57b0] 0 -> 4  (lat=4 from [5790] @P5 R2UR.OR via UR12)
+  restall [57c0] 15 -> 4  (lat=4 from [57a0] @P5 PLOP3.LUT via P5)
+  restall [5800] 2 -> 4  (lat=4 from [57e0] PLOP3.LUT via P2)
+  restall [5810] 0 -> 2  (lat=4 from [57f0] PLOP3.LUT via P5)
+  restall [5820] 2 -> 4  (lat=4 from [5810] @P5 R2UR via P2)
+  restall [5850] 2 -> 4  (lat=4 from [5840] @P5 R2UR.OR via P2)
+  restall [5860] 0 -> 4  (lat=10 from [57d0] @!P4 VIADD via R76)
+  restall [5870] 0 -> 4  (lat=4 from [5860] @P5 R2UR.OR via P2)
+  restall [5880] 0 -> 4  (lat=4 from [5860] @P5 R2UR.OR via UR12)
+  restall [5890] 15 -> 4  (lat=4 from [5870] @P5 PLOP3.LUT via P5)
+  STALL WARNING: [5270] F2FP.BF16.F32.PACK_AB needs 20 cycles after [5210] LDTM.x32 (via R8), has 9
+  STALL WARNING: [5270] F2FP.BF16.F32.PACK_AB needs 20 cycles after [5210] LDTM.x32 (via R9), has 9
+  STALL WARNING: [5280] F2FP.BF16.F32.PACK_AB needs 20 cycles after [5210] LDTM.x32 (via R7), has 10
+  STALL WARNING: [5280] F2FP.BF16.F32.PACK_AB needs 20 cycles after [5210] LDTM.x32 (via R6), has 10
+  STALL WARNING: [5290] HFMA2.BF16_V2 needs 4 cycles after [5270] F2FP.BF16.F32.PACK_AB (via R109), has 2
+  STALL WARNING: [52c0] HFMA2.BF16_V2 needs 20 cycles after [5250] LDS.128 (via R78), has 16
+  STALL WARNING: [52c0] HFMA2.BF16_V2 needs 4 cycles after [5290] HFMA2.BF16_V2 (via R109), has 2
+  STALL WARNING: [52d0] HFMA2.BF16_V2 needs 4 cycles after [52b0] F2FP.BF16.F32.PACK_AB (via R94), has 2
+  STALL WARNING: [5300] HFMA2.BF16_V2 needs 4 cycles after [52d0] HFMA2.BF16_V2 (via R94), has 3
+  STALL WARNING: [5330] HFMA2.BF16_V2 needs 4 cycles after [5310] F2FP.BF16.F32.PACK_AB (via R176), has 2
+  STALL WARNING: [5360] HFMA2.BF16_V2 needs 4 cycles after [5340] F2FP.BF16.F32.PACK_AB (via R92), has 2
+  STALL WARNING: [5370] HFMA2.BF16_V2 needs 4 cycles after [5350] HFMA2.BF16_V2 (via R94), has 2
+  STALL WARNING: [5380] HFMA2.BF16_V2 needs 4 cycles after [5360] HFMA2.BF16_V2 (via R92), has 1
+  STALL WARNING: [5440] HADD2.BF16_V2 needs 4 cycles after [5430] HADD2.BF16_V2 (via R93), has 0
+  STALL WARNING: [54d0] HADD2.BF16_V2 needs 4 cycles after [54b0] HADD2.BF16_V2 (via R93), has 2
+  STALL WARNING: [5530] HADD2.BF16_V2 needs 4 cycles after [5520] F2FP.BF16.F32.PACK_AB (via R93), has 0
+  STALL WARNING: [5550] HFMA2.BF16_V2 needs 20 cycles after [5510] LDS.128 (via R88), has 8
+  STALL WARNING: [5570] HADD2.BF16_V2 needs 20 cycles after [5510] LDS.128 (via R89), has 11
+  STALL WARNING: [5590] HFMA2.BF16_V2 needs 4 cycles after [5580] HFMA2.BF16_V2 (via R94), has 0
+  STALL WARNING: [5590] HFMA2.BF16_V2 needs 20 cycles after [5510] LDS.128 (via R90), has 16
+  STALL WARNING: [55c0] HADD2.BF16_V2 needs 4 cycles after [55b0] HADD2.BF16_V2 (via R96), has 0
+  STALL WARNING: [55e0] STS.128 needs 4 cycles after [55c0] HADD2.BF16_V2 (via R87), has 1
+  STALL WARNING: [5630] BRA.DIV needs 2 cycles after [5610] UMOV (via UR8), has 1
+  STALL WARNING: [5640] @!P4 LDC.64 needs 4 cycles after [5620] ISETP.NE.U32.AND (via P4), has 2
+  STALL WARNING: [5690] @!P4 IADD3 needs 20 cycles after [5640] @!P4 LDC.64 (via R76), has 8
+  STALL WARNING: [56a0] @!P4 R2UR needs 2 cycles after [5690] @!P4 IADD3 (via R78), has 0
+  STALL WARNING: [56e0] PLOP3.LUT needs 4 cycles after [56d0] PLOP3.LUT (via P2), has 0
+  STALL WARNING: [5710] IMAD.U32 needs 4 cycles after [5700] @!P4 R2UR (via UR9), has 0
+  STALL WARNING: [5730] @!P4 R2UR needs 4 cycles after [5720] IMAD.U32 (via R76), has 0
+  STALL WARNING: [5780] PLOP3.LUT needs 4 cycles after [5770] @P5 R2UR.OR (via P2), has 0
+  STALL WARNING: [57a0] @P5 PLOP3.LUT needs 4 cycles after [5790] @P5 R2UR.OR (via P2), has 0
+  STALL WARNING: [57c0] @P5 BRA.U.ANY needs 4 cycles after [57a0] @P5 PLOP3.LUT (via P5), has 2
+  STALL WARNING: [5800] PLOP3.LUT needs 4 cycles after [57e0] PLOP3.LUT (via P2), has 2
+  STALL WARNING: [5800] PLOP3.LUT needs 4 cycles after [57f0] PLOP3.LUT (via P5), has 0
+  STALL WARNING: [5810] @P5 R2UR needs 4 cycles after [57f0] PLOP3.LUT (via P5), has 2
+  STALL WARNING: [5820] PLOP3.LUT needs 4 cycles after [5810] @P5 R2UR (via P2), has 0
+  STALL WARNING: [5850] PLOP3.LUT needs 4 cycles after [5840] @P5 R2UR.OR (via P2), has 0
+  STALL WARNING: [5870] @P5 PLOP3.LUT needs 4 cycles after [5860] @P5 R2UR.OR (via P2), has 0
+  STALL WARNING: [5890] @P5 BRA.U.ANY needs 4 cycles after [5870] @P5 PLOP3.LUT (via P5), has 2
+  restall [5950] 0 -> 4  (lat=4 from [5930] ISETP.NE.U32.AND via P0)
+  restall [59c0] 0 -> 4  (lat=4 from [59b0] @P0 ELECT via P2)
+  restall [59e0] 15 -> 4  (lat=4 from [59d0] LDCU.64 via UR8)
+  restall [5a50] 0 -> 10  (lat=10 from [5a10] VIADD via R4)
+  restall [5a70] 0 -> 4  (lat=4 from [5a40] @P2 R2UR.BROADCAST via UR12)
+  restall [5a80] 15 -> 4  (lat=4 from [5a30] @P2 PLOP3.LUT via P0)
+  restall [5ac0] 0 -> 4  (lat=4 from [5a90] PLOP3.LUT via P0)
+  restall [5ad0] 0 -> 4  (lat=4 from [5ac0] @P0 ELECT via P2)
+  restall [5ae0] 0 -> 10  (lat=10 from [5aa0] VIADD via R5)
+  restall [5af0] 0 -> 10  (lat=10 from [5ab0] VIADD via R4)
+  restall [5b00] 0 -> 4  (lat=4 from [5ac0] @P0 ELECT via P2)
+  restall [5b10] 0 -> 4  (lat=4 from [5ae0] @P2 R2UR.BROADCAST via UR12)
+  restall [5b20] 0 -> 4  (lat=4 from [5ac0] @P0 ELECT via P2)
+  restall [5b40] 15 -> 4  (lat=4 from [5b00] @P2 PLOP3.LUT via P0)
+  restall [5b90] 0 -> 2  (lat=2 from [5b80] UMOV via UR8)
+  restall [5c00] 15 -> 4  (lat=4 from [5be0] IMAD.MOV.U32 via R76)
+  STALL WARNING: [5950] @P0 BRA needs 4 cycles after [5930] ISETP.NE.U32.AND (via P0), has 2
+  STALL WARNING: [59c0] @P2 R2UR.BROADCAST needs 4 cycles after [59b0] @P0 ELECT (via P2), has 0
+  STALL WARNING: [59e0] UIADD3 needs 4 cycles after [59d0] LDCU.64 (via UR8), has 0
+  STALL WARNING: [5a70] UTMALDG.2D needs 4 cycles after [5a40] @P2 R2UR.BROADCAST (via UR12), has 2
+  STALL WARNING: [5ad0] @P2 R2UR.BROADCAST needs 4 cycles after [5ac0] @P0 ELECT (via P2), has 0
+  STALL WARNING: [5b90] BRA.DIV needs 2 cycles after [5b80] UMOV (via UR8), has 0
+  STALL WARNING: [5c00] SHF.L.U32 needs 4 cycles after [5be0] IMAD.MOV.U32 (via R76), has 2
+  restall [5c40] 0 -> 4  (lat=4 from [5c20] SYNCS.PHASECHK.TRANS64.TRYWAIT via P0)
+  restall [5c80] 15 -> 4  (lat=4 from [5c70] IMAD.MOV.U32 via R153)
+  restall [5c90] 15 -> 2  (lat=2 from [5c80] IADD3 via R76)
+  restall [5cd0] 0 -> 4  (lat=4 from [5cc0] R2UR via UR10)
+  restall [5ce0] 5 -> 4  (lat=4 from [5ca0] IMAD via R197)
+  restall [5d30] 13 -> 4  (lat=4 from [5d20] IMAD.X via R77)
+  restall [5f30] 0 -> 4  (lat=4 from [5f10] IMAD.IADD via R4)
+  STALL WARNING: [5c80] IADD3 needs 4 cycles after [5c70] IMAD.MOV.U32 (via R153), has 0
+  STALL WARNING: [5c90] LEA needs 2 cycles after [5c80] IADD3 (via R76), has 0
+  STALL WARNING: [5c90] LEA needs 2 cycles after [5c80] IADD3 (via P0), has 0
+  STALL WARNING: [5cb0] LDG.E.128.CONSTANT needs 2 cycles after [5c90] LEA (via R172), has 1
+  STALL WARNING: [5cd0] LDG.E.128.CONSTANT needs 4 cycles after [5cc0] R2UR (via UR10), has 0
+  STALL WARNING: [5cf0] LDG.E.128.CONSTANT needs 4 cycles after [5cc0] R2UR (via UR10), has 3
+  STALL WARNING: [5d30] LEA.HI.X needs 4 cycles after [5d20] IMAD.X (via R77), has 0
+  STALL WARNING: [5f30] R2UR needs 4 cycles after [5f10] IMAD.IADD (via R4), has 2
+  restall [5fb0] 12 -> 4  (lat=4 from [5f90] HFMA2.BF16_V2 via R175)
+  restall [6030] 2 -> 4  (lat=4 from [6020] HFMA2.BF16_V2 via R181)
+  restall [6090] 0 -> 4  (lat=4 from [6080] HADD2.BF16_V2 via R182)
+  restall [6150] 0 -> 4  (lat=4 from [60f0] HADD2.BF16_V2 via R188)
+  restall [6160] 0 -> 4  (lat=4 from [6130] HADD2.BF16_V2 via R186)
+  restall [62a0] 0 -> 4  (lat=4 from [6290] F2FP.BF16.F32.PACK_AB via R93)
+  restall [62c0] 0 -> 4  (lat=4 from [62b0] F2FP.BF16.F32.PACK_AB via R93)
+  restall [62e0] 2 -> 4  (lat=4 from [62d0] F2FP.BF16.F32.PACK_AB via R94)
+  restall [6310] 0 -> 4  (lat=4 from [62f0] F2FP.BF16.F32.PACK_AB via R96)
+  restall [6360] 14 -> 4  (lat=4 from [6350] F2FP.BF16.F32.PACK_AB via R92)
+  restall [6380] 0 -> 4  (lat=4 from [6370] F2FP.BF16.F32.PACK_AB via R92)
+  restall [63a0] 0 -> 4  (lat=4 from [6380] HFMA2.BF16_V2 via R112)
+  restall [6400] 0 -> 4  (lat=4 from [63e0] HADD2.BF16_V2 via R115)
+  restall [6410] 0 -> 4  (lat=4 from [63d0] F2FP.BF16.F32.PACK_AB via R93)
+  restall [6420] 0 -> 4  (lat=4 from [6400] HADD2.BF16_V2 via R83)
+  restall [6440] 8 -> 4  (lat=4 from [6430] F2FP.BF16.F32.PACK_AB via R93)
+  restall [6450] 8 -> 4  (lat=4 from [6440] HFMA2.BF16_V2 via R120)
+  restall [6500] 0 -> 4  (lat=4 from [64f0] HADD2.BF16_V2 via R89)
+  restall [6530] 0 -> 4  (lat=4 from [6520] F2FP.BF16.F32.PACK_AB via R92)
+  restall [6540] 0 -> 4  (lat=4 from [6530] HADD2.BF16_V2 via R119)
+  restall [65b0] 0 -> 4  (lat=4 from [6570] HFMA2.BF16_V2 via R84)
+  restall [65c0] 0 -> 15  (lat=20 from [65a0] LDS.128 via R79 (NEEDS BARRIER: 20 > 15))
+  restall [65d0] 14 -> 15  (lat=20 from [65a0] LDS.128 via R78 (NEEDS BARRIER: 20 > 15))
+  restall [65e0] 0 -> 6  (lat=20 from [65a0] LDS.128 via R77)
+  restall [6600] 12 -> 6  (lat=20 from [65a0] LDS.128 via R76)
+  restall [6630] 0 -> 4  (lat=4 from [6610] LOP3.LUT via P0)
+  restall [6660] 0 -> 2  (lat=2 from [6650] UMOV via UR6)
+  restall [6670] 0 -> 4  (lat=4 from [6640] ISETP.NE.U32.AND via P2)
+  restall [66b0] 0 -> 4  (lat=4 from [6640] ISETP.NE.U32.AND via P2)
+  restall [66e0] 0 -> 2  (lat=2 from [66c0] @!P2 IADD3 via R78)
+  restall [66f0] 13 -> 5  (lat=20 from [6670] @!P2 LDC.64 via R77)
+  restall [6700] 0 -> 4  (lat=4 from [66f0] @!P2 IMAD.X via R76)
+  restall [6720] 15 -> 4  (lat=4 from [6700] @!P2 R2UR via UR7)
+  restall [6740] 0 -> 2  (lat=4 from [6720] IMAD.U32 via R77)
+  restall [6760] 0 -> 4  (lat=4 from [6750] IMAD.U32 via R76)
+  restall [6780] 2 -> 4  (lat=4 from [6770] @P3 R2UR via P0)
+  restall [67b0] 2 -> 4  (lat=4 from [67a0] @P3 R2UR.OR via P0)
+  restall [67c0] 0 -> 8  (lat=10 from [6790] @!P2 VIADD via R76)
+  restall [67d0] 0 -> 4  (lat=4 from [67c0] @P3 R2UR.OR via P0)
+  restall [67e0] 0 -> 4  (lat=4 from [67c0] @P3 R2UR.OR via UR12)
+  restall [67f0] 15 -> 4  (lat=4 from [67d0] @P3 PLOP3.LUT via P3)
+  restall [6830] 2 -> 4  (lat=4 from [6810] PLOP3.LUT via P0)
+  restall [6840] 0 -> 2  (lat=4 from [6820] PLOP3.LUT via P3)
+  restall [6850] 2 -> 4  (lat=4 from [6840] @P3 R2UR via P0)
+  restall [6870] 2 -> 4  (lat=4 from [6860] @P3 R2UR.OR via P0)
+  restall [6880] 0 -> 4  (lat=10 from [6800] @!P2 VIADD via R76)
+  restall [68a0] 0 -> 4  (lat=4 from [6880] @P3 R2UR.OR via P0)
+  restall [68b0] 0 -> 4  (lat=4 from [6880] @P3 R2UR.OR via UR12)
+  restall [68c0] 15 -> 4  (lat=4 from [68a0] @P3 PLOP3.LUT via P3)
+  restall [6900] 0 -> 4  (lat=4 from [68f0] ISETP.GT.U32.AND via P0)
+  restall [6930] 0 -> 4  (lat=4 from [6910] IMAD.IADD via R4)
+  STALL WARNING: [5f80] HADD2.BF16_V2 needs 4 cycles after [5f40] HADD2.BF16_V2 (via R176), has 3
+  STALL WARNING: [5fb0] HFMA2.BF16_V2 needs 4 cycles after [5f90] HFMA2.BF16_V2 (via R175), has 1
+  STALL WARNING: [6000] STS.128 needs 4 cycles after [5fc0] HFMA2.BF16_V2 (via R94), has 3
+  STALL WARNING: [6000] STS.128 needs 4 cycles after [5fd0] HADD2.BF16_V2 (via R95), has 2
+  STALL WARNING: [6030] HFMA2.BF16_V2 needs 4 cycles after [6020] HFMA2.BF16_V2 (via R181), has 0
+  STALL WARNING: [6040] HFMA2.BF16_V2 needs 4 cycles after [6010] HFMA2.BF16_V2 (via R179), has 3
+  STALL WARNING: [6060] HFMA2.BF16_V2 needs 4 cycles after [6050] HFMA2.BF16_V2 (via R183), has 0
+  STALL WARNING: [6090] HADD2.BF16_V2 needs 4 cycles after [6080] HADD2.BF16_V2 (via R182), has 0
+  STALL WARNING: [62a0] HADD2.BF16_V2 needs 4 cycles after [6290] F2FP.BF16.F32.PACK_AB (via R93), has 0
+  STALL WARNING: [62c0] HADD2.BF16_V2 needs 4 cycles after [62b0] F2FP.BF16.F32.PACK_AB (via R93), has 0
+  STALL WARNING: [62e0] HFMA2.BF16_V2 needs 4 cycles after [62d0] F2FP.BF16.F32.PACK_AB (via R94), has 0
+  STALL WARNING: [6310] HADD2.BF16_V2 needs 4 cycles after [62f0] F2FP.BF16.F32.PACK_AB (via R96), has 2
+  STALL WARNING: [6310] HADD2.BF16_V2 needs 40 cycles after [6180] LDG.E.128.CONSTANT (via R123), has 38
+  STALL WARNING: [6360] HFMA2.BF16_V2 needs 4 cycles after [6350] F2FP.BF16.F32.PACK_AB (via R92), has 0
+  STALL WARNING: [6380] HFMA2.BF16_V2 needs 4 cycles after [6370] F2FP.BF16.F32.PACK_AB (via R92), has 0
+  STALL WARNING: [63a0] HFMA2.BF16_V2 needs 4 cycles after [6380] HFMA2.BF16_V2 (via R112), has 2
+  STALL WARNING: [6400] HADD2.BF16_V2 needs 4 cycles after [63e0] HADD2.BF16_V2 (via R115), has 2
+  STALL WARNING: [6420] STS.128 needs 4 cycles after [6400] HADD2.BF16_V2 (via R83), has 3
+  STALL WARNING: [6440] HFMA2.BF16_V2 needs 4 cycles after [6430] F2FP.BF16.F32.PACK_AB (via R93), has 0
+  STALL WARNING: [6450] HFMA2.BF16_V2 needs 4 cycles after [6440] HFMA2.BF16_V2 (via R120), has 0
+  STALL WARNING: [6480] HFMA2.BF16_V2 needs 4 cycles after [6460] F2FP.BF16.F32.PACK_AB (via R95), has 2
+  STALL WARNING: [6490] HFMA2.BF16_V2 needs 4 cycles after [6470] F2FP.BF16.F32.PACK_AB (via R94), has 3
+  STALL WARNING: [64f0] HADD2.BF16_V2 needs 4 cycles after [64d0] HADD2.BF16_V2 (via R121), has 2
+  STALL WARNING: [6500] STS.128 needs 4 cycles after [64f0] HADD2.BF16_V2 (via R89), has 0
+  STALL WARNING: [6530] HADD2.BF16_V2 needs 4 cycles after [6520] F2FP.BF16.F32.PACK_AB (via R92), has 0
+  STALL WARNING: [6540] HADD2.BF16_V2 needs 4 cycles after [6530] HADD2.BF16_V2 (via R119), has 0
+  STALL WARNING: [65c0] HADD2.BF16_V2 needs 20 cycles after [65a0] LDS.128 (via R79), has 4
+  STALL WARNING: [65d0] HFMA2.BF16_V2 needs 20 cycles after [65a0] LDS.128 (via R78), has 6
+  STALL WARNING: [65e0] HADD2.BF16_V2 needs 20 cycles after [65a0] LDS.128 (via R77), has 8
+  STALL WARNING: [6600] HFMA2.BF16_V2 needs 20 cycles after [65a0] LDS.128 (via R76), has 11
+  STALL WARNING: [6610] LOP3.LUT needs 10 cycles after [65f0] VIADD (via R92), has 9
+  STALL WARNING: [6660] BRA.DIV needs 2 cycles after [6650] UMOV (via UR6), has 0
+  STALL WARNING: [66c0] @!P2 IADD3 needs 20 cycles after [6670] @!P2 LDC.64 (via R76), has 7
+  STALL WARNING: [66f0] @!P2 IMAD.X needs 20 cycles after [6670] @!P2 LDC.64 (via R77), has 17
+  STALL WARNING: [6700] @!P2 R2UR needs 4 cycles after [66f0] @!P2 IMAD.X (via R76), has 0
+  STALL WARNING: [6730] PLOP3.LUT needs 4 cycles after [6710] PLOP3.LUT (via P0), has 2
+  STALL WARNING: [6760] @!P2 R2UR needs 4 cycles after [6750] IMAD.U32 (via R76), has 0
+  STALL WARNING: [6780] PLOP3.LUT needs 4 cycles after [6770] @P3 R2UR (via P0), has 0
+  STALL WARNING: [67b0] PLOP3.LUT needs 4 cycles after [67a0] @P3 R2UR.OR (via P0), has 0
+  STALL WARNING: [67d0] @P3 PLOP3.LUT needs 4 cycles after [67c0] @P3 R2UR.OR (via P0), has 0
+  STALL WARNING: [67f0] @P3 BRA.U.ANY needs 4 cycles after [67d0] @P3 PLOP3.LUT (via P3), has 2
+  STALL WARNING: [6830] PLOP3.LUT needs 4 cycles after [6810] PLOP3.LUT (via P0), has 3
+  STALL WARNING: [6830] PLOP3.LUT needs 4 cycles after [6820] PLOP3.LUT (via P3), has 0
+  STALL WARNING: [6840] @P3 R2UR needs 4 cycles after [6820] PLOP3.LUT (via P3), has 2
+  STALL WARNING: [6850] PLOP3.LUT needs 4 cycles after [6840] @P3 R2UR (via P0), has 0
+  STALL WARNING: [6870] PLOP3.LUT needs 4 cycles after [6860] @P3 R2UR.OR (via P0), has 0
+  STALL WARNING: [68a0] @P3 PLOP3.LUT needs 4 cycles after [6880] @P3 R2UR.OR (via P0), has 1
+  STALL WARNING: [68b0] @!UP0 UTMASTG.2D needs 4 cycles after [6880] @P3 R2UR.OR (via UR12), has 3
+  STALL WARNING: [68b0] @!UP0 UTMASTG.2D needs 4 cycles after [6890] VOTEU.ALL (via UP0), has 2
+  STALL WARNING: [68c0] @P3 BRA.U.ANY needs 4 cycles after [68a0] @P3 PLOP3.LUT (via P3), has 2
+  STALL WARNING: [6900] @P0 BRA needs 4 cycles after [68f0] ISETP.GT.U32.AND (via P0), has 0
+  STALL WARNING: [6930] R2UR needs 4 cycles after [6910] IMAD.IADD (via R4), has 3
+Applied 480 edit(s). Patched data/stagesc_20260331_034827/base_4w_unpatched -> base_4w_patched (cubin at 0x9f320, 188880 bytes)

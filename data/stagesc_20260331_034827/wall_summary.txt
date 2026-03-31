@@ -1,0 +1,20 @@
+LABEL                      MS    DELTA  REGS  DFLAGS
+-------------------- -------- -------- -----  ------
+strip                   1.086        0    86  -DN_STAGES=5 -DTMA_RESIDUAL=1 -DSTRIP_EPILOGUE=1 INV
+base_4w                 1.471    0.385   200  -DN_STAGES=5 -DTMA_RESIDUAL=1
+base_wl1                1.161    0.075   200  -DN_STAGES=5 -DTMA_RESIDUAL=1 -DEPI_WARP_LIMIT=1 INV
+base_wl2                1.248    0.162   200  -DN_STAGES=5 -DTMA_RESIDUAL=1 -DEPI_WARP_LIMIT=2 INV
+base_nepi2              1.246    0.160   200  -DN_STAGES=5 -DTMA_RESIDUAL=1 -DNUM_EPI_WARPS=2 INV
+cutlass                 1.211    0.125        
+sc2nr_nepi2             1.244    0.158   202  -DN_STAGES=5 -DTMA_RESIDUAL=1 -DSTAGES_C=2 -DNUM_EPI_WARPS=2 INV
+sc2nr_nepi2_bs          1.245    0.159   186  -DN_STAGES=5 -DTMA_RESIDUAL=1 -DSTAGES_C=2 -DNUM_EPI_WARPS=2 -DBIAS_SMEM=1 INV
+base_4w_unp             1.473    0.387        data/stagesc_20260331_034827/base_4w_unpatched
+base_bs_unp             1.456    0.370        data/stagesc_20260331_034827/base_bs_unpatched
+cutlass_ab              1.211    0.125        
+strip_end               1.087    0.001    86  -DN_STAGES=5 -DTMA_RESIDUAL=1 -DSTRIP_EPILOGUE=1 INV
+
+=== SC2 no-reuse vs BASELINE (2 warps) ===
+  nepi2        base=1.246ms  sc2nr=1.244ms  Δ=-2.000μs
+  nepi2_bs     base=1.246ms  sc2nr=1.245ms  Δ=-1.000μs
+
+=== SASS-PATCHED vs UNPATCHED (tight A/B) ===

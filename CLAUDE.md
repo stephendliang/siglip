@@ -11,13 +11,13 @@ Three fused GEMM kernels for the vision encoder MLP. **Only FC2 is being activel
 |--------|-------|----------|---------|--------|------|------------------|--------|
 | **patch_embed** | [928256,768]×[768,768]^T | bias + pos_embed | 0.525 | 2085 | 174-214 | **2% faster** (0.536) | **DONE** |
 | **fc1_gelu** | [928256,768]×[768,3072]^T | bias + GELU | 2.267 | 1932 | 244 | **3% faster** (2.323) | **DONE** |
-| **fc2** | [928256,3072]×[3072,768]^T | bias + residual | 1.452 | 3016 | 207 | **19% slower** (1.225) | **ACTIVE** |
+| **fc2** | [928256,3072]×[3072,768]^T | bias + residual | 1.456 | 3005 | 200 | **20% slower** (1.211) | **ACTIVE** |
 
 Batch = 4736 images × 196 patches = 928256 rows. BF16 output, FP8 inputs.
 
 ### FC2 gap analysis (SASS-verified 2026-03-22)
 
-Best: **1.452ms / 3016 TFLOPS** (NS5, IS1, base config). CUTLASS: 1.225ms fused. Gap = **227μs (19%)**.
+Best: **1.456ms / 3005 TFLOPS** (NS5, IS1, BIAS_SMEM=1). CUTLASS: 1.211ms fused. Gap = **245μs (20%)**.
 At identical locked 1770 MHz: 1.482ms vs 1.263ms = **17.3% gap = ~1,940 cycles/tile**.
 Clock throttling disproved — both kernels run at ~1.85 GHz unlocked on the same Verda B200.
 
@@ -98,6 +98,10 @@ ALL of these have been benchmarked on B200 with zero effect on the 477μs gap:
 - PRE_COMBINE, EPI_NOINLINE: 0μs wall time
 - Source-level STS scheduling: ptxas immutable (byte-identical SASS)
 - W0_RES_FULL: +15% catastrophic
+- **STAGES_C=2 (no-reuse)**: sc2nr_nepi2=1.244ms ≈ base_nepi2=1.246ms = neutral. Pre-loading residual via W0 doesn't reduce per-warp contention.
+- **STAGES_C=2 + EPI_REUSE_SMEM**: FUNDAMENTALLY BROKEN — A/B overwrites pre-loaded residual at ki=2. `#error` guard added.
+- **STAGES_C + PRE_COMBINE**: BROKEN — macro discards residual inputs in x32 path. Dead code elimination.
+- **SASS fatbin-patch**: CP-SAT scheduler works (5/5 chunks, 480 edits) but patched binaries crash at runtime (`illegal instruction`). Encoding/control word corruption in `tools/sass_edit.py`.
 - **NOP_EPILOGUE** (dispatch pressure): 1.160ms at 3k/5k/10k cycles. Dispatch alone doesn't cause gap.
 - **EPI_DELAY** (TMEM timing): 1.162ms at 3k/5k/10k cycles. Late TMEM release doesn't cause gap.
 - **REG_PAD** (register file occupancy): 1.161ms at 186 regs (54.5% RF). RF allocation alone doesn't cause gap.
@@ -219,6 +223,14 @@ Per-kernel tiered parameter sweep with top-lock analysis, interaction sweeps, an
 - **EPI_LOAD_WARP**: Runtime hang (mbarrier bug)
 - Regs: 207 (NS5 base), down from 255 after W0 restructure
 
+**StagesC bench results (session 2026-03-31, data: `data/stagesc_20260331_034827/`):**
+- **BIAS_SMEM=1**: 1.456ms vs 1.471ms = **-15μs free win**. Eliminates 32 LDG bias loads from epilogue. Should be default.
+- **STAGES_C=2 no-reuse (NEPI=2)**: 1.244ms ≈ base_nepi2 1.246ms = neutral. W0 pre-load doesn't help.
+- **STAGES_C=2 + EPI_REUSE_SMEM**: `#error` — A/B overwrites pre-loaded residual in borrowed stages.
+- **STAGES_C + PRE_COMBINE**: `#error` — silently drops residual (COMBINED_CVT_STS_V4 discards r0-r3).
+- **SASS fatbin-patch**: CP-SAT schedules fine (5/5 chunks) but patched binaries crash (`illegal instruction`). Needs debugging.
+- **Only remaining path**: SASS binary patching to change per-warp epilogue scheduling (interleave STS with compute like CUTLASS). Requires fixing fatbin-patch first.
+
 ## Kernel structure
 
 Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1)`:
@@ -317,6 +329,7 @@ tools/                  # Analysis & sweep scripts
   sass_edit.py          # SASS binary editor + CP-SAT scheduler + fatbin patcher (see docs/sass_binary_editing.md)
   analyze_timing.py     # clock64 timing → equilibrium analysis
   fc2_strip_bench.sh     # Epilogue contention decomposition (30 experiments, ~10 min on B200)
+  fc2_stagesc_bench.sh   # StagesC + SASS-patching bench (SC2 variants, timing, fatbin-patch A/B)
   analyze_warp_scaling.py  # Warp-scaling benchmark analysis (scaling curves, BAR.SYNC effect)
   analyze_source_counters.py  # ncu SourceCounters CSV → stall breakdown
   simulate_lhs.py       # Bootstrap convergence simulation (no GPU)
