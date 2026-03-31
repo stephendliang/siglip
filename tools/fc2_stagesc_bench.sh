@@ -99,7 +99,7 @@ run_wall_timing() {
     log "  [timing] $label  DFLAGS='$dflags'"
 
     if [ "$DRY_RUN" = "1" ]; then
-        echo "  make fc2-timing DFLAGS=\"$dflags\" && ./fc2"
+        echo "  make fc2-timing DFLAGS=\"$dflags\" && ./fc2-timing"
         return 0
     fi
 
@@ -109,7 +109,7 @@ run_wall_timing() {
     fi
 
     local output
-    if ! output=$(./fc2 2>&1); then
+    if ! output=$(./fc2-timing 2>&1); then
         log "  [$label] TIMING RUN FAILED"
         return 1
     fi
@@ -254,7 +254,9 @@ build_and_patch() {
 
     local tmpdir="$OUTDIR/${label}_cubin_tmp"
     mkdir -p "$tmpdir"
-    (cd "$tmpdir" && cuobjdump -xelf all "$OLDPWD/fc2" > /dev/null 2>&1)
+    local fc2_abs
+    fc2_abs="$(pwd)/fc2"
+    (cd "$tmpdir" && cuobjdump -xelf all "$fc2_abs" > /dev/null 2>&1)
     local cubin="$tmpdir/fc2.sm_100a.cubin"
     if [ ! -f "$cubin" ]; then
         log "  [$label] cubin extraction failed"
@@ -327,8 +329,8 @@ build_and_patch() {
     rm -rf "$tmpdir"
 }
 
-run_patched() {
-    local label="$1" binary="$2"
+run_binary() {
+    local label="$1" binary="$2" tag="${3:-}"
     log "  [run] $label  binary=$binary"
 
     if [ "$DRY_RUN" = "1" ]; then
@@ -353,11 +355,11 @@ run_patched() {
     local result_line
     result_line=$(echo "$output" | grep '@@RESULT' | head -1)
     if [ -n "$result_line" ]; then
-        echo "${result_line} label=${label} regs=patched dflags=\"SASS-patched\"" >> "$OUTDIR/wall_results.txt"
+        echo "${result_line} label=${label} regs=${tag:-bin} dflags=\"${binary}\"" >> "$OUTDIR/wall_results.txt"
         local ms valid
         ms=$(echo "$result_line" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
         valid=$(echo "$result_line" | grep -o 'valid=[01]' | cut -d= -f2)
-        log "  [$label] ${ms}ms  valid=${valid}  (SASS-patched)"
+        log "  [$label] ${ms}ms  valid=${valid}  ${tag:+($tag)}"
     else
         log "  [$label] NO @@RESULT LINE"
     fi
@@ -369,10 +371,10 @@ build_and_patch "sc2bs_nepi2" "$BASE -DSTAGES_C=2 -DNUM_EPI_WARPS=2 -DBIAS_SMEM=
 
 # Tight A/B: unpatched → patched → CUTLASS (minimal thermal drift between comparisons)
 log "  --- A/B comparison (tight) ---"
-run_patched "sc2_nepi2_unp" "$OUTDIR/sc2_nepi2_unpatched"
-run_patched "sc2_nepi2_pat" "sc2_nepi2_patched"
-run_patched "sc2bs_nepi2_unp" "$OUTDIR/sc2bs_nepi2_unpatched"
-run_patched "sc2bs_nepi2_pat" "sc2bs_nepi2_patched"
+run_binary "sc2_nepi2_unp" "$OUTDIR/sc2_nepi2_unpatched" "unpatched"
+run_binary "sc2_nepi2_pat" "sc2_nepi2_patched" "patched"
+run_binary "sc2bs_nepi2_unp" "$OUTDIR/sc2bs_nepi2_unpatched" "unpatched"
+run_binary "sc2bs_nepi2_pat" "sc2bs_nepi2_patched" "patched"
 
 # Also run baseline fc2 + CUTLASS in the same window for direct comparison
 run_wall "base_4w_ab" "$BASE"
