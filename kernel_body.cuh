@@ -2450,9 +2450,14 @@ persistent_gemm(
 #endif
             }
 #if EPI_REUSE_SMEM
-            /* Signal W0 that staging SMEM (borrowed pipeline stages) is free.
-               On tile_start (no epilogue): forward-signal so W0 doesn't block.
-               On subsequent tiles: signals after Phase 1 completes. */
+            /* Wait for all TMA stores to finish reading from staging SMEM before
+               signaling it free. Without this, W0 overwrites staging (as pipeline
+               stages at ki=EPI_FIRST_BORROW_KI) while TMA stores are still reading
+               from it, corrupting output. */
+            if (lane == 0) {
+                asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+            }
+            __syncwarp();
             if (lane == 0) mbar_arrive(smem_to_uint(smem + OFF_EPI_DONE_MBAR));
 #endif
 #endif /* !STRIP_EPILOGUE */

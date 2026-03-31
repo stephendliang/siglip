@@ -50,6 +50,12 @@ if [ "$DRY_RUN" = "0" ]; then
     nvidia-smi --query-gpu=gpu_name,clocks.sm --format=csv,noheader | tee -a "$OUTDIR/session.log"
 fi
 
+# Auto-init CUTLASS submodule if not already present
+if [ ! -f "third_party/cutlass/include/cutlass/cutlass.h" ]; then
+    log "Initializing CUTLASS submodule..."
+    git submodule update --init third_party/cutlass 2>&1 | tail -1 | tee -a "$OUTDIR/session.log"
+fi
+
 BASE="-DN_STAGES=5 -DTMA_RESIDUAL=1"
 SC2="$BASE -DSTAGES_C=2 -DEPI_REUSE_SMEM=1"
 
@@ -126,6 +132,8 @@ START_TIME=$(date +%s)
 log ""
 log "==== TEST 1: REFERENCE BASELINES ===="
 
+# NOTE: WL<4 and NEPI<4 produce valid=0 — only 32*N rows per CTA rank are written
+# (row_group = ew % 4, fewer warps = incomplete row coverage). Timing-only configs.
 BASELINES=(
     "strip|$BASE -DSTRIP_EPILOGUE=1"
     "base_4w|$BASE"
@@ -139,17 +147,27 @@ for exp in "${BASELINES[@]}"; do
     run_wall "$label" "$dflags"
 done
 
-# CUTLASS reference (if available)
-if [ "$QUICK" = "0" ] && [ -x "./cutlass-bench-fc2-max" ]; then
-    log "  [cutlass] running..."
-    if [ "$DRY_RUN" = "0" ]; then
-        cutlass_out=$(./cutlass-bench-fc2-max 2>&1)
-        echo "$cutlass_out" > "$OUTDIR/cutlass_output.txt"
-        cutlass_ms=$(echo "$cutlass_out" | grep -oP '[0-9]+\.[0-9]+' | head -1)
-        log "  [cutlass] ${cutlass_ms:-ERR}ms"
+# CUTLASS reference (build if needed, run if available)
+if [ "$QUICK" = "0" ]; then
+    if [ ! -x "./cutlass-bench-fc2-max" ]; then
+        log "  [cutlass] building cutlass-bench-fc2-max..."
+        if [ "$DRY_RUN" = "0" ]; then
+            if make cutlass-bench-fc2-max > "$OUTDIR/cutlass_build.log" 2>&1; then
+                log "  [cutlass] build OK"
+            else
+                log "  [cutlass] BUILD FAILED (see cutlass_build.log)"
+            fi
+        fi
     fi
-elif [ "$QUICK" = "0" ]; then
-    log "  [cutlass] binary not found, skipping"
+    if [ -x "./cutlass-bench-fc2-max" ]; then
+        log "  [cutlass] running..."
+        if [ "$DRY_RUN" = "0" ]; then
+            cutlass_out=$(./cutlass-bench-fc2-max 2>&1)
+            echo "$cutlass_out" > "$OUTDIR/cutlass_output.txt"
+            cutlass_ms=$(echo "$cutlass_out" | grep -oP '[0-9]+\.[0-9]+' | head -1)
+            log "  [cutlass] ${cutlass_ms:-ERR}ms"
+        fi
+    fi
 fi
 
 # ════════════════════════════════════════
@@ -379,14 +397,12 @@ run_binary "sc2bs_nepi2_pat" "sc2bs_nepi2_patched" "patched"
 # Also run baseline fc2 + CUTLASS in the same window for direct comparison
 run_wall "base_4w_ab" "$BASE"
 run_wall "base_nepi2_ab" "$BASE -DNUM_EPI_WARPS=2"
-if [ -x "./cutlass-bench-fc2-max" ]; then
+if [ -x "./cutlass-bench-fc2-max" ] && [ "$DRY_RUN" = "0" ]; then
     log "  [cutlass_ab] running..."
-    if [ "$DRY_RUN" = "0" ]; then
-        cutlass_out=$(./cutlass-bench-fc2-max 2>&1)
-        echo "$cutlass_out" > "$OUTDIR/cutlass_ab_output.txt"
-        cutlass_ms=$(echo "$cutlass_out" | grep -oP '[0-9]+\.[0-9]+' | head -1)
-        log "  [cutlass_ab] ${cutlass_ms:-ERR}ms"
-    fi
+    cutlass_out=$(./cutlass-bench-fc2-max 2>&1)
+    echo "$cutlass_out" > "$OUTDIR/cutlass_ab_output.txt"
+    cutlass_ms=$(echo "$cutlass_out" | grep -oP '[0-9]+\.[0-9]+' | head -1)
+    log "  [cutlass_ab] ${cutlass_ms:-ERR}ms"
 fi
 
 # ════════════════════════════════════════
