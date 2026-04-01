@@ -361,9 +361,10 @@ fc2_w3_kernel(
         /* W2→epilogue: stage ready. W2 arrives with expect_tx. */
         for (int s = 0; s < NUM_EPI_STAGES; s++)
             mbar_init(smem_to_uint(smem + OFF_LOAD_MBAR + s * 8), 1);
-        /* epilogue→W2: stage released. All 4 epi warps arrive. */
+        /* epilogue→W2: stage released. One designated thread signals after
+           all 4 epilogue warps pass the stage barrier. */
         for (int s = 0; s < NUM_EPI_STAGES; s++)
-            mbar_init(smem_to_uint(smem + OFF_LOAD_CONSUMED + s * 8), NUM_EPI_WARPS);
+            mbar_init(smem_to_uint(smem + OFF_LOAD_CONSUMED + s * 8), 1);
 
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -412,6 +413,7 @@ fc2_w3_kernel(
     uint32_t consumed_mbar[NUM_EPI_STAGES];
     int load_phase[NUM_EPI_STAGES];
     int load_consumed_phase[NUM_EPI_STAGES];
+    int load_issue_count = 0;
     for (int s = 0; s < NUM_EPI_STAGES; s++) {
         load_mbar[s] = smem_to_uint(smem + OFF_LOAD_MBAR + s * 8);
         consumed_mbar[s] = smem_to_uint(smem + OFF_LOAD_CONSUMED + s * 8);
@@ -549,10 +551,11 @@ fc2_w3_kernel(
 
                 mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
                 ml_phase[prev_buf] ^= 1;
+                mbar_arrive(epi_mbar_masked + prev_buf * 8);
 
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                     const int stage = si % NUM_EPI_STAGES;
-                    if (si >= NUM_EPI_STAGES) {
+                    if (load_issue_count >= NUM_EPI_STAGES) {
                         mbar_wait(consumed_mbar[stage], load_consumed_phase[stage]);
                         load_consumed_phase[stage] ^= 1;
                     }
@@ -562,9 +565,8 @@ fc2_w3_kernel(
                         tma_load_2d_cta(res_dst, &tma_res,
                                         prev_n + si * 64, prev_m, load_mbar[stage]);
                     }
+                    load_issue_count++;
                 }
-
-                mbar_arrive(epi_mbar_masked + prev_buf * 8);
             }
 #endif /* STRIP_EPILOGUE W2 */
 
@@ -699,7 +701,7 @@ fc2_w3_kernel(
                     __syncwarp();
                     asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 
-                    if (lane == 0) {
+                    if (warp == 3 && lane == 0) {
                         mbar_arrive(consumed_mbar[stage]);
                     }
                 }
@@ -734,10 +736,11 @@ fc2_w3_kernel(
             /* W2: stream the last tile through the same 2-stage circular pipe. */
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
             ml_phase[last_buf] ^= 1;
+            mbar_arrive(epi_mbar_masked + last_buf * 8);
 
             for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                 const int stage = si % NUM_EPI_STAGES;
-                if (si >= NUM_EPI_STAGES) {
+                if (load_issue_count >= NUM_EPI_STAGES) {
                     mbar_wait(consumed_mbar[stage], load_consumed_phase[stage]);
                     load_consumed_phase[stage] ^= 1;
                 }
@@ -747,9 +750,8 @@ fc2_w3_kernel(
                     tma_load_2d_cta(res_dst, &tma_res,
                                     last_n + si * 64, last_m, load_mbar[stage]);
                 }
+                load_issue_count++;
             }
-
-            mbar_arrive(epi_mbar_masked + last_buf * 8);
 #endif /* STRIP_EPILOGUE drain W2 */
 
         } else {
@@ -861,7 +863,7 @@ fc2_w3_kernel(
                 }
                 __syncwarp();
                 asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
-                if (lane == 0) {
+                if (warp == 3 && lane == 0) {
                     mbar_arrive(consumed_mbar[stage]);
                 }
             }
