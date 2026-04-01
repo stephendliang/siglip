@@ -5,6 +5,13 @@ Shape: [928256,3072]×[3072,768]^T + bias + residual
 7 warps: W0(TMA A/B) | W1(MMA) | W2(EpilogueLoad) | W3-W6(Epilogue)
 cta_group::2  __cluster_dims__(2,1,1)
 
+Key architecture: ReuseSmemC + pre-load during K-loop.
+  - 4 epilogue stages × 16KB each = 64KB (same total as before).
+  - Each 16KB stage holds residual OR output sequentially (not both).
+  - W2 pre-loads residual for the CURRENT tile DURING the K-loop,
+    gated only by consumed_mbar from the previous tile's epilogue.
+  - By the time the epilogue starts, all residual is in SMEM — zero TMA wait.
+
 Compile-time flags:
   -DFP32_EPILOGUE    FP32 math (FADD, ~0% STS conflict) instead of BF16 (HADD2, 7.5%)
   -DSTRIP_EPILOGUE   Skip epilogue (benchmark GEMM core only, valid=0)
@@ -56,33 +63,28 @@ Compile-time flags:
 #define OFF_MAINLOOP_MBAR  (OFF_MMA_MBAR + N_STAGES * 8)
 #define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
 
-/* New barriers for W2↔epilogue coordination */
-#define OFF_LOAD_MBAR      (OFF_EPILOGUE_MBAR + 16)            /* W2→epi: load done (2 stages) */
-#define OFF_LOAD_CONSUMED  (OFF_LOAD_MBAR + 16)                /* epi→W2: stage consumed (2 stages) */
-#define _MBAR_END          (OFF_LOAD_CONSUMED + 16)
+/* New barriers for W2↔epilogue coordination (4 stages for ReuseSmemC) */
+#define NUM_EPI_STAGES     4
+#define OFF_LOAD_MBAR      (OFF_EPILOGUE_MBAR + 16)            /* W2→epi: load done (4 stages) */
+#define OFF_LOAD_CONSUMED  (OFF_LOAD_MBAR + NUM_EPI_STAGES * 8) /* epi→W2: stage consumed (4 stages) */
+#define _MBAR_END          (OFF_LOAD_CONSUMED + NUM_EPI_STAGES * 8)
 
 /* Bias SMEM: 256 BF16 = 512 B */
 #define OFF_BIAS_SMEM      ((_MBAR_END + 15) & ~15)
 #define BIAS_SMEM_BYTES    (TN * 2)
 
-/* Epilogue staging: 2 double-buffered stages, each 128 rows × 64 cols × 2B = 16 KB
-   Option A: separate load/store regions (simpler, +32 KB) */
+/* Epilogue staging: ReuseSmemC — 4 stages × 16 KB each = 64 KB total.
+   Each stage holds 128 rows × 64 cols × 2B = 16 KB, used for BOTH residual
+   load and output store sequentially (residual overwritten by output after LDS). */
 #define STAGING_REGION_BYTES  (32 * 128)                        /* 4096 B: 32 rows × 64 cols × 2B */
-
-/* ReuseSmemC=false for now (Option A): residual and output in separate regions.
-   Each stage = 16 KB residual + 16 KB output = 32 KB. 2 stages = 64 KB.
-   Actually: residual 128r×64c = 16KB, output 128r×64c = 16KB. */
-#define STAGE_RES_BYTES    (4 * STAGING_REGION_BYTES)           /* 16384: 4 row_groups × 4096 */
-#define STAGE_OUT_BYTES    (4 * STAGING_REGION_BYTES)           /* 16384: 4 row_groups × 4096 */
-#define STAGE_TOTAL_BYTES  (STAGE_RES_BYTES + STAGE_OUT_BYTES)  /* 32768 per stage */
+#define EPI_STAGE_BYTES    (4 * STAGING_REGION_BYTES)           /* 16384: 128 rows × 64 cols × 2B */
 
 #define OFF_STAGING        ((OFF_BIAS_SMEM + BIAS_SMEM_BYTES + 1023) & ~1023)  /* 1024-align */
-/* Stage s: OFF_STAGING + s * STAGE_TOTAL_BYTES
-   Within stage s:
-     residual[rg]: OFF_STAGING + s*STAGE_TOTAL_BYTES + rg*STAGING_REGION_BYTES
-     output[rg]:   OFF_STAGING + s*STAGE_TOTAL_BYTES + STAGE_RES_BYTES + rg*STAGING_REGION_BYTES */
+/* Stage si: OFF_STAGING + si * EPI_STAGE_BYTES
+   Within stage si (ReuseSmemC — same region for load and store):
+     data[rg]: OFF_STAGING + si*EPI_STAGE_BYTES + rg*STAGING_REGION_BYTES */
 
-#define SMEM_BYTES         ((OFF_STAGING + 2 * STAGE_TOTAL_BYTES + 127) & ~127)
+#define SMEM_BYTES         ((OFF_STAGING + NUM_EPI_STAGES * EPI_STAGE_BYTES + 127) & ~127)
 
 /* ── WGMMA / TMEM ── */
 #define TMEM_COLS      512
@@ -354,11 +356,11 @@ fc2_w3_kernel(
                (NUM_EPI_WARPS + 1) warps × 2 CTAs × 32 threads */
             mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR + i * 8), (NUM_EPI_WARPS + 1) * 2 * 32);
         }
-        /* W2→epilogue: load done (double-buffered). W2 arrives with expect_tx. */
-        for (int s = 0; s < 2; s++)
+        /* W2→epilogue: load done (4 stages). W2 arrives with expect_tx. */
+        for (int s = 0; s < NUM_EPI_STAGES; s++)
             mbar_init(smem_to_uint(smem + OFF_LOAD_MBAR + s * 8), 1);
-        /* epilogue→W2: load consumed (double-buffered). All 4 epi warps arrive. */
-        for (int s = 0; s < 2; s++)
+        /* epilogue→W2: stage consumed (4 stages). All 4 epi warps arrive. */
+        for (int s = 0; s < NUM_EPI_STAGES; s++)
             mbar_init(smem_to_uint(smem + OFF_LOAD_CONSUMED + s * 8), NUM_EPI_WARPS);
 
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -403,18 +405,19 @@ fc2_w3_kernel(
     int epi_phase[2] = {1, 1};
     int ml_phase[2]  = {start_buf, 1 - start_buf};
 
-    /* W2 + epilogue barrier addresses & phases (persist across tiles) */
-    const uint32_t load_mbar[2] = {
-        smem_to_uint(smem + OFF_LOAD_MBAR),
-        smem_to_uint(smem + OFF_LOAD_MBAR + 8)
-    };
-    const uint32_t consumed_mbar[2] = {
-        smem_to_uint(smem + OFF_LOAD_CONSUMED),
-        smem_to_uint(smem + OFF_LOAD_CONSUMED + 8)
-    };
-    int load_phase[2] = {0, 0};          /* epilogue side: wait phase for load_mbar */
-    int load_consumed_phase[2] = {0, 0}; /* W2 side: wait phase for consumed_mbar */
-    bool stage_fresh[2] = {true, true};  /* W2: skip first consumed wait per stage */
+    /* W2 + epilogue barrier addresses & phases (4 stages, persist across tiles) */
+    uint32_t load_mbar[NUM_EPI_STAGES];
+    uint32_t consumed_mbar[NUM_EPI_STAGES];
+    int load_phase[NUM_EPI_STAGES];
+    int load_consumed_phase[NUM_EPI_STAGES];
+    bool stage_fresh[NUM_EPI_STAGES];
+    for (int s = 0; s < NUM_EPI_STAGES; s++) {
+        load_mbar[s] = smem_to_uint(smem + OFF_LOAD_MBAR + s * 8);
+        consumed_mbar[s] = smem_to_uint(smem + OFF_LOAD_CONSUMED + s * 8);
+        load_phase[s] = 0;
+        load_consumed_phase[s] = 0;
+        stage_fresh[s] = true;
+    }
 
     /* ── Load bias into SMEM once ── */
     {
@@ -532,36 +535,29 @@ fc2_w3_kernel(
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
             }
 #else
-            /* ── W2: EpilogueLoad — TMA residual into shared staging ── */
+            /* ── W2: EpilogueLoad — pre-load residual for CURRENT tile during K-loop ──
+               Key change: no mainloop_mbar wait. W2 doesn't read TMEM.
+               consumed_mbar gates stage reuse from previous tile's epilogue. */
+
+            /* Arrive epi_mbar immediately for previous tile (W2 doesn't read TMEM) */
             if (tile_idx > tile_start) {
                 const int prev_buf = buf ^ 1;
-                const int prev_idx = tile_idx - 1;
-                const int ptm = prev_idx / TILES_N;
-                int ptn = prev_idx % TILES_N;
-                if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
-                const int prev_m = ptm * TM * 2 + cta_rank * TM;
-                const int prev_n = ptn * TN;
-
-                mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
-                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-                ml_phase[prev_buf] ^= 1;
-
-                for (int si = 0; si < 4; si++) {
-                    const int stg = si & 1;
-                    /* Wait for epilogue to release this stage before overwriting */
-                    if (!stage_fresh[stg]) {
-                        mbar_wait(consumed_mbar[stg], load_consumed_phase[stg]);
-                        load_consumed_phase[stg] ^= 1;
-                    }
-                    stage_fresh[stg] = false;
-                    if (lane == 0) {
-                        const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING + stg * STAGE_TOTAL_BYTES);
-                        mbar_arrive_expect_tx(load_mbar[stg], STAGE_RES_BYTES);
-                        tma_load_2d_cta(res_dst, &tma_res,
-                                        prev_n + si * 64, prev_m, load_mbar[stg]);
-                    }
-                }
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
+            }
+
+            /* Pre-load residual for CURRENT tile (overlaps with K-loop) */
+            for (int si = 0; si < NUM_EPI_STAGES; si++) {
+                if (!stage_fresh[si]) {
+                    mbar_wait(consumed_mbar[si], load_consumed_phase[si]);
+                    load_consumed_phase[si] ^= 1;
+                }
+                stage_fresh[si] = false;
+                if (lane == 0) {
+                    const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING + si * EPI_STAGE_BYTES);
+                    mbar_arrive_expect_tx(load_mbar[si], EPI_STAGE_BYTES);
+                    tma_load_2d_cta(res_dst, &tma_res,
+                                    n_start + si * 64, m_start, load_mbar[si]);
+                }
             }
 #endif /* STRIP_EPILOGUE W2 */
 
@@ -574,7 +570,7 @@ fc2_w3_kernel(
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
             }
 #else
-            /* ── W3-W6: Epilogue compute — shared SMEM, BAR.SYNC coordinated ── */
+            /* ── W3-W6: Epilogue compute — ReuseSmemC, BAR.SYNC coordinated ── */
             const int ew = warp - 3;                           /* 0..3 */
             const int row_group = ew;                          /* rows ew*32..(ew+1)*32-1 */
             const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
@@ -601,26 +597,22 @@ fc2_w3_kernel(
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
                 ml_phase[prev_buf] ^= 1;
 
-                for (int si = 0; si < 4; si++) {
-                    const int stg = si & 1;
+                for (int si = 0; si < NUM_EPI_STAGES; si++) {
                     const int nc_base = si * 64;   /* column offset within tile */
 
-                    /* Wait for W2's TMA load to land */
-                    mbar_wait(load_mbar[stg], load_phase[stg]);
-                    load_phase[stg] ^= 1;
-
-                    /* Wait for previous TMA store to finish reading output SMEM
-                       (needed when reusing same stage: si >= 2) */
-                    if (si >= 2) {
-                        if (lane == 0) {
-                            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
-                        }
-                        __syncwarp();
-                    }
+                    /* Wait for W2's TMA load to land (pre-loaded during K-loop) */
+                    mbar_wait(load_mbar[si], load_phase[si]);
+                    load_phase[si] ^= 1;
 
                     /* Process 2 chunks of 32 cols each */
                     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
                     float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
+
+                    /* ReuseSmemC: single SMEM region for both LDS residual and STS output */
+                    const uint32_t stage_base = smem_to_uint(smem + OFF_STAGING
+                        + si * EPI_STAGE_BYTES
+                        + row_group * STAGING_REGION_BYTES
+                        + lane * 128);
 
                     for (int chunk = 0; chunk < 2; chunk++) {
                         const int nc = nc_base + chunk * 32;
@@ -644,60 +636,46 @@ fc2_w3_kernel(
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
 
-                        /* LDS residual from shared staging (swizzled) */
-                        const uint32_t rs = smem_to_uint(smem + OFF_STAGING
-                            + stg * STAGE_TOTAL_BYTES
-                            + row_group * STAGING_REGION_BYTES
-                            + lane * 128);
+                        /* LDS residual from shared staging (swizzled, ReuseSmemC) */
                         const uint32_t rsw0 = chunk ? sw4 : sw0;
                         const uint32_t rsw1 = chunk ? sw5 : sw1;
                         const uint32_t rsw2 = chunk ? sw6 : sw2;
                         const uint32_t rsw3 = chunk ? sw7 : sw3;
                         uint4 rv0, rv1, rv2, rv3;
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(rs + rsw0));
+                            : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(stage_base + rsw0));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(rv1.x),"=r"(rv1.y),"=r"(rv1.z),"=r"(rv1.w) : "r"(rs + rsw1));
+                            : "=r"(rv1.x),"=r"(rv1.y),"=r"(rv1.z),"=r"(rv1.w) : "r"(stage_base + rsw1));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w) : "r"(rs + rsw2));
+                            : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w) : "r"(stage_base + rsw2));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w) : "r"(rs + rsw3));
+                            : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w) : "r"(stage_base + rsw3));
 
                         TMEM_WAIT();
 
-                        /* Output staging — STS to per-warp region within output area */
-                        const uint32_t os = smem_to_uint(smem + OFF_STAGING
-                            + stg * STAGE_TOTAL_BYTES + STAGE_RES_BYTES
-                            + row_group * STAGING_REGION_BYTES
-                            + lane * 128);
-
+                        /* STS output to SAME stage region (ReuseSmemC) */
                         BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                             bv0.x,bv0.y,bv0.z,bv0.w,
-                            rv0.x,rv0.y,rv0.z,rv0.w, os + rsw0);
+                            rv0.x,rv0.y,rv0.z,rv0.w, stage_base + rsw0);
                         BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
                             bv1.x,bv1.y,bv1.z,bv1.w,
-                            rv1.x,rv1.y,rv1.z,rv1.w, os + rsw1);
+                            rv1.x,rv1.y,rv1.z,rv1.w, stage_base + rsw1);
                         BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
                             bv2.x,bv2.y,bv2.z,bv2.w,
-                            rv2.x,rv2.y,rv2.z,rv2.w, os + rsw2);
+                            rv2.x,rv2.y,rv2.z,rv2.w, stage_base + rsw2);
                         BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
                             bv3.x,bv3.y,bv3.z,bv3.w,
-                            rv3.x,rv3.y,rv3.z,rv3.w, os + rsw3);
+                            rv3.x,rv3.y,rv3.z,rv3.w, stage_base + rsw3);
                     }
 
                     /* FENCE + BAR.SYNC: all 4 epilogue warps' STS must be visible */
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 
-                    /* Signal W2: this stage's residual data has been consumed */
-                    if (lane == 0) {
-                        mbar_arrive(consumed_mbar[stg]);
-                    }
-
                     /* TMA store: each warp stores its 32-row × 64-col output */
                     if (lane == 0) {
                         const uint32_t out_src = smem_to_uint(smem + OFF_STAGING
-                            + stg * STAGE_TOTAL_BYTES + STAGE_RES_BYTES
+                            + si * EPI_STAGE_BYTES
                             + row_group * STAGING_REGION_BYTES);
                         asm volatile(
                             "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group"
@@ -707,8 +685,20 @@ fc2_w3_kernel(
                         asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                     }
 
-                    /* No second bar.sync needed: each warp's TMA store reads from its own
-                       row_group region. wait_group 0 at si+2 handles per-warp timing. */
+                    /* Wait for TMA store to finish reading SMEM (ReuseSmemC: W2
+                       will overwrite this region for next tile after consumed signal) */
+                    if (lane == 0) {
+                        asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                    }
+                    __syncwarp();
+
+                    /* BAR.SYNC: all warps confirm TMA store consumed SMEM */
+                    asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
+
+                    /* Signal W2: stage freed (MUST be after TMA store for ReuseSmemC) */
+                    if (lane == 0) {
+                        mbar_arrive(consumed_mbar[si]);
+                    }
                 }
 
                 /* Signal W1: TMEM buffer free for next tile */
@@ -738,25 +728,8 @@ fc2_w3_kernel(
             ml_phase[last_buf] ^= 1;
             mbar_arrive(epi_mbar_masked + last_buf * 8);
 #else
-            /* W2: load residual for last tile */
-            mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
-            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-            ml_phase[last_buf] ^= 1;
-
-            for (int si = 0; si < 4; si++) {
-                const int stg = si & 1;
-                if (!stage_fresh[stg]) {
-                    mbar_wait(consumed_mbar[stg], load_consumed_phase[stg]);
-                    load_consumed_phase[stg] ^= 1;
-                }
-                stage_fresh[stg] = false;
-                if (lane == 0) {
-                    const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING + stg * STAGE_TOTAL_BYTES);
-                    mbar_arrive_expect_tx(load_mbar[stg], STAGE_RES_BYTES);
-                    tma_load_2d_cta(res_dst, &tma_res,
-                                    last_n + si * 64, last_m, load_mbar[stg]);
-                }
-            }
+            /* W2: last tile's residual was already pre-loaded in the last main-loop iteration.
+               Just arrive on epi_mbar (W2 doesn't read TMEM). */
             mbar_arrive(epi_mbar_masked + last_buf * 8);
 #endif /* STRIP_EPILOGUE drain W2 */
 
@@ -766,7 +739,7 @@ fc2_w3_kernel(
             ml_phase[last_buf] ^= 1;
             mbar_arrive(epi_mbar_masked + last_buf * 8);
 #else
-            /* W3-W6: epilogue for last tile */
+            /* W3-W6: epilogue for last tile (ReuseSmemC) */
             const int ew = warp - 3;
             const int row_group = ew;
             const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
@@ -782,22 +755,19 @@ fc2_w3_kernel(
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             ml_phase[last_buf] ^= 1;
 
-            for (int si = 0; si < 4; si++) {
-                const int stg = si & 1;
+            for (int si = 0; si < NUM_EPI_STAGES; si++) {
                 const int nc_base = si * 64;
 
-                mbar_wait(load_mbar[stg], load_phase[stg]);
-                load_phase[stg] ^= 1;
-
-                if (si >= 2) {
-                    if (lane == 0) {
-                        asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
-                    }
-                    __syncwarp();
-                }
+                mbar_wait(load_mbar[si], load_phase[si]);
+                load_phase[si] ^= 1;
 
                 float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
                 float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
+
+                const uint32_t stage_base = smem_to_uint(smem + OFF_STAGING
+                    + si * EPI_STAGE_BYTES
+                    + row_group * STAGING_REGION_BYTES
+                    + lane * 128);
 
                 for (int chunk = 0; chunk < 2; chunk++) {
                     const int nc = nc_base + chunk * 32;
@@ -819,55 +789,44 @@ fc2_w3_kernel(
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
 
-                    const uint32_t rs = smem_to_uint(smem + OFF_STAGING
-                        + stg * STAGE_TOTAL_BYTES
-                        + row_group * STAGING_REGION_BYTES
-                        + lane * 128);
+                    /* LDS residual (swizzled, ReuseSmemC) */
                     const uint32_t rsw0 = chunk ? sw4 : sw0;
                     const uint32_t rsw1 = chunk ? sw5 : sw1;
                     const uint32_t rsw2 = chunk ? sw6 : sw2;
                     const uint32_t rsw3 = chunk ? sw7 : sw3;
                     uint4 rv0, rv1, rv2, rv3;
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(rs + rsw0));
+                        : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(stage_base + rsw0));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(rv1.x),"=r"(rv1.y),"=r"(rv1.z),"=r"(rv1.w) : "r"(rs + rsw1));
+                        : "=r"(rv1.x),"=r"(rv1.y),"=r"(rv1.z),"=r"(rv1.w) : "r"(stage_base + rsw1));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w) : "r"(rs + rsw2));
+                        : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w) : "r"(stage_base + rsw2));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w) : "r"(rs + rsw3));
+                        : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w) : "r"(stage_base + rsw3));
 
                     TMEM_WAIT();
 
-                    const uint32_t os = smem_to_uint(smem + OFF_STAGING
-                        + stg * STAGE_TOTAL_BYTES + STAGE_RES_BYTES
-                        + row_group * STAGING_REGION_BYTES
-                        + lane * 128);
-
+                    /* STS output to SAME stage region (ReuseSmemC) */
                     BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                         bv0.x,bv0.y,bv0.z,bv0.w,
-                        rv0.x,rv0.y,rv0.z,rv0.w, os + rsw0);
+                        rv0.x,rv0.y,rv0.z,rv0.w, stage_base + rsw0);
                     BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
                         bv1.x,bv1.y,bv1.z,bv1.w,
-                        rv1.x,rv1.y,rv1.z,rv1.w, os + rsw1);
+                        rv1.x,rv1.y,rv1.z,rv1.w, stage_base + rsw1);
                     BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
                         bv2.x,bv2.y,bv2.z,bv2.w,
-                        rv2.x,rv2.y,rv2.z,rv2.w, os + rsw2);
+                        rv2.x,rv2.y,rv2.z,rv2.w, stage_base + rsw2);
                     BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
                         bv3.x,bv3.y,bv3.z,bv3.w,
-                        rv3.x,rv3.y,rv3.z,rv3.w, os + rsw3);
+                        rv3.x,rv3.y,rv3.z,rv3.w, stage_base + rsw3);
                 }
 
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 
                 if (lane == 0) {
-                    mbar_arrive(consumed_mbar[stg]);
-                }
-
-                if (lane == 0) {
                     const uint32_t out_src = smem_to_uint(smem + OFF_STAGING
-                        + stg * STAGE_TOTAL_BYTES + STAGE_RES_BYTES
+                        + si * EPI_STAGE_BYTES
                         + row_group * STAGING_REGION_BYTES);
                     asm volatile(
                         "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group"
@@ -876,13 +835,17 @@ fc2_w3_kernel(
                            "r"(out_src) : "memory");
                     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                 }
-            }
 
-            /* Wait for final TMA stores to complete before kernel exit */
-            if (lane == 0) {
-                asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                /* Wait for TMA store + signal consumed (ReuseSmemC) */
+                if (lane == 0) {
+                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                }
+                __syncwarp();
+                asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
+                if (lane == 0) {
+                    mbar_arrive(consumed_mbar[si]);
+                }
             }
-            __syncwarp();
 
             mbar_arrive(epi_mbar_masked + last_buf * 8);
 #endif /* STRIP_EPILOGUE drain W3-W6 */
