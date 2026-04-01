@@ -383,6 +383,9 @@ fc2_w3_kernel(
     }
     const uint32_t mainloop_mbar_addr = smem_to_uint(smem + OFF_MAINLOOP_MBAR);
     const uint32_t epilogue_mbar_addr = smem_to_uint(smem + OFF_EPILOGUE_MBAR);
+    /* Bit 24 = CTA select in cluster SMEM addressing.  Clear it so both CTAs
+       arrive on CTA 0's epilogue mbar (W1 runs on CTA 0 only). */
+    const uint32_t epi_mbar_masked = epilogue_mbar_addr & 0xFEFFFFFF;
 
     const int tile_start = (int)((long long)cluster_id * TOTAL_TILES / num_clusters);
     const int tile_end   = (int)((long long)(cluster_id + 1) * TOTAL_TILES / num_clusters);
@@ -525,7 +528,7 @@ fc2_w3_kernel(
                 const int prev_buf = buf ^ 1;
                 mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
                 ml_phase[prev_buf] ^= 1;
-                mbar_arrive(epilogue_mbar_addr + prev_buf * 8);
+                mbar_arrive(epi_mbar_masked + prev_buf * 8);
             }
 #else
             /* ── W2: EpilogueLoad — TMA residual into shared staging ── */
@@ -556,7 +559,7 @@ fc2_w3_kernel(
                                         prev_n + si * 64, prev_m, load_mbar[stg]);
                     }
                 }
-                mbar_arrive(epilogue_mbar_addr + prev_buf * 8);
+                mbar_arrive(epi_mbar_masked + prev_buf * 8);
             }
 #endif /* STRIP_EPILOGUE W2 */
 
@@ -566,7 +569,7 @@ fc2_w3_kernel(
                 const int prev_buf = buf ^ 1;
                 mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
                 ml_phase[prev_buf] ^= 1;
-                mbar_arrive(epilogue_mbar_addr + prev_buf * 8);
+                mbar_arrive(epi_mbar_masked + prev_buf * 8);
             }
 #else
             /* ── W3-W6: Epilogue compute — shared SMEM, BAR.SYNC coordinated ── */
@@ -707,7 +710,7 @@ fc2_w3_kernel(
                 }
 
                 /* Signal W1: TMEM buffer free for next tile */
-                mbar_arrive(epilogue_mbar_addr + prev_buf * 8);
+                mbar_arrive(epi_mbar_masked + prev_buf * 8);
             }
 #endif /* STRIP_EPILOGUE W3-W6 */
         }
@@ -731,7 +734,7 @@ fc2_w3_kernel(
 #ifdef STRIP_EPILOGUE
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
             ml_phase[last_buf] ^= 1;
-            mbar_arrive(epilogue_mbar_addr + last_buf * 8);
+            mbar_arrive(epi_mbar_masked + last_buf * 8);
 #else
             /* W2: load residual for last tile */
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
@@ -751,14 +754,14 @@ fc2_w3_kernel(
                                     last_n + si * 64, last_m, load_mbar[stg]);
                 }
             }
-            mbar_arrive(epilogue_mbar_addr + last_buf * 8);
+            mbar_arrive(epi_mbar_masked + last_buf * 8);
 #endif /* STRIP_EPILOGUE drain W2 */
 
         } else {
 #ifdef STRIP_EPILOGUE
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
             ml_phase[last_buf] ^= 1;
-            mbar_arrive(epilogue_mbar_addr + last_buf * 8);
+            mbar_arrive(epi_mbar_masked + last_buf * 8);
 #else
             /* W3-W6: epilogue for last tile */
             const int ew = warp - 3;
@@ -878,7 +881,7 @@ fc2_w3_kernel(
             }
             __syncwarp();
 
-            mbar_arrive(epilogue_mbar_addr + last_buf * 8);
+            mbar_arrive(epi_mbar_masked + last_buf * 8);
 #endif /* STRIP_EPILOGUE drain W3-W6 */
         }
     }
