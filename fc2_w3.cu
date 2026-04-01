@@ -414,6 +414,7 @@ fc2_w3_kernel(
     };
     int load_phase[2] = {0, 0};          /* epilogue side: wait phase for load_mbar */
     int load_consumed_phase[2] = {0, 0}; /* W2 side: wait phase for consumed_mbar */
+    bool stage_fresh[2] = {true, true};  /* W2: skip first consumed wait per stage */
 
     /* ── Load bias into SMEM once ── */
     {
@@ -547,11 +548,12 @@ fc2_w3_kernel(
 
                 for (int si = 0; si < 4; si++) {
                     const int stg = si & 1;
-                    /* Wait for previous consumer to free this stage (skip first 2) */
-                    if (si >= 2) {
+                    /* Wait for epilogue to release this stage before overwriting */
+                    if (!stage_fresh[stg]) {
                         mbar_wait(consumed_mbar[stg], load_consumed_phase[stg]);
                         load_consumed_phase[stg] ^= 1;
                     }
+                    stage_fresh[stg] = false;
                     if (lane == 0) {
                         const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING + stg * STAGE_TOTAL_BYTES);
                         mbar_arrive_expect_tx(load_mbar[stg], STAGE_RES_BYTES);
@@ -743,10 +745,11 @@ fc2_w3_kernel(
 
             for (int si = 0; si < 4; si++) {
                 const int stg = si & 1;
-                if (si >= 2) {
+                if (!stage_fresh[stg]) {
                     mbar_wait(consumed_mbar[stg], load_consumed_phase[stg]);
                     load_consumed_phase[stg] ^= 1;
                 }
+                stage_fresh[stg] = false;
                 if (lane == 0) {
                     const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING + stg * STAGE_TOTAL_BYTES);
                     mbar_arrive_expect_tx(load_mbar[stg], STAGE_RES_BYTES);
