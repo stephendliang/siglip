@@ -26,11 +26,13 @@ cd "$(dirname "$0")/.."
 
 DRY_RUN=0
 QUICK=0
+START_TEST=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=1; shift ;;
         --quick)   QUICK=1; shift ;;
-        *) echo "Unknown arg: $1"; exit 1 ;;
+        --from)    START_TEST="$2"; shift 2 ;;
+        *) echo "Unknown arg: $1 (usage: --dry-run --quick --from N)"; exit 1 ;;
     esac
 done
 
@@ -129,6 +131,7 @@ START_TIME=$(date +%s)
 # ════════════════════════════════════════
 # TEST 1: Reference baselines
 # ════════════════════════════════════════
+if [ "$START_TEST" -le 1 ]; then
 log ""
 log "==== TEST 1: REFERENCE BASELINES ===="
 
@@ -171,12 +174,15 @@ if [ "$QUICK" = "0" ]; then
     fi
 fi
 
+fi  # TEST 1
+
 # ════════════════════════════════════════
 # TEST 2: NEPI=2 valid + x64 combos
 # Multi-row-group loop makes NEPI<4 produce valid=1.
 # Tests whether overhead is warp-COUNT based (~1.25ms) or active-TIME based (~1.47ms).
 # x64 TMEM loads halve inner-loop iterations — may shorten per-warp active time.
 # ════════════════════════════════════════
+if [ "$START_TEST" -le 2 ]; then
 log ""
 log "==== TEST 2: NEPI=2 VALID + x64 COMBOS ===="
 
@@ -194,9 +200,12 @@ for exp in "${NEPI2_COMBOS[@]}"; do
     run_wall "$label" "$dflags"
 done
 
+fi  # TEST 2
+
 # ════════════════════════════════════════
 # TEST 3: NEPI=2 timing (cycle breakdown for best combos)
 # ════════════════════════════════════════
+if [ "$START_TEST" -le 3 ]; then
 log ""
 log "==== TEST 3: NEPI=2 TIMING ===="
 
@@ -204,39 +213,50 @@ run_wall_timing "t_nepi2_valid" "$BASE -DNUM_EPI_WARPS=2"
 run_wall_timing "t_nepi2_x64" "$BASE -DNUM_EPI_WARPS=2 -DTMEM_LOAD_WIDTH=64"
 run_wall_timing "t_nepi2_x64_bs" "$BASE -DNUM_EPI_WARPS=2 -DTMEM_LOAD_WIDTH=64 -DBIAS_SMEM=1"
 
+fi  # TEST 3
+
 # ════════════════════════════════════════
-# TEST 4: SC2 without EPI_REUSE_SMEM (2 warps, fits naturally)
+# TEST 4: BIAS_SMEM=1 confirmation (the one free win)
 # ════════════════════════════════════════
+if [ "$START_TEST" -le 4 ]; then
 log ""
-log "==== TEST 4: SC2 no-reuse (2 warps) ===="
+log "==== TEST 4: BIAS_SMEM=1 CONFIRMATION ===="
 
-run_wall "sc2nr_nepi2" "$BASE -DSTAGES_C=2 -DNUM_EPI_WARPS=2"
-run_wall "sc2nr_nepi2_bs" "$BASE -DSTAGES_C=2 -DNUM_EPI_WARPS=2 -DBIAS_SMEM=1"
+run_wall "base_bs1" "$BASE -DBIAS_SMEM=1"
+
+fi  # TEST 4
 
 # ════════════════════════════════════════
-# TEST 5: Timing comparison (best SC2 vs baseline strip)
+# TEST 5: Timing comparison (strip / base / nepi2 / bias_smem)
 # ════════════════════════════════════════
+if [ "$START_TEST" -le 5 ]; then
 log ""
 log "==== TEST 5: TIMING (kloop/ph1/epi_wait breakdown) ===="
 
 run_wall_timing "t_strip" "$BASE -DSTRIP_EPILOGUE=1"
 run_wall_timing "t_base" "$BASE"
 run_wall_timing "t_base_nepi2" "$BASE -DNUM_EPI_WARPS=2"
-run_wall_timing "t_sc2nr_nepi2" "$BASE -DSTAGES_C=2 -DNUM_EPI_WARPS=2"
+run_wall_timing "t_base_bs" "$BASE -DBIAS_SMEM=1"
+
+fi  # TEST 5
 
 # ════════════════════════════════════════
 # TEST 6: SASS-patched binaries (build + CP-SAT schedule + patch on target)
 # ════════════════════════════════════════
+if [ "$START_TEST" -le 6 ]; then
 log ""
 log "==== TEST 6: SASS-PATCHED BINARIES ===="
 
-# Pre-check: ortools required for CP-SAT scheduler
-if ! python3 -c "from ortools.sat.python import cp_model" 2>/dev/null; then
-    log "  [sass] ortools not found, installing..."
-    pip install ortools 2>&1 | tail -1 | tee -a "$OUTDIR/session.log"
+# Pre-check: ortools + pyelftools required for CP-SAT scheduler + fatbin-patch
+if ! python3 -c "from ortools.sat.python import cp_model" 2>/dev/null || \
+   ! python3 -c "from elftools.elf.elffile import ELFFile" 2>/dev/null; then
+    log "  [sass] installing ortools + pyelftools..."
+    pip3 install --break-system-packages --ignore-installed typing_extensions ortools pyelftools 2>&1 | tail -3 | tee -a "$OUTDIR/session.log"
 fi
 if ! python3 -c "from ortools.sat.python import cp_model" 2>/dev/null; then
     log "  [sass] SKIPPED: ortools install failed"
+elif ! python3 -c "from elftools.elf.elffile import ELFFile" 2>/dev/null; then
+    log "  [sass] SKIPPED: pyelftools install failed"
 else
 
 CPSAT_TIME=120  # seconds per chunk
@@ -394,6 +414,7 @@ if [ -x "./cutlass-bench-fc2-max" ] && [ "$DRY_RUN" = "0" ]; then
 fi
 
 fi  # ortools check
+fi  # TEST 6
 
 # ════════════════════════════════════════
 # Thermal drift check
@@ -445,19 +466,6 @@ if [ -f "$OUTDIR/wall_results.txt" ] && [ "$DRY_RUN" = "0" ]; then
             [ -n "$base4w_ms" ] && d4w=$(echo "($ms - $base4w_ms) * 1000" | bc -l 2>/dev/null | sed 's/^\./0./' | cut -c1-7 || echo "?")
             [ -n "$cutlass_ms2" ] && dcut=$(echo "($ms - $cutlass_ms2) * 1000" | bc -l 2>/dev/null | sed 's/^\./0./' | cut -c1-7 || echo "?")
             printf "  %-18s %sms  v=%s  Δ4w=%sμs  Δcut=%sμs\n" "$label" "$ms" "${valid:-?}" "$d4w" "$dcut" | tee -a "$OUTDIR/wall_summary.txt"
-        fi
-    done
-
-    # SC2 no-reuse vs baseline (2 warps only — the only valid SC2 config with NS5)
-    echo "" | tee -a "$OUTDIR/wall_summary.txt"
-    echo "=== SC2 no-reuse vs BASELINE (2 warps) ===" | tee -a "$OUTDIR/wall_summary.txt"
-    for pair in "nepi2:base_nepi2:sc2nr_nepi2" "nepi2_bs:base_nepi2:sc2nr_nepi2_bs"; do
-        IFS=: read -r plabel blab slab <<< "$pair"
-        bms=$(grep "label=${blab} " "$OUTDIR/wall_results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
-        sms=$(grep "label=${slab} " "$OUTDIR/wall_results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
-        if [ -n "$bms" ] && [ -n "$sms" ]; then
-            diff_us=$(echo "($sms - $bms) * 1000" | bc -l 2>/dev/null | sed 's/^\./0./' | cut -c1-7 || echo "?")
-            printf "  %-12s base=%sms  sc2nr=%sms  Δ=%sμs\n" "$plabel" "$bms" "$sms" "$diff_us" | tee -a "$OUTDIR/wall_summary.txt"
         fi
     done
 

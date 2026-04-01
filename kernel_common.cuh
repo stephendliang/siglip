@@ -358,6 +358,9 @@ Problem dimensions — N_DIM must be defined before including this header
 #if (4 % NUM_EPI_WARPS) != 0
 #error "NUM_EPI_WARPS must divide 4 (valid: 1, 2, 4)"
 #endif
+#if STAGES_C && ROW_GROUPS_PER_WARP > 1
+#error "STAGES_C incompatible with multi-row-group (NUM_EPI_WARPS<4): W0 pre-load and mbar protocol assume 1 rg/warp"
+#endif
 #else
 #define ROW_GROUPS_PER_WARP       1
 #endif
