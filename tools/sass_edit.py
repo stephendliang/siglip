@@ -53,26 +53,24 @@ INSN_SIZE = 16  # 128-bit instructions = 16 bytes
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def decode_ctrl(ctrl):
-    """Decode control word into field dict (SM89 layout, stall verified for SM100a)."""
+    """Decode control word into field dict.
+
+    SM100a layout (128-bit instructions, empirically verified):
+      bits [7:0]    — extended operand (register for HFMA2/IMAD/LEA/LOP3, etc.)
+      bits [52:8]   — unknown (instruction-format-dependent)
+      bits [55:53]  — stall count (3 bits, range 0-7)
+      bits [63:56]  — flags (bit 56 = .reuse in some formats)
+    Only the stall field is verified. Other bit assignments are placeholders.
+    """
     return {
-        'stall':     ctrl & 0xf,
-        'yield':     (ctrl >> 4) & 1,
-        'wr_bar':    (ctrl >> 5) & 0x1f,
-        'rd_bar':    (ctrl >> 10) & 0x1f,
-        'wait_mask': (ctrl >> 15) & 0x3f,
-        'reuse':     (ctrl >> 21) & 3,
+        'stall':     (ctrl >> 53) & 0x7,
     }
 
 
 def encode_ctrl(fields, original_ctrl):
-    """Encode control word fields, preserving bits above [22]."""
-    mask = 0x7fffff  # bits [22:0]
-    val = ((fields['stall'] & 0xf) |
-           ((fields['yield'] & 1) << 4) |
-           ((fields['wr_bar'] & 0x1f) << 5) |
-           ((fields['rd_bar'] & 0x1f) << 10) |
-           ((fields['wait_mask'] & 0x3f) << 15) |
-           ((fields['reuse'] & 3) << 21))
+    """Encode control word fields, preserving all bits except stall."""
+    mask = 0x7 << 53  # bits [55:53]
+    val = (fields['stall'] & 0x7) << 53
     return (original_ctrl & ~mask) | val
 
 
@@ -100,7 +98,7 @@ LATENCY = {
     'LDTM': 20,
 }
 LATENCY_DEFAULT = 4
-MAX_STALL = 15
+MAX_STALL = 7  # SM100a: 3-bit stall field at bits 53-55, range 0-7
 
 STORE_NO_REG_OUTPUT = frozenset([
     'STS', 'STG', 'STL', 'ATOMS', 'ATOMG', 'RED',
@@ -121,14 +119,8 @@ def get_latency(mnemonic):
 def ctrl_str(ctrl_val):
     """Format control word for display."""
     c = decode_ctrl(ctrl_val)
-    parts = ['st=%2d' % c['stall']]
-    if c['yield']:
-        parts.append('Y')
-    # Show raw low 23 bits for full visibility
-    parts.append('lo=%06x' % (ctrl_val & 0x7fffff))
-    hi = ctrl_val >> 23
-    if hi:
-        parts.append('hi=%010x' % hi)
+    parts = ['st=%d' % c['stall']]
+    parts.append('ctrl=%016x' % ctrl_val)
     return ' '.join(parts)
 
 
@@ -300,7 +292,7 @@ class Instruction:
 
     @property
     def stall(self):
-        return self.control & 0xf
+        return (self.control >> 53) & 0x7
 
     def clone(self):
         i = Instruction(self.offset, self.encoding, self.control)
@@ -917,7 +909,7 @@ def compute_stalls(instructions, keep_first=True):
                     if lat == 0:
                         break
                     # sum stall counts between producer and consumer (exclusive)
-                    covered = sum(instructions[k].control & 0xf for k in range(j + 1, i))
+                    covered = sum(instructions[k].stall for k in range(j + 1, i))
                     needed = lat - covered
                     if needed > max_needed:
                         max_needed = needed
@@ -929,7 +921,7 @@ def compute_stalls(instructions, keep_first=True):
             continue
 
         new_stall = min(max_needed, MAX_STALL)
-        old_stall = insn.control & 0xf
+        old_stall = insn.stall
         if new_stall == old_stall:
             continue
 
@@ -955,7 +947,8 @@ def apply_stall_changes(instructions, changes):
         insn = addr_map.get(ch.addr)
         if insn is None:
             continue
-        insn.control = (insn.control & ~0xf) | (ch.new_stall & 0xf)
+        mask = 0x7 << 53
+        insn.control = (insn.control & ~mask) | ((ch.new_stall & 0x7) << 53)
         applied += 1
     return applied
 
@@ -986,7 +979,7 @@ def audit_stalls(instructions):
                     lat = get_latency(instructions[j].mnemonic)
                     if lat == 0:
                         break
-                    covered = sum(instructions[k].control & 0xf for k in range(j + 1, i))
+                    covered = sum(instructions[k].stall for k in range(j + 1, i))
                     if covered < lat:
                         warnings.append(StallWarning(
                             insn.offset,
@@ -1688,7 +1681,7 @@ def analyze_control_words(kernels):
         var_mask = 0
         for c in unique:
             var_mask |= c ^ default_ctrl
-        stall_dist = dict(collections.Counter(c & 0xf for c in ctrls).most_common())
+        stall_dist = dict(collections.Counter((c >> 53) & 0x7 for c in ctrls).most_common())
         family_stats[family] = {
             'n_instances': len(ctrls), 'n_unique': len(unique),
             'default': default_ctrl, 'var_mask': var_mask,
@@ -2714,7 +2707,7 @@ def schedule_cpsat(instructions, time_limit=60.0, verbose=True):
         idx = ordered_indices[p]
         addr = instructions[idx].offset
         if p == 0:
-            stall_counts[addr] = instructions[idx].control & 0xf  # keep original
+            stall_counts[addr] = instructions[idx].stall  # keep original
         else:
             prev_idx = ordered_indices[p - 1]
             gap = solver.value(time[idx]) - solver.value(time[prev_idx])
@@ -2766,7 +2759,7 @@ def schedule_cpsat(instructions, time_limit=60.0, verbose=True):
 
     # --- Compare with original ---
     if verbose:
-        orig_stalls = sum(insn.control & 0xf for insn in instructions)
+        orig_stalls = sum(insn.stall for insn in instructions)
         new_stalls = sum(stall_counts.values())
         print('\nOriginal total stalls: %d cycles' % orig_stalls)
         print('Optimized total stalls: %d cycles' % int(obj_val))
@@ -3078,10 +3071,12 @@ class CubinEditor:
         self._modified = True
 
     def patch_stall(self, kernel, addr, stall):
-        """Set stall count at addr (most common operation)."""
+        """Set stall count at addr (most common operation).
+        SM100a: stall is 3 bits at bits 53-55 of the control word."""
         idx = addr // INSN_SIZE
         insn = kernel.instructions[idx]
-        insn.control = (insn.control & ~0xf) | (stall & 0xf)
+        mask = 0x7 << 53
+        insn.control = (insn.control & ~mask) | ((stall & 0x7) << 53)
         self._modified = True
 
     def patch_reg(self, kernel, addr, field_name, new_reg_num):
@@ -3188,7 +3183,7 @@ class CubinEditor:
         for i in range(n_asm, n_slots):
             insn = kernel.instructions[start_idx + i]
             insn.encoding = NOP_ENCODING
-            insn.control = insn.control & ~0xf  # zero stall, keep other ctrl bits
+            insn.control = insn.control & ~(0x7 << 53)  # zero stall, keep other ctrl bits
             insn.mnemonic = 'NOP'
             insn.operands = ''
 
@@ -3458,7 +3453,7 @@ def cmd_dump(args):
         if end is not None and insn.offset >= end:
             break
 
-        stall = insn.control & 0xf
+        stall = insn.stall
         stall_bar = '#' * stall if stall else '.'
 
         if insn.mnemonic:
@@ -3791,8 +3786,8 @@ def cmd_diff(args):
             enc_diff = '  enc' if a.encoding != b.encoding else '     '
             ctrl_diff = '  ctrl' if a.control != b.control else '      '
 
-            stall_a = a.control & 0xf
-            stall_b = b.control & 0xf
+            stall_a = a.stall
+            stall_b = b.stall
             stall_str = ''
             if stall_a != stall_b:
                 stall_str = '  st: %d->%d' % (stall_a, stall_b)
@@ -4816,7 +4811,8 @@ def encode_instruction(insn, pc=0, labels=None):
         # Operand .reuse flags are NOT applied (they're in encoding bits, not ctrl).
         ctrl = insn.directives['.ctrl']
         if '.stall' in insn.directives:
-            ctrl = (ctrl & ~0xf) | (insn.directives['.stall'] & 0xf)
+            mask = 0x7 << 53
+            ctrl = (ctrl & ~mask) | ((insn.directives['.stall'] & 0x7) << 53)
         if '.yield' in insn.directives:
             ctrl = ctrl | (1 << 4)
         elif '.noyield' in insn.directives:
@@ -4828,7 +4824,8 @@ def encode_instruction(insn, pc=0, labels=None):
         family = insn.family
         ctrl = CONTROL_DEFAULTS.get(family, 0x000fe20000000000)
         if '.stall' in insn.directives:
-            ctrl = (ctrl & ~0xf) | (insn.directives['.stall'] & 0xf)
+            mask = 0x7 << 53
+            ctrl = (ctrl & ~mask) | ((insn.directives['.stall'] & 0x7) << 53)
         if '.yield' in insn.directives:
             ctrl = ctrl | (1 << 4)
         if '.barrier.wait' in insn.directives:
@@ -4867,7 +4864,7 @@ def disassemble_region(kernel, start, end):
     for idx in range(start_idx, end_idx):
         insn = kernel.instructions[idx]
         ctrl = insn.control
-        stall = ctrl & 0xf
+        stall = (ctrl >> 53) & 0x7
 
         # Emit control word as raw hex (exact round-trip),
         # plus human-readable stall/yield/reuse for editability
@@ -5019,7 +5016,7 @@ def cmd_assemble(args):
             else:
                 guard = '@%s%sP%d ' % (neg, u, insn.guard_reg)
         ops = ', '.join(repr(op) for op in insn.operands)
-        stall = ctrl & 0xf
+        stall = (ctrl >> 53) & 0x7
         print('  [%04x] %016x %016x  stall=%d  %s%s %s' % (
             pc, enc, ctrl, stall, guard, insn.mnemonic, ops))
 
