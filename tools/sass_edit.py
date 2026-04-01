@@ -3035,25 +3035,15 @@ class CubinEditor:
         # Snapshot originals
         orig = {a: instrs[a // INSN_SIZE].clone() for a in new_order}
 
-        # Write in new order, clearing scoreboard barrier fields.
-        # Barriers (wr_bar, rd_bar, wait_mask) encode producer/consumer
-        # relationships for the ORIGINAL instruction order.  After reorder
-        # they point to wrong instructions → "illegal instruction" crash.
-        # The CP-SAT stall counts fully cover all latencies (solver enforces
-        # gap <= MAX_STALL between consecutive positions), so barriers are
-        # redundant.  Clear them: wr_bar=7 rd_bar=7 wait_mask=0.
-        # Bits [22:0] layout: [3:0]=stall [4]=yield [9:5]=wr_bar [14:10]=rd_bar [20:15]=wait_mask [22:21]=reuse
-        BARRIER_MASK = (0x1f << 5) | (0x1f << 10) | (0x3f << 15)  # wr_bar + rd_bar + wait_mask
-        BARRIER_CLEAR = (0x7 << 5) | (0x7 << 10) | (0x0 << 15)   # wr=7(none) rd=7(none) wm=0
+        # Write in new order.  Control words move with their instructions
+        # unchanged — only stall counts (bits 0-3) are patched afterward.
+        # SM100a control word layout above bit 4 is NOT verified, so we
+        # must not modify any bits other than stall to avoid corruption.
         for i, addr in enumerate(new_order):
             src = orig[addr]
             dst = instrs[start_idx + i]
             dst.encoding = src.encoding
-            ctrl = src.control
-            # Clear barrier fields unless it's a barrier instruction (DEPBAR etc)
-            if src.mnemonic and not is_barrier(src.mnemonic):
-                ctrl = (ctrl & ~BARRIER_MASK) | BARRIER_CLEAR
-            dst.control = ctrl
+            dst.control = src.control
             dst.mnemonic = src.mnemonic
             dst.operands = src.operands
 
