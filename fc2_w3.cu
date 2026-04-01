@@ -684,18 +684,18 @@ fc2_w3_kernel(
                                "r"(out_src) : "memory");
                         asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                     }
+                }
 
-                    /* Wait for TMA store to finish reading SMEM (ReuseSmemC: W2
-                       will overwrite this region for next tile after consumed signal) */
-                    if (lane == 0) {
-                        asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
-                    }
-                    __syncwarp();
+                /* Wait for ALL TMA stores to finish, then free all 4 stages at once.
+                   With 4 independent stages, no within-tile reuse — only need one
+                   wait_group + BAR after all sub-iters, not per sub-iter. */
+                if (lane == 0) {
+                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                }
+                __syncwarp();
+                asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 
-                    /* BAR.SYNC: all warps confirm TMA store consumed SMEM */
-                    asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
-
-                    /* Signal W2: stage freed (MUST be after TMA store for ReuseSmemC) */
+                for (int si = 0; si < NUM_EPI_STAGES; si++) {
                     if (lane == 0) {
                         mbar_arrive(consumed_mbar[si]);
                     }
@@ -835,13 +835,15 @@ fc2_w3_kernel(
                            "r"(out_src) : "memory");
                     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                 }
+            }
 
-                /* Wait for TMA store + signal consumed (ReuseSmemC) */
-                if (lane == 0) {
-                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
-                }
-                __syncwarp();
-                asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
+            /* Wait for all TMA stores, free all stages, signal done */
+            if (lane == 0) {
+                asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+            }
+            __syncwarp();
+            asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
+            for (int si = 0; si < NUM_EPI_STAGES; si++) {
                 if (lane == 0) {
                     mbar_arrive(consumed_mbar[si]);
                 }
