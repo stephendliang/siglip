@@ -2641,12 +2641,13 @@ def schedule_cpsat(instructions, time_limit=60.0, verbose=True):
         model.add_element(pos[i], time_at_pos, time[i])
 
     # Consecutive position constraint: monotonically increasing issue times.
-    # No upper bound — the hardware can stall beyond 15 cycles via scoreboard
-    # waits and pipe contention. The 15-cycle stall cap only limits what we
-    # can encode; actual issue gaps may be larger (hardware blocks naturally).
-    # We clamp to 15 when producing the stall output.
+    # Upper bound = MAX_STALL (15) — since reorder invalidates scoreboard
+    # barriers, stall counts must fully cover all latencies without relying
+    # on hardware barrier waits.  Forces the solver to spread high-latency
+    # deps across intermediate instructions rather than exceeding the stall cap.
     for p in range(N - 1):
         model.add(time_at_pos[p + 1] >= time_at_pos[p] + 1)
+        model.add(time_at_pos[p + 1] <= time_at_pos[p] + MAX_STALL)
 
     # --- Same-pipe throughput constraints ---
     # For instructions on the same pipe, enforce minimum gap.
@@ -3034,12 +3035,25 @@ class CubinEditor:
         # Snapshot originals
         orig = {a: instrs[a // INSN_SIZE].clone() for a in new_order}
 
-        # Write in new order
+        # Write in new order, clearing scoreboard barrier fields.
+        # Barriers (wr_bar, rd_bar, wait_mask) encode producer/consumer
+        # relationships for the ORIGINAL instruction order.  After reorder
+        # they point to wrong instructions → "illegal instruction" crash.
+        # The CP-SAT stall counts fully cover all latencies (solver enforces
+        # gap <= MAX_STALL between consecutive positions), so barriers are
+        # redundant.  Clear them: wr_bar=7 rd_bar=7 wait_mask=0.
+        # Bits [22:0] layout: [3:0]=stall [4]=yield [9:5]=wr_bar [14:10]=rd_bar [20:15]=wait_mask [22:21]=reuse
+        BARRIER_MASK = (0x1f << 5) | (0x1f << 10) | (0x3f << 15)  # wr_bar + rd_bar + wait_mask
+        BARRIER_CLEAR = (0x7 << 5) | (0x7 << 10) | (0x0 << 15)   # wr=7(none) rd=7(none) wm=0
         for i, addr in enumerate(new_order):
             src = orig[addr]
             dst = instrs[start_idx + i]
             dst.encoding = src.encoding
-            dst.control = src.control
+            ctrl = src.control
+            # Clear barrier fields unless it's a barrier instruction (DEPBAR etc)
+            if src.mnemonic and not is_barrier(src.mnemonic):
+                ctrl = (ctrl & ~BARRIER_MASK) | BARRIER_CLEAR
+            dst.control = ctrl
             dst.mnemonic = src.mnemonic
             dst.operands = src.operands
 
