@@ -13,6 +13,14 @@ Key architecture: ReuseSmemC + circular producer/consumer epilogue pipeline.
   - W3-W6 wait/release one stage per sub-iteration instead of consuming
     four fully materialized tile-wide stages.
 
+Barrier protocol (CUTLASS-style):
+  - consumed_mbar count=128 (all epilogue threads), not single-thread.
+    Structurally guaranteed by BAR.SYNC — eliminates scheduling races.
+  - wait_group 1 (allow 1 TMA store in-flight), wait_group 0 on last sub-iter.
+  - Deferred consumed: signaled 1 sub-iter after store, when previous store
+    is confirmed drained. Both stages signaled on last sub-iter.
+  - W2's epi_mbar arrive is after all loads, not before.
+
 Compile-time flags:
   -DFP32_EPILOGUE    FP32 math (FADD, ~0% STS conflict) instead of BF16 (HADD2, 7.5%)
   -DSTRIP_EPILOGUE   Skip epilogue (benchmark GEMM core only, valid=0)
@@ -361,10 +369,10 @@ fc2_w3_kernel(
         /* W2→epilogue: stage ready. W2 arrives with expect_tx. */
         for (int s = 0; s < NUM_EPI_STAGES; s++)
             mbar_init(smem_to_uint(smem + OFF_LOAD_MBAR + s * 8), 1);
-        /* epilogue→W2: stage released. One designated thread signals after
-           all 4 epilogue warps pass the stage barrier. */
+        /* epilogue→W2: stage released. ALL epilogue threads arrive after
+           TMA store completes, structurally guaranteed by BAR.SYNC. */
         for (int s = 0; s < NUM_EPI_STAGES; s++)
-            mbar_init(smem_to_uint(smem + OFF_LOAD_CONSUMED + s * 8), 1);
+            mbar_init(smem_to_uint(smem + OFF_LOAD_CONSUMED + s * 8), NUM_EPI_WARPS * 32);
 
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -529,29 +537,24 @@ fc2_w3_kernel(
             }
 
         } else if (warp == 2) {
+            /* W2 must wait on mainloop_mbar EVERY tile (including tile_start)
+               to consume the free-pass phase. Only epilogue work is conditional. */
+            const int prev_buf = buf ^ 1;
+            mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
+            ml_phase[prev_buf] ^= 1;
 #ifdef STRIP_EPILOGUE
-            if (tile_idx > tile_start) {
-                const int prev_buf = buf ^ 1;
-                mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
-                ml_phase[prev_buf] ^= 1;
+            if (tile_idx > tile_start)
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
-            }
 #else
             /* ── W2: EpilogueLoad — circular producer for PREVIOUS tile ──
-               Wait for previous tile's accumulators, then stream four 64-col
-               slices through a 2-stage shared pipe. */
+               Stream four 64-col slices through a 2-stage shared pipe. */
             if (tile_idx > tile_start) {
-                const int prev_buf = buf ^ 1;
                 const int prev_idx = tile_idx - 1;
                 const int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
                 const int prev_m = ptm * TM * 2 + cta_rank * TM;
                 const int prev_n = ptn * TN;
-
-                mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
-                ml_phase[prev_buf] ^= 1;
-                mbar_arrive(epi_mbar_masked + prev_buf * 8);
 
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                     const int stage = si % NUM_EPI_STAGES;
@@ -567,17 +570,22 @@ fc2_w3_kernel(
                     }
                     load_issue_count++;
                 }
+
+                /* Arrive epi_mbar AFTER all loads — prevents W1 from starting
+                   next tile's MMA while W2 still issues TMA loads. */
+                mbar_arrive(epi_mbar_masked + prev_buf * 8);
             }
 #endif /* STRIP_EPILOGUE W2 */
 
         } else {
+            /* W3-W6 must wait on mainloop_mbar EVERY tile (including tile_start)
+               to consume the free-pass phase. Only epilogue work is conditional. */
+            const int prev_buf = buf ^ 1;
+            mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
+            ml_phase[prev_buf] ^= 1;
 #ifdef STRIP_EPILOGUE
-            if (tile_idx > tile_start) {
-                const int prev_buf = buf ^ 1;
-                mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
-                ml_phase[prev_buf] ^= 1;
+            if (tile_idx > tile_start)
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
-            }
 #else
             /* ── W3-W6: Epilogue compute — ReuseSmemC, BAR.SYNC coordinated ── */
             const int ew = warp - 3;                           /* 0..3 */
@@ -592,7 +600,6 @@ fc2_w3_kernel(
             const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
 
             if (tile_idx > tile_start) {
-                const int prev_buf = buf ^ 1;
                 const int prev_idx = tile_idx - 1;
                 const int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
@@ -602,9 +609,7 @@ fc2_w3_kernel(
                 const int gm_base = prev_m + row_group * 32;
                 const int taddr_base = prev_buf * TN + ((cta_rank * 128 + row_group * 32) << 16);
 
-                mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-                ml_phase[prev_buf] ^= 1;
 
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                     const int stage = si % NUM_EPI_STAGES;
@@ -695,13 +700,24 @@ fc2_w3_kernel(
                         asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                     }
 
+                    /* wait_group 1: allow 1 TMA store in-flight (CUTLASS-style).
+                       Last sub-iter drains all with wait_group 0. */
                     if (lane == 0) {
-                        asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                        if (si == NUM_EPI_SUBITERS - 1)
+                            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                        else
+                            asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
                     }
                     __syncwarp();
                     asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 
-                    if (warp == 3 && lane == 0) {
+                    /* Deferred consumed: signal stage whose store is confirmed done.
+                       After wait_group 1, previous sub-iter's store is drained.
+                       After wait_group 0 (last), current store is also drained. */
+                    if (si > 0) {
+                        mbar_arrive(consumed_mbar[(si - 1) % NUM_EPI_STAGES]);
+                    }
+                    if (si == NUM_EPI_SUBITERS - 1) {
                         mbar_arrive(consumed_mbar[stage]);
                     }
                 }
@@ -736,7 +752,6 @@ fc2_w3_kernel(
             /* W2: stream the last tile through the same 2-stage circular pipe. */
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
             ml_phase[last_buf] ^= 1;
-            mbar_arrive(epi_mbar_masked + last_buf * 8);
 
             for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                 const int stage = si % NUM_EPI_STAGES;
@@ -752,6 +767,8 @@ fc2_w3_kernel(
                 }
                 load_issue_count++;
             }
+
+            mbar_arrive(epi_mbar_masked + last_buf * 8);
 #endif /* STRIP_EPILOGUE drain W2 */
 
         } else {
@@ -859,11 +876,17 @@ fc2_w3_kernel(
                 }
 
                 if (lane == 0) {
-                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                    if (si == NUM_EPI_SUBITERS - 1)
+                        asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                    else
+                        asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
                 }
                 __syncwarp();
                 asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
-                if (warp == 3 && lane == 0) {
+                if (si > 0) {
+                    mbar_arrive(consumed_mbar[(si - 1) % NUM_EPI_STAGES]);
+                }
+                if (si == NUM_EPI_SUBITERS - 1) {
                     mbar_arrive(consumed_mbar[stage]);
                 }
             }
