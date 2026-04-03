@@ -22,8 +22,11 @@ Barrier protocol (CUTLASS-style):
   - W2's epi_mbar arrive is after all loads, not before.
 
 Compile-time flags:
-  -DFP32_EPILOGUE    FP32 math (FADD, ~0% STS conflict) instead of BF16 (HADD2, 7.5%)
-  -DSTRIP_EPILOGUE   Skip epilogue (benchmark GEMM core only, valid=0)
+  -DFP32_EPILOGUE       FP32 math (FADD, ~0% STS conflict) instead of BF16 (HADD2, 7.5%)
+  -DSTRIP_EPILOGUE      Skip epilogue (benchmark GEMM core only, valid=0)
+  -DSINGLE_WARP_STORE=1 Only ew==0 issues TMA stores (4 per sub-iter, 1 commit group)
+  -DDELAY_TMA_STORE=1   Issue TMA store from sub-iter N at start of sub-iter N+1
+  -DNUM_EPI_STAGES=N    Epilogue staging depth (default 2, try 3 with DELAY_TMA_STORE)
 */
 
 #include <cuda.h>
@@ -73,7 +76,15 @@ Compile-time flags:
 #define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
 
 /* New barriers for W2↔epilogue coordination (2-stage circular load pipe). */
+#ifndef NUM_EPI_STAGES
 #define NUM_EPI_STAGES     2
+#endif
+#ifndef SINGLE_WARP_STORE
+#define SINGLE_WARP_STORE  0
+#endif
+#ifndef DELAY_TMA_STORE
+#define DELAY_TMA_STORE    0
+#endif
 #define NUM_EPI_SUBITERS   4
 #define OFF_LOAD_MBAR      (OFF_EPILOGUE_MBAR + 16)             /* W2→epi: stage ready */
 #define OFF_LOAD_CONSUMED  (OFF_LOAD_MBAR + NUM_EPI_STAGES * 8) /* epi→W2: stage released */
@@ -291,6 +302,52 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
         : "memory")
 
 #endif /* FP32_EPILOGUE */
+
+/* TMA store + wait helpers — shared between main loop and drain.
+   EPI_STORE: issue TMA store(s) + commit_group.
+   EPI_WAIT:  wait_group + __syncwarp + bar.sync. */
+#if SINGLE_WARP_STORE
+#define EPI_STORE(STAGE, NC, PN, PM) do { \
+    if (ew == 0 && lane == 0) { \
+        for (int rg_ = 0; rg_ < NUM_EPI_WARPS; rg_++) { \
+            const uint32_t s_ = smem_to_uint(smem + OFF_STAGING \
+                + (STAGE) * EPI_STAGE_BYTES + rg_ * STAGING_REGION_BYTES); \
+            asm volatile( \
+                "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group" \
+                " [%0, {%1, %2}], [%3];" \
+                :: "l"(&tma_c), "r"((PN) + (NC)), "r"((PM) + rg_ * 32), \
+                   "r"(s_) : "memory"); \
+        } \
+        asm volatile("cp.async.bulk.commit_group;" ::: "memory"); \
+    } \
+} while(0)
+#define EPI_WAIT_PRED (ew == 0 && lane == 0)
+#else
+#define EPI_STORE(STAGE, NC, PN, PM) do { \
+    if (lane == 0) { \
+        const uint32_t s_ = smem_to_uint(smem + OFF_STAGING \
+            + (STAGE) * EPI_STAGE_BYTES + row_group * STAGING_REGION_BYTES); \
+        asm volatile( \
+            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group" \
+            " [%0, {%1, %2}], [%3];" \
+            :: "l"(&tma_c), "r"((PN) + (NC)), "r"((PM) + row_group * 32), \
+               "r"(s_) : "memory"); \
+        asm volatile("cp.async.bulk.commit_group;" ::: "memory"); \
+    } \
+} while(0)
+#define EPI_WAIT_PRED (lane == 0)
+#endif
+
+#define EPI_WAIT(LAST) do { \
+    if (EPI_WAIT_PRED) { \
+        if (LAST) \
+            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory"); \
+        else \
+            asm volatile("cp.async.bulk.wait_group 1;" ::: "memory"); \
+    } \
+    __syncwarp(); \
+    asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory"); \
+} while(0)
 
 /* ── K-iteration macro (accumulating, ki >= 1) ── */
 #define K_ITER_ACCUM(S) do { \
@@ -611,9 +668,25 @@ fc2_w3_kernel(
 
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
+#if DELAY_TMA_STORE
+                int have_pending = 0;
+                int pend_nc, pend_stage;
+#endif
+
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                     const int stage = si % NUM_EPI_STAGES;
                     const int nc_base = si * 64;   /* column offset within tile */
+
+#if DELAY_TMA_STORE
+                    /* Issue delayed TMA store from previous sub-iter */
+                    if (have_pending)
+                        EPI_STORE(pend_stage, pend_nc, prev_n, prev_m);
+                    /* Wait for 2-ago store + consumed signal */
+                    if (si >= 2) {
+                        EPI_WAIT(0);
+                        mbar_arrive(consumed_mbar[(si - 2) % NUM_EPI_STAGES]);
+                    }
+#endif
 
                     /* Wait for W2's TMA load to land for this sub-iteration. */
                     mbar_wait(load_mbar[stage], load_phase[stage]);
@@ -687,40 +760,27 @@ fc2_w3_kernel(
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 
-                    /* TMA store: each warp stores its 32-row × 64-col output */
-                    if (lane == 0) {
-                        const uint32_t out_src = smem_to_uint(smem + OFF_STAGING
-                            + stage * EPI_STAGE_BYTES
-                            + row_group * STAGING_REGION_BYTES);
-                        asm volatile(
-                            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group"
-                            " [%0, {%1, %2}], [%3];"
-                            :: "l"(&tma_c), "r"(prev_n + nc_base), "r"(gm_base),
-                               "r"(out_src) : "memory");
-                        asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-                    }
-
-                    /* wait_group 1: allow 1 TMA store in-flight (CUTLASS-style).
-                       Last sub-iter drains all with wait_group 0. */
-                    if (lane == 0) {
-                        if (si == NUM_EPI_SUBITERS - 1)
-                            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
-                        else
-                            asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
-                    }
-                    __syncwarp();
-                    asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
-
-                    /* Deferred consumed: signal stage whose store is confirmed done.
-                       After wait_group 1, previous sub-iter's store is drained.
-                       After wait_group 0 (last), current store is also drained. */
-                    if (si > 0) {
+#if DELAY_TMA_STORE
+                    have_pending = 1;
+                    pend_nc = nc_base;
+                    pend_stage = stage;
+#else
+                    EPI_STORE(stage, nc_base, prev_n, prev_m);
+                    EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
+                    if (si > 0)
                         mbar_arrive(consumed_mbar[(si - 1) % NUM_EPI_STAGES]);
-                    }
-                    if (si == NUM_EPI_SUBITERS - 1) {
+                    if (si == NUM_EPI_SUBITERS - 1)
                         mbar_arrive(consumed_mbar[stage]);
-                    }
+#endif
                 }
+
+#if DELAY_TMA_STORE
+                /* Drain delayed pipeline: issue last store + drain all */
+                EPI_STORE(pend_stage, pend_nc, prev_n, prev_m);
+                EPI_WAIT(1);
+                mbar_arrive(consumed_mbar[(NUM_EPI_SUBITERS - 2) % NUM_EPI_STAGES]);
+                mbar_arrive(consumed_mbar[pend_stage]);
+#endif
 
                 /* Signal W1: TMEM buffer free for the next user of prev_buf. */
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
@@ -793,9 +853,23 @@ fc2_w3_kernel(
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             ml_phase[last_buf] ^= 1;
 
+#if DELAY_TMA_STORE
+            int have_pending = 0;
+            int pend_nc, pend_stage;
+#endif
+
             for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                 const int stage = si % NUM_EPI_STAGES;
                 const int nc_base = si * 64;
+
+#if DELAY_TMA_STORE
+                if (have_pending)
+                    EPI_STORE(pend_stage, pend_nc, last_n, last_m);
+                if (si >= 2) {
+                    EPI_WAIT(0);
+                    mbar_arrive(consumed_mbar[(si - 2) % NUM_EPI_STAGES]);
+                }
+#endif
 
                 mbar_wait(load_mbar[stage], load_phase[stage]);
                 load_phase[stage] ^= 1;
@@ -863,33 +937,26 @@ fc2_w3_kernel(
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 
-                if (lane == 0) {
-                    const uint32_t out_src = smem_to_uint(smem + OFF_STAGING
-                        + stage * EPI_STAGE_BYTES
-                        + row_group * STAGING_REGION_BYTES);
-                    asm volatile(
-                        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group"
-                        " [%0, {%1, %2}], [%3];"
-                        :: "l"(&tma_c), "r"(last_n + nc_base), "r"(gm_base),
-                           "r"(out_src) : "memory");
-                    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-                }
-
-                if (lane == 0) {
-                    if (si == NUM_EPI_SUBITERS - 1)
-                        asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
-                    else
-                        asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
-                }
-                __syncwarp();
-                asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
-                if (si > 0) {
+#if DELAY_TMA_STORE
+                have_pending = 1;
+                pend_nc = nc_base;
+                pend_stage = stage;
+#else
+                EPI_STORE(stage, nc_base, last_n, last_m);
+                EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
+                if (si > 0)
                     mbar_arrive(consumed_mbar[(si - 1) % NUM_EPI_STAGES]);
-                }
-                if (si == NUM_EPI_SUBITERS - 1) {
+                if (si == NUM_EPI_SUBITERS - 1)
                     mbar_arrive(consumed_mbar[stage]);
-                }
+#endif
             }
+
+#if DELAY_TMA_STORE
+            EPI_STORE(pend_stage, pend_nc, last_n, last_m);
+            EPI_WAIT(1);
+            mbar_arrive(consumed_mbar[(NUM_EPI_SUBITERS - 2) % NUM_EPI_STAGES]);
+            mbar_arrive(consumed_mbar[pend_stage]);
+#endif
 
             mbar_arrive(epi_mbar_masked + last_buf * 8);
 #endif /* STRIP_EPILOGUE drain W3-W6 */
@@ -924,6 +991,14 @@ int main() {
     printf("FC2 W3 kernel — 7 warps, shared-SMEM epilogue\n");
     printf("  GEMM: [%d,%d] x [%d,%d]^T  %d-stage pipeline  SMEM: %d bytes\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, N_STAGES, SMEM_BYTES);
+    printf("  EPI: stages=%d  SWS=%d  DTS=%d  FP32=%d\n",
+           NUM_EPI_STAGES, SINGLE_WARP_STORE, DELAY_TMA_STORE,
+#ifdef FP32_EPILOGUE
+           1
+#else
+           0
+#endif
+           );
 
     uint8_t *d_A, *d_B;
     __nv_bfloat16 *d_bias, *d_residual, *d_C;
