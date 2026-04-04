@@ -349,11 +349,13 @@ int main() {
         config.gridDim = grid;
         config.blockDim = block;
         config.dynamicSmemBytes = SmemBytes;
-        cudaLaunchAttribute attrs[1];
+        cudaLaunchAttribute attrs[2];
         attrs[0].id = cudaLaunchAttributeClusterDimension;
         attrs[0].val.clusterDim = {2, 1, 1};
+        attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[1].val.programmaticStreamSerializationAllowed = 1;
         config.attrs = attrs;
-        config.numAttrs = 1;
+        config.numAttrs = 2;
         void* kernel_args[] = { &p };
         CUDA_CHECK(cudaLaunchKernelExC(&config, (void const*)fc2_hybrid_kernel, kernel_args));
     };
