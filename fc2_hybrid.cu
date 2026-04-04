@@ -181,7 +181,6 @@ Phase 2: Operator = GemmUniversal<HybridMainloop, ...> (our mainloop + CUTLASS e
 template <typename Operator>
 __global__ void
 __launch_bounds__(Operator::MaxThreadsPerBlock, 1)
-__cluster_dims__(2, 1, 1)
 fc2_hybrid_kernel_impl(typename Operator::Params const params) {
     extern __shared__ char smem_buf[];
     Operator op;
@@ -344,8 +343,8 @@ int main() {
     printf("  CUTLASS initialized (workspace=%zu, grid=%dx%d, block=%d, smem=%zu)\n",
            ws, grid.x, grid.y, block.x, SmemBytes);
 
-    /* Cluster launch config — <<<>>> doesn't set up clusters, must use cudaLaunchKernelEx */
-    auto launch_hybrid = [&](typename GemmKernel::Params const& p) {
+    /* Cluster launch — match CUTLASS's ClusterLauncher exactly (C API, no __cluster_dims__) */
+    auto launch_hybrid = [&](typename GemmKernel::Params& p) {
         cudaLaunchConfig_t config = {};
         config.gridDim = grid;
         config.blockDim = block;
@@ -355,7 +354,8 @@ int main() {
         attrs[0].val.clusterDim = {2, 1, 1};
         config.attrs = attrs;
         config.numAttrs = 1;
-        CUDA_CHECK(cudaLaunchKernelEx(&config, fc2_hybrid_kernel, p));
+        void* kernel_args[] = { &p };
+        CUDA_CHECK(cudaLaunchKernelExC(&config, (void const*)fc2_hybrid_kernel, kernel_args));
     };
 
     /* Warmup */
