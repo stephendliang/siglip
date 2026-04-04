@@ -96,7 +96,11 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
 
 constexpr int EpilogueSmemBytes = static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage));
 
+#ifdef MAINLOOP_STAGES
+using StageCountType = cutlass::gemm::collective::StageCount<MAINLOOP_STAGES>;
+#else
 using StageCountType = cutlass::gemm::collective::StageCountAutoCarveout<EpilogueSmemBytes>;
+#endif
 
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
