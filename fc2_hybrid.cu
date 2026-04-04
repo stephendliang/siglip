@@ -48,6 +48,7 @@ Phase 3 (future): Also override CollectiveMainloop::load() with our TMA PTX.
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
+#include "cutlass/device_kernel.h"  /* CUTLASS_GRID_CONSTANT (__grid_constant__) */
 
 #include <cuda_bf16.h>
 #include "cutlass/epilogue/thread/activation.h"
@@ -181,7 +182,7 @@ Phase 2: Operator = GemmUniversal<HybridMainloop, ...> (our mainloop + CUTLASS e
 template <typename Operator>
 __global__ void
 __launch_bounds__(Operator::MaxThreadsPerBlock, 1)
-fc2_hybrid_kernel_impl(typename Operator::Params const params) {
+fc2_hybrid_kernel_impl(CUTLASS_GRID_CONSTANT typename Operator::Params const params) {
     extern __shared__ char smem_buf[];
     Operator op;
     op(params, smem_buf);
