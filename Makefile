@@ -9,7 +9,7 @@ CUTLASS_DIR = third_party/cutlass
 CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUTLASS_FLAGS = -std=c++17 --expt-relaxed-constexpr
 
-.PHONY: all clean timing fc1-gelu fc2 fc2-timing fc2-w3 fc2-w3-fp32 fc2-w3-strip cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-warp calib-all tma-bench mma-bench
+.PHONY: all clean timing fc1-gelu fc2 fc2-timing fc2-w3 fc2-w3-fp32 fc2-w3-strip fc2-cutlass fc2-cutlass-strip cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-warp calib-all tma-bench mma-bench
 
 all: $(TARGET)
 
@@ -39,6 +39,13 @@ fc2-w3-fp32: fc2_w3.cu
 
 fc2-w3-strip: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
+
+# ── FC2 CUTLASS kernel (CUTLASS GemmUniversal, reference epilogue) ──
+fc2-cutlass: fc2_cutlass.cu
+	$(NVCC) $(CFLAGS) $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)
+
+fc2-cutlass-strip: fc2_cutlass.cu
+	$(NVCC) $(CFLAGS) -DSTRIP_EPILOGUE $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)
 
 # ── CUTLASS benchmark (per-tensor FP8, grid search) ──
 cutlass-bench: bench/cutlass_bench.cu bench/siglip_periodic_add.hpp
@@ -132,5 +139,5 @@ compare-fast:
 	python3 tools/compare_all.py --runs 5 --layer patch_embed --csv data/compare.csv
 
 clean:
-	rm -f $(TARGET) patch_embed_timing fc1-gelu fc2 fc2-w3 fc2-w3-fp32 fc2-w3-strip cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cublas-bench cublas-bench-fc1 cublas-bench-fc2 calibration calib-tput calib-lat calib-conflict calib-warp tma-bench mma-bench
+	rm -f $(TARGET) patch_embed_timing fc1-gelu fc2 fc2-w3 fc2-w3-fp32 fc2-w3-strip fc2-cutlass fc2-cutlass-strip cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cublas-bench cublas-bench-fc1 cublas-bench-fc2 calibration calib-tput calib-lat calib-conflict calib-warp tma-bench mma-bench
 	rm -rf sass/
