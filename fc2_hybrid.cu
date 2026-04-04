@@ -1,38 +1,34 @@
 /*
-FC2 Hybrid kernel — scaffold for our PTX mainloop + CUTLASS CollectiveEpilogue.
+FC2 Hybrid kernel — our optimized mainloop + CUTLASS CollectiveEpilogue.
 Shape: [928256,3072]×[3072,768]^T + bias + residual
 
 Goal: best of both worlds.
-  Our mainloop:      1.095ms strip (62μs faster than CUTLASS's 1.157ms)
+  Our mainloop:      1.089ms strip (62μs faster than CUTLASS's 1.152ms)
   CUTLASS epilogue:  72μs overhead (vs our 388μs)
-  Hybrid ceiling:    1.095 + 0.072 = 1.167ms
+  Hybrid ceiling:    1.089 + 0.072 = 1.161ms
 
 Architecture: 8 warps (256 threads), cta_group::2, cluster 2×1
   W0: Scheduler (CLC)
-  W1: MMA           ← Phase 2: replace with our PTX K-loop via custom CollectiveMainloop
-  W2: MainloopLoad  ← Phase 3: replace with our PTX TMA loads
+  W1: MMA           ← Phase 2: HybridMainloop overrides mma() with unrolled K-loop
+  W2: MainloopLoad  ← Phase 3: override load() with our TMA PTX
   W3: EpilogueLoad  — CUTLASS (unchanged)
   W4-W7: Epilogue   — CUTLASS (unchanged)
 
 Build:
   make fc2-hybrid              # Phase 1: CUTLASS via custom launch
-  make fc2-hybrid-strip        # GEMM-only
-  make fc2-hybrid-mma          # Phase 2: (stub, same as Phase 1 until mainloop wrapper ready)
+  make fc2-hybrid-strip        # GEMM-only (STRIP_EPILOGUE)
+  make fc2-hybrid-mma          # Phase 2: HybridMainloop (unrolled K-loop + CUTLASS epilogue)
 
-Phase 1 (current): Custom __global__ that delegates to GemmKernel::operator().
-  Validates: type extraction, custom launch mechanism, Makefile/bench integration.
-  Performance: identical to fc2-cutlass (1.224ms fused, 1.157ms strip).
+Phase 1: Custom __global__ that delegates to GemmKernel::operator().
+  Pure CUTLASS — validates custom launch mechanism.
+  Performance: identical to fc2-cutlass (1.224ms fused, 1.152ms strip).
 
-Phase 2 (next): Override CollectiveMainloop::mma() with our PTX K-loop.
-  Approach: Create HybridMainloop class that wraps CUTLASS's CollectiveMainloop,
-  overriding only the mma() method. Use with GemmUniversal<..., HybridMainloop, ...>.
-  This stays WITHIN GemmKernel::operator() template chain, avoiding
-  __host__/__device__ template instantiation errors from CuTe's tapply().
+Phase 2 (HYBRID_MMA): HybridMainloop inherits CollectiveMainloop, overrides mma().
+  Key change: _Pragma("unroll 5") on K-loop (CUTLASS uses NO_UNROLL).
+  All types inherited — GemmUniversal selects same SM100 kernel specialization.
+  Keeps CUTLASS's load pipeline (TMA A + CpAsync B) and epilogue unchanged.
 
-  Key lesson: cannot call CUTLASS epilogue from custom device code — must inject
-  our PTX through the CollectiveMainloop interface, not through the kernel dispatch.
-
-Phase 3 (future): Also override CollectiveMainloop::load() with our TMA PTX.
+Phase 3 (future): Also override load() with our TMA-for-both PTX loads.
 */
 
 #include <cstdio>
@@ -131,53 +127,110 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     MainloopSchedule
 >::CollectiveOp;
 
+/* ═══════════════════════════════════════════════════════════════════
+   Phase 2: HybridMainloop — CUTLASS mainloop with our MMA K-loop
+   ═══════════════════════════════════════════════════════════════════ */
+
+#ifdef HYBRID_MMA
+/*
+HybridMainloop inherits CUTLASS's CollectiveMainloop and overrides mma().
+Our fc2_w3 mainloop is 62μs faster (1.089 vs 1.152ms strip). The primary
+difference: CUTLASS uses PRAGMA_NO_UNROLL on the K-loop while our kernel
+uses partial unroll (5). This override keeps CUTLASS's load pipeline and
+epilogue while testing our K-loop scheduling.
+
+All types (SharedStorage, Params, TiledMma, etc.) are inherited unchanged,
+so GemmUniversal's enable_if on DispatchPolicy::Schedule resolves to the
+same SM100 specialization.
+*/
+struct HybridMainloop : CollectiveMainloop {
+    using CollectiveMainloop::CollectiveMainloop;
+    using CollectiveMainloop::MainloopPipeline;
+    using CollectiveMainloop::MainloopPipelineState;
+
+    /*
+    Override mma(): identical to base class except _Pragma("unroll 5") on
+    the K-loop (CUTLASS uses PRAGMA_NO_UNROLL). Our fc2_w3 uses partial
+    unroll = 5, matching N_STAGES. Tests whether K-loop codegen scheduling
+    is the source of the 62μs mainloop gap.
+    */
+    template <
+        class AccumulatorPipeline,
+        class FrgEngine, class FrgLayout,
+        class MmaParams,
+        class CtaTileCoord
+    >
+    CUTLASS_DEVICE auto
+    mma(cute::tuple<MainloopPipeline,
+                    AccumulatorPipeline> pipelines,
+        cute::tuple<MainloopPipelineState,
+                    typename AccumulatorPipeline::PipelineState> pipeline_states,
+        cute::tuple<cute::Tensor<FrgEngine, FrgLayout>> const& accumulators_pair,
+        MmaParams const& mma_inputs,
+        CtaTileCoord cta_tile_coord,
+        int k_tile_count)
+    {
+        static_assert(cute::is_tmem<FrgEngine>::value, "Accumulator must be tmem resident.");
+        static_assert(rank(FrgLayout{}) == 3, "Accumulator must be MMA-partitioned: (MMA, MMA_M, MMA_N)");
+
+        auto accumulators = get<0>(accumulators_pair);
+        auto [tiled_mma, tCrA, tCrB] = mma_inputs;
+        auto [mainloop_pipeline, accumulator_pipeline] = pipelines;
+        auto [mainloop_pipe_consumer_state, accumulator_pipe_producer_state] = pipeline_states;
+
+        tiled_mma.accumulate_ = cute::UMMA::ScaleOut::Zero;
+        accumulator_pipeline.producer_acquire(accumulator_pipe_producer_state);
+
+        /* FC2-specific: K_DIM and TK (128) are compile-time constants.
+           Use constexpr trip count so #pragma unroll 5 actually unrolls.
+           CUTLASS uses runtime k_tile_count with PRAGMA_NO_UNROLL. */
+        constexpr int kKIters = K_DIM / 128;
+        (void)k_tile_count;
+
+        auto barrier_token = mainloop_pipeline.consumer_try_wait(mainloop_pipe_consumer_state, 0);
+
+        _Pragma("unroll 5")
+        for (int ki = 0; ki < kKIters; ++ki) {
+            mainloop_pipeline.consumer_wait(mainloop_pipe_consumer_state, barrier_token);
+
+            int read_stage = mainloop_pipe_consumer_state.index();
+            auto curr_mainloop_pipe_consumer_state = mainloop_pipe_consumer_state;
+
+            ++mainloop_pipe_consumer_state;
+            uint32_t skip_wait = (ki + 1 >= kKIters) ? 1U : 0U;
+            barrier_token = mainloop_pipeline.consumer_try_wait(mainloop_pipe_consumer_state, skip_wait);
+
+            CUTLASS_PRAGMA_UNROLL
+            for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
+                cute::gemm(tiled_mma,
+                           tCrA(_,_,k_block,read_stage),
+                           tCrB(_,_,k_block,read_stage),
+                           accumulators);
+                tiled_mma.accumulate_ = cute::UMMA::ScaleOut::One;
+            }
+            mainloop_pipeline.consumer_release(curr_mainloop_pipe_consumer_state);
+        }
+
+        return mainloop_pipe_consumer_state;
+    }
+};
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>,
+    HybridMainloop,
+    CollectiveEpilogue>;
+#else
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     Shape<int, int, int, int>,
     CollectiveMainloop,
     CollectiveEpilogue>;
+#endif
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
 /* ═══════════════════════════════════════════════════════════════════
-   PTX helpers — for Phase 2 (our MMA inner loop)
-   ═══════════════════════════════════════════════════════════════════ */
-
-static __device__ __forceinline__
-uint32_t smem_to_uint(const void* p) {
-    return static_cast<uint32_t>(
-        reinterpret_cast<uintptr_t>(__cvta_generic_to_shared(p)));
-}
-
-/* WGMMA descriptor for SWIZZLE_128B mode, SBO=1024 */
-static __device__ __forceinline__
-uint64_t make_smem_desc(uint32_t addr) {
-    uint64_t d = 0;
-    constexpr uint32_t SBO = 1024;
-    d |= (uint64_t)((addr & 0x3FFFF) >> 4);
-    d |= (uint64_t)((SBO  & 0x3FFFF) >> 4) << 32;
-    d |= (1ULL << 46);
-    d |= (2ULL << 61);   /* SWIZZLE_128B */
-    return d;
-}
-
-static __device__ __forceinline__
-void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
-    asm volatile(
-        "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;"
-        :: "r"(mbar_addr), "h"(cta_mask) : "memory");
-}
-
-/* ═══════════════════════════════════════════════════════════════════
    Custom kernel — template __global__ matching CUTLASS's device_kernel<>
    ═══════════════════════════════════════════════════════════════════ */
-
-/*
-Both Phase 1 and Phase 2 use the same launch pattern as CUTLASS:
-  fc2_hybrid_kernel_impl<Operator>(params) → Operator::operator()(params, smem)
-
-Phase 1: Operator = GemmKernel (pure CUTLASS — validates custom launch)
-Phase 2: Operator = GemmUniversal<HybridMainloop, ...> (our mainloop + CUTLASS epilogue)
-*/
 
 template <typename Operator>
 __global__ void
@@ -188,10 +241,6 @@ fc2_hybrid_kernel_impl(CUTLASS_GRID_CONSTANT typename Operator::Params const par
     op(params, smem_buf);
 }
 
-/* For now, Phase 2 = Phase 1. When HybridMainloop is ready:
-   using HybridGemmKernel = GemmUniversal<Shape<int,int,int,int>,
-                                           HybridMainloop, CollectiveEpilogue>;
-   static auto* fc2_hybrid_kernel = fc2_hybrid_kernel_impl<HybridGemmKernel>; */
 static auto* fc2_hybrid_kernel = fc2_hybrid_kernel_impl<GemmKernel>;
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -214,7 +263,11 @@ int main() {
     printf("ERROR: CUTLASS_ARCH_MMA_SM100_SUPPORTED not defined.\n");
     return 1;
 #else
-    printf("FC2 HYBRID — custom kernel launch with CUTLASS types\n");
+#ifdef HYBRID_MMA
+    printf("FC2 HYBRID Phase 2 — HybridMainloop (unrolled K-loop) + CUTLASS epilogue\n");
+#else
+    printf("FC2 HYBRID Phase 1 — pure CUTLASS via custom launch\n");
+#endif
 #ifdef STRIP_EPILOGUE
     printf("  MODE: GEMM-only (STRIP_EPILOGUE)\n");
 #else
