@@ -19,6 +19,7 @@ Build:  make fc2-cutlass              (fused: bias + residual)
 #include "cutlass/epilogue/fusion/operations.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
 #include <cuda_bf16.h>
@@ -112,10 +113,17 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     MainloopSchedule
 >::CollectiveOp;
 
+#ifdef STATIC_SCHED
+using TileSchedulerTag = cutlass::gemm::StaticPersistentScheduler;
+#else
+using TileSchedulerTag = void;  /* default: DynamicPersistentScheduler (CLC) */
+#endif
+
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     Shape<int, int, int, int>,
     CollectiveMainloop,
-    CollectiveEpilogue>;
+    CollectiveEpilogue,
+    TileSchedulerTag>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
