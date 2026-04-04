@@ -29,7 +29,9 @@ Compile-time flags:
   -DSTRIP_EPILOGUE      Skip epilogue (benchmark GEMM core only, valid=0)
   -DSINGLE_WARP_STORE=1 Only ew==0 issues TMA stores (4 per sub-iter, 1 commit group)
   -DDELAY_TMA_STORE=1   Issue TMA store from sub-iter N at start of sub-iter N+1
-  -DNUM_EPI_STAGES=N    Epilogue staging depth (default 2, try 3 with DELAY_TMA_STORE)
+  -DNUM_EPI_STAGES=N    Epilogue staging depth (default 2, try 3/4)
+  -DNO_PRE_STORE_BAR=1  Remove bar.sync before TMA store (each warp stores own region independently)
+  -DNO_POST_STORE_BAR=1 Remove bar.sync after TMA store wait (warps decouple across sub-iters)
 */
 
 #include <cuda.h>
@@ -93,6 +95,16 @@ Compile-time flags:
 #endif
 #ifndef CUTLASS_LOOP
 #define CUTLASS_LOOP       0
+#endif
+#ifndef NO_PRE_STORE_BAR
+#define NO_PRE_STORE_BAR   0
+#endif
+#ifndef NO_POST_STORE_BAR
+#define NO_POST_STORE_BAR  0
+#endif
+
+#if NO_PRE_STORE_BAR && SINGLE_WARP_STORE
+#error "NO_PRE_STORE_BAR requires SINGLE_WARP_STORE=0 (each warp stores its own region)"
 #endif
 #define NUM_EPI_SUBITERS   4
 #define OFF_LOAD_MBAR      (OFF_EPILOGUE_MBAR + 16)             /* W2→epi: stage ready */
@@ -540,6 +552,17 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 #define EPI_WAIT_PRED (lane == 0)
 #endif
 
+#if NO_POST_STORE_BAR
+#define EPI_WAIT(LAST) do { \
+    if (EPI_WAIT_PRED) { \
+        if (LAST) \
+            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory"); \
+        else \
+            asm volatile("cp.async.bulk.wait_group 1;" ::: "memory"); \
+    } \
+    __syncwarp(); \
+} while(0)
+#else
 #define EPI_WAIT(LAST) do { \
     if (EPI_WAIT_PRED) { \
         if (LAST) \
@@ -550,6 +573,7 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
     __syncwarp(); \
     asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory"); \
 } while(0)
+#endif
 
 /* ── K-iteration macro (accumulating, ki >= 1) ── */
 #define K_ITER_ACCUM(S) do { \
@@ -1057,7 +1081,9 @@ fc2_w3_kernel(
 #else
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 #endif
+#if !NO_PRE_STORE_BAR
                     asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
+#endif
 
 #if DELAY_TMA_STORE
                     have_pending = 1;
@@ -1325,7 +1351,9 @@ fc2_w3_kernel(
 #else
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 #endif
+#if !NO_PRE_STORE_BAR
                 asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
+#endif
 
 #if DELAY_TMA_STORE
                 have_pending = 1;
