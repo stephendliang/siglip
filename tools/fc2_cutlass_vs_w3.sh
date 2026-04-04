@@ -35,12 +35,14 @@ if [ "$DRY_RUN" = "0" ]; then
     nvidia-smi --query-gpu=gpu_name,clocks.sm --format=csv,noheader | tee -a "$OUTDIR/session.log"
 fi
 
-# Build all 6 variants (CLC vs static scheduler vs our kernel)
+# Build all 8 variants (CLC vs static vs hybrid vs our kernel)
 EXPERIMENTS=(
     "cutlass_fused|make fc2-cutlass|./fc2-cutlass"
     "cutlass_strip|make fc2-cutlass-strip|./fc2-cutlass-strip"
     "static_fused|make fc2-cutlass-static|./fc2-cutlass-static"
     "static_strip|make fc2-cutlass-static-strip|./fc2-cutlass-static-strip"
+    "hybrid_fused|make fc2-hybrid|./fc2-hybrid"
+    "hybrid_strip|make fc2-hybrid-strip|./fc2-hybrid-strip"
     "w3_fused|make fc2-w3|./fc2-w3"
     "w3_strip|make fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|./fc2-w3"
 )
