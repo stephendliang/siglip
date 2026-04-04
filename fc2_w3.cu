@@ -23,6 +23,9 @@ Barrier protocol (CUTLASS-style):
 
 Compile-time flags:
   -DFP32_EPILOGUE       FP32 math (FADD, ~0% STS conflict) instead of BF16 (HADD2, 7.5%)
+  -DCUTLASS_EPILOGUE    CUTLASS-clone: FP32 res add, BF16 bias, per-group STS, @!PT LDS fences
+  -DCUTE_STORE          C++ pointer stores (no asm STS) — tests CuTe store pattern vs asm volatile
+  -DCUTLASS_LOOP=N      Loop structure: 1=nounroll si, 2=+nounroll chunk, 3=+C++ FP32 compute
   -DSTRIP_EPILOGUE      Skip epilogue (benchmark GEMM core only, valid=0)
   -DSINGLE_WARP_STORE=1 Only ew==0 issues TMA stores (4 per sub-iter, 1 commit group)
   -DDELAY_TMA_STORE=1   Issue TMA store from sub-iter N at start of sub-iter N+1
@@ -84,6 +87,12 @@ Compile-time flags:
 #endif
 #ifndef DELAY_TMA_STORE
 #define DELAY_TMA_STORE    0
+#endif
+#ifndef CPP_EPILOGUE
+#define CPP_EPILOGUE       0
+#endif
+#ifndef CUTLASS_LOOP
+#define CUTLASS_LOOP       0
 #endif
 #define NUM_EPI_SUBITERS   4
 #define OFF_LOAD_MBAR      (OFF_EPILOGUE_MBAR + 16)             /* W2→epi: stage ready */
@@ -302,6 +311,199 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
         : "memory")
 
 #endif /* FP32_EPILOGUE */
+
+#if CPP_EPILOGUE
+/*
+ * Break monolithic asm volatile blocks into individual instructions.
+ * CVT and ADD: non-volatile asm — compiler/ptxas can freely reorder.
+ * STS: volatile (must execute) but NO "memory" clobber — no scheduling barrier.
+ *
+ * Tests hypothesis: asm volatile + "memory" prevents ptxas from interleaving
+ * STS from chunk N with CVT/ADD from chunk N+1. Exact same instructions,
+ * just schedulable independently.
+ */
+
+#ifdef FP32_EPILOGUE
+#undef CVT_STS_V4
+#define CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, SADDR) \
+    do { \
+        uint32_t _s0, _s1, _s2, _s3; \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_s0) : "f"(f0), "f"(f1)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_s1) : "f"(f2), "f"(f3)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_s2) : "f"(f4), "f"(f5)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_s3) : "f"(f6), "f"(f7)); \
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" \
+            :: "r"(SADDR), "r"(_s0), "r"(_s1), "r"(_s2), "r"(_s3)); \
+    } while(0)
+
+#else /* BF16 + CPP_EPILOGUE */
+#undef BIAS_RES_CVT_STS_V4
+#define BIAS_RES_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3, r0,r1,r2,r3, SADDR) \
+    do { \
+        uint32_t _o0, _o1, _o2, _o3; \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_o0) : "f"(f0), "f"(f1)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_o1) : "f"(f2), "f"(f3)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_o2) : "f"(f4), "f"(f5)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_o3) : "f"(f6), "f"(f7)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o0) : "r"(_o0), "r"(b0)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o1) : "r"(_o1), "r"(b1)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o2) : "r"(_o2), "r"(b2)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o3) : "r"(_o3), "r"(b3)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o0) : "r"(_o0), "r"(r0)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o1) : "r"(_o1), "r"(r1)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o2) : "r"(_o2), "r"(r2)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o3) : "r"(_o3), "r"(r3)); \
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" \
+            :: "r"(SADDR), "r"(_o0), "r"(_o1), "r"(_o2), "r"(_o3)); \
+    } while(0)
+
+#endif /* FP32_EPILOGUE */
+#endif /* CPP_EPILOGUE */
+
+#ifdef CUTE_STORE
+/*
+ * C++ pointer stores instead of asm volatile STS.
+ * CuTe's R2S copy uses C++ assignment: dst(i) = src(i), which nvcc
+ * compiles to st.shared without asm volatile. Tests whether ptxas
+ * schedules C++-generated stores differently from inline asm stores.
+ * Compute (CVT, ADD) stays as non-volatile asm (same as CPP_EPILOGUE).
+ */
+#ifdef CUTLASS_EPILOGUE
+#error "CUTE_STORE and CUTLASS_EPILOGUE are mutually exclusive"
+#endif
+
+/*
+ * CUTE_STORE macro takes a char* pointer (from extern __shared__ smem[])
+ * instead of uint32_t address. Callers pass stage_cptr + offset.
+ * The __shared__ provenance makes nvcc emit st.shared.v4.b32.
+ */
+#ifdef FP32_EPILOGUE
+#undef CVT_STS_V4
+#define CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, SPTR) \
+    do { \
+        uint32_t _s0, _s1, _s2, _s3; \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_s0) : "f"(f0), "f"(f1)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_s1) : "f"(f2), "f"(f3)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_s2) : "f"(f4), "f"(f5)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_s3) : "f"(f6), "f"(f7)); \
+        *(uint4*)(SPTR) = make_uint4(_s0, _s1, _s2, _s3); \
+    } while(0)
+
+#else /* BF16 + CUTE_STORE */
+#undef BIAS_RES_CVT_STS_V4
+#define BIAS_RES_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3, r0,r1,r2,r3, SPTR) \
+    do { \
+        uint32_t _o0, _o1, _o2, _o3; \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_o0) : "f"(f0), "f"(f1)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_o1) : "f"(f2), "f"(f3)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_o2) : "f"(f4), "f"(f5)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_o3) : "f"(f6), "f"(f7)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o0) : "r"(_o0), "r"(b0)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o1) : "r"(_o1), "r"(b1)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o2) : "r"(_o2), "r"(b2)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o3) : "r"(_o3), "r"(b3)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o0) : "r"(_o0), "r"(r0)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o1) : "r"(_o1), "r"(r1)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o2) : "r"(_o2), "r"(r2)); \
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_o3) : "r"(_o3), "r"(r3)); \
+        *(uint4*)(SPTR) = make_uint4(_o0, _o1, _o2, _o3); \
+    } while(0)
+#endif /* FP32_EPILOGUE */
+#endif /* CUTE_STORE */
+
+#if CUTLASS_LOOP >= 3
+#if defined(CUTLASS_EPILOGUE) || defined(CUTE_STORE)
+#error "CUTLASS_LOOP=3 is mutually exclusive with CUTLASS_EPILOGUE and CUTE_STORE"
+#endif
+/*
+ * CUTLASS_LOOP=3: Full C++ epilogue path.
+ * No inline asm for loads/compute/stores — only TMEM load+wait.
+ * FP32 math: unpack BF16→FP32, FADD residual+bias, CVT back, C++ store.
+ * Combined with #pragma unroll 1, tests whether nvcc's C++ code generation
+ * path produces structurally different PTX that ptxas schedules better.
+ */
+#define CPP_FP32_GROUP(a0,a1,a2,a3,a4,a5,a6,a7, bv, rv, SPTR, RSW) \
+    do { \
+        (a0) += __uint_as_float((rv).x << 16)        + __uint_as_float((bv).x << 16); \
+        (a1) += __uint_as_float((rv).x & 0xFFFF0000u) + __uint_as_float((bv).x & 0xFFFF0000u); \
+        (a2) += __uint_as_float((rv).y << 16)        + __uint_as_float((bv).y << 16); \
+        (a3) += __uint_as_float((rv).y & 0xFFFF0000u) + __uint_as_float((bv).y & 0xFFFF0000u); \
+        (a4) += __uint_as_float((rv).z << 16)        + __uint_as_float((bv).z << 16); \
+        (a5) += __uint_as_float((rv).z & 0xFFFF0000u) + __uint_as_float((bv).z & 0xFFFF0000u); \
+        (a6) += __uint_as_float((rv).w << 16)        + __uint_as_float((bv).w << 16); \
+        (a7) += __uint_as_float((rv).w & 0xFFFF0000u) + __uint_as_float((bv).w & 0xFFFF0000u); \
+        uint32_t _p0, _p1, _p2, _p3; \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_p0) : "f"(a0), "f"(a1)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_p1) : "f"(a2), "f"(a3)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_p2) : "f"(a4), "f"(a5)); \
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(_p3) : "f"(a6), "f"(a7)); \
+        *(uint4*)((SPTR) + (RSW)) = make_uint4(_p0, _p1, _p2, _p3); \
+    } while(0)
+#endif /* CUTLASS_LOOP >= 3 */
+
+#ifdef CUTLASS_EPILOGUE
+/*
+ * CUTLASS-clone epilogue: FP32 residual add → F2FP → BF16 bias add → STS.
+ *
+ * Splits the monolithic BIAS_RES_CVT_STS_V4 into:
+ *   Phase A (C++, non-volatile): unpack residual BF16→FP32 + FADD to acc
+ *   Phase B (asm volatile, per group): F2FP → HADD2 bias → STS.128
+ *
+ * Creates FADD→F2FP→HADD2→STS serial chain per group (4-deep).
+ * ptxas should pipeline group N+1's FADD while group N's STS is in-flight.
+ * Matches CUTLASS: FFMA→SHF→PRMT→HFMA2→STS pattern.
+ */
+
+/* Unpack uint4 of BF16x2 → 8 FP32 values (generates SHF+LOP3 in SASS) */
+#define UNPACK_RES_FP32(dst, src) \
+    do { \
+        (dst)[0] = __uint_as_float((src).x << 16); \
+        (dst)[1] = __uint_as_float((src).x & 0xFFFF0000u); \
+        (dst)[2] = __uint_as_float((src).y << 16); \
+        (dst)[3] = __uint_as_float((src).y & 0xFFFF0000u); \
+        (dst)[4] = __uint_as_float((src).z << 16); \
+        (dst)[5] = __uint_as_float((src).z & 0xFFFF0000u); \
+        (dst)[6] = __uint_as_float((src).w << 16); \
+        (dst)[7] = __uint_as_float((src).w & 0xFFFF0000u); \
+    } while(0)
+
+/* Per-group: F2FP → HADD2 (bias) → STS.128. One STS per call.
+   Input: 8 FP32 accumulators (already have residual added), 4 BF16x2 bias, addr. */
+#define CVT_BIAS_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3, SADDR) \
+    asm volatile( \
+        "{\n\t" \
+        ".reg .b32 o0, o1, o2, o3;\n\t" \
+        "cvt.rn.bf16x2.f32 o0, %1, %0;\n\t" \
+        "cvt.rn.bf16x2.f32 o1, %3, %2;\n\t" \
+        "cvt.rn.bf16x2.f32 o2, %5, %4;\n\t" \
+        "cvt.rn.bf16x2.f32 o3, %7, %6;\n\t" \
+        "add.rn.bf16x2 o0, o0, %8;\n\t" \
+        "add.rn.bf16x2 o1, o1, %9;\n\t" \
+        "add.rn.bf16x2 o2, o2, %10;\n\t" \
+        "add.rn.bf16x2 o3, o3, %11;\n\t" \
+        "st.shared.v4.b32 [%12], {o0,o1,o2,o3};\n\t" \
+        "}" \
+        :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
+           "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
+           "r"(b0),"r"(b1),"r"(b2),"r"(b3), \
+           "r"(SADDR) \
+        : "memory")
+
+/* LDS pipeline drain + fence in one asm block.
+   ptxas DCEs separate drain loads (even with asm volatile).
+   Merging with fence.proxy.async prevents removal: ptxas can't remove
+   the fence, and the loads inside the same block share its liveness. */
+#define LDS_DRAIN_AND_FENCE(SADDR) \
+    asm volatile( \
+        "{\n\t" \
+        ".reg .b32 __dr;\n\t" \
+        "ld.shared.b32 __dr, [%0];\n\t" \
+        "ld.shared.b32 __dr, [%0];\n\t" \
+        "ld.shared.b32 __dr, [%0];\n\t" \
+        "ld.shared.b32 __dr, [%0];\n\t" \
+        "fence.proxy.async.shared::cta;\n\t" \
+        "}" :: "r"(SADDR) : "memory")
+#endif /* CUTLASS_EPILOGUE */
 
 /* TMA store + wait helpers — shared between main loop and drain.
    EPI_STORE: issue TMA store(s) + commit_group.
@@ -673,6 +875,9 @@ fc2_w3_kernel(
                 int pend_nc, pend_stage;
 #endif
 
+#if CUTLASS_LOOP >= 1
+                PRAGMA_UNROLL(1)
+#endif
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                     const int stage = si % NUM_EPI_STAGES;
                     const int nc_base = si * 64;   /* column offset within tile */
@@ -701,7 +906,16 @@ fc2_w3_kernel(
                         + stage * EPI_STAGE_BYTES
                         + row_group * STAGING_REGION_BYTES
                         + lane * 128);
+#ifdef CUTE_STORE
+                    char* stage_cptr = smem + OFF_STAGING
+                        + stage * EPI_STAGE_BYTES
+                        + row_group * STAGING_REGION_BYTES
+                        + lane * 128;
+#endif
 
+#if CUTLASS_LOOP >= 2
+                    PRAGMA_UNROLL(1)
+#endif
                     for (int chunk = 0; chunk < 2; chunk++) {
                         const int nc = nc_base + chunk * 32;
 
@@ -712,6 +926,39 @@ fc2_w3_kernel(
                                       a24,a25,a26,a27,a28,a29,a30,a31,
                                       taddr_base + nc);
 
+#if CUTLASS_LOOP >= 3
+                        {
+                            const uint32_t rsw0 = chunk ? sw4 : sw0;
+                            const uint32_t rsw1 = chunk ? sw5 : sw1;
+                            const uint32_t rsw2 = chunk ? sw6 : sw2;
+                            const uint32_t rsw3 = chunk ? sw7 : sw3;
+                            char* sptr = smem + OFF_STAGING
+                                + stage * EPI_STAGE_BYTES
+                                + row_group * STAGING_REGION_BYTES
+                                + lane * 128;
+
+                            /* C++ reads: bias from linear SMEM */
+                            const char* bp = smem + OFF_BIAS_SMEM + nc * 2;
+                            uint4 bv0 = *(const uint4*)(bp);
+                            uint4 bv1 = *(const uint4*)(bp + 16);
+                            uint4 bv2 = *(const uint4*)(bp + 32);
+                            uint4 bv3 = *(const uint4*)(bp + 48);
+
+                            /* C++ reads: residual from swizzled staging SMEM */
+                            uint4 rv0 = *(const uint4*)(sptr + rsw0);
+                            uint4 rv1 = *(const uint4*)(sptr + rsw1);
+                            uint4 rv2 = *(const uint4*)(sptr + rsw2);
+                            uint4 rv3 = *(const uint4*)(sptr + rsw3);
+
+                            TMEM_WAIT();
+
+                            /* FP32 compute + C++ store per group */
+                            CPP_FP32_GROUP(a0,a1,a2,a3,a4,a5,a6,a7, bv0, rv0, sptr, rsw0);
+                            CPP_FP32_GROUP(a8,a9,a10,a11,a12,a13,a14,a15, bv1, rv1, sptr, rsw1);
+                            CPP_FP32_GROUP(a16,a17,a18,a19,a20,a21,a22,a23, bv2, rv2, sptr, rsw2);
+                            CPP_FP32_GROUP(a24,a25,a26,a27,a28,a29,a30,a31, bv3, rv3, sptr, rsw3);
+                        }
+#else
                         /* LDS bias from SMEM (linear, not swizzled) */
                         const uint32_t bs = bias_saddr + nc * 2;
                         uint4 bv0, bv1, bv2, bv3;
@@ -739,9 +986,54 @@ fc2_w3_kernel(
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w) : "r"(stage_base + rsw3));
 
+#ifdef CUTLASS_EPILOGUE
+                        /* Pre-unpack residual BF16→FP32 (hides in TMEM latency) */
+                        float rr0[8], rr1[8], rr2[8], rr3[8];
+                        UNPACK_RES_FP32(rr0, rv0);
+                        UNPACK_RES_FP32(rr1, rv1);
+                        UNPACK_RES_FP32(rr2, rv2);
+                        UNPACK_RES_FP32(rr3, rv3);
+
+                        TMEM_WAIT();
+
+                        /* Per-group: FP32 residual add → F2FP → BF16 bias add → STS */
+                        a0+=rr0[0]; a1+=rr0[1]; a2+=rr0[2]; a3+=rr0[3];
+                        a4+=rr0[4]; a5+=rr0[5]; a6+=rr0[6]; a7+=rr0[7];
+                        CVT_BIAS_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                            bv0.x,bv0.y,bv0.z,bv0.w, stage_base + rsw0);
+
+                        a8+=rr1[0]; a9+=rr1[1]; a10+=rr1[2]; a11+=rr1[3];
+                        a12+=rr1[4]; a13+=rr1[5]; a14+=rr1[6]; a15+=rr1[7];
+                        CVT_BIAS_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                            bv1.x,bv1.y,bv1.z,bv1.w, stage_base + rsw1);
+
+                        a16+=rr2[0]; a17+=rr2[1]; a18+=rr2[2]; a19+=rr2[3];
+                        a20+=rr2[4]; a21+=rr2[5]; a22+=rr2[6]; a23+=rr2[7];
+                        CVT_BIAS_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                            bv2.x,bv2.y,bv2.z,bv2.w, stage_base + rsw2);
+
+                        a24+=rr3[0]; a25+=rr3[1]; a26+=rr3[2]; a27+=rr3[3];
+                        a28+=rr3[4]; a29+=rr3[5]; a30+=rr3[6]; a31+=rr3[7];
+                        CVT_BIAS_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                            bv3.x,bv3.y,bv3.z,bv3.w, stage_base + rsw3);
+#else
                         TMEM_WAIT();
 
                         /* STS output to SAME stage region (ReuseSmemC) */
+#ifdef CUTE_STORE
+                        BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                            bv0.x,bv0.y,bv0.z,bv0.w,
+                            rv0.x,rv0.y,rv0.z,rv0.w, stage_cptr + rsw0);
+                        BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                            bv1.x,bv1.y,bv1.z,bv1.w,
+                            rv1.x,rv1.y,rv1.z,rv1.w, stage_cptr + rsw1);
+                        BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                            bv2.x,bv2.y,bv2.z,bv2.w,
+                            rv2.x,rv2.y,rv2.z,rv2.w, stage_cptr + rsw2);
+                        BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                            bv3.x,bv3.y,bv3.z,bv3.w,
+                            rv3.x,rv3.y,rv3.z,rv3.w, stage_cptr + rsw3);
+#else
                         BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                             bv0.x,bv0.y,bv0.z,bv0.w,
                             rv0.x,rv0.y,rv0.z,rv0.w, stage_base + rsw0);
@@ -754,10 +1046,17 @@ fc2_w3_kernel(
                         BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
                             bv3.x,bv3.y,bv3.z,bv3.w,
                             rv3.x,rv3.y,rv3.z,rv3.w, stage_base + rsw3);
+#endif /* CUTE_STORE */
+#endif /* CUTLASS_EPILOGUE */
+#endif /* CUTLASS_LOOP >= 3 */
                     }
 
                     /* FENCE + BAR.SYNC: all 4 epilogue warps' STS must be visible */
+#ifdef CUTLASS_EPILOGUE
+                    LDS_DRAIN_AND_FENCE(stage_base);
+#else
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#endif
                     asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 
 #if DELAY_TMA_STORE
@@ -858,6 +1157,9 @@ fc2_w3_kernel(
             int pend_nc, pend_stage;
 #endif
 
+#if CUTLASS_LOOP >= 1
+            PRAGMA_UNROLL(1)
+#endif
             for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                 const int stage = si % NUM_EPI_STAGES;
                 const int nc_base = si * 64;
@@ -881,7 +1183,16 @@ fc2_w3_kernel(
                     + stage * EPI_STAGE_BYTES
                     + row_group * STAGING_REGION_BYTES
                     + lane * 128);
+#ifdef CUTE_STORE
+                char* stage_cptr = smem + OFF_STAGING
+                    + stage * EPI_STAGE_BYTES
+                    + row_group * STAGING_REGION_BYTES
+                    + lane * 128;
+#endif
 
+#if CUTLASS_LOOP >= 2
+                PRAGMA_UNROLL(1)
+#endif
                 for (int chunk = 0; chunk < 2; chunk++) {
                     const int nc = nc_base + chunk * 32;
 
@@ -891,6 +1202,36 @@ fc2_w3_kernel(
                                   a24,a25,a26,a27,a28,a29,a30,a31,
                                   taddr_base + nc);
 
+#if CUTLASS_LOOP >= 3
+                    {
+                        const uint32_t rsw0 = chunk ? sw4 : sw0;
+                        const uint32_t rsw1 = chunk ? sw5 : sw1;
+                        const uint32_t rsw2 = chunk ? sw6 : sw2;
+                        const uint32_t rsw3 = chunk ? sw7 : sw3;
+                        char* sptr = smem + OFF_STAGING
+                            + stage * EPI_STAGE_BYTES
+                            + row_group * STAGING_REGION_BYTES
+                            + lane * 128;
+
+                        const char* bp = smem + OFF_BIAS_SMEM + nc * 2;
+                        uint4 bv0 = *(const uint4*)(bp);
+                        uint4 bv1 = *(const uint4*)(bp + 16);
+                        uint4 bv2 = *(const uint4*)(bp + 32);
+                        uint4 bv3 = *(const uint4*)(bp + 48);
+
+                        uint4 rv0 = *(const uint4*)(sptr + rsw0);
+                        uint4 rv1 = *(const uint4*)(sptr + rsw1);
+                        uint4 rv2 = *(const uint4*)(sptr + rsw2);
+                        uint4 rv3 = *(const uint4*)(sptr + rsw3);
+
+                        TMEM_WAIT();
+
+                        CPP_FP32_GROUP(a0,a1,a2,a3,a4,a5,a6,a7, bv0, rv0, sptr, rsw0);
+                        CPP_FP32_GROUP(a8,a9,a10,a11,a12,a13,a14,a15, bv1, rv1, sptr, rsw1);
+                        CPP_FP32_GROUP(a16,a17,a18,a19,a20,a21,a22,a23, bv2, rv2, sptr, rsw2);
+                        CPP_FP32_GROUP(a24,a25,a26,a27,a28,a29,a30,a31, bv3, rv3, sptr, rsw3);
+                    }
+#else
                     const uint32_t bs = bias_saddr + nc * 2;
                     uint4 bv0, bv1, bv2, bv3;
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -917,9 +1258,51 @@ fc2_w3_kernel(
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w) : "r"(stage_base + rsw3));
 
+#ifdef CUTLASS_EPILOGUE
+                    float rr0[8], rr1[8], rr2[8], rr3[8];
+                    UNPACK_RES_FP32(rr0, rv0);
+                    UNPACK_RES_FP32(rr1, rv1);
+                    UNPACK_RES_FP32(rr2, rv2);
+                    UNPACK_RES_FP32(rr3, rv3);
+
                     TMEM_WAIT();
 
-                    /* STS output to SAME stage region (ReuseSmemC) */
+                    a0+=rr0[0]; a1+=rr0[1]; a2+=rr0[2]; a3+=rr0[3];
+                    a4+=rr0[4]; a5+=rr0[5]; a6+=rr0[6]; a7+=rr0[7];
+                    CVT_BIAS_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                        bv0.x,bv0.y,bv0.z,bv0.w, stage_base + rsw0);
+
+                    a8+=rr1[0]; a9+=rr1[1]; a10+=rr1[2]; a11+=rr1[3];
+                    a12+=rr1[4]; a13+=rr1[5]; a14+=rr1[6]; a15+=rr1[7];
+                    CVT_BIAS_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                        bv1.x,bv1.y,bv1.z,bv1.w, stage_base + rsw1);
+
+                    a16+=rr2[0]; a17+=rr2[1]; a18+=rr2[2]; a19+=rr2[3];
+                    a20+=rr2[4]; a21+=rr2[5]; a22+=rr2[6]; a23+=rr2[7];
+                    CVT_BIAS_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                        bv2.x,bv2.y,bv2.z,bv2.w, stage_base + rsw2);
+
+                    a24+=rr3[0]; a25+=rr3[1]; a26+=rr3[2]; a27+=rr3[3];
+                    a28+=rr3[4]; a29+=rr3[5]; a30+=rr3[6]; a31+=rr3[7];
+                    CVT_BIAS_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                        bv3.x,bv3.y,bv3.z,bv3.w, stage_base + rsw3);
+#else
+                    TMEM_WAIT();
+
+#ifdef CUTE_STORE
+                    BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                        bv0.x,bv0.y,bv0.z,bv0.w,
+                        rv0.x,rv0.y,rv0.z,rv0.w, stage_cptr + rsw0);
+                    BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                        bv1.x,bv1.y,bv1.z,bv1.w,
+                        rv1.x,rv1.y,rv1.z,rv1.w, stage_cptr + rsw1);
+                    BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                        bv2.x,bv2.y,bv2.z,bv2.w,
+                        rv2.x,rv2.y,rv2.z,rv2.w, stage_cptr + rsw2);
+                    BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                        bv3.x,bv3.y,bv3.z,bv3.w,
+                        rv3.x,rv3.y,rv3.z,rv3.w, stage_cptr + rsw3);
+#else
                     BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                         bv0.x,bv0.y,bv0.z,bv0.w,
                         rv0.x,rv0.y,rv0.z,rv0.w, stage_base + rsw0);
@@ -932,9 +1315,16 @@ fc2_w3_kernel(
                     BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
                         bv3.x,bv3.y,bv3.z,bv3.w,
                         rv3.x,rv3.y,rv3.z,rv3.w, stage_base + rsw3);
+#endif /* CUTE_STORE */
+#endif /* CUTLASS_EPILOGUE */
+#endif /* CUTLASS_LOOP >= 3 */
                 }
 
+#ifdef CUTLASS_EPILOGUE
+                LDS_DRAIN_AND_FENCE(stage_base);
+#else
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#endif
                 asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 
 #if DELAY_TMA_STORE
@@ -991,14 +1381,14 @@ int main() {
     printf("FC2 W3 kernel — 7 warps, shared-SMEM epilogue\n");
     printf("  GEMM: [%d,%d] x [%d,%d]^T  %d-stage pipeline  SMEM: %d bytes\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, N_STAGES, SMEM_BYTES);
-    printf("  EPI: stages=%d  SWS=%d  DTS=%d  FP32=%d\n",
+    printf("  EPI: stages=%d  SWS=%d  DTS=%d  FP32=%d  CPP=%d\n",
            NUM_EPI_STAGES, SINGLE_WARP_STORE, DELAY_TMA_STORE,
 #ifdef FP32_EPILOGUE
-           1
+           1,
 #else
-           0
+           0,
 #endif
-           );
+           CPP_EPILOGUE);
 
     uint8_t *d_A, *d_B;
     __nv_bfloat16 *d_bias, *d_residual, *d_C;
