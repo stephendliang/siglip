@@ -565,20 +565,18 @@ static auto* fc2_phase3_kernel = fc2_phase3_kernel_impl<GemmKernel>;
 #endif /* HYBRID_PHASE3 */
 
 /* ═══════════════════════════════════════════════════════════════════
-   Phase 4: 8-warp kernel — our PTX mainloop + CUTLASS epilogue
+   Phase 4: 8-warp kernel — mirrors CUTLASS operator() exactly,
+   but with static tile scheduling instead of CLC.
 
-   Goal: combine our faster mainloop (1.089ms strip) with CUTLASS's
-   epilogue (72μs overhead) for theoretical 1.161ms ceiling.
+   Goal: first match Phase 1 perf (1.222ms) to prove dispatch is correct,
+   then replace Load+MMA with our PTX for mainloop speedup.
 
-   Step 1 (skeleton): 8-warp CUTLASS mainloop + epilogue + idle warp.
-   Should match Phase 1 perf (1.222ms).
-   Steps 2-4: Replace Load+MMA with our PTX.
-
-   W0: MainloopLoad   (Step 1: CUTLASS → Steps 3+: our PTX)
-   W1: MMA            (Step 1: CUTLASS → Steps 4+: our PTX)
-   W2: Idle
-   W3: EpilogueLoad   (CUTLASS epilogue.load())
-   W4-W7: Epilogue    (CUTLASS epilogue.store())
+   Warp layout MATCHES CUTLASS exactly:
+   W0: Sched (idle — static scheduling, no CLC)
+   W1: MMA
+   W2: MainloopLoad
+   W3: EpilogueLoad
+   W4-W7: Epilogue
    ═══════════════════════════════════════════════════════════════════ */
 
 #ifdef HYBRID_PHASE4
@@ -603,6 +601,9 @@ fc2_phase4_kernel_impl(CUTLASS_GRID_CONSTANT typename GK::Params const params) {
     using AccumulatorPipelineState = typename GK::AccumulatorPipelineState;
     using LoadOrderBarrier      = typename GK::LoadOrderBarrier;
     using TmemAllocator         = typename GK::TmemAllocator;
+    using CLCPipeline           = typename GK::CLCPipeline;
+    using CLCPipelineState      = typename CLCPipeline::PipelineState;
+    using CLCThrottlePipeline   = typename GK::CLCThrottlePipeline;
 
     using TileShape       = typename CM::TileShape;
     using TiledMma        = typename CM::TiledMma;
@@ -613,16 +614,22 @@ fc2_phase4_kernel_impl(CUTLASS_GRID_CONSTANT typename GK::Params const params) {
     static constexpr bool IsOverlapping = GK::IsOverlappingAccum;
     static constexpr bool HasPeerCta    = size(AtomThrShapeMNK{}) == 2;
 
+    /* Match CUTLASS's warp-to-role mapping exactly:
+       W0=Sched, W1=MMA, W2=Load, W3=EpiLoad, W4-7=Epilogue */
+    enum WarpCat { WSched=0, WMMA=1, WLoad=2, WEpiL=3, WEpi=4 };
+
     extern __shared__ char smem_buf[];
     SharedStorage& ss = *reinterpret_cast<SharedStorage*>(smem_buf);
 
     int warp_idx = cutlass::canonical_warp_idx_sync();
     uint32_t lane_pred = elect_one_sync();
+    WarpCat wc = warp_idx < WEpi ? WarpCat(warp_idx) : WEpi;
 
     auto cluster_shape = cutlass::detail::select_cluster_shape(
         typename CM::DispatchPolicy::ClusterShape{});
     int cluster_size = size(cluster_shape);
     uint32_t cta_rank = block_rank_in_cluster();
+    bool is_first_cta = cta_rank == 0;
     int cta_v = cta_rank % size<0>(typename TiledMma::AtomThrID{});
     bool is_mma_leader = cta_v == 0;
     [[maybe_unused]] uint32_t peer_rank = HasPeerCta ? cta_rank ^ 1 : cta_rank;
@@ -633,59 +640,78 @@ fc2_phase4_kernel_impl(CUTLASS_GRID_CONSTANT typename GK::Params const params) {
     CM collective_mainloop(params.mainloop, cluster_shape, cta_rank);
     CE collective_epilogue(params.epilogue, ss.tensors.epilogue);
 
-    /* TMA descriptor prefetch */
-    if (warp_idx == 0 && lane_pred) collective_mainloop.prefetch_tma_descriptors();
-    if (warp_idx == 3 && lane_pred) collective_epilogue.prefetch_tma_descriptors(params.epilogue);
+    /* TMA descriptor prefetch — match CUTLASS: Sched prefetches mainloop, EpiLoad prefetches epilogue */
+    if (wc == WSched && lane_pred) collective_mainloop.prefetch_tma_descriptors();
+    if (wc == WEpiL  && lane_pred) collective_epilogue.prefetch_tma_descriptors(params.epilogue);
 
     bool epi_load_needed = collective_epilogue.is_producer_load_needed();
 
-    /* ── Warp roles: W0=Load W1=MMA W2=Idle W3=EpiLoad W4-7=Epilogue ── */
-    enum { RLoad=0, RMMA=1, RIdle=2, REpiL=3, REpi=4 };
-    int role;
-    if (warp_idx == 0)      role = RLoad;
-    else if (warp_idx == 1) role = RMMA;
-    else if (warp_idx == 2) role = RIdle;
-    else if (warp_idx == 3) role = REpiL;
-    else                    role = REpi;
+    /* ── Pipeline init — MATCH CUTLASS EXACTLY (all 7 pipelines) ── */
 
-    /* ── Pipeline init ── */
+    /* 1. MainloopPipeline (init warp 0) */
     typename MainloopPipeline::Params ml_p;
-    if (role == RLoad) ml_p.role = MainloopPipeline::ThreadCategory::Producer;
-    if (role == RMMA)  ml_p.role = MainloopPipeline::ThreadCategory::Consumer;
-    ml_p.is_leader = lane_pred && is_mma_leader && (role == RLoad);
+    if (wc == WLoad) ml_p.role = MainloopPipeline::ThreadCategory::Producer;
+    if (wc == WMMA)  ml_p.role = MainloopPipeline::ThreadCategory::Consumer;
+    ml_p.is_leader = lane_pred && is_mma_leader && (wc == WLoad);
     ml_p.transaction_bytes = CM::TmaTransactionBytes;
     ml_p.initializing_warp = 0;
     MainloopPipeline mainloop_pipe(ss.pipelines.mainloop, ml_p, cluster_shape,
                                    true_type{}, false_type{});
 
+    /* 2. EpiLoadPipeline (init warp 1) */
     typename EpiLoadPipeline::Params el_p;
-    if (role == REpiL) el_p.role = EpiLoadPipeline::ThreadCategory::Producer;
-    if (role == REpi)  el_p.role = EpiLoadPipeline::ThreadCategory::Consumer;
+    if (wc == WEpiL) el_p.role = EpiLoadPipeline::ThreadCategory::Producer;
+    if (wc == WEpi)  el_p.role = EpiLoadPipeline::ThreadCategory::Consumer;
     el_p.dst_blockid = cta_rank;
     el_p.producer_arv_count = 32;
     el_p.consumer_arv_count = GK::NumEpilogueThreads;
     el_p.transaction_bytes = CE::TmaTransactionBytes;
-    el_p.initializing_warp = 3;
+    el_p.initializing_warp = 1;
     EpiLoadPipeline epi_load_pipe(ss.pipelines.epi_load, el_p);
 
+    /* 3. EpiStorePipeline (no shared storage) */
     typename EpiStorePipeline::Params es_p;
     es_p.always_wait = true;
     EpiStorePipeline epi_store_pipe(es_p);
 
+    /* 4. LoadOrderBarrier (init warp 3) */
     typename LoadOrderBarrier::Params lo_p;
-    lo_p.group_id = (role == RLoad) ? 0 : 1;
+    lo_p.group_id = (wc == WLoad) ? 0 : 1;
     lo_p.group_size = 32;
-    lo_p.initializing_warp = 2;
+    lo_p.initializing_warp = 3;
     LoadOrderBarrier load_order(ss.pipelines.load_order, lo_p);
 
+    /* 5. CLCPipeline (init warp 4) — must construct even though we don't use CLC */
+    typename CLCPipeline::Params clc_p;
+    if (wc == WSched) clc_p.role = CLCPipeline::ThreadCategory::ProducerConsumer;
+    else              clc_p.role = CLCPipeline::ThreadCategory::Consumer;
+    clc_p.producer_blockid = 0;
+    clc_p.producer_arv_count = 1;
+    clc_p.consumer_arv_count = 32 + cluster_size * (32 + GK::NumEpilogueThreads + 32);
+    if (epi_load_needed) clc_p.consumer_arv_count += cluster_size * 32;
+    clc_p.transaction_bytes = GK::CLCResponseSize;
+    clc_p.initializing_warp = 4;
+    CLCPipeline clc_pipe(ss.pipelines.clc, clc_p, cluster_shape);
+
+    /* 6. AccumulatorPipeline (init warp 5) */
     typename AccumulatorPipeline::Params ap_p;
-    if (role == RMMA) ap_p.role = AccumulatorPipeline::ThreadCategory::Producer;
-    if (role == REpi) ap_p.role = AccumulatorPipeline::ThreadCategory::Consumer;
+    if (wc == WMMA) ap_p.role = AccumulatorPipeline::ThreadCategory::Producer;
+    if (wc == WEpi) ap_p.role = AccumulatorPipeline::ThreadCategory::Consumer;
     ap_p.producer_arv_count = 1;
     ap_p.consumer_arv_count = size(AtomThrShapeMNK{}) * GK::NumEpilogueThreads;
-    ap_p.initializing_warp = 4;
+    ap_p.initializing_warp = 5;
     AccumulatorPipeline acc_pipe(ss.pipelines.accumulator, ap_p, cluster_shape,
                                 true_type{}, false_type{});
+
+    /* 7. CLCThrottlePipeline (init warp 3) */
+    typename CLCThrottlePipeline::Params clct_p;
+    if (wc == WLoad)  clct_p.role = CLCThrottlePipeline::ThreadCategory::Producer;
+    if (wc == WSched) clct_p.role = CLCThrottlePipeline::ThreadCategory::Consumer;
+    clct_p.producer_arv_count = 32;
+    clct_p.consumer_arv_count = 32;
+    clct_p.dst_blockid = 0;
+    clct_p.initializing_warp = 3;
+    CLCThrottlePipeline clc_throttle_pipe(ss.pipelines.clc_throttle, clct_p);
 
     /* TMEM allocator + sync barriers */
     TmemAllocator tmem_alloc{};
@@ -693,7 +719,7 @@ fc2_phase4_kernel_impl(CUTLASS_GRID_CONSTANT typename GK::Params const params) {
         cutlass::arch::ReservedNamedBarriers::TmemAllocBarrier);
     auto& tmem_dealloc = ss.pipelines.tmem_dealloc;
     [[maybe_unused]] uint32_t dealloc_phase = 0;
-    if (role == RMMA) {
+    if (wc == WMMA) {
         if constexpr (!IsOverlapping) {
             if (HasPeerCta && lane_pred) tmem_dealloc.init(32);
         } else {
@@ -733,7 +759,7 @@ fc2_phase4_kernel_impl(CUTLASS_GRID_CONSTANT typename GK::Params const params) {
 
     /* ═══ WARP DISPATCH ═══ */
 
-    if (role == RLoad) {
+    if (wc == WLoad) {
         cutlass::arch::wait_on_dependent_grids();
         bool do_arrive = epi_load_needed;
         for (int ti = t0; ti < t1; ti++) {
@@ -752,7 +778,7 @@ fc2_phase4_kernel_impl(CUTLASS_GRID_CONSTANT typename GK::Params const params) {
         collective_mainloop.load_tail(mainloop_pipe, ml_prod);
     }
 
-    else if (role == RMMA) {
+    else if (wc == WMMA) {
         tmem_alloc.allocate(TmemAllocator::Sm100TmemCapacityColumns, &ss.tmem_base_ptr);
         __syncwarp();
         tmem_bar.arrive();
@@ -790,11 +816,11 @@ fc2_phase4_kernel_impl(CUTLASS_GRID_CONSTANT typename GK::Params const params) {
         tmem_alloc.free(tptr, TmemAllocator::Sm100TmemCapacityColumns);
     }
 
-    else if (role == RIdle) {
-        /* W2: idle — does nothing after pipeline init + cluster sync */
+    else if (wc == WSched) {
+        /* W0: Sched — idle with static scheduling */
     }
 
-    else if (role == REpiL) {
+    else if (wc == WEpiL) {
         if (epi_load_needed) {
             cutlass::arch::wait_on_dependent_grids();
             bool do_wait = true;
