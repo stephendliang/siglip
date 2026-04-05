@@ -1,430 +1,256 @@
-# SigLIP2 Vision Encoder — Persistent GEMM Kernels
+# FC2 Optimization — SigLIP2 Vision Encoder
 
-Hand-tuned Blackwell (SM100a) persistent kernels for `google/siglip2-base-patch16-224`.
-FP8 (E4M3) precision, tcgen05 WGMMA, TMA, `cta_group::2` with 2-CTA clusters. Cross-compiled on CPU VPS, runs on B200.
+Hand-tuned Blackwell (SM100a) persistent GEMM kernel for FC2 layer of `google/siglip2-base-patch16-224`.
+FP8 (E4M3) inputs, BF16 output, tcgen05 MMA, TMA, `cta_group::2` with 2-CTA clusters.
+Cross-compiled on CPU VPS, runs on B200. PE and FC1 kernels are done — see `CLAUDE.md.mothballed` for their docs.
 
-## Current state
+## The problem
 
-Three fused GEMM kernels for the vision encoder MLP. **Only FC2 is being actively optimized** — PE and FC1 beat CUTLASS and are done. Do NOT suggest or run grid search / B200 sessions on PE or FC1.
+FC2 shape: [928256, 3072] x [3072, 768]^T + bias + residual. Batch = 4736 images x 196 patches.
 
-| Kernel | Shape | Epilogue | Best ms | TFLOPS | Regs | vs CUTLASS fused | Status |
-|--------|-------|----------|---------|--------|------|------------------|--------|
-| **patch_embed** | [928256,768]×[768,768]^T | bias + pos_embed | 0.525 | 2085 | 174-214 | **2% faster** (0.536) | **DONE** |
-| **fc1_gelu** | [928256,768]×[768,3072]^T | bias + GELU | 2.267 | 1932 | 244 | **3% faster** (2.323) | **DONE** |
-| **fc2** | [928256,3072]×[3072,768]^T | bias + residual | 1.456 | 3005 | 200 | **20% slower** (1.211) | **ACTIVE** |
+| | Strip (GEMM-only) | Fused | Epilogue overhead |
+|---|---|---|---|
+| **fc2_w3 (ours)** | **1.089ms** | 1.477ms | **388us (36%)** |
+| **CUTLASS** | 1.152ms | **1.224ms** | **72us (6.3%)** |
 
-Batch = 4736 images × 196 patches = 928256 rows. BF16 output, FP8 inputs.
+**Our mainloop is 63us FASTER. The entire gap is epilogue overhead: 388us vs 72us = 5.4x worse.**
+Theoretical ceiling if we had CUTLASS-quality epilogue: 1.089 + 0.072 = **1.161ms** (5% faster than CUTLASS).
 
-### FC2 gap analysis (SASS-verified 2026-03-22)
+Both use identical tile/cluster config: 256x256x128, 2x1 cluster, cta_group::2, 74 clusters.
 
-Best: **1.456ms / 3005 TFLOPS** (NS5, IS1, BIAS_SMEM=1). CUTLASS: 1.211ms fused. Gap = **245μs (20%)**.
-At identical locked 1770 MHz: 1.482ms vs 1.263ms = **17.3% gap = ~1,940 cycles/tile**.
-Clock throttling disproved — both kernels run at ~1.85 GHz unlocked on the same Verda B200.
+## Architecture comparison
 
-**CUTLASS uses identical tile/cluster config**: 256×256×128, 2×1 cluster, cta_group::2. But has 2,864 SASS instructions vs our 2,248 (27% MORE code, 17% FASTER). **The entire gap is epilogue scheduling quality.**
-
-### CUTLASS vs our architecture (SASS-verified)
-
-**CUTLASS uses 8 warps (256 threads) — 2 extra warps we don't have:**
-- **Warp 3: Dedicated EpilogueLoad** — pre-loads residual+bias into SMEM via TMA, independently from compute. Epilogue warps just LDS from SMEM. **This is the single biggest architectural difference. DO NOT FORGET THIS.**
-- Warp 0: Tile scheduler via `UTCBAR.2CTA.MULTICAST` (NOT CLC — no CLCX/SETCTAID in SASS)
-- Warp 1: MMA, Warp 2: MainloopLoad, Warps 4-7: Epilogue (128 threads)
-
-**Our 6 warps (192 threads) — epilogue warps must self-load:**
-- W0: TMA A/B loads. W1: MMA. W2-W5: Epilogue.
-- **No dedicated epilogue load warp. Epilogue warps issue 16× LDG.E.128.CONSTANT (global loads) themselves.**
-
-### SASS-verified epilogue differences
-
-| | **Our FC2** | **CUTLASS** |
+| | **fc2_w3 (ours)** | **CUTLASS** |
 |---|---|---|
-| Epilogue math | **BF16** (HFMA2/HADD2 after F2FP) | **FP32** (FFMA, F2FP only at end) |
-| Bias/res source | LDG from global IN epilogue warps | LDS from SMEM (**W3 pre-loaded**) |
-| STS placement | **4 consecutive** at block end (serialized) | **Interleaved** with FFMA/F2FP, 2-4 ops/shadow |
-| Intra-epi pipeline | None — sequential | **2× BAR.SYNC + DEPBAR** per sub-iter |
-| Sub-iterations | 3 (×64 cols, 8 STS each) | 4 (×64 cols, 4 STS each) |
-| Instruction flow | 16 LDG → 16 F2FP → 64 BF16 → 8 STS | 12 LDS → LDTM → 64 FFMA ↔ F2FP ↔ STS |
-
-### What's actually wrong — STRIP_EPILOGUE breakthrough (2026-03-26)
-
-**The epilogue is NOT overlapped. It inflates the K-loop by 36%.** STRIP_EPILOGUE (commit 33a13eb) proves this definitively:
-
-| | GEMM-only | Fused | Epilogue overhead |
-|---|-----------|-------|-------------------|
-| **Ours** | 1.161ms | 1.636ms | **+475μs (+41%)** |
-| **CUTLASS** | 1.147ms | 1.225ms | **+78μs (+6.8%)** |
-
-K-loops are identical (1.161 vs 1.147ms = 1.2% difference). **The entire gap is epilogue-induced K-loop inflation.** Our epilogue causes **6x more K-loop overhead** than CUTLASS's.
-
-Per-tile W1 timing confirms this is uniform across all tiles, not outlier tiles:
-- Stripped: kloop avg=13,773 cyc, total p50=13,645
-- Full: kloop avg=18,714 cyc, total p50=19,944
-- **K-loop inflates +4,941 cyc (+36%) with epilogue running**
-
-**Why microbenchmarks (mma_bench, warp_scaling) were misleading:** They tested single tiles in isolation. The contention only manifests in the persistent kernel with 10,878 tiles, cross-tile mbarrier handoffs, and sustained concurrent memory traffic from all 74 clusters.
-
-See "Confirmed dead" and "Strip bench decomposition" sections below for full dead-end list.
-
-### Strip bench decomposition (2026-03-27) — NO single operation is the cause
-
-30-experiment sweep (`tools/fc2_strip_bench.sh`, data: `data/strip_bench_20260328_055725/`). **Devastating result: ALL variants ≈ 1.635ms regardless of which epilogue operation is active.** Only STRIP_EPILOGUE (no epilogue at all) is fast at 1.160ms.
-
-| Variant | ms | Delta | What it keeps |
-|---|---|---|---|
-| baseline | 1.637 | +477μs | Full epilogue |
-| strip_all | 1.160 | 0 | Nothing (STRIP_EPILOGUE) |
-| only_tma_load | 1.634 | +474μs | TMA loads only |
-| only_tma_store | 1.636 | +476μs | TMA stores only |
-| only_compute | 1.633 | +473μs | STS/BF16 only |
-| bar_chunk | 1.635 | +475μs | BAR.SYNC serialization |
-| fp32_epi | 1.638 | +478μs | FP32 epilogue math |
-
-**Conclusion: the overhead is from epilogue warps BEING ACTIVE, not from what they do.** Even the lightest possible epilogue (a single TMA load per pass) causes the full 477μs.
-
-**SASS diff (base 186-reg vs strip 78-reg):** K-loop is 347 structurally identical opcodes. Only register indices differ (base R104-R169, strip R2-R61). The compiler eliminates all dead epilogue code when STRIP_EPILOGUE=1, reducing regs from 186→78. Register file occupancy: 54.5% (base) vs 22.9% (strip).
-
-### Confirmed dead — do NOT retry (updated 2026-03-28)
-
-ALL of these have been benchmarked on B200 with zero effect on the 477μs gap:
-- **BAR.SYNC serialization** (EPI_SYNC, EPI_BAR_PASS, EPI_BAR_CHUNK): ≈1.635ms. Does not help.
-- **Combinatorial strips** (only_tma_load, only_tma_store, only_compute): ≈1.635ms. No single operation is the cause.
-- **BAR.SYNC + strip combos** (bar_chunk_no_load, bar_chunk_no_store): ≈1.635ms.
-- **FP32_EPILOGUE**: 1.638ms. ALU type doesn't matter.
-- **Stagger** (500/2000 cycles): ≈1.633ms. Temporal offset doesn't help.
-- **Pass count** (NUM_PASSES_PARAM=4): 1.635ms.
-- **Store deferred** (STORE_TIMING=1): 1.642ms.
-- EPI_LOAD_WARP (serial): +13% regression
-- EPI_PIPELINE (fire-and-forget): +0.8% noise
-- PRE_COMBINE, EPI_NOINLINE: 0μs wall time
-- Source-level STS scheduling: ptxas immutable (byte-identical SASS)
-- W0_RES_FULL: +15% catastrophic
-- **STAGES_C=2 (no-reuse)**: sc2nr_nepi2=1.244ms ≈ base_nepi2=1.246ms = neutral. Pre-loading residual via W0 doesn't reduce per-warp contention.
-- **STAGES_C=2 + EPI_REUSE_SMEM**: FUNDAMENTALLY BROKEN — A/B overwrites pre-loaded residual at ki=2. `#error` guard added.
-- **STAGES_C + PRE_COMBINE**: BROKEN — macro discards residual inputs in x32 path. Dead code elimination.
-- **SASS fatbin-patch**: CP-SAT scheduler works (5/5 chunks, 480 edits) but patched binaries crash at runtime (`illegal instruction`). Encoding/control word corruption in `tools/sass_edit.py`.
-- **NOP_EPILOGUE** (dispatch pressure): 1.160ms at 3k/5k/10k cycles. Dispatch alone doesn't cause gap.
-- **EPI_DELAY** (TMEM timing): 1.162ms at 3k/5k/10k cycles. Late TMEM release doesn't cause gap.
-- **REG_PAD** (register file occupancy): 1.161ms at 186 regs (54.5% RF). RF allocation alone doesn't cause gap.
-
-### Hypothesis isolation (2026-03-28) — ALL individual hypotheses ruled out
-
-NOP_EPILOGUE=N: arrive first (free TMEM), busy-wait N cycles after (dispatch pressure only).
-EPI_DELAY=N: busy-wait N cycles, then arrive (dispatch + TMEM timing).
-REG_PAD: full epilogue compiled (186 regs allocated) but skipped at runtime via volatile __device__ flag.
-
-| Variant | ms | Regs | RF occupancy | Epilogue runs |
-|---|---|---|---|---|
-| strip_all | 1.160 | 78 | 22.9% | no |
-| nop_3000 | 1.161 | 80 | 23.5% | no (busy-wait) |
-| nop_5000 | 1.160 | 80 | 23.5% | no (busy-wait) |
-| nop_10000 | 1.160 | 80 | 23.5% | no (busy-wait) |
-| delay_3000 | 1.162 | 80 | 23.5% | no (busy-wait) |
-| delay_5000 | 1.162 | 80 | 23.5% | no (busy-wait) |
-| delay_10000 | 1.162 | 80 | 23.5% | no (busy-wait) |
-| **regpad** | **1.161** | **186** | **54.5%** | **no** |
-| **baseline** | **1.637** | **186** | **54.5%** | **yes** |
-
-- **Warp scheduler dispatch pressure**: RULED OUT. Epilogue warps actively issuing clock64 loops for 10k cycles = zero effect.
-- **TMEM release timing**: RULED OUT. Delaying mbar_arrive by 10k cycles = zero effect.
-- **Register file occupancy**: RULED OUT. REG_PAD allocates 186 regs (54.5% RF) but runs at 1.161ms = strip speed.
-- **The overhead is from epilogue warps actively executing memory/compute instructions** — aggregate pressure on shared hardware resources (SMEM ports, L2 bandwidth, TMA units) across 74 clusters sustained over 10,878 tiles. No single resource is the bottleneck — it's the combined load.
-
-### EPI_WARP_LIMIT scaling (2026-03-28) — overhead is LINEAR at ~120μs/warp
-
-EPI_WARP_LIMIT=N: only first N epilogue warps run full epilogue, rest just mbar_arrive.
-
-| Active warps | ms | Overhead | Per-warp |
-|---|---|---|---|
-| 0 (strip_all) | 1.160 | 0 | — |
-| 1 | 1.280 | 120μs | 120μs |
-| 2 | 1.396 | 236μs | 118μs |
-| 3 | 1.517 | 357μs | 119μs |
-| 4 (baseline) | 1.637 | 477μs | 120μs |
-
-**Almost perfectly linear.** No threshold, no saturation. Each warp contributes ~120μs regardless of how many others are active. This means the strip decomposition (all variants ≈1.635ms at 4 warps) was seeing SATURATION — at 4 warps, any single operation's overhead was hidden by the 3 other warps' full overhead.
-
-**CUTLASS comparison:** CUTLASS has 4 epilogue warps with 78μs total overhead = ~20μs/warp. Our per-warp cost is **6× higher**. The gap isn't warp count — it's per-warp memory activity duration. CUTLASS's epilogue warps are active for fewer cycles per tile because:
-1. W3 pre-loads residual into SMEM → no TMA stall in epilogue warps
-2. Interleaved STS in SASS → epilogue finishes faster
-3. LDS from pre-loaded SMEM → no global memory latency in epilogue path
-
-**Implication:** Reducing to 2 warps would give ~236μs overhead (vs 477μs). To match CUTLASS (78μs), we need per-warp overhead down from 120μs to ~40μs = 3× faster epilogue per warp. Path: fewer warps + SASS-patched scheduling + architectural pre-load.
-
-**SM100a hardware data** (from `bench/tma_bench.cu` raw: `data/tma0-3.txt`, `bench/mma_bench.cu` raw: `data/mma0-1.txt`):
-- STS.128 throughput: 27 cyc | LDS.128: 25 cyc @ILP=1, 3.5 cyc @ILP=7
-- STS shadow: ≤4 BF16 free, 8=+55%, 15=+161% | LDS+STS overlap: 82.3%
-- TMA load: 419 cyc (L2-warm) | TMA store: 197 cyc | TMA↔LSU: independent
-- mbarrier arrive: 2 cyc | wait: 47 cyc | fence.proxy.async: 10 cyc
-- **TMEM load (tcgen05.ld.sync): 2 cyc total** regardless of x16/x32/x64 width or ILP (bandwidth-limited)
-- **TMEM double-buffer: zero contention** — read buf0 while MMA writes buf1 = +0.0 cyc
-- **MMA K-iteration: 665 cyc** (fence + 4×MMA + commit + wait). Pipelined K=24: **525.6 cyc/iter**
-- **MMA shadow budget: HUGE** — 16 STS or 64 BF16 or 8 full epilogue chunks = 100% hidden
-- **Epilogue warps add +0.7 cyc (0.1%) to K-iter IN ISOLATION** — single-tile microbenchmark only. Real persistent kernel: **+36% K-loop inflation** (STRIP_EPILOGUE proof). Microbenchmarks miss cross-tile/cross-cluster contention.
-- **Cross-warp handoff: 725 cyc** (W1 commit → W2 mbar_wait + TMEM_LD). +60 cyc vs same-warp K-iter.
-- **Multi-SM spread: 0.2%** — perfectly uniform across 74 clusters
-- CUTLASS epilogue source: `third_party/cutlass/.../sm100_epilogue_tma_warpspecialized.hpp`
-
-**Multi-warp pipe scaling** (from `bench/calib/gen_warp_scaling.py`, raw: `data/warp_scaling.txt`):
-- **4 sub-partitions**: warp i → sub-partition i%4. Visible in STS bimodal per-warp data.
-- **STS**: 10→37 cyc (3.65× at 8 warps) — heaviest contention, SMEM store port shared
-- **LDS**: 4.5→16 cyc (3.56×) — nearly as bad as STS
-- **HFMA2/HADD2**: flat 2 cyc for 1-4 warps, doubles to 4 cyc at 5+ (2-partition BF16 ALU)
-- **FFMA**: 1.5→2.0 cyc (1.36×) — nearly free
-- **F2FP**: flat 2.0 cyc for ALL warp counts — zero contention, dedicated units
-- **LDG L1**: 2→5.5 cyc (2.77×) | **LDG L2**: 23.6→35.6 cyc (1.50× — latency-dominated)
-- **FFMA compute is free alongside any epilogue**: F_4ldgmix_0ffma = F_4ldgmix_2ffma = 8.25 us
-- **BAR.SYNC hurts mixed epilogue by +25%**: B_4mixbar_i8=10.3 vs nobar=8.25 us
-- **Dedicated load warp always adds overhead** in P-tests
-
-### Multi-warp scheduling calibration (`bench/calib/gen_warp_scaling.py`)
-
-134 generated kernels across 8 test suites, all single-CTA with per-warp `clock64()` timing.
-3 warmup + 10 measured launches per kernel, reports min CPI across launches.
-**Data collected 2026-03-26**: `data/warp_scaling.txt`. Key findings integrated into hardware data above.
-
-| Suite | Count | What it measures |
-|-------|-------|-----------------|
-| **S** | 80 | Same-pipe throughput scaling: 10 pipes (STS, FFMA, HFMA2, LDS, F2FP, HADD2, NOP, **LDG**, **STS_ILP1**, **LDG_L2**) × 8 warp counts (1–8). Key: is STS throughput per-warp or per-SM? LDG pipe (TEX/L1) scaling for FC2 epilogue. STS_ILP1 reveals sub-partition structure. **LDG_L2** uses 32 MB buffer to force L2 miss — real FC2 residual loads hit L2, not L1. |
-| **X** | 11 | Cross-pipe independence: different warps on different pipes simultaneously. STS+LDS scaling at 2+2, 3+3, 4+4 warps (SMEM port contention). **STS+LDG** cross-pipe (LSU vs TEX — FC2 epilogue does both). |
-| **F** | 15 | Foreground/background interference: FC2-like configs (4 STS warps + 1–4 FFMA warps, mixed epi, reverse). FC2-realistic LDG+BF16+STS epi mix. **6-warp FC2-exact** (4 ldgmix epi + 1 LDG W0 proxy + 1 FFMA W1 proxy). **L2-miss LDG** variants force realistic memory latency. |
-| **P** | 11 | Producer-consumer (CUTLASS W3 pattern): 4 epi warps self-loading via LDG (our arch) vs LDS from pre-loaded SMEM (CUTLASS result) vs with dedicated load warp (nanosleep-idle, like W3). With/without 1–2 K-loop FFMA warps. **Directly tests whether a dedicated idle load warp reduces dispatch contention.** |
-| **B** | 9 | BAR.SYNC contention effect: 4 STS warps with periodic BAR.SYNC (intervals 4/8/16/32) + 2 FFMA compute warps, plus no-BAR baseline. **Mixed-epi variants** (LDG+BF16+STS bar warps for realistic epilogue pipe mix). |
-| **N** | 6 | Nanosleep calibration: actual sleep duration for values 10/50/100/500/1000/5000. Validates P-test load warp idle simulation. |
-| **A** | 2 | Asymmetric duration: epi warps run REPS/2 or REPS/4 then exit, compute warps run full REPS. **Tests dynamic dispatch recovery** — does compute CPI improve after epi warps finish? |
-
-## Grid search (FC2 only)
-
-Per-kernel tiered parameter sweep with top-lock analysis, interaction sweeps, and dynamic branching. **Only run on FC2** — PE and FC1 are exhausted/won.
-
-### How it works
-
-1. **Per-kernel tiers**: Ordered tiers of params (most impactful first). Sweep tier 1, carry top-k winners as branches into tier 2, etc.
-2. **Top-lock analysis**: After each tier, checks if any param is universally locked at the top (single value in all top-5/10/20 results, base rate <70%). Auto-pins into subsequent tier branches.
-3. **Dynamic k**: Reduces branching when the gap is clear (>2% → k=1, >0.5% → k≤2). Structural params (`BRANCH_PARAMS`) override this.
-4. **Interaction sweeps**: After all tiers, tests cross-tier param combinations. Skipped only if ALL params in the group are noise.
-5. **Inline η²**: Per-param eta-squared printed after each tier/interaction.
-
-### FC2 tier ordering (K=3072, N=768, 3 N-tiles, 24 K-iterations)
-
-- Tier 1: `N_STAGES`, `K_LOOP_UNROLL`, `TMA_RESIDUAL`, `W0_RES_PREFETCH`, `W0_RES_FULL`, `BATCH_MMA`
-- Tier 2: `INTERLEAVE_STRATEGY`, `PHASE1_UNROLL`, `BIAS_SMEM`, `TMEM_LOAD_WIDTH`
-- Tier 3: `BATCH_EPILOGUE`, `STORE_TIMING`, `STS_WIDTH`, `PRELOAD_MODE`, `DEFERRED_WAIT`
-- Tier 4: `EPILOGUE_LOOP`, `EPI_SYNC`, `NUM_PASSES_PARAM`
-- N_STAGES and BATCH_MMA are `BRANCH_PARAMS` — always branch both values
-
-### FC2 confirmed results (session 2026-03-19)
-
-- **N_STAGES=5 mandatory**: 1.452ms vs 1.594ms (NS4) — 10% gap, never test NS4 again
-- **IS1 ≈ IS2**: Noise for FC2 (both within ±0.003ms)
-- **BATCH_MMA**: Zero effect — K-loop overhead hidden by pipeline overlap
-- **PREFETCH_MBAR, OVERLAP_EPI_WAIT**: Noise
-- **W0_RES_FULL**: Catastrophic (+15%), epi_wait 107→5400 cycles
-- **W0_RES_PREFETCH**: Neutral
-- **EPI_LOAD_WARP**: Runtime hang (mbarrier bug)
-- Regs: 207 (NS5 base), down from 255 after W0 restructure
-
-**StagesC bench results (session 2026-03-31, data: `data/stagesc_20260331_034827/`):**
-- **BIAS_SMEM=1**: 1.456ms vs 1.471ms = **-15μs free win**. Eliminates 32 LDG bias loads from epilogue. Should be default.
-- **STAGES_C=2 no-reuse (NEPI=2)**: 1.244ms ≈ base_nepi2 1.246ms = neutral. W0 pre-load doesn't help.
-- **STAGES_C=2 + EPI_REUSE_SMEM**: `#error` — A/B overwrites pre-loaded residual in borrowed stages.
-- **STAGES_C + PRE_COMBINE**: `#error` — silently drops residual (COMBINED_CVT_STS_V4 discards r0-r3).
-- **SASS fatbin-patch**: CP-SAT schedules fine (5/5 chunks) but patched binaries crash (`illegal instruction`). Needs debugging.
-- **Only remaining path**: SASS binary patching to change per-warp epilogue scheduling (interleave STS with compute like CUTLASS). Requires fixing fatbin-patch first.
-
-## Kernel structure
-
-Warp-specialized, 6 warps (192 threads), `cta_group::2`, `__cluster_dims__(2,1,1)`:
-
-- **W0**: TMA async bulk loads (A + B tiles, all threads compute addrs, lane 0 issues TMA). FC2: optionally prefetches (`W0_RES_PREFETCH`) or fully loads (`W0_RES_FULL`) residual via TMA after K-loop.
-- **W1**: TMEM alloc (512 cols, single alloc for double buffering) + `tcgen05.mma.cta_group::2` accumulation into TMEM (CTA0 lane-0 only, multicast commit to both CTAs)
-- **W2-W5**: Overlapped epilogue (4 warps) — each warp independently polls mainloop mbarrier, then runs unified SMEM-staged store: Phase 1 (all 256 cols through 4 SWIZZLE_128B regions: x32 `tcgen05.ld` → epilogue op → CVT → `st.shared`, with **interleaved TMA stores** hiding in TMEM stall windows), Phase 2 (`cp.async.bulk.commit_group` only — all TMA stores already issued inline), **mbar_arrive** signals TMEM free for W1.
-- **No dedicated EpilogueLoad warp** — epilogue warps (W2-W5) load bias/residual themselves via LDG from global memory. CUTLASS has a dedicated W3 that pre-loads into SMEM via TMA.
-
-Epilogue ops: bias+pos_embed (PE), bias+GELU (FC1), bias+residual (FC2). FC2's residual loads a full [M,N] matrix — heaviest epilogue, memory-bound. FC1's GELU is compute-bound. PE's add is trivial. **FC2 epilogue uses BF16 math (HFMA2/HADD2); CUTLASS uses FP32 (FFMA) and converts at the end.**
-
-The overlapped epilogue for tile N-1 runs concurrently with the K-loop for tile N (double-buffered TMEM, mbarrier-protected).
-
-### Tile config
-- Tile: 256×256×128 (M=2×128 from cta_group::2, N=256, K=128)
-- TMEM: single alloc of 512 cols (TN*2), double-buffered via column offset
-- SMEM: 4-stage pipeline (131 KB) + epilogue staging (64 KB, SWIZZLE_128B) = ~197 KB of 228 KB
-- Tiles: 3626 M-tiles × N_TILES (3 for PE/FC2, 12 for FC1), snake ordering
-- K-iterations: 6 (PE/FC1, K=768) or 24 (FC2, K=3072)
-
-## B200 sessions
-
-All execution, profiling, and benchmarking requires B200 hardware. Cross-compilation works anywhere.
-
-```bash
-./tools/b200_session.sh                    # grid search + benchmark (no CUTLASS, default)
-./tools/b200_session.sh --cutlass          # include CUTLASS build + comparison
-python3 tools/analyze_session.py data/session_*/
-```
-
-Phases: machine snapshot → grid search + benchmark → ncu profiling → SASS dumps. Autocommits session data to git. All outputs to timestamped `data/session_*/`.
-
-## Development workflow
-
-All kernels share `kernel_common.cuh` (pipeline, TMEM, TMA, mbarriers, tuning params) and `kernel_body.cuh` (epilogue_store template, persistent_gemm template). Each `.cu` file `#define N_DIM` and `K_DIM`, defines its epilogue macro, then includes both headers.
-
-```
-edit kernel_common.cuh / kernel_body.cuh / patch_embed.cu / fc1_gelu.cu / fc2.cu -> make -> ./patch_embed (or ./fc1_gelu, ./fc2)
-```
-
-### Compile-time tuning params (FC2-relevant)
-
-Key params (controlled via `-D` flags, swept by grid_search.py):
-
-| Param | Values | FC2 best | Effect |
-|-------|--------|----------|--------|
-| `N_STAGES` | 3,4,5 | **5** | Pipeline depth. NS5 mandatory (10% gap vs NS4). |
-| `K_LOOP_UNROLL` | 1,2,4,6,8 | 4 | K-loop unroll factor |
-| `TMA_RESIDUAL` | 0,1,2 | **1** | TMAR=1 (TMA coalesced) is key. |
-| `BIAS_SMEM` | 0,1 | 1 | Load bias vector into SMEM (vs global `__ldg`). |
-| `INTERLEAVE_STRATEGY` | 0,1,2,3 | 1 | TMA store interleaving. IS1≈IS2 for FC2. |
-| `PHASE1_UNROLL` | 1,2,4 | 1 | Epilogue unroll. |
-| `BATCH_MMA` | 0,1 | 0 | Single asm block for 4 sub-MMAs. **Noise** — hidden by overlap. |
-| `BATCH_EPILOGUE` | 0,1 | 0 | 1=separate compute/store phases. |
-| `STORE_TIMING` | 0,1 | 0 | 0=inline stores, 1=all deferred after Phase 1. |
-| `DEFERRED_WAIT` | 0,1 | 0 | Defers `wait_group 0` after TMEM load. |
-
-See grid_search.py `RANGES` dict for full parameter list and valid values.
-
-## Code style
-
-Names say what, comments say why. No single-line `/**/`. No multi-line `//`.
-No decorated block comments (no leading `*` per line). Bare `/*` open, undecorated lines, `*/` close.
-No restating code. Mark ownership/lifetime when types don't show it.
-
-## Context efficiency
-
-Don't narrate tool calls ("Let me read the file..."). Just do it.
-Don't echo back file contents — the user can see them.
-Keep explanations proportional to complexity. Simple changes need one sentence.
-Parallelize independent tool calls (e.g., multiple reads/greps) in one message.
-Use Grep to locate relevant sections before reading entire large files.
-For files over 500 lines, use offset/limit to read only the relevant section.
-When using subagents, include output rules: "Final response under 2000 characters. List outcomes, not process."
-
-## Repository structure
-
-```
-kernel_common.cuh       # Shared infrastructure (pipeline, TMEM, TMA, mbarriers, tuning params)
-kernel_body.cuh         # Shared kernel body (epilogue_store template, persistent_gemm template)
-patch_embed.cu          # Patch embed GEMM — [928256,768]×[768,768]^T + bias + pos_embed
-fc1_gelu.cu             # FC1+GELU GEMM — [928256,768]×[768,3072]^T + bias + GELU
-fc2.cu                  # FC2 GEMM — [928256,3072]×[3072,768]^T + bias + residual
-Makefile                # Build rules (sm_100a, nvcc flags)
-CLAUDE.md               # This file
-TASKS.md                # B200 session playbook — automated benchmarking workflow
-
-tools/                  # Analysis & sweep scripts
-  grid_search.py        # Per-kernel tiered parameter sweep (top-lock, interactions, CSV output)
-  b200_session.sh       # Automated B200 session (grid search, benchmark, ncu, SASS, autocommit)
-  compare_all.py        # Benchmark: CUTLASS vs ours (--no-cutlass default in sessions)
-  analyze_session.py    # Summarize session output for Claude Code interpretation
-  analyze_sweep.py      # Grid search analysis: eta-squared, balanced subsets, RF importance
-  balanced_eta.py       # Standalone balanced-subset eta-squared tool
-  sass_analysis.py      # SASS scheduling analyzer (control words, dep graphs, slack)
-  sass_edit.py          # SASS binary editor + CP-SAT scheduler + fatbin patcher (see docs/sass_binary_editing.md)
-  analyze_timing.py     # clock64 timing → equilibrium analysis
-  fc2_strip_bench.sh     # Epilogue contention decomposition (30 experiments, ~10 min on B200)
-  fc2_stagesc_bench.sh   # StagesC + SASS-patching bench (SC2 variants, timing, fatbin-patch A/B)
-  analyze_warp_scaling.py  # Warp-scaling benchmark analysis (scaling curves, BAR.SYNC effect)
-  analyze_source_counters.py  # ncu SourceCounters CSV → stall breakdown
-  simulate_lhs.py       # Bootstrap convergence simulation (no GPU)
-  analyze_gelu_variants.py  # Static GELU variant scheduling analysis (no GPU)
-  remote.py             # Remote B200 provisioning + sweep runner
-  ncu_diff.py           # ncu CSV diff tool
-  compare_sass.py       # SASS dump diff tool
-  cutlass_sweep.sh      # Build + run all CUTLASS bench variants
-
-bench/                  # Benchmark & calibration kernels
-  cutlass_bench.cu      # CUTLASS tile/policy sweep (compile-time N/K/epilogue via -D flags)
-  siglip_periodic_add.hpp # Custom EVT visitor (Sm100PeriodicAddNode)
-  cublas_bench.cu       # cuBLAS baseline benchmark
-  calibration.cu        # SASS latency microbenchmarks (K1-K26)
-  common.h              # Shared PTX helpers (mbarrier, TMA, tcgen05)
-  profiler.h            # globaltimer-based kernel profiler
-  calib/                # Generated calibration benchmarks (instruction DB + codegen)
-    instruction_db.py   # 18 SM100a instruction families, resource class hypotheses
-    gen_kernels.py      # Generates tput/lat/conflict .cu files from instruction_db.py
-    gen_warp_scaling.py # Multi-warp scheduling calibration (134 kernels: S/X/F/P/B/N/A tests)
-    run.sh              # Generate → build → SASS verify → run all calibration suites
-
-data/                   # Sweep results, ncu profiles, session outputs (data/session_*/)
-docs/                   # Experiments (F1-F40), proposals, grid search, SASS notes, ncu analysis
-  sass_binary_editing.md # SASS binary editor: capabilities, workflow, FC2 patching plan
-  sass_editor_roadmap.md # SASS editor improvement checklist — deps, barriers, latency, loader
-```
+| Warps | 7 (W0-W6, 6 active + 1 idle) | 8 (W0-W7) |
+| W0 | TMA Load (A/B) | Scheduler (tile dispatch) |
+| W1 | MMA (tcgen05.mma) | MMA |
+| W2 | **EpilogueLoad (TMA residual→SMEM)** | MainloopLoad (TMA A/B) |
+| W3 / W3 | Epilogue (part of W3-W6) | **EpilogueLoad (TMA residual+bias→SMEM)** |
+| W3-W6 / W4-W7 | Epilogue (4 warps, LDS from SMEM) | Epilogue (4 warps, LDS from SMEM) |
+| Epilogue source | **LDS from SMEM (W2 pre-loaded via TMA)** | **LDS from SMEM (W3 pre-loaded via TMA)** |
+| Epilogue math | BF16 (HFMA2/HADD2) | FP32 (FFMA, F2FP at end) |
+| STS scheduling | **4-8 consecutive at block end** | **Interleaved with FFMA/F2FP (6-12 ops between)** |
+| @!PT LDS fences | **None (ptxas DCE's all attempts)** | **4 per sub-iter (pipeline drain)** |
+| BAR.SYNC.DEFER | **2 per sub-iter (same as CUTLASS)** | **2 per sub-iter (SMEM coherence)** |
+| Per-warp epi cost | ~97us/warp | ~18us/warp |
+
+**Both kernels have a dedicated EpilogueLoad warp and LDS from SMEM.** The architecture is structurally the same. Barriers are identical (2 BAR.SYNC.DEFER_BLOCKING per sub-iter each; removing ours = zero effect). The 5.4x per-warp epilogue cost difference is dominated by **STS clustering**:
+
+**STS clustering is the #1 suspect for the 388us epilogue overhead.** Both kernels issue exactly 32 STS.128 per tile per thread — same total work. But the temporal distribution is completely different:
+- **CUTLASS**: FP32 math (64 FFMA per 32-col sub-iter) creates a long compute chain. ptxas naturally interleaves STS into this chain with 6-12 ops (12-24 cyc) between each STS. Each STS's SMEM write latency (27 cyc) is fully hidden by the next compute burst.
+- **Ours**: BF16 math (HFMA2/HADD2) finishes in ~1/4 the cycles. By the time compute ends, all 4 STS fire back-to-back with 0-2 ops between them. This creates a ~108 cyc burst of SMEM write pressure (4×27 cyc) per chunk, 8 chunks per sub-iter, across 4 warps simultaneously.
+
+**Why this might cause K-loop inflation**: The K-loop's W0 TMA loads and W1 MMA both need SMEM ports. Clustered STS bursts from 4 epilogue warps could saturate SMEM write ports, stalling W0's TMA loads (which also write SMEM) or W1's MMA (which reads SMEM). CUTLASS's spread-out STS avoids this burst pattern.
+
+**Why we can't fix it from source**: ptxas controls STS scheduling. We've tried 6+ source-level approaches (FP32 epilogue, CUTLASS-style C++, per-group STS, different loop structures) — all produce identical STS clustering in SASS. The BF16 compute chain is simply too short to give ptxas room to spread STS apart. The only known way to get CUTLASS-quality STS scheduling is to use CUTLASS's actual FP32 epilogue code path.
+
+The other known difference is @!PT LDS pipeline drain fences (CUTLASS has 4 per sub-iter, we have 0, ptxas DCE's all attempts to add them).
+
+## Current approach: fc2_hybrid.cu
+
+Trying to combine our fast PTX mainloop with CUTLASS's efficient epilogue.
+
+### Phase 1 / Phase 3a — Pure CUTLASS (WORKS, 1.222ms)
+
+`make fc2-hybrid && ./fc2-hybrid`
+
+Wraps CUTLASS `GemmUniversal` with our host setup (FP8 scaling, validation). Uses CUTLASS's full operator() with CLC scheduler, 8 warps, all pipelines. **This is our working reference baseline.** 1.222ms fused, 1.152ms strip.
+
+### Phase 2 — HybridMainloop override (DEAD, same as Phase 1)
+
+`make fc2-hybrid-mma && ./fc2-hybrid-mma`
+
+Inherits `CollectiveMainloop`, overrides `mma()` with unrolled K-loop. Result: 1.220ms = identical to Phase 1. **K-loop unrolling is NOT the 63us mainloop gap.** The gap is architectural (6 vs 8 warps, TMA load pattern), not codegen.
+
+### Phase 3b — 7-warp custom kernel (DEAD, 2.76ms)
+
+`make fc2-hybrid-phase3 && ./fc2-hybrid-phase3`
+
+Custom 7-warp kernel calling CUTLASS's `collective_mainloop.load()/mma()` + `collective_epilogue`. Static tile scheduling (no CLC). Result: **2.763ms fused, 2.629ms strip = 2.3x slower than CUTLASS.** Correct output (valid=1).
+
+Root cause: CUTLASS's `collective_mainloop.mma()` internal pipeline ops assume 8-warp threading. `threadIdx.x % ThreadCount` rotation, pipeline arrival counts, umma_arrive multicast — all technically correct but catastrophic warp scheduling at 7 warps.
+
+### Phase 4 — 8-warp our-dispatch + CUTLASS mainloop (DEAD, 2.77ms)
+
+`make fc2-hybrid-phase4 && ./fc2-hybrid-phase4`
+
+8-warp kernel matching CUTLASS's exact warp mapping (W0=Sched, W1=MMA, W2=Load, W3=EpiLoad, W4-7=Epilogue). All 7 pipelines initialized (MainloopPipeline, EpiLoadPipeline, EpiStorePipeline, LoadOrderBarrier, AccumulatorPipeline, CLCPipeline, CLCThrottlePipeline). Static tile scheduling replaces CLC queries. Result: **2.764ms fused, 2.627ms strip = same as Phase 3b.**
+
+Two versions tried:
+- v1: Custom warp mapping, 5 pipelines -> 2.770ms
+- v2: CUTLASS-exact warp mapping, all 7 pipelines -> 2.764ms (no improvement)
+
+**Root cause unknown.** Something about static `for ti=t0..t1` loop vs CUTLASS's `do { ... scheduler.fetch_next_work() ... } while (valid)` pattern. Both produce correct output.
+
+### 8-warp strip test (PASSED)
+
+`make fc2-w3-8w && ./fc2-w3-8w` (adds idle 8th warp to fc2_w3)
+
+fc2-w3-8w strip=1.086ms vs fc2-w3 strip=1.088ms. **8 warps does NOT hurt mainloop speed.** The theoretical ceiling of 1.161ms remains viable.
+
+### Next step: ncu profiling to identify the contended hardware resource
+
+We know WHAT: epilogue warps inflate the K-loop by 36% (388us). We know it's NOT any single operation (strip decomposition proved TMA-load-only, TMA-store-only, and compute-only ALL produce identical overhead). We know it's NOT dispatch pressure, TMEM timing, or register file occupancy (all individually ruled out via busy-wait and REG_PAD experiments). The overhead is from epilogue warps actively executing instructions, creating aggregate pressure on shared hardware. But we don't know WHICH resource.
+
+The root cause is the same across all our kernels (old fc2 at 120us/warp, fc2_w3 at 98us/warp) because they share the same structural deficiencies vs CUTLASS:
+
+**What our epilogue does wrong (SASS-verified):**
+Both kernels have the same architecture (EpilogueLoad warp + LDS from SMEM) and identical barriers (2 BAR.SYNC.DEFER_BLOCKING per sub-iter). The differences:
+1. **STS clustering (primary suspect)**: Our STS.128 are clustered 4-8 back-to-back with 0-2 ops between them. CUTLASS interleaves 6-12 FFMA/F2FP ops between each STS. Same 32 STS/tile, but our burst pattern creates ~108 cyc SMEM write storms per chunk across 4 warps simultaneously — likely saturating SMEM ports and stalling the K-loop's W0 TMA loads and W1 MMA reads. See architecture comparison above for full analysis.
+2. **Missing @!PT LDS pipeline drain fences**: CUTLASS has 4 per sub-iter after STS, before MEMBAR+FENCE, ensuring STS are visible in SMEM before TMA store reads it. ptxas DCE's all our attempts to add them (3 approaches tried).
+
+**ncu must answer: which of these creates the K-loop contention?** Candidates:
+- **SMEM port contention**: clustered STS create burst write pressure on shared memory ports, interfering with K-loop SMEM activity. ncu metrics: `shared_pct`, `smem_st_wavefronts`, `smem_ld_wavefronts`.
+- **Warp scheduler starvation**: 6 active warps (vs 2 in strip) competing for issue slots, starving the MMA warp of execution bandwidth. ncu metrics: `warps_eligible`, `not_selected`.
+- **TMA unit saturation**: epilogue TMA stores + W2 residual TMA loads compete with W0's TMA loads for MIO queue slots. ncu metrics: `mio_throttle`, `mio_pq_read/write_cycles`.
+- **DRAM/L2 bandwidth saturation**: W2's TMA residual loads add ~1.36GB of reads across 74 clusters, competing with W0's TMA loads for A/B tiles. ncu metrics: `long_scoreboard`, `dram_pct`, `global_ld_wavefronts`.
+
+These are NOT mutually exclusive — it's likely a combination, which is why no single strip variant showed improvement. The ncu data will reveal the proportions.
+
+Run `./tools/fc2_ncu_bench.sh` on the B200. See `docs/ncu_diagnosis_guide.txt` for detailed interpretation of each metric and what to look for in each comparison pair (Q1: strip vs fused, Q2: w3 vs CUTLASS, Q3: Phase 4 broken).
+
+## What we know works
+
+- Our PTX mainloop is fastest (1.089ms strip vs CUTLASS 1.152ms)
+- 8 warps doesn't hurt mainloop (1.086ms with idle W7)
+- CUTLASS's full operator() with CLC produces 1.222ms (Phase 1/3a)
+- Theoretical ceiling: 1.089 + 0.072 = 1.161ms
+
+## What doesn't work
+
+Calling CUTLASS's `collective_mainloop.load()/mma()` from our own dispatch loop = 2.3x slower, regardless of:
+- Warp count (7 or 8)
+- Pipeline init (5 or 7 pipelines)
+- Warp-to-role mapping (custom or CUTLASS-exact)
+- Grid linearization approach
+
+## Exhaustive dead-end list
+
+### Source-level epilogue attempts on fc2_w3 (all ~1.48ms)
+
+- CUTLASS_LOOP=1/2/3: changes SASS interleaving, zero perf
+- FP32_EPILOGUE: zero perf
+- CUTLASS_EPILOGUE (FP32 per-group STS, 113 regs): identical STS clustering in SASS
+- CPP_EPILOGUE: byte-identical SASS to asm volatile
+- CUTE_STORE (C++ pointer stores): byte-identical SASS
+- @!PT LDS fences (3 approaches): all DCE'd by ptxas
+- cvta.shared + generic store: ptxas DCEs all 64 stores
+- NO_PRE_STORE_BAR + NO_POST_STORE_BAR: 17->1 BAR.SYNC, zero perf (we already HAVE 2 BAR.SYNC.DEFER_BLOCKING per sub-iter, same as CUTLASS — removing them changes nothing)
+- NUM_EPI_STAGES=3/4: -6 to -23us (noise)
+- All combinations of above: noise
+- **ptxas STS scheduling is immutable from any source-level approach**
+
+### Architectural attempts on fc2 (old kernel, all ~1.635ms at 4 warps)
+
+- BAR.SYNC serialization (EPI_SYNC, EPI_BAR_PASS, EPI_BAR_CHUNK)
+- Combinatorial strips (only_tma_load, only_tma_store, only_compute)
+- FP32_EPILOGUE, stagger (500/2000 cyc), pass count, store deferred
+- EPI_LOAD_WARP (+13% regression), EPI_PIPELINE (+0.8% noise)
+- W0_RES_FULL (+15% catastrophic), W0_RES_PREFETCH (neutral)
+- STAGES_C=2 (neutral), STAGES_C+EPI_REUSE_SMEM (broken), STAGES_C+PRE_COMBINE (broken)
+- NOP_EPILOGUE, EPI_DELAY, REG_PAD: all ruled out individual causes
+- SASS fatbin-patch: CP-SAT schedules fine, patched binaries crash (illegal instruction)
+
+### Hypothesis isolation (all ruled out)
+
+- Warp scheduler dispatch pressure: 10k-cycle busy-wait = zero effect
+- TMEM release timing: 10k-cycle delay = zero effect
+- Register file occupancy: 186 regs (54.5% RF) allocated but unused = strip speed
+- **Overhead is from epilogue warps actively executing memory/compute instructions**
+- Linear at ~98us/warp (fc2_w3) / ~120us/warp (fc2 old). No threshold, no saturation.
+
+### CUTLASS integration attempts (fc2_hybrid.cu)
+
+- Phase 2 HybridMainloop: K-loop unrolling = zero effect (1.220 vs 1.222ms)
+- Phase 3b 7-warp custom: CUTLASS mainloop dies at 7 warps (2.76ms)
+- Phase 4 8-warp static dispatch: same 2.77ms despite matching all init
+- CUTLASS stage count sweep (3-7): all identical. Do NOT repeat.
+- StaticPersistentScheduler: CLC is NOT the mainloop gap (+7us noise)
+
+## Kernel structure (fc2_w3.cu)
+
+Warp-specialized, 7 warps (224 threads), `cta_group::2`, `__cluster_dims__(2,1,1)`:
+
+- **W0**: TMA async bulk loads (A + B tiles)
+- **W1**: TMEM alloc + tcgen05.mma.cta_group::2 accumulation
+- **W2**: EpilogueLoad — TMA loads residual into SMEM (circular 2-stage pipe, previous tile)
+- **W3-W6**: Overlapped epilogue (4 warps) — LDS residual+bias from SMEM, TMEM ld, epilogue math, CVT, STS, TMA store
+- **W7**: Idle (8-warp mode via NUM_IDLE_WARPS=1, only exists when flag set)
+
+Tile: 256x256x128, TMEM 512 cols double-buffered, 5-stage SMEM pipeline, 24 K-iterations.
+
+## SM100a hardware data (B200-measured)
+
+- STS.128: 27 cyc | LDS.128: 25 cyc @ILP=1, 3.5 cyc @ILP=7
+- TMA load: 419 cyc (L2-warm) | TMA store: 197 cyc
+- TMEM load (tcgen05.ld.sync): 2 cyc regardless of width/ILP
+- MMA K-iteration: 665 cyc (pipelined: 525.6 cyc/iter)
+- STS scaling: 10->37 cyc at 8 warps (3.65x contention)
+- LDS scaling: 4.5->16 cyc (3.56x)
+- FFMA: nearly free (1.36x at 8 warps)
+- F2FP: zero contention (flat 2.0 cyc all warp counts)
 
 ## Build and run
 
 ```bash
-# FC2 — the active target
-make fc2                # compile fc2.cu -> fc2
-./fc2                   # run on B200, prints timing + TFLOPS + checksum
-make fc2-timing         # compile with -DTIMING for cycle breakdown
+# Primary kernel
+make fc2-w3 && ./fc2-w3                                    # fused (1.477ms)
+make fc2-w3 DFLAGS=-DSTRIP_EPILOGUE && ./fc2-w3            # strip (1.089ms)
+make fc2-w3-8w && ./fc2-w3-8w                              # 8-warp strip test
 
-# FC2 strip bench (epilogue contention decomposition, ~30 experiments)
-bash tools/fc2_strip_bench.sh              # run everything (~10 min)
-bash tools/fc2_strip_bench.sh --batch 1    # run only batch 1
-bash tools/fc2_strip_bench.sh --dry-run    # print commands without running
+# Hybrid (CUTLASS integration)
+make fc2-hybrid && ./fc2-hybrid                            # Phase 1/3a (1.222ms) WORKS
+make fc2-hybrid-mma && ./fc2-hybrid-mma                    # Phase 2 (1.220ms) = Phase 1
+make fc2-hybrid-phase3 && ./fc2-hybrid-phase3              # Phase 3b (2.76ms) BROKEN
+make fc2-hybrid-phase4 && ./fc2-hybrid-phase4              # Phase 4 (2.77ms) BROKEN
 
-# FC2 architecture search (combinatorial sweep on B200)
-./tools/fc2_arch_search.sh              # full: 48 configs (32 combinatorial + 16 W0_RES)
-./tools/fc2_arch_search.sh --quick      # 32 combinatorial configs only
+# CUTLASS reference
+make fc2-cutlass && ./fc2-cutlass                          # CUTLASS GemmUniversal (1.224ms)
+make fc2-cutlass-strip && ./fc2-cutlass-strip              # CUTLASS strip (1.152ms)
 
-# FC2 grid search
-python3 tools/grid_search.py --kernel fc2 --tier all            # FC2 tiered sweep
-python3 tools/grid_search.py --kernel fc2 --full-cross          # FC2 full cross-product
-python3 tools/grid_search.py --kernel fc2 --only TMA_RESIDUAL   # sweep specific params
-python3 tools/grid_search.py --kernel fc2 --interact residual   # residual interaction group
+# Head-to-head comparison
+bash tools/fc2_cutlass_vs_w3.sh                            # all variants
 
-# CUTLASS FC2 comparison
-make cutlass-bench-fc2-max && ./cutlass-bench-fc2-max
-python3 tools/compare_all.py --runs 20 --csv data/compare.csv
-
-# Analysis (local, no GPU)
+# Analysis (no GPU)
 python3 tools/analyze_sweep.py data/session_*/sweep_fc2.csv
-python3 tools/balanced_eta.py data/session_*/sweep_fc2.csv
 python3 tools/sass_analysis.py --cubin fc2 --deps
-
-# SASS binary editing + CP-SAT scheduler (local, no GPU needed)
-nvcc --cubin -arch=sm_100a -O3 fc2.cu -o fc2.cubin       # produce standalone cubin
-python3 tools/sass_edit.py info fc2.cubin                  # list kernels
-python3 tools/sass_edit.py dump fc2.cubin --sass sass/fc2.txt --start 0x50f0 --end 0x5160
-python3 tools/sass_edit.py schedule fc2.cubin --sass sass/fc2.txt -s 0x51c0 -e 0x5620 --recipe recipe.txt
-python3 tools/sass_edit.py schedule fc2.cubin --sass sass/fc2.txt -s 0x51c0 -e 0x63b0 --time-limit 3600  # full epilogue
-python3 tools/sass_edit.py script fc2.cubin recipe.txt -o fc2_patched.cubin
-python3 tools/sass_edit.py fatbin-patch fc2 --sass sass/fc2.txt --script recipe.txt -o fc2_patched
-python3 tools/sass_edit.py diff fc2.cubin fc2_patched.cubin
-# see docs/sass_binary_editing.md for full workflow + FC2 patching plan
-
-# Calibration microbenchmarks (generated from instruction DB)
-./bench/calib/run.sh              # generate + build + SASS verify + run (all 3 suites)
-./bench/calib/run.sh tput         # throughput ILP sweep only (90 kernels)
-./bench/calib/run.sh conflict     # NxN conflict matrix (153 pairwise tests)
-make calib-all                    # just build (Makefile targets)
-
-# Multi-warp scheduling calibration (134 kernels, requires B200)
-make calib-warp                                              # build
-./calib-warp > data/warp_scaling.txt                         # run on B200
-python3 tools/analyze_warp_scaling.py data/warp_scaling.txt  # analyze
-
-# PE and FC1 (done — do NOT sweep or optimize)
-make                    # compile patch_embed.cu -> patch_embed
-make fc1-gelu           # compile fc1_gelu.cu -> fc1-gelu
 ```
+
+## Key files
+
+```
+fc2_w3.cu               # Our hand-tuned PTX kernel (ACTIVE)
+fc2_hybrid.cu           # CUTLASS integration experiments (Phases 1-4)
+fc2_cutlass.cu          # Pure CUTLASS GemmUniversal wrapper
+fc2.cu                  # Old FC2 kernel (predecessor to fc2_w3)
+kernel_common.cuh       # Shared infrastructure (pipeline, TMEM, TMA, mbarriers)
+kernel_body.cuh         # Shared kernel body (epilogue_store, persistent_gemm)
+Makefile                # Build rules (sm_100a)
+tools/                  # Sweep scripts, SASS tools, benchmarks
+bench/                  # Microbenchmarks (TMA, MMA, warp scaling, calibration)
+data/                   # All benchmark results
+docs/                   # Experiment logs, proposals
+CLAUDE.md.mothballed    # Full docs for PE/FC1 (done), grid search, calibration suites
+```
+
+## Code style
+
+Names say what, comments say why. No single-line `/**/`. No multi-line `//`.
+No decorated block comments. Bare `/*` open, undecorated lines, `*/` close.
+
+## Context efficiency
+
+Don't narrate tool calls. Don't echo file contents. Keep explanations proportional.
+Parallelize independent tool calls. Use offset/limit for large files.
 
 ## Key constraints
 
-- Target: `sm_100a` (B200, 148 SMs)
-- `cta_group::2` with `__cluster_dims__(2,1,1)` — 74 clusters of 2 CTAs
-- TMEM: 512 cols/SM total, single alloc for double buffering (two separate allocs deadlock)
-- SMEM: 228 KB/SM — current usage ~192-225 KB depending on N_STAGES
-- All inline PTX — no CUTLASS dependency for the kernels themselves
-- Validation: non-uniform B, non-uniform bias/pos_embed, 1024 strided checksum + 32 CPU reference spot checks
-- **OFF_STAGING must be 1024-byte aligned** for SWIZZLE_128B correctness
-- **`fence.proxy.async.shared::cta` required** before every TMA store that reads from SMEM written by `st.shared`
-- FC2 regs: 184-217 depending on config (down from 255 after W0 restructure + `cta_rank` uniformity fix).
+- Target: sm_100a (B200, 148 SMs), cta_group::2, 74 clusters
+- TMEM: 512 cols, single alloc for double buffering
+- SMEM: 228 KB/SM
+- All inline PTX in fc2_w3.cu (no CUTLASS dependency)
+- OFF_STAGING must be 1024-byte aligned for SWIZZLE_128B
+- fence.proxy.async.shared::cta required before TMA store after st.shared
+- N_STAGES=5 mandatory (10% gap vs NS4)
+- BIAS_SMEM=1 default (-15us free)
