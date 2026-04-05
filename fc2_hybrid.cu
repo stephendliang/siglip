@@ -8,27 +8,30 @@ Goal: best of both worlds.
   Hybrid ceiling:    1.089 + 0.072 = 1.161ms
 
 Architecture: 8 warps (256 threads), cta_group::2, cluster 2×1
-  W0: Scheduler (CLC)
-  W1: MMA           ← Phase 2: HybridMainloop overrides mma() with unrolled K-loop
-  W2: MainloopLoad  ← Phase 3: override load() with our TMA PTX
-  W3: EpilogueLoad  — CUTLASS (unchanged)
-  W4-W7: Epilogue   — CUTLASS (unchanged)
+  W0: MMA            ← Phase 2+3a: unrolled K-loop
+  W1: Scheduler (CLC)
+  W2: MainloopLoad   ← Phase 3a: unrolled TMA load loop
+  W3: EpilogueLoad   — CUTLASS (unchanged)
+  W4-W7: Epilogue    — CUTLASS (unchanged)
 
 Build:
   make fc2-hybrid              # Phase 1: CUTLASS via custom launch
   make fc2-hybrid-strip        # GEMM-only (STRIP_EPILOGUE)
-  make fc2-hybrid-mma          # Phase 2: HybridMainloop (unrolled K-loop + CUTLASS epilogue)
+  make fc2-hybrid-mma          # Phase 2+3a: HybridMainloop (unrolled load + K-loop)
 
 Phase 1: Custom __global__ that delegates to GemmKernel::operator().
   Pure CUTLASS — validates custom launch mechanism.
   Performance: identical to fc2-cutlass (1.224ms fused, 1.152ms strip).
 
 Phase 2 (HYBRID_MMA): HybridMainloop inherits CollectiveMainloop, overrides mma().
-  Key change: _Pragma("unroll 5") on K-loop (CUTLASS uses NO_UNROLL).
-  All types inherited — GemmUniversal selects same SM100 kernel specialization.
-  Keeps CUTLASS's load pipeline (TMA A + CpAsync B) and epilogue unchanged.
+  B200 result: 1.220ms fused = identical to Phase 1. K-loop unrolling NOT the gap.
 
-Phase 3 (future): Also override load() with our TMA-for-both PTX loads.
+Phase 3a (HYBRID_MMA): Also overrides load() with unrolled TMA load loop.
+  Tests whether TMA load scheduling is the source of the 62μs mainloop gap.
+  Same cute::copy operations, different loop structure (unroll 5 vs NO_UNROLL).
+
+Phase 3b (future): Custom 7-warp kernel — our PTX mainloop + CUTLASS epilogue.
+  Tests warp count hypothesis + captures epilogue quality improvement.
 */
 
 #include <cstdio>
@@ -133,11 +136,10 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
 
 #ifdef HYBRID_MMA
 /*
-HybridMainloop inherits CUTLASS's CollectiveMainloop and overrides mma().
-Our fc2_w3 mainloop is 62μs faster (1.089 vs 1.152ms strip). The primary
-difference: CUTLASS uses PRAGMA_NO_UNROLL on the K-loop while our kernel
-uses partial unroll (5). This override keeps CUTLASS's load pipeline and
-epilogue while testing our K-loop scheduling.
+HybridMainloop inherits CUTLASS's CollectiveMainloop, overrides load() + mma().
+
+Phase 2: mma() override — unrolled K-loop. B200 result: 1.220ms = neutral.
+Phase 3a: load() override — unrolled TMA load loop. Tests load codegen.
 
 All types (SharedStorage, Params, TiledMma, etc.) are inherited unchanged,
 so GemmUniversal's enable_if on DispatchPolicy::Schedule resolves to the
@@ -149,10 +151,57 @@ struct HybridMainloop : CollectiveMainloop {
     using CollectiveMainloop::MainloopPipelineState;
 
     /*
-    Override mma(): identical to base class except _Pragma("unroll 5") on
-    the K-loop (CUTLASS uses PRAGMA_NO_UNROLL). Our fc2_w3 uses partial
-    unroll = 5, matching N_STAGES. Tests whether K-loop codegen scheduling
-    is the source of the 62μs mainloop gap.
+    Override load(): identical to base class except _Pragma("unroll 5") on
+    the K-tile loop (CUTLASS uses PRAGMA_NO_UNROLL). Tests whether TMA load
+    scheduling/codegen is the source of the 62μs mainloop gap.
+    */
+    template <class LP, class TileCoordMNKL, class KTileIterator>
+    CUTLASS_DEVICE auto
+    load(MainloopPipeline mainloop_pipeline,
+         MainloopPipelineState mainloop_pipe_producer_state,
+         LP const& load_inputs,
+         TileCoordMNKL const& cta_coord_mnkl,
+         KTileIterator k_tile_iter, int k_tile_count)
+    {
+        using namespace cute;
+        using TiledMma_ = typename CollectiveMainloop::TiledMma;
+
+        auto [unused_k_tiles,
+              tAgA_mkl, tBgB_nkl, tAsA, tBsB,
+              mcast_mask_a, mcast_mask_b] = load_inputs;
+
+        /* Slice out the work coord from partitioned tensors */
+        auto tAgA = tAgA_mkl(_, get<0>(cta_coord_mnkl) / size(typename TiledMma_::AtomThrID{}), _, get<3>(cta_coord_mnkl));
+        auto tBgB = tBgB_nkl(_, get<1>(cta_coord_mnkl), _, get<3>(cta_coord_mnkl));
+
+        auto barrier_token = mainloop_pipeline.producer_try_acquire(mainloop_pipe_producer_state);
+
+        /* Unrolled K-tile loop (CUTLASS uses PRAGMA_NO_UNROLL) */
+        _Pragma("unroll 5")
+        for (int ki = 0; ki < k_tile_count; ++ki) {
+            mainloop_pipeline.producer_acquire(mainloop_pipe_producer_state, barrier_token);
+
+            using BarrierType = typename MainloopPipeline::ProducerBarrierType;
+            BarrierType* tma_barrier = mainloop_pipeline.producer_get_barrier(mainloop_pipe_producer_state);
+
+            int write_stage = mainloop_pipe_producer_state.index();
+            ++mainloop_pipe_producer_state;
+            barrier_token = mainloop_pipeline.producer_try_acquire(mainloop_pipe_producer_state);
+
+            if (elect_one_sync()) {
+                copy(this->observed_tma_load_a_->with(*tma_barrier, mcast_mask_a), tAgA(_,*k_tile_iter), tAsA(_,write_stage));
+                copy(this->observed_tma_load_b_->with(*tma_barrier, mcast_mask_b), tBgB(_,*k_tile_iter), tBsB(_,write_stage));
+            }
+
+            ++k_tile_iter;
+        }
+
+        return make_tuple(mainloop_pipe_producer_state, k_tile_iter);
+    }
+
+    /*
+    Override mma(): _Pragma("unroll 5") on K-loop (CUTLASS uses NO_UNROLL).
+    Phase 2 B200 result: 1.220ms = neutral (K-loop codegen is NOT the gap).
     */
     template <
         class AccumulatorPipeline,
@@ -244,6 +293,277 @@ fc2_hybrid_kernel_impl(CUTLASS_GRID_CONSTANT typename Operator::Params const par
 static auto* fc2_hybrid_kernel = fc2_hybrid_kernel_impl<GemmKernel>;
 
 /* ═══════════════════════════════════════════════════════════════════
+   Phase 3b: Custom 7-warp kernel — our warp count + CUTLASS epilogue
+
+   Tests the warp count hypothesis: 7 warps (no Sched) vs 8 warps.
+   Uses CUTLASS's collective_mainloop.load()/mma() for codegen parity —
+   the ONLY difference is fewer warps + static tile scheduling.
+
+   W0: MainloopLoad (CUTLASS TMA loads)
+   W1: MMA          (CUTLASS MMA)
+   W2: EpilogueLoad (CUTLASS epilogue TMA loads)
+   W3-W6: Epilogue  (CUTLASS epilogue store)
+   ═══════════════════════════════════════════════════════════════════ */
+
+#ifdef HYBRID_PHASE3
+
+template <typename GK>
+__global__ void
+__launch_bounds__(224, 1)
+fc2_phase3_kernel_impl(CUTLASS_GRID_CONSTANT typename GK::Params const params) {
+    using namespace cute;
+
+    using CM = typename GK::CollectiveMainloop;
+    using CE = typename GK::CollectiveEpilogue;
+    using SharedStorage = typename GK::SharedStorage;
+
+    using MainloopPipeline      = typename GK::MainloopPipeline;
+    using MainloopPipelineState  = typename GK::MainloopPipelineState;
+    using EpiLoadPipeline       = typename GK::EpiLoadPipeline;
+    using EpiLoadPipelineState   = typename GK::EpiLoadPipelineState;
+    using EpiStorePipeline      = typename GK::EpiStorePipeline;
+    using EpiStorePipelineState  = typename GK::EpiStorePipelineState;
+    using AccumulatorPipeline   = typename GK::AccumulatorPipeline;
+    using AccumulatorPipelineState = typename GK::AccumulatorPipelineState;
+    using LoadOrderBarrier      = typename GK::LoadOrderBarrier;
+    using TmemAllocator         = typename GK::TmemAllocator;
+
+    using TileShape       = typename CM::TileShape;
+    using TiledMma        = typename CM::TiledMma;
+    using AtomThrShapeMNK = typename CM::AtomThrShapeMNK;
+    using CtaShape_MNK    = typename CM::CtaShape_MNK;
+    using EpilogueTile    = typename GK::EpilogueTile;
+
+    static constexpr bool IsOverlapping = GK::IsOverlappingAccum;
+    static constexpr bool HasPeerCta    = size(AtomThrShapeMNK{}) == 2;
+
+    extern __shared__ char smem_buf[];
+    SharedStorage& ss = *reinterpret_cast<SharedStorage*>(smem_buf);
+
+    int warp_idx = cutlass::canonical_warp_idx_sync();
+    uint32_t lane_pred = elect_one_sync();
+
+    auto cluster_shape = cutlass::detail::select_cluster_shape(
+        typename CM::DispatchPolicy::ClusterShape{});
+    int cluster_size = size(cluster_shape);
+    uint32_t cta_rank = block_rank_in_cluster();
+    int cta_v = cta_rank % size<0>(typename TiledMma::AtomThrID{});
+    bool is_mma_leader = cta_v == 0;
+    [[maybe_unused]] uint32_t peer_rank = HasPeerCta ? cta_rank ^ 1 : cta_rank;
+
+    auto problem_MNKL = append<4>(params.problem_shape, Int<1>{});
+    auto [M,N,K,L] = problem_MNKL;
+
+    CM collective_mainloop(params.mainloop, cluster_shape, cta_rank);
+    CE collective_epilogue(params.epilogue, ss.tensors.epilogue);
+
+    /* TMA descriptor prefetch */
+    if (warp_idx == 0 && lane_pred) collective_mainloop.prefetch_tma_descriptors();
+    if (warp_idx == 2 && lane_pred) collective_epilogue.prefetch_tma_descriptors(params.epilogue);
+
+    bool epi_load_needed = collective_epilogue.is_producer_load_needed();
+
+    /* ── Warp roles: W0=Load W1=MMA W2=EpiLoad W3-6=Epilogue ── */
+    enum { RLoad=0, RMMA=1, REpiL=2, REpi=3 };
+    int role = warp_idx < REpi ? warp_idx : REpi;
+
+    /* ── Pipeline init ── */
+    typename MainloopPipeline::Params ml_p;
+    if (role == RLoad) ml_p.role = MainloopPipeline::ThreadCategory::Producer;
+    if (role == RMMA)  ml_p.role = MainloopPipeline::ThreadCategory::Consumer;
+    ml_p.is_leader = lane_pred && is_mma_leader && (role == RLoad);
+    ml_p.transaction_bytes = CM::TmaTransactionBytes;
+    ml_p.initializing_warp = 0;
+    MainloopPipeline mainloop_pipe(ss.pipelines.mainloop, ml_p, cluster_shape,
+                                   true_type{}, false_type{});
+
+    typename EpiLoadPipeline::Params el_p;
+    if (role == REpiL) el_p.role = EpiLoadPipeline::ThreadCategory::Producer;
+    if (role == REpi)  el_p.role = EpiLoadPipeline::ThreadCategory::Consumer;
+    el_p.dst_blockid = cta_rank;
+    el_p.producer_arv_count = 32;
+    el_p.consumer_arv_count = GK::NumEpilogueThreads;
+    el_p.transaction_bytes = CE::TmaTransactionBytes;
+    el_p.initializing_warp = 1;
+    EpiLoadPipeline epi_load_pipe(ss.pipelines.epi_load, el_p);
+
+    typename EpiStorePipeline::Params es_p;
+    es_p.always_wait = true;
+    EpiStorePipeline epi_store_pipe(es_p);
+
+    typename LoadOrderBarrier::Params lo_p;
+    lo_p.group_id = (role == RLoad) ? 0 : 1;
+    lo_p.group_size = 32;
+    lo_p.initializing_warp = 2;
+    LoadOrderBarrier load_order(ss.pipelines.load_order, lo_p);
+
+    typename AccumulatorPipeline::Params ap_p;
+    if (role == RMMA) ap_p.role = AccumulatorPipeline::ThreadCategory::Producer;
+    if (role == REpi) ap_p.role = AccumulatorPipeline::ThreadCategory::Consumer;
+    ap_p.producer_arv_count = 1;
+    ap_p.consumer_arv_count = size(AtomThrShapeMNK{}) * GK::NumEpilogueThreads;
+    ap_p.initializing_warp = 3;
+    AccumulatorPipeline acc_pipe(ss.pipelines.accumulator, ap_p, cluster_shape,
+                                true_type{}, false_type{});
+
+    /* TMEM allocator + sync barriers */
+    TmemAllocator tmem_alloc{};
+    cutlass::arch::NamedBarrier tmem_bar(32 + GK::NumEpilogueThreads,
+        cutlass::arch::ReservedNamedBarriers::TmemAllocBarrier);
+    auto& tmem_dealloc = ss.pipelines.tmem_dealloc;
+    [[maybe_unused]] uint32_t dealloc_phase = 0;
+    if (role == RMMA) {
+        if constexpr (!IsOverlapping) {
+            if (HasPeerCta && lane_pred) tmem_dealloc.init(32);
+        } else {
+            if (HasPeerCta && lane_pred) tmem_dealloc.init(GK::NumEpilogueThreads * 2);
+            else if (lane_pred) tmem_dealloc.init(GK::NumEpilogueThreads);
+        }
+    }
+
+    /* ── Cluster sync ── */
+    cutlass::pipeline_init_arrive_relaxed(cluster_size);
+
+    auto load_inputs = collective_mainloop.load_init(problem_MNKL, ss.tensors.mainloop);
+
+    MainloopPipelineState ml_cons, ml_prod = cutlass::make_producer_start_state<MainloopPipeline>();
+    EpiLoadPipelineState  el_cons, el_prod = cutlass::make_producer_start_state<EpiLoadPipeline>();
+    EpiStorePipelineState es_prod = cutlass::make_producer_start_state<EpiStorePipeline>();
+    AccumulatorPipelineState ac_cons, ac_prod = cutlass::make_producer_start_state<AccumulatorPipeline>();
+
+    auto tmem_st = collective_mainloop.template init_tmem_tensors<EpilogueTile, IsOverlapping>(EpilogueTile{});
+
+    dim3 bid = block_id_in_cluster();
+    mainloop_pipe.init_masks(cluster_shape, bid);
+    acc_pipe.init_masks(cluster_shape, bid);
+
+    cutlass::pipeline_init_wait(cluster_size);
+
+    /* ── Static tile scheduling ── */
+    int cid = blockIdx.x / cluster_size;
+    int nc  = gridDim.x / cluster_size;
+    int tm_count = cute::ceil_div(int(M), int(get<0>(CtaShape_MNK{})));
+    int tn_count = cute::ceil_div(int(N), int(get<1>(CtaShape_MNK{})));
+    int total = tm_count * tn_count;
+    int t0 = (int)((long long)cid * total / nc);
+    int t1 = (int)((long long)(cid+1) * total / nc);
+    int k_tiles = cute::ceil_div(int(K), int(get<2>(TileShape{})));
+
+    /* ═══ WARP DISPATCH ═══ */
+
+    if (role == RLoad) {
+        cutlass::arch::wait_on_dependent_grids();
+        bool do_arrive = epi_load_needed;
+        for (int ti = t0; ti < t1; ti++) {
+            int tm = ti / tn_count, tn = ti % tn_count;
+            if (tm & 1) tn = tn_count - 1 - tn;
+            auto coord = make_coord(tm, tn, _, Int<0>{});
+            auto ki = make_coord_iterator(load_inputs.k_tiles);
+            int prol = min(int(MainloopPipeline::Stages), k_tiles);
+
+            auto [s1,k1] = collective_mainloop.load(mainloop_pipe, ml_prod, load_inputs, coord, ki, prol);
+            ml_prod = s1;
+            if (do_arrive) { load_order.arrive(); do_arrive = false; }
+            auto [s2,k2] = collective_mainloop.load(mainloop_pipe, ml_prod, load_inputs, coord, k1, k_tiles - prol);
+            ml_prod = s2;
+        }
+        collective_mainloop.load_tail(mainloop_pipe, ml_prod);
+    }
+
+    else if (role == RMMA) {
+        tmem_alloc.allocate(TmemAllocator::Sm100TmemCapacityColumns, &ss.tmem_base_ptr);
+        __syncwarp();
+        tmem_bar.arrive();
+        uint32_t tptr = ss.tmem_base_ptr;
+        collective_mainloop.set_tmem_offsets(tmem_st, tptr);
+        auto mma_in = collective_mainloop.mma_init(tmem_st, ss.tensors.mainloop);
+
+        for (int ti = t0; ti < t1; ti++) {
+            int tm = ti / tn_count, tn = ti % tn_count;
+            if (tm & 1) tn = tn_count - 1 - tn;
+            auto coord = make_coord(tm, tn, _, Int<0>{});
+            int as = [&]{ if constexpr(IsOverlapping) return ac_prod.phase()^1; else return ac_prod.index(); }();
+            if (is_mma_leader) {
+                ml_cons = collective_mainloop.mma(
+                    make_tuple(mainloop_pipe, acc_pipe),
+                    make_tuple(ml_cons, ac_prod),
+                    collective_mainloop.slice_accumulator(tmem_st, as),
+                    mma_in, coord, k_tiles);
+                acc_pipe.producer_commit(ac_prod);
+            }
+            ++ac_prod;
+        }
+        cutlass::arch::launch_dependent_grids();
+        tmem_alloc.release_allocation_lock();
+        if constexpr (!IsOverlapping) {
+            if (is_mma_leader) acc_pipe.producer_tail(ac_prod);
+            if constexpr (HasPeerCta) {
+                tmem_dealloc.arrive(peer_rank, !is_mma_leader);
+                tmem_dealloc.wait(dealloc_phase);
+                tmem_dealloc.arrive(peer_rank, is_mma_leader);
+            }
+        } else {
+            tmem_dealloc.wait(dealloc_phase);
+        }
+        tmem_alloc.free(tptr, TmemAllocator::Sm100TmemCapacityColumns);
+    }
+
+    else if (role == REpiL) {
+        if (epi_load_needed) {
+            cutlass::arch::wait_on_dependent_grids();
+            bool do_wait = true;
+            for (int ti = t0; ti < t1; ti++) {
+                int tm = ti / tn_count, tn = ti % tn_count;
+                if (tm & 1) tn = tn_count - 1 - tn;
+                auto coord = make_coord(tm, tn, _, Int<0>{});
+                if (do_wait) { load_order.wait(); do_wait = false; }
+                int w = ti - t0;
+                bool rev = IsOverlapping && (w % 2 == 0);
+                el_prod = collective_epilogue.template load<IsOverlapping>(
+                    epi_load_pipe, el_prod, problem_MNKL, CtaShape_MNK{}, coord,
+                    TileShape{}, TiledMma{}, ss.tensors.epilogue, rev);
+            }
+            collective_epilogue.load_tail(epi_load_pipe, el_prod, epi_store_pipe, es_prod);
+        }
+    }
+
+    else { /* Epilogue W3-W6 */
+        tmem_bar.arrive_and_wait();
+        uint32_t tptr = ss.tmem_base_ptr;
+        collective_mainloop.set_tmem_offsets(tmem_st, tptr);
+        bool did_store = false;
+
+        for (int ti = t0; ti < t1; ti++) {
+            int tm = ti / tn_count, tn = ti % tn_count;
+            if (tm & 1) tn = tn_count - 1 - tn;
+            auto coord = make_coord(tm, tn, _, Int<0>{});
+            int as = [&]{ if constexpr(IsOverlapping) return ac_cons.phase(); else return ac_cons.index(); }();
+            auto acc = get<0>(collective_mainloop.slice_accumulator(tmem_st, as));
+
+            auto [l,s,a] = collective_epilogue.template store<IsOverlapping>(
+                epi_load_pipe, el_cons, epi_store_pipe, es_prod,
+                acc_pipe, ac_cons,
+                problem_MNKL, CtaShape_MNK{}, coord,
+                TileShape{}, TiledMma{}, acc, ss.tensors.epilogue);
+            el_cons = l; es_prod = s; ac_cons = a;
+            did_store = true;
+        }
+
+        if constexpr (IsOverlapping) {
+            if constexpr (HasPeerCta) tmem_dealloc.arrive(peer_rank);
+            tmem_dealloc.arrive();
+        }
+        if (did_store) {
+            collective_epilogue.store_tail(epi_load_pipe, el_cons, epi_store_pipe, es_prod, CtaShape_MNK{});
+        }
+    }
+}
+
+static auto* fc2_phase3_kernel = fc2_phase3_kernel_impl<GemmKernel>;
+
+#endif /* HYBRID_PHASE3 */
+
+/* ═══════════════════════════════════════════════════════════════════
    Host code — identical to fc2_cutlass.cu except launches our kernel
    ═══════════════════════════════════════════════════════════════════ */
 
@@ -263,8 +583,10 @@ int main() {
     printf("ERROR: CUTLASS_ARCH_MMA_SM100_SUPPORTED not defined.\n");
     return 1;
 #else
-#ifdef HYBRID_MMA
-    printf("FC2 HYBRID Phase 2 — HybridMainloop (unrolled K-loop) + CUTLASS epilogue\n");
+#if defined(HYBRID_PHASE3)
+    printf("FC2 HYBRID Phase 3b — 7-warp custom kernel + CUTLASS epilogue\n");
+#elif defined(HYBRID_MMA)
+    printf("FC2 HYBRID Phase 3a — HybridMainloop (unrolled load+K-loop) + CUTLASS epilogue\n");
 #else
     printf("FC2 HYBRID Phase 1 — pure CUTLASS via custom launch\n");
 #endif
@@ -389,19 +711,37 @@ int main() {
     auto grid = GemmKernel::get_grid_shape(kernel_params);
     auto block = GemmKernel::get_block_shape();
 
-    CUDA_CHECK(cudaFuncSetAttribute(fc2_hybrid_kernel,
+#ifdef HYBRID_PHASE3
+    /* Phase 3b: use our 7-warp kernel */
+    auto* the_kernel = (void const*)fc2_phase3_kernel;
+    dim3 phase3_block(224, 1, 1); /* 7 warps */
+#else
+    auto* the_kernel = (void const*)fc2_hybrid_kernel;
+#endif
+
+    CUDA_CHECK(cudaFuncSetAttribute(the_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SmemBytes));
-    CUDA_CHECK(cudaFuncSetAttribute(fc2_hybrid_kernel,
+    CUDA_CHECK(cudaFuncSetAttribute(the_kernel,
         cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
 
     printf("  CUTLASS initialized (workspace=%zu, grid=%dx%d, block=%d, smem=%zu)\n",
-           ws, grid.x, grid.y, block.x, SmemBytes);
+           ws, grid.x, grid.y,
+#ifdef HYBRID_PHASE3
+           phase3_block.x,
+#else
+           block.x,
+#endif
+           SmemBytes);
 
     /* Cluster launch — match CUTLASS's ClusterLauncher exactly (C API, no __cluster_dims__) */
     auto launch_hybrid = [&](typename GemmKernel::Params& p) {
         cudaLaunchConfig_t config = {};
         config.gridDim = grid;
+#ifdef HYBRID_PHASE3
+        config.blockDim = phase3_block;
+#else
         config.blockDim = block;
+#endif
         config.dynamicSmemBytes = SmemBytes;
         cudaLaunchAttribute attrs[2];
         attrs[0].id = cudaLaunchAttributeClusterDimension;
@@ -411,7 +751,7 @@ int main() {
         config.attrs = attrs;
         config.numAttrs = 2;
         void* kernel_args[] = { &p };
-        CUDA_CHECK(cudaLaunchKernelExC(&config, (void const*)fc2_hybrid_kernel, kernel_args));
+        CUDA_CHECK(cudaLaunchKernelExC(&config, the_kernel, kernel_args));
     };
 
     /* Warmup */

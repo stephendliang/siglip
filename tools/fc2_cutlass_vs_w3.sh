@@ -45,6 +45,8 @@ EXPERIMENTS=(
     "hybrid_strip|make fc2-hybrid-strip|./fc2-hybrid-strip"
     "hybrid_mma_fused|make fc2-hybrid-mma|./fc2-hybrid-mma"
     "hybrid_mma_strip|make fc2-hybrid-mma DFLAGS=-DSTRIP_EPILOGUE|./fc2-hybrid-mma"
+    "phase3_fused|make fc2-hybrid-phase3|./fc2-hybrid-phase3"
+    "phase3_strip|make fc2-hybrid-phase3 DFLAGS=-DSTRIP_EPILOGUE|./fc2-hybrid-phase3"
     "w3_fused|make fc2-w3|./fc2-w3"
     "w3_strip|make fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|./fc2-w3"
 )
