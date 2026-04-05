@@ -439,9 +439,10 @@ fc2_phase3_kernel_impl(CUTLASS_GRID_CONSTANT typename GK::Params const params) {
 
     cutlass::pipeline_init_wait(cluster_size);
 
-    /* ── Static tile scheduling ── */
-    int cid = blockIdx.x / cluster_size;
-    int nc  = gridDim.x / cluster_size;
+    /* ── Static tile scheduling (linearize 2D/3D grid → flat cluster ID) ── */
+    int bid_linear = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y;
+    int cid = bid_linear / cluster_size;
+    int nc  = (gridDim.x * gridDim.y * gridDim.z) / cluster_size;
     int tm_count = cute::ceil_div(int(M), int(get<0>(CtaShape_MNK{})));
     int tn_count = cute::ceil_div(int(N), int(get<1>(CtaShape_MNK{})));
     int total = tm_count * tn_count;
