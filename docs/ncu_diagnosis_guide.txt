@@ -448,3 +448,42 @@ Do this in order. Stop as soon as root cause is clear.
      -> W2's TMA residual loads + epilogue TMA stores saturate DRAM/L2
      -> ncu numbers quantify how much memory bandwidth epilogue consumes
   8. Only run --set full if targeted metrics are inconclusive
+
+
+=============================================================================
+SECTION 11: RESULTS (B200-verified 2026-04-05)
+=============================================================================
+
+Data: data/ncu_20260405_202913/
+Analysis: python3 tools/ncu_anova.py
+
+Q1 ANSWERED: Epilogue overhead is from STS clustering causing barrier stalls.
+  - short_scoreboard: +137K (+11261%) from back-to-back STS WAR hazards
+  - barrier: +71K (+31%) from uneven warp progress
+  - long_scoreboard: +0.3% = DRAM is NOT the bottleneck
+  - mio_throttle: +0.3% = TMA is NOT the bottleneck
+
+Q2 ANSWERED: Head-to-head, barrier stalls are the dominant difference.
+  - barrier: w3=298K vs cutlass=31K (+860%, accounts for 110% of stall delta)
+  - short_scoreboard: basically identical in fused mode (139K vs 136K)
+  - Barriers are a SYMPTOM of STS clustering, not the cause
+    (removing barriers = zero effect, proven by NO_PRE_STORE_BAR experiment)
+  - CUTLASS's epilogue DECREASES barrier stalls by 60K (fills idle time)
+  - Our epilogue INCREASES barrier stalls by 71K (STS bursts → uneven progress)
+
+Q3 ANSWERED: Phase 4 does ~2x the work of CUTLASS.
+  - inst_executed: 396M vs 163M (+143%)
+  - cycles_active: 4.9M vs 1.9M (+152%)
+  - long_scoreboard: 6.87M vs 2.74M (+151%)
+  - Static tile dispatch is fundamentally broken (redundant work or L2 thrashing)
+
+RULED OUT by data:
+  - DRAM bandwidth: long_scoreboard flat (+0.3%)
+  - TMA saturation: mio_throttle flat (16 → 16)
+  - Warp scheduler: not_selected small absolute (5.8K)
+
+CONFIRMED:
+  - STS clustering is the root cause of epilogue overhead
+  - Mechanism: back-to-back STS → SMEM port contention → uneven warp progress
+    → barrier stall inflation (+860%)
+  - Cannot be fixed from source (ptxas controls STS scheduling, 6+ approaches tried)

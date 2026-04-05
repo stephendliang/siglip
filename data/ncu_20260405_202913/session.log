@@ -1,0 +1,106 @@
+[20:29:13] ========================================
+[20:29:13]   FC2 NCU DIAGNOSIS  20260405_202913
+[20:29:13]   Output: data/ncu_20260405_202913
+[20:29:13] ========================================
+NVIDIA B200, 120 MHz
+[20:29:13] 
+[20:29:13] ── Phase 1: Building binaries ──
+[20:29:13]   [w3_strip] make -B fc2-w3 DFLAGS=-DSTRIP_EPILOGUE
+[20:29:15]   [w3_strip] copied fc2-w3 -> fc2-w3-strip
+[20:29:15]   [w3_strip] built (regs=41, bars=1)
+[20:29:15]   [w3_fused] make -B fc2-w3
+[20:29:16]   [w3_fused] built (regs=117, bars=2)
+[20:29:16]   [cutlass_fused] make fc2-cutlass
+[20:29:48]   [cutlass_fused] built (regs=16, bars=0)
+[20:29:48]   [cutlass_strip] make fc2-cutlass-strip
+[20:30:16]   [cutlass_strip] built (regs=16, bars=0)
+[20:30:16]   [hybrid_fused] make fc2-hybrid
+[20:30:46]   [hybrid_fused] built (regs=252, bars=7)
+[20:30:46]   [hybrid_strip] make fc2-hybrid-strip
+[20:31:17]   [hybrid_strip] built (regs=186, bars=7)
+[20:31:17]   [phase4_strip] make -B fc2-hybrid-phase4 DFLAGS=-DSTRIP_EPILOGUE
+[20:31:49]   [phase4_strip] copied fc2-hybrid-phase4 -> fc2-hybrid-phase4-strip
+[20:31:49]   [phase4_strip] built (regs=186, bars=7)
+[20:31:49]   [phase4_fused] make -B fc2-hybrid-phase4
+[20:32:25]   [phase4_fused] built (regs=252, bars=7)
+[20:32:25] 
+[20:32:25] ── Phase 2: Wall time sanity checks ──
+[20:32:27]   [w3_strip] 1.088ms  4026.74 TFLOPS  valid=0
+[20:32:28]   [w3_fused] 1.480ms  2959.85 TFLOPS  valid=0
+[20:32:29]   [cutlass_fused] 1.221ms  3586.59 TFLOPS  valid=1
+[20:32:31]   [cutlass_strip] 1.151ms  3803.93 TFLOPS  valid=1
+[20:32:32]   [hybrid_fused] 1.220ms  3589.29 TFLOPS  valid=1
+[20:32:34]   [hybrid_strip] 1.149ms  3812.92 TFLOPS  valid=1
+[20:32:35]   [phase4_strip] 2.629ms  1666.10 TFLOPS  valid=1
+[20:32:37]   [phase4_fused] 2.764ms  1584.48 TFLOPS  valid=1
+[20:32:37] 
+[20:32:37] ── Phase 3: Targeted ncu metric collection ──
+[20:32:37]   [w3_strip] collecting ncu metrics...
+[20:32:49]   [w3_strip] ncu done (391 CSV lines)
+[20:32:49]   [w3_fused] collecting ncu metrics...
+[20:33:01]   [w3_fused] ncu done (391 CSV lines)
+[20:33:01]   [cutlass_fused] collecting ncu metrics...
+[20:33:14]   [cutlass_fused] ncu done (391 CSV lines)
+[20:33:14]   [cutlass_strip] collecting ncu metrics...
+[20:33:26]   [cutlass_strip] ncu done (391 CSV lines)
+[20:33:26]   [hybrid_fused] collecting ncu metrics...
+[20:33:39]   [hybrid_fused] ncu done (391 CSV lines)
+[20:33:39]   [hybrid_strip] collecting ncu metrics...
+[20:33:51]   [hybrid_strip] ncu done (391 CSV lines)
+[20:33:51]   [phase4_strip] collecting ncu metrics...
+[20:34:04]   [phase4_strip] ncu done (391 CSV lines)
+[20:34:04]   [phase4_fused] collecting ncu metrics...
+[20:34:17]   [phase4_fused] ncu done (391 CSV lines)
+[20:34:17] 
+[20:34:17] ── Phase 4: Metric diffs ──
+[20:34:17]   diff_q1: w3_strip.csv vs w3_fused.csv
+[20:34:17]   diff_q1_cutlass: cutlass_strip.csv vs cutlass_fused.csv
+[20:34:17]   diff_q2: w3_fused.csv vs cutlass_fused.csv
+[20:34:17]   diff_q2_strip: w3_strip.csv vs cutlass_strip.csv
+[20:34:17]   diff_q2_hybrid: w3_fused.csv vs hybrid_fused.csv
+[20:34:17]   diff_q3: hybrid_fused.csv vs phase4_fused.csv
+[20:34:17]   diff_q3_strip: hybrid_strip.csv vs phase4_strip.csv
+[20:34:17] 
+[20:34:17] ── Phase 5: Summary table ──
+metric                          w3_strip          w3_fused     cutlass_fused     cutlass_strip      hybrid_fused      hybrid_strip      phase4_strip      phase4_fused
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+long_scoreboard                    2.54M             2.55M             2.74M             2.44M             2.75M             2.44M             5.89M             6.87M
+short_scoreboard                    1.2K            138.9K            135.9K             30.3K            135.7K             30.8K            213.9K            422.2K
+wait                              254.5K            376.6K            228.2K            141.0K            228.2K            141.0K            654.6K            905.3K
+barrier                           227.5K            298.1K             31.1K             91.4K             31.0K             91.0K            177.9K            140.3K
+sleeping                           14.6K             37.6K              0.00              0.00              0.00              0.00              0.00            104.89
+not_selected                      690.83              5.8K             21.9K             25.6K             21.8K             25.6K             41.1K             36.8K
+mio_throttle                       16.02             16.07              3.8K              2.2K              3.7K              2.2K              2.5K              3.2K
+math_throttle                     170.20              1.8K              2.6K            604.42              2.5K            608.20              7.1K              7.2K
+dram_read_bytes                     3.33              6.30              4.28              2.85              4.28              2.85              2.85              4.28
+dram_write_bytes                    8.10              1.42              1.40              1.40              1.40              1.40              1.41              1.41
+dram_pct                           26.02             52.20             42.11             31.98             42.10             31.99             13.27             16.89
+lts_pct                            72.41             69.54             70.04             66.88             70.18             65.89             57.58             57.78
+l1tex_pct                          48.49             49.09             53.55             52.06             53.65             52.03             41.94             41.79
+sm_pct                             97.34             86.74             93.65             95.06             93.84             95.00             76.28             72.42
+shared_pct                         96.98             83.85             91.98             93.68             92.16             93.62             75.80             72.04
+warps_active                        7.00              7.00              7.50              6.50              7.50              6.50              6.91              7.77
+cycles_active                      1.82M             2.10M             1.94M             1.91M             1.94M             1.91M             4.65M             4.90M
+inst_executed                     42.63M           101.09M           163.09M           141.73M           163.09M           141.73M           345.76M           396.37M
+warps_eligible                      0.04              0.08              0.15              0.14              0.15              0.14              0.13              0.14
+regs_per_thread                    41.00            117.00            252.00            186.00            252.00            186.00            166.00            228.00
+occupancy                            n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a
+smem_wavefronts                   101.9K            39.89M            60.39M            20.00M            60.46M            19.96M            35.47M           113.78M
+smem_ld_wf                          2.1K            24.90M            38.04M            440.9K            37.94M            437.9K            468.1K            70.01M
+smem_st_wf                          1.2K            13.59M            19.00M            16.44M            19.07M            16.50M            28.67M            36.84M
+global_ld_wf                         n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a
+[20:34:17] 
+[20:34:17] ════════════════════════════════════════
+[20:34:17]   DONE
+[20:34:17] ════════════════════════════════════════
+[20:34:17] 
+[20:34:17] Key outputs:
+[20:34:17]   data/ncu_20260405_202913/results.txt       — wall times
+[20:34:17]   data/ncu_20260405_202913/summary.txt       — stall metrics side-by-side
+[20:34:17]   data/ncu_20260405_202913/diff_q1.txt       — Q1: w3 strip vs fused
+[20:34:17]   data/ncu_20260405_202913/diff_q2.txt       — Q2: w3 vs CUTLASS
+[20:34:17]   data/ncu_20260405_202913/diff_q3.txt       — Q3: Phase 1 vs Phase 4
+[20:34:17]   data/ncu_20260405_202913/diff_q3_strip.txt — Q3: strip comparison
+[20:34:17] 
+[20:34:17] To interpret: read summary.txt first, then diff_q*.txt for specifics.
+[20:34:17] See docs/ncu_diagnosis_guide.txt for what each metric means.

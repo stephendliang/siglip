@@ -89,26 +89,73 @@ Two versions tried:
 
 fc2-w3-8w strip=1.086ms vs fc2-w3 strip=1.088ms. **8 warps does NOT hurt mainloop speed.** The theoretical ceiling of 1.161ms remains viable.
 
-### Next step: ncu profiling to identify the contended hardware resource
+### ncu profiling results (B200-verified 2026-04-05)
 
-We know WHAT: epilogue warps inflate the K-loop by 36% (388us). We know it's NOT any single operation (strip decomposition proved TMA-load-only, TMA-store-only, and compute-only ALL produce identical overhead). We know it's NOT dispatch pressure, TMEM timing, or register file occupancy (all individually ruled out via busy-wait and REG_PAD experiments). The overhead is from epilogue warps actively executing instructions, creating aggregate pressure on shared hardware. But we don't know WHICH resource.
+**STS clustering CONFIRMED as root cause. Barrier stalls are the dominant visible symptom.**
 
-The root cause is the same across all our kernels (old fc2 at 120us/warp, fc2_w3 at 98us/warp) because they share the same structural deficiencies vs CUTLASS:
+Data: `data/ncu_20260405_202913/`, analysis: `python3 tools/ncu_anova.py`
 
-**What our epilogue does wrong (SASS-verified):**
-Both kernels have the same architecture (EpilogueLoad warp + LDS from SMEM) and identical barriers (2 BAR.SYNC.DEFER_BLOCKING per sub-iter). The differences:
-1. **STS clustering (primary suspect)**: Our STS.128 are clustered 4-8 back-to-back with 0-2 ops between them. CUTLASS interleaves 6-12 FFMA/F2FP ops between each STS. Same 32 STS/tile, but our burst pattern creates ~108 cyc SMEM write storms per chunk across 4 warps simultaneously — likely saturating SMEM ports and stalling the K-loop's W0 TMA loads and W1 MMA reads. See architecture comparison above for full analysis.
-2. **Missing @!PT LDS pipeline drain fences**: CUTLASS has 4 per sub-iter after STS, before MEMBAR+FENCE, ensuring STS are visible in SMEM before TMA store reads it. ptxas DCE's all our attempts to add them (3 approaches tried).
+#### Q1: What our epilogue adds (w3 fused - strip)
 
-**ncu must answer: which of these creates the K-loop contention?** Candidates:
-- **SMEM port contention**: clustered STS create burst write pressure on shared memory ports, interfering with K-loop SMEM activity. ncu metrics: `shared_pct`, `smem_st_wavefronts`, `smem_ld_wavefronts`.
-- **Warp scheduler starvation**: 6 active warps (vs 2 in strip) competing for issue slots, starving the MMA warp of execution bandwidth. ncu metrics: `warps_eligible`, `not_selected`.
-- **TMA unit saturation**: epilogue TMA stores + W2 residual TMA loads compete with W0's TMA loads for MIO queue slots. ncu metrics: `mio_throttle`, `mio_pq_read/write_cycles`.
-- **DRAM/L2 bandwidth saturation**: W2's TMA residual loads add ~1.36GB of reads across 74 clusters, competing with W0's TMA loads for A/B tiles. ncu metrics: `long_scoreboard`, `dram_pct`, `global_ld_wavefronts`.
+| Metric | Strip | Fused | Δ% | Verdict |
+|---|---|---|---|---|
+| short_scoreboard | 1,222 | 138,859 | **+11,261%** | STS WAR hazards from clustering |
+| SMEM wavefronts | 102K | 39.9M | +39,035% | LDS/STS from epilogue (expected) |
+| barrier | 227,465 | 298,055 | +31% | Uneven warp progress from STS bursts |
+| wait | 254,519 | 376,622 | +48% | General wait increase |
+| **long_scoreboard** | 2,540,781 | 2,549,600 | **+0.3%** | **DRAM is NOT the bottleneck** |
+| **mio_throttle** | 16 | 16 | **+0.3%** | **TMA is NOT the bottleneck** |
 
-These are NOT mutually exclusive — it's likely a combination, which is why no single strip variant showed improvement. The ncu data will reveal the proportions.
+#### Q1b: What CUTLASS's epilogue adds (cutlass fused - strip)
 
-Run `./tools/fc2_ncu_bench.sh` on the B200. See `docs/ncu_diagnosis_guide.txt` for detailed interpretation of each metric and what to look for in each comparison pair (Q1: strip vs fused, Q2: w3 vs CUTLASS, Q3: Phase 4 broken).
+| Metric | Strip | Fused | Δ% |
+|---|---|---|---|
+| short_scoreboard | 30,309 | 135,873 | +348% (from higher base) |
+| barrier | 91,410 | 31,069 | **-66%** (epilogue fills idle time!) |
+| long_scoreboard | 2,439,589 | 2,741,875 | +12.4% |
+| mio_throttle | 2,176 | 3,785 | +74% |
+
+CUTLASS's epilogue DECREASES barrier stalls — warps fill time that would otherwise be idle. Our epilogue INCREASES them because STS clustering causes uneven warp progress.
+
+#### Q2: w3 fused vs cutlass fused — head-to-head
+
+| Stall | w3_fused | cutlass_fused | Δ% | Notes |
+|---|---|---|---|---|
+| short_scoreboard | 138,859 | 135,873 | +2.2% | Basically same! |
+| long_scoreboard | 2,549,600 | 2,741,875 | -7.0% | We're slightly better |
+| **barrier** | **298,055** | **31,069** | **+860%** | THE dominant difference |
+| **wait** | **376,622** | **228,165** | **+65%** | Significant |
+| sleeping | 37,566 | 0 | w3 only | |
+
+**Barrier stalls (+267K, +860%) account for 110% of the total stall delta** (other stalls partially cancel). But removing barriers = zero perf effect, so barrier stalls are a SYMPTOM: STS clustering → SMEM port contention across 4 warps → uneven STS completion → earlier-finishing warps wait at barriers → inflated barrier stall count.
+
+#### Q2b: Strip comparison (mainloop only)
+
+| Metric | w3_strip | cutlass_strip |
+|---|---|---|
+| SMEM wavefronts | 102K | 20.0M |
+| short_scoreboard | 1,222 | 30,309 |
+| cycles_active | 1,824,165 | 1,914,702 (-4.7%) |
+
+Our mainloop is cleaner — nearly zero SMEM activity. Confirms our strip speed advantage.
+
+#### Q3b: Phase 4 — why it's 2.5x broken
+
+| Metric | phase4_fused | cutlass_fused | Δ% |
+|---|---|---|---|
+| cycles_active | 4,897,540 | 1,944,987 | +152% |
+| inst_executed | 396M | 163M | +143% |
+| long_scoreboard | 6.87M | 2.74M | +151% |
+| wait | 905K | 228K | +297% |
+| LTS read sectors | 1.18B | 618M | +91% |
+
+Phase 4 does ~2x the work. Static `for ti=t0..t1` dispatch causes either redundant work, L2 thrashing from bad tile ordering, or failure to overlap mainloop/epilogue across tiles.
+
+#### Ruled out by ncu data
+
+- **DRAM bandwidth**: long_scoreboard +0.3% fused vs strip. Not a factor.
+- **TMA saturation**: mio_throttle flat at 16. Not a factor.
+- **Warp scheduler starvation**: not_selected +5K (+739%) but absolute is tiny (5.8K vs 22K for CUTLASS). Not dominant.
 
 ## What we know works
 
