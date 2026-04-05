@@ -68,9 +68,13 @@ Compile-time flags:
 #define K_LOOP_UNROLL  N_STAGES
 #endif
 
-/* ── Threads: 7 warps = 224 ── */
+/* ── Threads ── */
 #define NUM_EPI_WARPS  4
-#define THREADS        (32 * 7)   /* W0 + W1 + W2(loader) + W3-W6(epilogue) */
+#ifndef NUM_IDLE_WARPS
+#define NUM_IDLE_WARPS 0
+#endif
+#define NUM_WARPS      (3 + NUM_EPI_WARPS + NUM_IDLE_WARPS)  /* W0+W1+W2 + epi + idle */
+#define THREADS        (32 * NUM_WARPS)
 
 /* ── SMEM layout ── */
 #define STAGE_BYTES    32768                                    /* 16KB A + 16KB B */
@@ -645,9 +649,9 @@ fc2_w3_kernel(
         }
         for (int i = 0; i < 2; i++) {
             mbar_init(smem_to_uint(smem + OFF_MAINLOOP_MBAR + i * 8), 1);
-            /* epilogue mbar: all epilogue warps (W3-W6) + W2 arrive.
-               (NUM_EPI_WARPS + 1) warps × 2 CTAs × 32 threads */
-            mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR + i * 8), (NUM_EPI_WARPS + 1) * 2 * 32);
+            /* epilogue mbar: W2 + W3-W6 + idle warps arrive.
+               (NUM_EPI_WARPS + 1 + NUM_IDLE_WARPS) warps × 2 CTAs × 32 threads */
+            mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR + i * 8), (NUM_EPI_WARPS + 1 + NUM_IDLE_WARPS) * 2 * 32);
         }
         /* W2→epilogue: stage ready. W2 arrives with expect_tx. */
         for (int s = 0; s < NUM_EPI_STAGES; s++)
@@ -861,11 +865,19 @@ fc2_w3_kernel(
 #endif /* STRIP_EPILOGUE W2 */
 
         } else {
-            /* W3-W6 must wait on mainloop_mbar EVERY tile (including tile_start)
+            /* W3+ must wait on mainloop_mbar EVERY tile (including tile_start)
                to consume the free-pass phase. Only epilogue work is conditional. */
             const int prev_buf = buf ^ 1;
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             ml_phase[prev_buf] ^= 1;
+#if NUM_IDLE_WARPS > 0
+            if (warp >= 3 + NUM_EPI_WARPS) {
+                /* Idle warps: just arrive at epi_mbar, no epilogue work */
+                if (tile_idx > tile_start)
+                    mbar_arrive(epi_mbar_masked + prev_buf * 8);
+                continue;
+            }
+#endif
 #ifdef STRIP_EPILOGUE
             if (tile_idx > tile_start)
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
@@ -1157,6 +1169,15 @@ fc2_w3_kernel(
 #endif /* STRIP_EPILOGUE drain W2 */
 
         } else {
+#if NUM_IDLE_WARPS > 0 && !defined(STRIP_EPILOGUE)
+            if (warp >= 3 + NUM_EPI_WARPS) {
+                /* Idle warps: drain — just arrive at barriers */
+                mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
+                ml_phase[last_buf] ^= 1;
+                mbar_arrive(epi_mbar_masked + last_buf * 8);
+            } else
+#endif
+            {
 #ifdef STRIP_EPILOGUE
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
             ml_phase[last_buf] ^= 1;
@@ -1378,6 +1399,7 @@ fc2_w3_kernel(
 
             mbar_arrive(epi_mbar_masked + last_buf * 8);
 #endif /* STRIP_EPILOGUE drain W3-W6 */
+            } /* close brace for idle-warp else */
         }
     }
 
@@ -1406,7 +1428,8 @@ __global__ void init_residual(__nv_bfloat16* __restrict__ res, int n_dim, long l
 
 int main() {
     setbuf(stdout, NULL);
-    printf("FC2 W3 kernel — 7 warps, shared-SMEM epilogue\n");
+    printf("FC2 W3 kernel — %d warps (%d idle), shared-SMEM epilogue\n",
+           NUM_WARPS, NUM_IDLE_WARPS);
     printf("  GEMM: [%d,%d] x [%d,%d]^T  %d-stage pipeline  SMEM: %d bytes\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, N_STAGES, SMEM_BYTES);
     printf("  EPI: stages=%d  SWS=%d  DTS=%d  FP32=%d  CPP=%d\n",

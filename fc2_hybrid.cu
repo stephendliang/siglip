@@ -565,6 +565,291 @@ static auto* fc2_phase3_kernel = fc2_phase3_kernel_impl<GemmKernel>;
 #endif /* HYBRID_PHASE3 */
 
 /* ═══════════════════════════════════════════════════════════════════
+   Phase 4: 8-warp kernel — our PTX mainloop + CUTLASS epilogue
+
+   Goal: combine our faster mainloop (1.089ms strip) with CUTLASS's
+   epilogue (72μs overhead) for theoretical 1.161ms ceiling.
+
+   Step 1 (skeleton): 8-warp CUTLASS mainloop + epilogue + idle warp.
+   Should match Phase 1 perf (1.222ms).
+   Steps 2-4: Replace Load+MMA with our PTX.
+
+   W0: MainloopLoad   (Step 1: CUTLASS → Steps 3+: our PTX)
+   W1: MMA            (Step 1: CUTLASS → Steps 4+: our PTX)
+   W2: Idle
+   W3: EpilogueLoad   (CUTLASS epilogue.load())
+   W4-W7: Epilogue    (CUTLASS epilogue.store())
+   ═══════════════════════════════════════════════════════════════════ */
+
+#ifdef HYBRID_PHASE4
+
+template <typename GK>
+__global__ void
+__launch_bounds__(256, 1)
+fc2_phase4_kernel_impl(CUTLASS_GRID_CONSTANT typename GK::Params const params) {
+    using namespace cute;
+
+    using CM = typename GK::CollectiveMainloop;
+    using CE = typename GK::CollectiveEpilogue;
+    using SharedStorage = typename GK::SharedStorage;
+
+    using MainloopPipeline      = typename GK::MainloopPipeline;
+    using MainloopPipelineState  = typename GK::MainloopPipelineState;
+    using EpiLoadPipeline       = typename GK::EpiLoadPipeline;
+    using EpiLoadPipelineState   = typename GK::EpiLoadPipelineState;
+    using EpiStorePipeline      = typename GK::EpiStorePipeline;
+    using EpiStorePipelineState  = typename GK::EpiStorePipelineState;
+    using AccumulatorPipeline   = typename GK::AccumulatorPipeline;
+    using AccumulatorPipelineState = typename GK::AccumulatorPipelineState;
+    using LoadOrderBarrier      = typename GK::LoadOrderBarrier;
+    using TmemAllocator         = typename GK::TmemAllocator;
+
+    using TileShape       = typename CM::TileShape;
+    using TiledMma        = typename CM::TiledMma;
+    using AtomThrShapeMNK = typename CM::AtomThrShapeMNK;
+    using CtaShape_MNK    = typename CM::CtaShape_MNK;
+    using EpilogueTile    = typename GK::EpilogueTile;
+
+    static constexpr bool IsOverlapping = GK::IsOverlappingAccum;
+    static constexpr bool HasPeerCta    = size(AtomThrShapeMNK{}) == 2;
+
+    extern __shared__ char smem_buf[];
+    SharedStorage& ss = *reinterpret_cast<SharedStorage*>(smem_buf);
+
+    int warp_idx = cutlass::canonical_warp_idx_sync();
+    uint32_t lane_pred = elect_one_sync();
+
+    auto cluster_shape = cutlass::detail::select_cluster_shape(
+        typename CM::DispatchPolicy::ClusterShape{});
+    int cluster_size = size(cluster_shape);
+    uint32_t cta_rank = block_rank_in_cluster();
+    int cta_v = cta_rank % size<0>(typename TiledMma::AtomThrID{});
+    bool is_mma_leader = cta_v == 0;
+    [[maybe_unused]] uint32_t peer_rank = HasPeerCta ? cta_rank ^ 1 : cta_rank;
+
+    auto problem_MNKL = append<4>(params.problem_shape, Int<1>{});
+    auto [M,N,K,L] = problem_MNKL;
+
+    CM collective_mainloop(params.mainloop, cluster_shape, cta_rank);
+    CE collective_epilogue(params.epilogue, ss.tensors.epilogue);
+
+    /* TMA descriptor prefetch */
+    if (warp_idx == 0 && lane_pred) collective_mainloop.prefetch_tma_descriptors();
+    if (warp_idx == 3 && lane_pred) collective_epilogue.prefetch_tma_descriptors(params.epilogue);
+
+    bool epi_load_needed = collective_epilogue.is_producer_load_needed();
+
+    /* ── Warp roles: W0=Load W1=MMA W2=Idle W3=EpiLoad W4-7=Epilogue ── */
+    enum { RLoad=0, RMMA=1, RIdle=2, REpiL=3, REpi=4 };
+    int role;
+    if (warp_idx == 0)      role = RLoad;
+    else if (warp_idx == 1) role = RMMA;
+    else if (warp_idx == 2) role = RIdle;
+    else if (warp_idx == 3) role = REpiL;
+    else                    role = REpi;
+
+    /* ── Pipeline init ── */
+    typename MainloopPipeline::Params ml_p;
+    if (role == RLoad) ml_p.role = MainloopPipeline::ThreadCategory::Producer;
+    if (role == RMMA)  ml_p.role = MainloopPipeline::ThreadCategory::Consumer;
+    ml_p.is_leader = lane_pred && is_mma_leader && (role == RLoad);
+    ml_p.transaction_bytes = CM::TmaTransactionBytes;
+    ml_p.initializing_warp = 0;
+    MainloopPipeline mainloop_pipe(ss.pipelines.mainloop, ml_p, cluster_shape,
+                                   true_type{}, false_type{});
+
+    typename EpiLoadPipeline::Params el_p;
+    if (role == REpiL) el_p.role = EpiLoadPipeline::ThreadCategory::Producer;
+    if (role == REpi)  el_p.role = EpiLoadPipeline::ThreadCategory::Consumer;
+    el_p.dst_blockid = cta_rank;
+    el_p.producer_arv_count = 32;
+    el_p.consumer_arv_count = GK::NumEpilogueThreads;
+    el_p.transaction_bytes = CE::TmaTransactionBytes;
+    el_p.initializing_warp = 3;
+    EpiLoadPipeline epi_load_pipe(ss.pipelines.epi_load, el_p);
+
+    typename EpiStorePipeline::Params es_p;
+    es_p.always_wait = true;
+    EpiStorePipeline epi_store_pipe(es_p);
+
+    typename LoadOrderBarrier::Params lo_p;
+    lo_p.group_id = (role == RLoad) ? 0 : 1;
+    lo_p.group_size = 32;
+    lo_p.initializing_warp = 2;
+    LoadOrderBarrier load_order(ss.pipelines.load_order, lo_p);
+
+    typename AccumulatorPipeline::Params ap_p;
+    if (role == RMMA) ap_p.role = AccumulatorPipeline::ThreadCategory::Producer;
+    if (role == REpi) ap_p.role = AccumulatorPipeline::ThreadCategory::Consumer;
+    ap_p.producer_arv_count = 1;
+    ap_p.consumer_arv_count = size(AtomThrShapeMNK{}) * GK::NumEpilogueThreads;
+    ap_p.initializing_warp = 4;
+    AccumulatorPipeline acc_pipe(ss.pipelines.accumulator, ap_p, cluster_shape,
+                                true_type{}, false_type{});
+
+    /* TMEM allocator + sync barriers */
+    TmemAllocator tmem_alloc{};
+    cutlass::arch::NamedBarrier tmem_bar(32 + GK::NumEpilogueThreads,
+        cutlass::arch::ReservedNamedBarriers::TmemAllocBarrier);
+    auto& tmem_dealloc = ss.pipelines.tmem_dealloc;
+    [[maybe_unused]] uint32_t dealloc_phase = 0;
+    if (role == RMMA) {
+        if constexpr (!IsOverlapping) {
+            if (HasPeerCta && lane_pred) tmem_dealloc.init(32);
+        } else {
+            if (HasPeerCta && lane_pred) tmem_dealloc.init(GK::NumEpilogueThreads * 2);
+            else if (lane_pred) tmem_dealloc.init(GK::NumEpilogueThreads);
+        }
+    }
+
+    /* ── Cluster sync ── */
+    cutlass::pipeline_init_arrive_relaxed(cluster_size);
+
+    auto load_inputs = collective_mainloop.load_init(problem_MNKL, ss.tensors.mainloop);
+
+    MainloopPipelineState ml_cons, ml_prod = cutlass::make_producer_start_state<MainloopPipeline>();
+    EpiLoadPipelineState  el_cons, el_prod = cutlass::make_producer_start_state<EpiLoadPipeline>();
+    EpiStorePipelineState es_prod = cutlass::make_producer_start_state<EpiStorePipeline>();
+    AccumulatorPipelineState ac_cons, ac_prod = cutlass::make_producer_start_state<AccumulatorPipeline>();
+
+    auto tmem_st = collective_mainloop.template init_tmem_tensors<EpilogueTile, IsOverlapping>(EpilogueTile{});
+
+    dim3 bid = block_id_in_cluster();
+    mainloop_pipe.init_masks(cluster_shape, bid);
+    acc_pipe.init_masks(cluster_shape, bid);
+
+    cutlass::pipeline_init_wait(cluster_size);
+
+    /* ── Static tile scheduling (linearize 2D/3D grid → flat cluster ID) ── */
+    int bid_linear = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y;
+    int cid = bid_linear / cluster_size;
+    int nc  = (gridDim.x * gridDim.y * gridDim.z) / cluster_size;
+    int tm_count = cute::ceil_div(int(M), int(get<0>(CtaShape_MNK{})));
+    int tn_count = cute::ceil_div(int(N), int(get<1>(CtaShape_MNK{})));
+    int total = tm_count * tn_count;
+    int t0 = (int)((long long)cid * total / nc);
+    int t1 = (int)((long long)(cid+1) * total / nc);
+    int k_tiles = cute::ceil_div(int(K), int(get<2>(TileShape{})));
+
+    /* ═══ WARP DISPATCH ═══ */
+
+    if (role == RLoad) {
+        cutlass::arch::wait_on_dependent_grids();
+        bool do_arrive = epi_load_needed;
+        for (int ti = t0; ti < t1; ti++) {
+            int tm = ti / tn_count, tn = ti % tn_count;
+            if (tm & 1) tn = tn_count - 1 - tn;
+            auto coord = make_coord(tm, tn, _, Int<0>{});
+            auto ki = make_coord_iterator(load_inputs.k_tiles);
+            int prol = min(int(MainloopPipeline::Stages), k_tiles);
+
+            auto [s1,k1] = collective_mainloop.load(mainloop_pipe, ml_prod, load_inputs, coord, ki, prol);
+            ml_prod = s1;
+            if (do_arrive) { load_order.arrive(); do_arrive = false; }
+            auto [s2,k2] = collective_mainloop.load(mainloop_pipe, ml_prod, load_inputs, coord, k1, k_tiles - prol);
+            ml_prod = s2;
+        }
+        collective_mainloop.load_tail(mainloop_pipe, ml_prod);
+    }
+
+    else if (role == RMMA) {
+        tmem_alloc.allocate(TmemAllocator::Sm100TmemCapacityColumns, &ss.tmem_base_ptr);
+        __syncwarp();
+        tmem_bar.arrive();
+        uint32_t tptr = ss.tmem_base_ptr;
+        collective_mainloop.set_tmem_offsets(tmem_st, tptr);
+        auto mma_in = collective_mainloop.mma_init(tmem_st, ss.tensors.mainloop);
+
+        for (int ti = t0; ti < t1; ti++) {
+            int tm = ti / tn_count, tn = ti % tn_count;
+            if (tm & 1) tn = tn_count - 1 - tn;
+            auto coord = make_coord(tm, tn, _, Int<0>{});
+            int as = [&]{ if constexpr(IsOverlapping) return ac_prod.phase()^1; else return ac_prod.index(); }();
+            if (is_mma_leader) {
+                ml_cons = collective_mainloop.mma(
+                    make_tuple(mainloop_pipe, acc_pipe),
+                    make_tuple(ml_cons, ac_prod),
+                    collective_mainloop.slice_accumulator(tmem_st, as),
+                    mma_in, coord, k_tiles);
+                acc_pipe.producer_commit(ac_prod);
+            }
+            ++ac_prod;
+        }
+        cutlass::arch::launch_dependent_grids();
+        tmem_alloc.release_allocation_lock();
+        if constexpr (!IsOverlapping) {
+            if (is_mma_leader) acc_pipe.producer_tail(ac_prod);
+            if constexpr (HasPeerCta) {
+                tmem_dealloc.arrive(peer_rank, !is_mma_leader);
+                tmem_dealloc.wait(dealloc_phase);
+                tmem_dealloc.arrive(peer_rank, is_mma_leader);
+            }
+        } else {
+            tmem_dealloc.wait(dealloc_phase);
+        }
+        tmem_alloc.free(tptr, TmemAllocator::Sm100TmemCapacityColumns);
+    }
+
+    else if (role == RIdle) {
+        /* W2: idle — does nothing after pipeline init + cluster sync */
+    }
+
+    else if (role == REpiL) {
+        if (epi_load_needed) {
+            cutlass::arch::wait_on_dependent_grids();
+            bool do_wait = true;
+            for (int ti = t0; ti < t1; ti++) {
+                int tm = ti / tn_count, tn = ti % tn_count;
+                if (tm & 1) tn = tn_count - 1 - tn;
+                auto coord = make_coord(tm, tn, _, Int<0>{});
+                if (do_wait) { load_order.wait(); do_wait = false; }
+                int w = ti - t0;
+                bool rev = IsOverlapping && (w % 2 == 0);
+                el_prod = collective_epilogue.template load<IsOverlapping>(
+                    epi_load_pipe, el_prod, problem_MNKL, CtaShape_MNK{}, coord,
+                    TileShape{}, TiledMma{}, ss.tensors.epilogue, rev);
+            }
+            collective_epilogue.load_tail(epi_load_pipe, el_prod, epi_store_pipe, es_prod);
+        }
+    }
+
+    else { /* Epilogue W4-W7 */
+        tmem_bar.arrive_and_wait();
+        uint32_t tptr = ss.tmem_base_ptr;
+        collective_mainloop.set_tmem_offsets(tmem_st, tptr);
+        bool did_store = false;
+
+        for (int ti = t0; ti < t1; ti++) {
+            int tm = ti / tn_count, tn = ti % tn_count;
+            if (tm & 1) tn = tn_count - 1 - tn;
+            auto coord = make_coord(tm, tn, _, Int<0>{});
+            int as = [&]{ if constexpr(IsOverlapping) return ac_cons.phase(); else return ac_cons.index(); }();
+            auto acc = get<0>(collective_mainloop.slice_accumulator(tmem_st, as));
+
+            auto [l,s,a] = collective_epilogue.template store<IsOverlapping>(
+                epi_load_pipe, el_cons, epi_store_pipe, es_prod,
+                acc_pipe, ac_cons,
+                problem_MNKL, CtaShape_MNK{}, coord,
+                TileShape{}, TiledMma{}, acc, ss.tensors.epilogue);
+            el_cons = l; es_prod = s; ac_cons = a;
+            did_store = true;
+        }
+
+        if constexpr (IsOverlapping) {
+            if constexpr (HasPeerCta) tmem_dealloc.arrive(peer_rank);
+            tmem_dealloc.arrive();
+        }
+        if (did_store) {
+            collective_epilogue.store_tail(epi_load_pipe, el_cons, epi_store_pipe, es_prod, CtaShape_MNK{});
+        }
+    }
+}
+
+static auto* fc2_phase4_kernel = fc2_phase4_kernel_impl<GemmKernel>;
+
+#endif /* HYBRID_PHASE4 */
+
+/* ═══════════════════════════════════════════════════════════════════
    Host code — identical to fc2_cutlass.cu except launches our kernel
    ═══════════════════════════════════════════════════════════════════ */
 
@@ -584,7 +869,9 @@ int main() {
     printf("ERROR: CUTLASS_ARCH_MMA_SM100_SUPPORTED not defined.\n");
     return 1;
 #else
-#if defined(HYBRID_PHASE3)
+#if defined(HYBRID_PHASE4)
+    printf("FC2 HYBRID Phase 4 — 8-warp, our PTX mainloop + CUTLASS epilogue\n");
+#elif defined(HYBRID_PHASE3)
     printf("FC2 HYBRID Phase 3b — 7-warp custom kernel + CUTLASS epilogue\n");
 #elif defined(HYBRID_MMA)
     printf("FC2 HYBRID Phase 3a — HybridMainloop (unrolled load+K-loop) + CUTLASS epilogue\n");
@@ -712,10 +999,14 @@ int main() {
     auto grid = GemmKernel::get_grid_shape(kernel_params);
     auto block = GemmKernel::get_block_shape();
 
-#ifdef HYBRID_PHASE3
+#if defined(HYBRID_PHASE4)
+    /* Phase 4: 8-warp kernel (our PTX mainloop + CUTLASS epilogue) */
+    auto* the_kernel = (void const*)fc2_phase4_kernel;
+    dim3 custom_block(256, 1, 1);
+#elif defined(HYBRID_PHASE3)
     /* Phase 3b: use our 7-warp kernel */
     auto* the_kernel = (void const*)fc2_phase3_kernel;
-    dim3 phase3_block(224, 1, 1); /* 7 warps */
+    dim3 custom_block(224, 1, 1); /* 7 warps */
 #else
     auto* the_kernel = (void const*)fc2_hybrid_kernel;
 #endif
@@ -727,8 +1018,8 @@ int main() {
 
     printf("  CUTLASS initialized (workspace=%zu, grid=%dx%d, block=%d, smem=%zu)\n",
            ws, grid.x, grid.y,
-#ifdef HYBRID_PHASE3
-           phase3_block.x,
+#if defined(HYBRID_PHASE4) || defined(HYBRID_PHASE3)
+           custom_block.x,
 #else
            block.x,
 #endif
@@ -738,8 +1029,8 @@ int main() {
     auto launch_hybrid = [&](typename GemmKernel::Params& p) {
         cudaLaunchConfig_t config = {};
         config.gridDim = grid;
-#ifdef HYBRID_PHASE3
-        config.blockDim = phase3_block;
+#if defined(HYBRID_PHASE4) || defined(HYBRID_PHASE3)
+        config.blockDim = custom_block;
 #else
         config.blockDim = block;
 #endif
