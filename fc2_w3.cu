@@ -729,6 +729,22 @@ fc2_w3_kernel(
     }
     __syncthreads();
 
+#ifdef WARP_STAGGER
+    /*
+     * Set P6 = (warp_id & 1) for inter-warp stagger.
+     * Epilogue warps W3-W6: P6=1 for {W3,W5}, P6=0 for {W4,W6}.
+     * SASS patching replaces NOPs with @P6 YIELD so odd warps yield.
+     */
+    {
+        unsigned ws;
+        asm volatile("mov.u32 %0, %%warpid;" : "=r"(ws));
+        unsigned bit = ws & 1;
+        asm volatile(
+            "setp.ne.u32 %%p6, %0, 0;" :: "r"(bit)
+        );
+    }
+#endif
+
     /* ════════════════════════════════════════════
        MAIN TILE LOOP
        ════════════════════════════════════════════ */
