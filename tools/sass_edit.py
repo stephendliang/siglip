@@ -5237,8 +5237,8 @@ def cmd_fatbin_patch(args):
             ed.patch_stall(k, addr, val)
             n_ops += 1
 
-        if n_ops == 0:
-            print('No edits specified (use --script, --stall, or --asm)')
+        if n_ops == 0 and not args.identity:
+            print('No edits specified (use --script, --stall, --asm, or --identity)')
             sys.exit(1)
 
         # save patched cubin to another temp file
@@ -5510,6 +5510,8 @@ def main():
     s.add_argument('--kernel', '-k', default=None)
     s.add_argument('--cubin-index', type=int, default=0, help='Which cubin (0=largest)')
     s.add_argument('--force', '-f', action='store_true')
+    s.add_argument('--identity', action='store_true',
+                   help='Identity round-trip (zero edits) — tests pipeline only')
 
     args = p.parse_args()
 
