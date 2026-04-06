@@ -64,13 +64,14 @@ else
     cuobjdump -sass fc2-w3 > "$SASS" 2>/dev/null || die "cuobjdump failed"
 fi
 
-# Run baseline and capture result
-run_and_check() {
+# Run binary and capture @@RESULT line. Returns checksum+valid+ms on stdout.
+# Does NOT require valid=1 — patched builds are compared against baseline.
+run_binary() {
     local label="$1" binary="$2"
     local output
 
     if [ "$DRY_RUN" = "1" ]; then
-        echo "  ./$binary → check valid=1"
+        echo "  ./$binary"
         return 0
     fi
 
@@ -87,27 +88,39 @@ run_and_check() {
         return 1
     fi
 
-    local valid ms
-    valid=$(echo "$result_line" | grep -oP 'valid=\K[0-9]+')
+    local ms cksum valid
     ms=$(echo "$result_line" | grep -oP 'ms=\K[0-9.]+')
+    cksum=$(echo "$result_line" | grep -oP 'checksum=\K[0-9.e+-]+')
+    valid=$(echo "$result_line" | grep -oP 'valid=\K[0-9]+')
+    log "  [$label] OK — ms=$ms checksum=$cksum valid=$valid"
 
-    if [ "$valid" != "1" ]; then
-        log "  [$label] INVALID — valid=$valid ms=$ms"
-        log "  [$label] $result_line"
+    # Return checksum for comparison
+    echo "$cksum"
+    return 0
+}
+
+# Compare patched result against baseline — must produce same checksum
+check_vs_baseline() {
+    local label="$1" binary="$2"
+    local cksum
+    cksum=$(run_binary "$label" "$binary") || return 1
+
+    if [ "$DRY_RUN" = "1" ]; then return 0; fi
+
+    if [ "$cksum" != "$BASELINE_CKSUM" ]; then
+        log "  [$label] MISMATCH — checksum=$cksum vs baseline=$BASELINE_CKSUM"
         return 1
     fi
-
-    log "  [$label] PASS — valid=1 ms=$ms"
-    echo "$ms"
+    log "  [$label] checksum matches baseline"
     return 0
 }
 
 log ""
 log "── Baseline ──"
-BASELINE_MS=""
+BASELINE_CKSUM=""
 if [ "$DRY_RUN" = "0" ]; then
-    BASELINE_MS=$(run_and_check "baseline" "$OUTDIR/baseline") || die "baseline failed — cannot continue"
-    log "  baseline: ${BASELINE_MS}ms"
+    BASELINE_CKSUM=$(run_binary "baseline" "$OUTDIR/baseline") || die "baseline crashed — cannot continue"
+    log "  baseline checksum: $BASELINE_CKSUM"
 fi
 
 should_run() {
@@ -175,7 +188,7 @@ if should_run 0; then
             die "LEVEL 0 FAILED — identity round-trip changes bytes"
         fi
 
-        run_and_check "level0" "$OUTDIR/level0" || die "LEVEL 0 FAILED — identity binary crashes"
+        check_vs_baseline "level0" "$OUTDIR/level0" || die "LEVEL 0 FAILED — identity binary differs"
     fi
 fi
 
@@ -213,7 +226,7 @@ print(insn.stall)
             log "  (not fatal if it still runs correctly)"
         fi
 
-        run_and_check "level1" "$OUTDIR/level1" || die "LEVEL 1 FAILED — null stall patch crashes"
+        check_vs_baseline "level1" "$OUTDIR/level1" || die "LEVEL 1 FAILED — null stall patch differs"
     fi
 fi
 
@@ -238,7 +251,7 @@ if should_run 2; then
         NDIFF=$(cmp -l "$OUTDIR/baseline" "$OUTDIR/level2" | wc -l)
         log "  bytes changed: $NDIFF (expect 1)"
 
-        run_and_check "level2" "$OUTDIR/level2" || die "LEVEL 2 FAILED — stall change on NOP crashes"
+        check_vs_baseline "level2" "$OUTDIR/level2" || die "LEVEL 2 FAILED — stall change on NOP differs"
     fi
 fi
 
@@ -271,7 +284,7 @@ if should_run 3; then
             NDIFF=$(cmp -l "$OUTDIR/baseline" "$OUTDIR/level3" | wc -l)
             log "  bytes changed: $NDIFF"
 
-            run_and_check "level3" "$OUTDIR/level3" || die "LEVEL 3 FAILED — restall-only crashes"
+            check_vs_baseline "level3" "$OUTDIR/level3" || die "LEVEL 3 FAILED — restall-only differs"
         fi
     fi
 fi
@@ -346,7 +359,7 @@ else:
                 NDIFF=$(cmp -l "$OUTDIR/baseline" "$OUTDIR/level4" | wc -l)
                 log "  bytes changed: $NDIFF"
 
-                run_and_check "level4" "$OUTDIR/level4" || die "LEVEL 4 FAILED — single swap crashes"
+                check_vs_baseline "level4" "$OUTDIR/level4" || die "LEVEL 4 FAILED — single swap differs"
             fi
         fi
     fi
@@ -387,7 +400,7 @@ if should_run 5; then
                 NDIFF=$(cmp -l "$OUTDIR/baseline" "$OUTDIR/level5" | wc -l)
                 log "  bytes changed: $NDIFF"
 
-                run_and_check "level5" "$OUTDIR/level5" || die "LEVEL 5 FAILED — full schedule crashes"
+                check_vs_baseline "level5" "$OUTDIR/level5" || die "LEVEL 5 FAILED — full schedule differs"
             fi
         fi
     fi
