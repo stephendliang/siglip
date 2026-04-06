@@ -311,6 +311,55 @@ else
     fi
 fi
 
+# ── Experiment 4: LDS_DRAIN (LSU pipeline drain after STS) ────────
+
+log ""
+log "════════════════════════════════════════"
+log "  EXP 4: LDS_DRAIN"
+log "  (4x @P5 ld.shared after STS, P5=runtime false)"
+log "════════════════════════════════════════"
+
+if [ "$DRY_RUN" = "1" ]; then
+    echo "  make fc2-w3-drain && run N=$N_RUNS"
+else
+    if grep -q 'LDS_DRAIN' fc2_w3.cu 2>/dev/null; then
+        log "Building fc2-w3 with LDS_DRAIN..."
+        if make fc2-w3-drain > "$OUTDIR/drain_build.log" 2>&1; then
+            verify_sass "./fc2-w3-drain" "drain_fused" "$BASELINE_SASS"
+
+            DRAIN_RESULT=$(run_n_times "./fc2-w3-drain" "drain_fused" "$N_RUNS")
+            if ! echo "$DRAIN_RESULT" | grep -qE 'RUN_FAIL|NO_RESULT'; then
+                echo "$DRAIN_RESULT" >> "$OUTDIR/results.txt"
+                DRAIN_MS=$(parse_result "$DRAIN_RESULT" "median")
+                DRAIN_CS=$(parse_result "$DRAIN_RESULT" "checksum")
+                log "  drain_fused: median=${DRAIN_MS}ms"
+
+                if [ "$DRAIN_CS" != "$BASE_CHECKSUM" ]; then
+                    log "  WARNING: checksum mismatch! drain=$DRAIN_CS baseline=$BASE_CHECKSUM"
+                fi
+            else
+                log "  drain_fused: FAILED ($DRAIN_RESULT)"
+            fi
+
+            # Strip variant
+            log "Building fc2-w3 strip+LDS_DRAIN..."
+            if make fc2-w3 DFLAGS="-DSTRIP_EPILOGUE -DLDS_DRAIN" > /dev/null 2>&1; then
+                DRAIN_STRIP_RESULT=$(run_n_times "./fc2-w3" "drain_strip" "$N_RUNS")
+                if ! echo "$DRAIN_STRIP_RESULT" | grep -qE 'RUN_FAIL|NO_RESULT'; then
+                    echo "$DRAIN_STRIP_RESULT" >> "$OUTDIR/results.txt"
+                    DRAIN_STRIP_MS=$(parse_result "$DRAIN_STRIP_RESULT" "median")
+                    log "  drain_strip: median=${DRAIN_STRIP_MS}ms"
+                fi
+            fi
+        else
+            log "  Build failed"
+            tail -5 "$OUTDIR/drain_build.log"
+        fi
+    else
+        log "  SKIPPED: LDS_DRAIN not in fc2_w3.cu"
+    fi
+fi
+
 # ── Summary ────────────────────────────────────────────────────────
 
 log ""
@@ -349,6 +398,10 @@ if [ "$DRY_RUN" = "0" ] && [ -f "$OUTDIR/results.txt" ]; then
     if [ -n "${PRED_MS:-}" ] && [ -n "${PRED_STRIP_MS:-}" ]; then
         epi_pred=$(echo "$PRED_MS - $PRED_STRIP_MS" | bc 2>/dev/null || echo "n/a")
         log "  Predicated epilogue overhead: ${epi_pred}ms (${PRED_MS} - ${PRED_STRIP_MS})"
+    fi
+    if [ -n "${DRAIN_MS:-}" ] && [ -n "${DRAIN_STRIP_MS:-}" ]; then
+        epi_drain=$(echo "$DRAIN_MS - $DRAIN_STRIP_MS" | bc 2>/dev/null || echo "n/a")
+        log "  LDS_DRAIN epilogue overhead: ${epi_drain}ms (${DRAIN_MS} - ${DRAIN_STRIP_MS})"
     fi
 
     log ""

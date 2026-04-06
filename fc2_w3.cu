@@ -745,6 +745,16 @@ fc2_w3_kernel(
     }
 #endif
 
+#ifdef LDS_DRAIN
+    /*
+     * Drain accumulator: XOR'd into drain loads to keep them alive.
+     * Initialized to 0 so XOR is identity. ptxas can't prove it's 0
+     * because it comes from asm volatile.
+     */
+    uint32_t drain_acc = 0;
+    asm volatile("mov.u32 %0, 0;" : "=r"(drain_acc));
+#endif
+
     /* ════════════════════════════════════════════
        MAIN TILE LOOP
        ════════════════════════════════════════════ */
@@ -1104,6 +1114,27 @@ fc2_w3_kernel(
                     }
 
                     /* FENCE + BAR.SYNC: all 4 epilogue warps' STS must be visible */
+#ifdef LDS_DRAIN
+                    /*
+                     * LSU pipeline drain: 4 LDS from addresses 128B apart
+                     * so ptxas can't merge into a single wide load.
+                     * Each feeds drain_acc in its own asm block.
+                     */
+                    { uint32_t _d;
+                    asm volatile("ld.shared.b32 %0, [%1];"
+                        : "=r"(_d) : "r"(stage_base) : "memory");
+                    drain_acc ^= _d;
+                    asm volatile("ld.shared.b32 %0, [%1+128];"
+                        : "=r"(_d) : "r"(stage_base) : "memory");
+                    drain_acc ^= _d;
+                    asm volatile("ld.shared.b32 %0, [%1+256];"
+                        : "=r"(_d) : "r"(stage_base) : "memory");
+                    drain_acc ^= _d;
+                    asm volatile("ld.shared.b32 %0, [%1+384];"
+                        : "=r"(_d) : "r"(stage_base) : "memory");
+                    drain_acc ^= _d;
+                    }
+#endif
 #ifdef CUTLASS_EPILOGUE
                     LDS_DRAIN_AND_FENCE(stage_base);
 #else
@@ -1136,7 +1167,11 @@ fc2_w3_kernel(
 #endif
 
                 /* Signal W1: TMEM buffer free for the next user of prev_buf. */
+#ifdef LDS_DRAIN
+                mbar_arrive((epi_mbar_masked ^ drain_acc) + prev_buf * 8);
+#else
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
+#endif
             }
 #endif /* STRIP_EPILOGUE W3-W6 */
         }
@@ -1214,6 +1249,11 @@ fc2_w3_kernel(
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             ml_phase[last_buf] ^= 1;
+
+#ifdef LDS_DRAIN
+            uint32_t drain_acc = 0;
+            asm volatile("mov.u32 %0, 0;" : "=r"(drain_acc));
+#endif
 
 #if DELAY_TMA_STORE
             int have_pending = 0;
@@ -1383,6 +1423,15 @@ fc2_w3_kernel(
 #endif /* CUTLASS_LOOP >= 3 */
                 }
 
+#ifdef LDS_DRAIN
+                asm volatile(
+                    "{  .reg .b32 __d;\n\t"
+                    "   @%%p5 ld.shared.b32 __d, [%0];\n\t"
+                    "   @%%p5 ld.shared.b32 __d, [%0];\n\t"
+                    "   @%%p5 ld.shared.b32 __d, [%0];\n\t"
+                    "   @%%p5 ld.shared.b32 __d, [%0];\n\t"
+                    "}" :: "r"(stage_base) : "memory");
+#endif
 #ifdef CUTLASS_EPILOGUE
                 LDS_DRAIN_AND_FENCE(stage_base);
 #else
@@ -1413,7 +1462,11 @@ fc2_w3_kernel(
             mbar_arrive(consumed_mbar[pend_stage]);
 #endif
 
+#ifdef LDS_DRAIN
+            mbar_arrive((epi_mbar_masked ^ drain_acc) + last_buf * 8);
+#else
             mbar_arrive(epi_mbar_masked + last_buf * 8);
+#endif
 #endif /* STRIP_EPILOGUE drain W3-W6 */
             } /* close brace for idle-warp else */
         }

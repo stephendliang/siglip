@@ -43,6 +43,9 @@ fc2-w3-fp32: fc2_w3.cu
 fc2-w3-strip: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
 
+fc2-w3-drain: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DLDS_DRAIN $< -o $@ $(LDFLAGS)
+
 # ── FC2 CUTLASS kernel (CUTLASS GemmUniversal, reference epilogue) ──
 fc2-cutlass: fc2_cutlass.cu
 	$(NVCC) $(CFLAGS) $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)
