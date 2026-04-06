@@ -7,14 +7,15 @@
 #   2  Stall+1 on a NOP (harmless real change)
 #   3  Stall-only recipe (restall a region, no reorder)
 #   4  Single swap (two adjacent independent instructions)
-#   5  Full CP-SAT schedule (reorder + restall)
+#   5  Full CP-SAT schedule (reorder + restall, 1 chunk)
+#   6  Full epilogue schedule (all LDTM chunks, parallel CP-SAT)
 #
 # Usage:
 #   ./tools/test_sass_patch.sh           # run all levels
 #   ./tools/test_sass_patch.sh --level 3 # run only level 3
 #   ./tools/test_sass_patch.sh --dry-run # print commands only
 #
-# Requires: GPU (B200), pyelftools, ortools (for level 5)
+# Requires: GPU (B200), pyelftools, ortools (for level 5-6)
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -33,7 +34,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTDIR="data/sass_patch_test_${TIMESTAMP}"
 mkdir -p "$OUTDIR"
 
-log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUTDIR/session.log"; }
+log() { echo "[$(date +%H:%M:%S)] $*" >> "$OUTDIR/session.log"; echo "[$(date +%H:%M:%S)] $*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 
 log "========================================"
@@ -146,11 +147,13 @@ fi
 find_addresses() {
     if [ "$DRY_RUN" = "1" ]; then return; fi
 
-    # Find first NOP with a stall > 0 (good target for harmless edits)
-    NOP_ADDR=$(grep -P '/\*\s*0x[0-9a-f]+\s*\*/\s+NOP;' "$SASS" | head -1 | grep -oP '0x[0-9a-f]+' | head -1)
+    # Find first NOP (good target for harmless edits)
+    NOP_ADDR=$(grep -oP '/\*\s*\K[0-9a-fA-F]+(?=\s*\*/\s+NOP)' "$SASS" | head -1)
+    if [ -n "$NOP_ADDR" ]; then NOP_ADDR="0x$NOP_ADDR"; fi
 
     # Find first STS.128 in epilogue (the instruction we ultimately want to spread)
-    STS_ADDR=$(grep -P '/\*\s*0x[0-9a-f]+\s*\*/\s+STS\.128' "$SASS" | head -1 | grep -oP '0x[0-9a-f]+' | head -1)
+    STS_ADDR=$(grep -oP '/\*\s*\K[0-9a-fA-F]+(?=\s*\*/\s+STS\.128)' "$SASS" | head -1)
+    if [ -n "$STS_ADDR" ]; then STS_ADDR="0x$STS_ADDR"; fi
 
     # Find LDTM boundaries (epilogue chunk delimiters)
     mapfile -t LDTM_ADDRS < <(grep -oP '/\*\s*\K[0-9a-f]+(?=\s*\*/\s+LDTM)' "$SASS")
@@ -159,6 +162,12 @@ find_addresses() {
     # Look for consecutive HFMA2 or FFMA that write different registers
     SWAP_A=""
     SWAP_B=""
+
+    # Fallback: if no NOP, use first LDTM (stall change on any insn is testable)
+    if [ -z "$NOP_ADDR" ] && [ "${#LDTM_ADDRS[@]}" -gt 0 ]; then
+        NOP_ADDR="0x${LDTM_ADDRS[0]}"
+        log "  (no NOP found, using LDTM at $NOP_ADDR as stall target)"
+    fi
 
     log "  Addresses: NOP=$NOP_ADDR STS=$STS_ADDR LDTMs=${#LDTM_ADDRS[@]}"
 }
@@ -401,6 +410,115 @@ if should_run 5; then
                 log "  bytes changed: $NDIFF"
 
                 check_vs_baseline "level5" "$OUTDIR/level5" || die "LEVEL 5 FAILED — full schedule differs"
+            fi
+        fi
+    fi
+fi
+
+# ── Level 6: Full epilogue schedule (all LDTM chunks) ─────────────────────
+#
+# Strategy: schedule all chunks in parallel, then validate each chunk
+# individually on GPU before merging. This finds chunks that cross
+# structural boundaries (e.g., between main loop and drain epilogue)
+# and would produce illegal instructions due to reordered branch targets.
+
+if should_run 6; then
+    log ""
+    log "── Level 6: Full epilogue CP-SAT (all LDTM chunks, validated) ──"
+
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "  Schedule all ${#LDTM_ADDRS[@]} LDTM chunks with CP-SAT, validate each, merge safe ones"
+    else
+        NLDTM=${#LDTM_ADDRS[@]}
+        if [ "$NLDTM" -lt 2 ]; then
+            log "  SKIP — not enough LDTM boundaries (need ≥2, have $NLDTM)"
+        else
+            NCHUNKS=$((NLDTM - 1))
+            log "  $NLDTM LDTMs → $NCHUNKS chunks to schedule"
+
+            # Schedule all chunks in parallel
+            CPSAT_TIME=60
+            declare -a L6_PIDS=() L6_RECIPES=()
+            for ((i=0; i<NCHUNKS; i++)); do
+                CS="0x${LDTM_ADDRS[$i]}"
+                CE="0x${LDTM_ADDRS[$((i+1))]}"
+                CHUNK_RECIPE="$OUTDIR/level6_chunk${i}.recipe"
+                L6_RECIPES+=("$CHUNK_RECIPE")
+                python3 tools/sass_edit.py schedule "$CUBIN" --sass "$SASS" \
+                    -s "$CS" -e "$CE" --recipe "$CHUNK_RECIPE" --time-limit "$CPSAT_TIME" --quiet \
+                    > "$OUTDIR/level6_chunk${i}.log" 2>&1 &
+                L6_PIDS+=($!)
+            done
+
+            log "  waiting for $NCHUNKS CP-SAT solvers (${CPSAT_TIME}s limit each)..."
+            L6_OK=0 L6_FAIL=0
+            for pid in "${L6_PIDS[@]}"; do
+                if wait "$pid"; then ((L6_OK++)); else ((L6_FAIL++)); fi
+            done
+            log "  CP-SAT: $L6_OK/$NCHUNKS chunks scheduled ($L6_FAIL failed)"
+
+            # Validate each chunk individually on GPU
+            log "  validating each chunk individually..."
+            declare -a GOOD_CHUNKS=()
+            for ((i=0; i<NCHUNKS; i++)); do
+                CHUNK_RECIPE="${L6_RECIPES[$i]}"
+                if [ ! -f "$CHUNK_RECIPE" ]; then
+                    continue
+                fi
+                NOPS=$(grep -c -E '^(reorder|stall)' "$CHUNK_RECIPE" 2>/dev/null) || NOPS=0
+                if [ "$NOPS" -lt 1 ]; then
+                    continue
+                fi
+
+                CS="0x${LDTM_ADDRS[$i]}"
+                CE="0x${LDTM_ADDRS[$((i+1))]}"
+                HAS_REORDER=$(grep -c '^reorder' "$CHUNK_RECIPE" 2>/dev/null) || HAS_REORDER=0
+
+                # Patch baseline with just this chunk
+                CHUNK_BIN="$OUTDIR/level6_chunk${i}"
+                if python3 tools/sass_edit.py fatbin-patch "$OUTDIR/baseline" \
+                    --sass "$SASS" --script "$CHUNK_RECIPE" -o "$CHUNK_BIN" \
+                    > "$OUTDIR/level6_chunk${i}_patch.log" 2>&1; then
+
+                    # Run on GPU — check for crash
+                    CHUNK_CKSUM=$(run_binary "chunk${i}" "$CHUNK_BIN") || true
+
+                    if [ -n "$CHUNK_CKSUM" ] && [ "$CHUNK_CKSUM" = "$BASELINE_CKSUM" ]; then
+                        log "  chunk ${i} [$CS, $CE) — PASS (${NOPS} ops, ${HAS_REORDER} reorders)"
+                        GOOD_CHUNKS+=("$i")
+                    else
+                        log "  chunk ${i} [$CS, $CE) — FAIL (crash or checksum mismatch)"
+                    fi
+                else
+                    log "  chunk ${i} [$CS, $CE) — FAIL (fatbin-patch error)"
+                fi
+            done
+
+            log "  validated: ${#GOOD_CHUNKS[@]}/$NCHUNKS chunks safe"
+
+            if [ "${#GOOD_CHUNKS[@]}" -lt 1 ]; then
+                log "  SKIP — no safe chunks"
+            else
+                # Merge only validated chunk recipes
+                MERGED="$OUTDIR/level6_merged.recipe"
+                > "$MERGED"
+                for ci in "${GOOD_CHUNKS[@]}"; do
+                    cat "${L6_RECIPES[$ci]}" >> "$MERGED"
+                done
+
+                TOTAL_OPS=$(grep -c -E '^(reorder|stall)' "$MERGED" 2>/dev/null) || TOTAL_OPS=0
+                TOTAL_REORDERS=$(grep -c '^reorder' "$MERGED" 2>/dev/null) || TOTAL_REORDERS=0
+                TOTAL_STALLS=$(grep -c '^stall' "$MERGED" 2>/dev/null) || TOTAL_STALLS=0
+                log "  merged recipe (safe only): $TOTAL_OPS ops ($TOTAL_REORDERS reorders, $TOTAL_STALLS stalls)"
+
+                python3 tools/sass_edit.py fatbin-patch "$OUTDIR/baseline" \
+                    --sass "$SASS" --script "$MERGED" -o "$OUTDIR/level6" \
+                    > "$OUTDIR/level6_patch.log" 2>&1 || die "level 6 fatbin-patch failed"
+
+                NDIFF=$(cmp -l "$OUTDIR/baseline" "$OUTDIR/level6" | wc -l)
+                log "  bytes changed: $NDIFF"
+
+                check_vs_baseline "level6" "$OUTDIR/level6" || die "LEVEL 6 FAILED — merged safe chunks still differ"
             fi
         fi
     fi
