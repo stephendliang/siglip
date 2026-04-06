@@ -9,7 +9,7 @@ CUTLASS_DIR = third_party/cutlass
 CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUTLASS_FLAGS = -std=c++17 --expt-relaxed-constexpr
 
-.PHONY: all clean timing fc1-gelu fc2 fc2-timing fc2-w3 fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-warp calib-all tma-bench mma-bench stmatrix-bench
+.PHONY: all clean timing fc1-gelu fc2 fc2-timing fc2-w3 fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-w3-self fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-warp calib-all tma-bench mma-bench stmatrix-bench
 
 all: $(TARGET)
 
@@ -45,6 +45,12 @@ fc2-w3-strip: fc2_w3.cu
 
 fc2-w3-drain: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DLDS_DRAIN $< -o $@ $(LDFLAGS)
+
+fc2-w3-reorder: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DEPI_REORDER $< -o $@ $(LDFLAGS)
+
+fc2-w3-self: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DSELF_LOAD $< -o $@ $(LDFLAGS)
 
 # ── FC2 CUTLASS kernel (CUTLASS GemmUniversal, reference epilogue) ──
 fc2-cutlass: fc2_cutlass.cu
@@ -171,5 +177,5 @@ compare-fast:
 	python3 tools/compare_all.py --runs 5 --layer patch_embed --csv data/compare.csv
 
 clean:
-	rm -f $(TARGET) patch_embed_timing fc1-gelu fc2 fc2-w3 fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cublas-bench cublas-bench-fc1 cublas-bench-fc2 calibration calib-tput calib-lat calib-conflict calib-warp tma-bench mma-bench stmatrix-bench
+	rm -f $(TARGET) patch_embed_timing fc1-gelu fc2 fc2-w3 fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-w3-reorder fc2-w3-self fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cublas-bench cublas-bench-fc1 cublas-bench-fc2 calibration calib-tput calib-lat calib-conflict calib-warp tma-bench mma-bench stmatrix-bench
 	rm -rf sass/

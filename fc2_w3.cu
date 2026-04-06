@@ -32,6 +32,12 @@ Compile-time flags:
   -DNUM_EPI_STAGES=N    Epilogue staging depth (default 2, try 3/4)
   -DNO_PRE_STORE_BAR=1  Remove bar.sync before TMA store (each warp stores own region independently)
   -DNO_POST_STORE_BAR=1 Remove bar.sync after TMA store wait (warps decouple across sub-iters)
+  -DCHUNK_REORDER       Odd warps reverse chunk order (1,0 vs 0,1) within each sub-iter
+  -DGROUP_REORDER       Rotate STS group order per-warp (4-phase bank conflict elimination)
+  -DEPI_REORDER         Shorthand for CHUNK_REORDER + GROUP_REORDER + NO_PRE_STORE_BAR
+  -DSELF_LOAD           Per-warp TMA residual load (no W2, no cross-warp sync in epilogue)
+  -DSELF_STAGGER=N      With SELF_LOAD: warp ew sleeps ew*N nanoseconds before first sub-iter
+                        (0=disabled, ~50=non-overlapping STS, ~200=full isolation)
 */
 
 #include <cuda.h>
@@ -107,13 +113,53 @@ Compile-time flags:
 #define NO_POST_STORE_BAR  0
 #endif
 
+/* EPI_REORDER: shorthand for the full inter-warp stagger experiment.
+   CHUNK_REORDER: odd warps reverse chunk order within sub-iter (2-phase temporal stagger,
+     chunks 0/1 hit different SMEM bank halves so concurrent warps avoid bank conflicts).
+   GROUP_REORDER: rotate the 4 STS group calls per-warp (groups 0-3 map to non-overlapping
+     bank sets under SWIZZLE_128B, rotation eliminates remaining cross-warp bank conflicts).
+   Combined with NO_PRE_STORE_BAR to let drift accumulate across sub-iters. */
+#ifdef EPI_REORDER
+#ifndef CHUNK_REORDER
+#define CHUNK_REORDER
+#endif
+#ifndef GROUP_REORDER
+#define GROUP_REORDER
+#endif
+#undef NO_PRE_STORE_BAR
+#define NO_PRE_STORE_BAR 1
+#endif
+
+#if defined(GROUP_REORDER) && (defined(CUTLASS_EPILOGUE) || defined(CUTE_STORE) || CUTLASS_LOOP >= 3)
+#error "GROUP_REORDER only supported with default BF16 epilogue path"
+#endif
+
+#ifdef SELF_LOAD
+#undef NO_PRE_STORE_BAR
+#define NO_PRE_STORE_BAR 1
+#undef NO_POST_STORE_BAR
+#define NO_POST_STORE_BAR 1
+#if SINGLE_WARP_STORE
+#error "SELF_LOAD requires SINGLE_WARP_STORE=0"
+#endif
+#if DELAY_TMA_STORE
+#error "SELF_LOAD incompatible with DELAY_TMA_STORE"
+#endif
+#endif
+
 #if NO_PRE_STORE_BAR && SINGLE_WARP_STORE
 #error "NO_PRE_STORE_BAR requires SINGLE_WARP_STORE=0 (each warp stores its own region)"
 #endif
 #define NUM_EPI_SUBITERS   4
+#ifdef SELF_LOAD
+/* Per-warp TMA load barriers replace W2's shared circular pipe */
+#define OFF_SELF_LOAD_MBAR (OFF_EPILOGUE_MBAR + 16)
+#define _MBAR_END          (OFF_SELF_LOAD_MBAR + NUM_EPI_WARPS * NUM_EPI_STAGES * 8)
+#else
 #define OFF_LOAD_MBAR      (OFF_EPILOGUE_MBAR + 16)             /* W2→epi: stage ready */
 #define OFF_LOAD_CONSUMED  (OFF_LOAD_MBAR + NUM_EPI_STAGES * 8) /* epi→W2: stage released */
 #define _MBAR_END          (OFF_LOAD_CONSUMED + NUM_EPI_STAGES * 8)
+#endif
 
 /* Bias SMEM: 256 BF16 = 512 B */
 #define OFF_BIAS_SMEM      ((_MBAR_END + 15) & ~15)
@@ -653,6 +699,12 @@ fc2_w3_kernel(
                (NUM_EPI_WARPS + 1 + NUM_IDLE_WARPS) warps × 2 CTAs × 32 threads */
             mbar_init(smem_to_uint(smem + OFF_EPILOGUE_MBAR + i * 8), (NUM_EPI_WARPS + 1 + NUM_IDLE_WARPS) * 2 * 32);
         }
+#ifdef SELF_LOAD
+        /* Per-warp TMA load completion barriers */
+        for (int ew = 0; ew < NUM_EPI_WARPS; ew++)
+            for (int s = 0; s < NUM_EPI_STAGES; s++)
+                mbar_init(smem_to_uint(smem + OFF_SELF_LOAD_MBAR + (ew * NUM_EPI_STAGES + s) * 8), 1);
+#else
         /* W2→epilogue: stage ready. W2 arrives with expect_tx. */
         for (int s = 0; s < NUM_EPI_STAGES; s++)
             mbar_init(smem_to_uint(smem + OFF_LOAD_MBAR + s * 8), 1);
@@ -660,6 +712,7 @@ fc2_w3_kernel(
            TMA store completes, structurally guaranteed by BAR.SYNC. */
         for (int s = 0; s < NUM_EPI_STAGES; s++)
             mbar_init(smem_to_uint(smem + OFF_LOAD_CONSUMED + s * 8), NUM_EPI_WARPS * 32);
+#endif
 
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -703,6 +756,7 @@ fc2_w3_kernel(
     int epi_phase[2] = {1, 1};
     int ml_phase[2]  = {start_buf, 1 - start_buf};
 
+#ifndef SELF_LOAD
     /* W2 + epilogue barrier addresses & phases for the circular load pipe. */
     uint32_t load_mbar[NUM_EPI_STAGES];
     uint32_t consumed_mbar[NUM_EPI_STAGES];
@@ -715,6 +769,7 @@ fc2_w3_kernel(
         load_phase[s] = 0;
         load_consumed_phase[s] = 0;
     }
+#endif
 
     /* ── Load bias into SMEM once ── */
     {
@@ -855,7 +910,7 @@ fc2_w3_kernel(
             const int prev_buf = buf ^ 1;
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             ml_phase[prev_buf] ^= 1;
-#ifdef STRIP_EPILOGUE
+#if defined(STRIP_EPILOGUE) || defined(SELF_LOAD)
             if (tile_idx > tile_start)
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
 #else
@@ -932,9 +987,25 @@ fc2_w3_kernel(
 
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
+#ifdef SELF_LOAD
+                uint32_t self_mbar_arr[NUM_EPI_STAGES];
+                int self_mbar_phase[NUM_EPI_STAGES] = {0};
+                for (int s = 0; s < NUM_EPI_STAGES; s++)
+                    self_mbar_arr[s] = smem_to_uint(smem + OFF_SELF_LOAD_MBAR + (ew * NUM_EPI_STAGES + s) * 8);
+#endif
+
 #if DELAY_TMA_STORE
                 int have_pending = 0;
                 int pend_nc, pend_stage;
+#endif
+
+#if defined(SELF_LOAD) && defined(SELF_STAGGER) && SELF_STAGGER > 0
+                /* Deliberate initial offset: spread warps temporally.
+                   Warp 0 starts immediately, warp ew sleeps ew*SELF_STAGGER ns. */
+                if (ew > 0) {
+                    uint32_t _ns = (uint32_t)ew * SELF_STAGGER;
+                    asm volatile("nanosleep.u32 %0;" :: "r"(_ns));
+                }
 #endif
 
 #if CUTLASS_LOOP >= 1
@@ -955,9 +1026,29 @@ fc2_w3_kernel(
                     }
 #endif
 
+#ifdef SELF_LOAD
+                    /* Wait for 2-ago TMA store before reusing SMEM stage */
+                    if (si >= NUM_EPI_STAGES) {
+                        if (lane == 0)
+                            asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
+                        __syncwarp();
+                    }
+                    /* Issue per-warp TMA load: 32 rows × 64 cols */
+                    if (lane == 0) {
+                        const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING
+                            + stage * EPI_STAGE_BYTES + ew * STAGING_REGION_BYTES);
+                        mbar_arrive_expect_tx(self_mbar_arr[stage], STAGING_REGION_BYTES);
+                        tma_load_2d_cta(res_dst, &tma_res,
+                                        prev_n + si * 64, prev_m + ew * 32,
+                                        self_mbar_arr[stage]);
+                    }
+                    mbar_wait(self_mbar_arr[stage], self_mbar_phase[stage]);
+                    self_mbar_phase[stage] ^= 1;
+#else
                     /* Wait for W2's TMA load to land for this sub-iteration. */
                     mbar_wait(load_mbar[stage], load_phase[stage]);
                     load_phase[stage] ^= 1;
+#endif
 
                     /* Process 2 chunks of 32 cols each */
                     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
@@ -978,7 +1069,12 @@ fc2_w3_kernel(
 #if CUTLASS_LOOP >= 2
                     PRAGMA_UNROLL(1)
 #endif
-                    for (int chunk = 0; chunk < 2; chunk++) {
+                    for (int _ci = 0; _ci < 2; _ci++) {
+#ifdef CHUNK_REORDER
+                        const int chunk = (ew & 1) ? (1 - _ci) : _ci;
+#else
+                        const int chunk = _ci;
+#endif
                         const int nc = nc_base + chunk * 32;
 
                         /* TMEM load: 32 FP32 accumulators */
@@ -1096,6 +1192,28 @@ fc2_w3_kernel(
                             bv3.x,bv3.y,bv3.z,bv3.w,
                             rv3.x,rv3.y,rv3.z,rv3.w, stage_cptr + rsw3);
 #else
+#ifdef GROUP_REORDER
+                        /* Rotate STS group order by ew: at each time step, 4 warps
+                           write to 4 disjoint SMEM bank sets (SWIZZLE_128B). */
+#define _GR0 BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, \
+    bv0.x,bv0.y,bv0.z,bv0.w, rv0.x,rv0.y,rv0.z,rv0.w, stage_base + rsw0)
+#define _GR1 BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, \
+    bv1.x,bv1.y,bv1.z,bv1.w, rv1.x,rv1.y,rv1.z,rv1.w, stage_base + rsw1)
+#define _GR2 BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, \
+    bv2.x,bv2.y,bv2.z,bv2.w, rv2.x,rv2.y,rv2.z,rv2.w, stage_base + rsw2)
+#define _GR3 BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, \
+    bv3.x,bv3.y,bv3.z,bv3.w, rv3.x,rv3.y,rv3.z,rv3.w, stage_base + rsw3)
+                        switch (ew) {
+                        case 0: _GR0; _GR1; _GR2; _GR3; break;
+                        case 1: _GR1; _GR2; _GR3; _GR0; break;
+                        case 2: _GR2; _GR3; _GR0; _GR1; break;
+                        case 3: _GR3; _GR0; _GR1; _GR2; break;
+                        }
+#undef _GR0
+#undef _GR1
+#undef _GR2
+#undef _GR3
+#else
                         BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                             bv0.x,bv0.y,bv0.z,bv0.w,
                             rv0.x,rv0.y,rv0.z,rv0.w, stage_base + rsw0);
@@ -1108,6 +1226,7 @@ fc2_w3_kernel(
                         BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
                             bv3.x,bv3.y,bv3.z,bv3.w,
                             rv3.x,rv3.y,rv3.z,rv3.w, stage_base + rsw3);
+#endif /* GROUP_REORDER */
 #endif /* CUTE_STORE */
 #endif /* CUTLASS_EPILOGUE */
 #endif /* CUTLASS_LOOP >= 3 */
@@ -1144,7 +1263,9 @@ fc2_w3_kernel(
                     asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 #endif
 
-#if DELAY_TMA_STORE
+#ifdef SELF_LOAD
+                    EPI_STORE(stage, nc_base, prev_n, prev_m);
+#elif DELAY_TMA_STORE
                     have_pending = 1;
                     pend_nc = nc_base;
                     pend_stage = stage;
@@ -1158,7 +1279,12 @@ fc2_w3_kernel(
 #endif
                 }
 
-#if DELAY_TMA_STORE
+#ifdef SELF_LOAD
+                /* Drain all outstanding TMA stores */
+                if (lane == 0)
+                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                __syncwarp();
+#elif DELAY_TMA_STORE
                 /* Drain delayed pipeline: issue last store + drain all */
                 EPI_STORE(pend_stage, pend_nc, prev_n, prev_m);
                 EPI_WAIT(1);
@@ -1192,7 +1318,7 @@ fc2_w3_kernel(
         } else if (warp == 1) {
             /* W1: nothing — already committed mainloop_mbar */
         } else if (warp == 2) {
-#ifdef STRIP_EPILOGUE
+#if defined(STRIP_EPILOGUE) || defined(SELF_LOAD)
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
             ml_phase[last_buf] ^= 1;
             mbar_arrive(epi_mbar_masked + last_buf * 8);
@@ -1217,7 +1343,7 @@ fc2_w3_kernel(
             }
 
             mbar_arrive(epi_mbar_masked + last_buf * 8);
-#endif /* STRIP_EPILOGUE drain W2 */
+#endif /* STRIP_EPILOGUE/SELF_LOAD drain W2 */
 
         } else {
 #if NUM_IDLE_WARPS > 0 && !defined(STRIP_EPILOGUE)
@@ -1250,6 +1376,13 @@ fc2_w3_kernel(
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             ml_phase[last_buf] ^= 1;
 
+#ifdef SELF_LOAD
+            uint32_t self_mbar_arr[NUM_EPI_STAGES];
+            int self_mbar_phase[NUM_EPI_STAGES] = {0};
+            for (int s = 0; s < NUM_EPI_STAGES; s++)
+                self_mbar_arr[s] = smem_to_uint(smem + OFF_SELF_LOAD_MBAR + (ew * NUM_EPI_STAGES + s) * 8);
+#endif
+
 #ifdef LDS_DRAIN
             uint32_t drain_acc = 0;
             asm volatile("mov.u32 %0, 0;" : "=r"(drain_acc));
@@ -1258,6 +1391,13 @@ fc2_w3_kernel(
 #if DELAY_TMA_STORE
             int have_pending = 0;
             int pend_nc, pend_stage;
+#endif
+
+#if defined(SELF_LOAD) && defined(SELF_STAGGER) && SELF_STAGGER > 0
+            if (ew > 0) {
+                uint32_t _ns = (uint32_t)ew * SELF_STAGGER;
+                asm volatile("nanosleep.u32 %0;" :: "r"(_ns));
+            }
 #endif
 
 #if CUTLASS_LOOP >= 1
@@ -1276,8 +1416,28 @@ fc2_w3_kernel(
                 }
 #endif
 
+#ifdef SELF_LOAD
+                /* Wait for 2-ago TMA store before reusing SMEM stage */
+                if (si >= NUM_EPI_STAGES) {
+                    if (lane == 0)
+                        asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
+                    __syncwarp();
+                }
+                /* Issue per-warp TMA load: 32 rows × 64 cols */
+                if (lane == 0) {
+                    const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING
+                        + stage * EPI_STAGE_BYTES + ew * STAGING_REGION_BYTES);
+                    mbar_arrive_expect_tx(self_mbar_arr[stage], STAGING_REGION_BYTES);
+                    tma_load_2d_cta(res_dst, &tma_res,
+                                    last_n + si * 64, last_m + ew * 32,
+                                    self_mbar_arr[stage]);
+                }
+                mbar_wait(self_mbar_arr[stage], self_mbar_phase[stage]);
+                self_mbar_phase[stage] ^= 1;
+#else
                 mbar_wait(load_mbar[stage], load_phase[stage]);
                 load_phase[stage] ^= 1;
+#endif
 
                 float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
                 float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
@@ -1296,7 +1456,12 @@ fc2_w3_kernel(
 #if CUTLASS_LOOP >= 2
                 PRAGMA_UNROLL(1)
 #endif
-                for (int chunk = 0; chunk < 2; chunk++) {
+                for (int _ci = 0; _ci < 2; _ci++) {
+#ifdef CHUNK_REORDER
+                    const int chunk = (ew & 1) ? (1 - _ci) : _ci;
+#else
+                    const int chunk = _ci;
+#endif
                     const int nc = nc_base + chunk * 32;
 
                     TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,
@@ -1406,6 +1571,26 @@ fc2_w3_kernel(
                         bv3.x,bv3.y,bv3.z,bv3.w,
                         rv3.x,rv3.y,rv3.z,rv3.w, stage_cptr + rsw3);
 #else
+#ifdef GROUP_REORDER
+#define _GR0 BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, \
+    bv0.x,bv0.y,bv0.z,bv0.w, rv0.x,rv0.y,rv0.z,rv0.w, stage_base + rsw0)
+#define _GR1 BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15, \
+    bv1.x,bv1.y,bv1.z,bv1.w, rv1.x,rv1.y,rv1.z,rv1.w, stage_base + rsw1)
+#define _GR2 BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23, \
+    bv2.x,bv2.y,bv2.z,bv2.w, rv2.x,rv2.y,rv2.z,rv2.w, stage_base + rsw2)
+#define _GR3 BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31, \
+    bv3.x,bv3.y,bv3.z,bv3.w, rv3.x,rv3.y,rv3.z,rv3.w, stage_base + rsw3)
+                    switch (ew) {
+                    case 0: _GR0; _GR1; _GR2; _GR3; break;
+                    case 1: _GR1; _GR2; _GR3; _GR0; break;
+                    case 2: _GR2; _GR3; _GR0; _GR1; break;
+                    case 3: _GR3; _GR0; _GR1; _GR2; break;
+                    }
+#undef _GR0
+#undef _GR1
+#undef _GR2
+#undef _GR3
+#else
                     BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                         bv0.x,bv0.y,bv0.z,bv0.w,
                         rv0.x,rv0.y,rv0.z,rv0.w, stage_base + rsw0);
@@ -1418,6 +1603,7 @@ fc2_w3_kernel(
                     BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
                         bv3.x,bv3.y,bv3.z,bv3.w,
                         rv3.x,rv3.y,rv3.z,rv3.w, stage_base + rsw3);
+#endif /* GROUP_REORDER */
 #endif /* CUTE_STORE */
 #endif /* CUTLASS_EPILOGUE */
 #endif /* CUTLASS_LOOP >= 3 */
@@ -1441,7 +1627,9 @@ fc2_w3_kernel(
                 asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 #endif
 
-#if DELAY_TMA_STORE
+#ifdef SELF_LOAD
+                EPI_STORE(stage, nc_base, last_n, last_m);
+#elif DELAY_TMA_STORE
                 have_pending = 1;
                 pend_nc = nc_base;
                 pend_stage = stage;
@@ -1455,7 +1643,12 @@ fc2_w3_kernel(
 #endif
             }
 
-#if DELAY_TMA_STORE
+#ifdef SELF_LOAD
+            /* Drain all outstanding TMA stores */
+            if (lane == 0)
+                asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+            __syncwarp();
+#elif DELAY_TMA_STORE
             EPI_STORE(pend_stage, pend_nc, last_n, last_m);
             EPI_WAIT(1);
             mbar_arrive(consumed_mbar[(NUM_EPI_SUBITERS - 2) % NUM_EPI_STAGES]);
@@ -1497,8 +1690,13 @@ __global__ void init_residual(__nv_bfloat16* __restrict__ res, int n_dim, long l
 
 int main() {
     setbuf(stdout, NULL);
+#ifdef SELF_LOAD
+    printf("FC2 W3 kernel — %d warps (%d idle), SELF_LOAD epilogue (per-warp TMA)\n",
+           NUM_WARPS, NUM_IDLE_WARPS);
+#else
     printf("FC2 W3 kernel — %d warps (%d idle), shared-SMEM epilogue\n",
            NUM_WARPS, NUM_IDLE_WARPS);
+#endif
     printf("  GEMM: [%d,%d] x [%d,%d]^T  %d-stage pipeline  SMEM: %d bytes\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, N_STAGES, SMEM_BYTES);
     printf("  EPI: stages=%d  SWS=%d  DTS=%d  FP32=%d  CPP=%d\n",
@@ -1595,7 +1793,11 @@ int main() {
     {
         uint64_t dims[2]    = {(uint64_t)N_DIM, (uint64_t)M_TOTAL};
         uint64_t strides[1] = {(uint64_t)N_DIM * sizeof(__nv_bfloat16)};
+#ifdef SELF_LOAD
+        uint32_t box[2]     = {64, 32};   /* Per-warp: 32 rows × 64 cols */
+#else
         uint32_t box[2]     = {64, 128};  /* W2 loads full 128 rows × 64 cols per sub-iter */
+#endif
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_res,
             CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_residual,
