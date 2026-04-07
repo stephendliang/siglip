@@ -49,6 +49,9 @@ fc2-w3-drain: fc2_w3.cu
 fc2-w3-reorder: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DEPI_REORDER $< -o $@ $(LDFLAGS)
 
+fc2-w3-bidir: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DBIDIR_SNAKE $< -o $@ $(LDFLAGS)
+
 fc2-w3-self: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSELF_LOAD $< -o $@ $(LDFLAGS)
 

@@ -780,7 +780,14 @@ fc2_w3_kernel(
     int _prev_tile = -1;
 #else
     const int tile_stride = num_clusters;  /* strided: cluster 0 gets 0,74,148,... */
+#ifdef BIDIR_SNAKE
+    /* Even clusters go forward (0,74,148,...), odd clusters go backward (10877,10803,...) */
+    const bool reverse = (cluster_id & 1);
+    const int fwd_id = reverse ? (num_clusters - 1 - cluster_id) : cluster_id;
+    const int tile_count = (TOTAL_TILES - fwd_id + tile_stride - 1) / tile_stride;
+#else
     const int tile_count  = (TOTAL_TILES - cluster_id + tile_stride - 1) / tile_stride;
+#endif
 #endif
 
     int tma_phase[N_STAGES] = {0};
@@ -914,7 +921,12 @@ fc2_w3_kernel(
         const int buf = _iter & 1;
 #else
     for (int _ti = 0; _ti < tile_count; _ti++) {
+#ifdef BIDIR_SNAKE
+        const int fwd_tile = fwd_id + _ti * tile_stride;
+        const int tile_idx = reverse ? (TOTAL_TILES - 1 - fwd_tile) : fwd_tile;
+#else
         const int tile_idx = cluster_id + _ti * tile_stride;
+#endif
         const int buf = _ti & 1;
 #endif
         const int tm = tile_idx / TILES_N;
@@ -1026,6 +1038,9 @@ fc2_w3_kernel(
             if (has_prev) {
 #if TILE_DISPATCH >= 1
                 const int prev_idx = _prev_tile;
+#elif defined(BIDIR_SNAKE)
+                const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
+                const int prev_idx = reverse ? (TOTAL_TILES - 1 - prev_fwd) : prev_fwd;
 #else
                 const int prev_idx = tile_idx - tile_stride;
 #endif
@@ -1089,6 +1104,9 @@ fc2_w3_kernel(
             if (has_prev) {
 #if TILE_DISPATCH >= 1
                 const int prev_idx = _prev_tile;
+#elif defined(BIDIR_SNAKE)
+                const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
+                const int prev_idx = reverse ? (TOTAL_TILES - 1 - prev_fwd) : prev_fwd;
 #else
                 const int prev_idx = tile_idx - tile_stride;
 #endif
@@ -1431,7 +1449,12 @@ fc2_w3_kernel(
         const int last_idx = _prev_tile;
         const int last_buf = (_iter - 1) & 1;
 #else
+#ifdef BIDIR_SNAKE
+        const int last_fwd = fwd_id + (tile_count - 1) * tile_stride;
+        const int last_idx = reverse ? (TOTAL_TILES - 1 - last_fwd) : last_fwd;
+#else
         const int last_idx = cluster_id + (tile_count - 1) * tile_stride;
+#endif
         const int last_buf = (tile_count - 1) & 1;
 #endif
         const int ltm = last_idx / TILES_N;
