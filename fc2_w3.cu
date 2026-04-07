@@ -87,7 +87,9 @@ Compile-time flags:
 #endif
 
 /* ── Threads ── */
+#ifndef NUM_EPI_WARPS
 #define NUM_EPI_WARPS  4
+#endif
 #ifndef NUM_IDLE_WARPS
 #define NUM_IDLE_WARPS 0
 #endif
@@ -200,8 +202,9 @@ Compile-time flags:
 /* Epilogue staging: ReuseSmemC — 2-stage circular pipe.
    Each stage holds 128 rows × 64 cols × 2B = 16 KB, used for BOTH residual
    load and output store sequentially (residual overwritten by output after LDS). */
+#define EPI_ROW_GROUPS     4                                     /* 128 rows / 32 per group — always 4 */
 #define STAGING_REGION_BYTES  (32 * 128)                        /* 4096 B: 32 rows × 64 cols × 2B */
-#define EPI_STAGE_BYTES    (4 * STAGING_REGION_BYTES)           /* 16384: 128 rows × 64 cols × 2B */
+#define EPI_STAGE_BYTES    (EPI_ROW_GROUPS * STAGING_REGION_BYTES)  /* 16384: 128 rows × 64 cols × 2B */
 
 #define OFF_STAGING        ((OFF_BIAS_SMEM + BIAS_SMEM_BYTES + 1023) & ~1023)  /* 1024-align */
 /* Stage si: OFF_STAGING + si * EPI_STAGE_BYTES
@@ -605,7 +608,7 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 #if SINGLE_WARP_STORE
 #define EPI_STORE(STAGE, NC, PN, PM) do { \
     if (ew == 0 && lane == 0) { \
-        for (int rg_ = 0; rg_ < NUM_EPI_WARPS; rg_++) { \
+        for (int rg_ = 0; rg_ < EPI_ROW_GROUPS; rg_++) { \
             const uint32_t s_ = smem_to_uint(smem + OFF_STAGING \
                 + (STAGE) * EPI_STAGE_BYTES + rg_ * STAGING_REGION_BYTES); \
             asm volatile( \
@@ -1103,9 +1106,8 @@ fc2_w3_kernel(
             if (has_prev)
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
 #else
-            /* ── W3-W6: Epilogue compute — ReuseSmemC, BAR.SYNC coordinated ── */
-            const int ew = warp - 3;                           /* 0..3 */
-            const int row_group = ew;                          /* rows ew*32..(ew+1)*32-1 */
+            /* ── W3+: Epilogue compute — ReuseSmemC, BAR.SYNC coordinated ── */
+            const int ew = warp - 3;                           /* 0..NUM_EPI_WARPS-1 */
             const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
 
             /* Swizzle constants (SWIZZLE_128B: 128-byte rows, XOR with lane-group) */
@@ -1130,8 +1132,6 @@ fc2_w3_kernel(
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
                 const int prev_m = ptm * TM * 2 + cta_rank * TM;
                 const int prev_n = ptn * TN;
-                const int gm_base = prev_m + row_group * 32;
-                const int taddr_base = prev_buf * TN + ((cta_rank * 128 + row_group * 32) << 16);
 
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
@@ -1197,6 +1197,9 @@ fc2_w3_kernel(
                     mbar_wait(load_mbar[stage], load_phase[stage]);
                     load_phase[stage] ^= 1;
 #endif
+
+                  for (int row_group = ew; row_group < EPI_ROW_GROUPS; row_group += NUM_EPI_WARPS) {
+                    const int taddr_base = prev_buf * TN + ((cta_rank * 128 + row_group * 32) << 16);
 
                     /* Process 2 chunks of 32 cols each */
                     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
@@ -1379,31 +1382,31 @@ fc2_w3_kernel(
 #endif /* CUTLASS_EPILOGUE */
 #endif /* CUTLASS_LOOP >= 3 */
                     }
+                  } /* row_group loop */
 
-                    /* FENCE + BAR.SYNC: all 4 epilogue warps' STS must be visible */
+                    /* FENCE + BAR.SYNC: all epilogue warps' STS must be visible */
 #ifdef LDS_DRAIN
-                    /*
-                     * LSU pipeline drain: 4 LDS from addresses 128B apart
-                     * so ptxas can't merge into a single wide load.
-                     * Each feeds drain_acc in its own asm block.
-                     */
                     { uint32_t _d;
+                    const uint32_t drain_base = smem_to_uint(smem + OFF_STAGING
+                        + stage * EPI_STAGE_BYTES + ew * STAGING_REGION_BYTES + lane * 128);
                     asm volatile("ld.shared.b32 %0, [%1];"
-                        : "=r"(_d) : "r"(stage_base) : "memory");
+                        : "=r"(_d) : "r"(drain_base) : "memory");
                     drain_acc ^= _d;
                     asm volatile("ld.shared.b32 %0, [%1+128];"
-                        : "=r"(_d) : "r"(stage_base) : "memory");
+                        : "=r"(_d) : "r"(drain_base) : "memory");
                     drain_acc ^= _d;
                     asm volatile("ld.shared.b32 %0, [%1+256];"
-                        : "=r"(_d) : "r"(stage_base) : "memory");
+                        : "=r"(_d) : "r"(drain_base) : "memory");
                     drain_acc ^= _d;
                     asm volatile("ld.shared.b32 %0, [%1+384];"
-                        : "=r"(_d) : "r"(stage_base) : "memory");
+                        : "=r"(_d) : "r"(drain_base) : "memory");
                     drain_acc ^= _d;
                     }
 #endif
 #ifdef CUTLASS_EPILOGUE
-                    LDS_DRAIN_AND_FENCE(stage_base);
+                    { const uint32_t drain_base = smem_to_uint(smem + OFF_STAGING
+                        + stage * EPI_STAGE_BYTES + ew * STAGING_REGION_BYTES + lane * 128);
+                    LDS_DRAIN_AND_FENCE(drain_base); }
 #else
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 #endif
@@ -1411,14 +1414,18 @@ fc2_w3_kernel(
                     asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 #endif
 
+                  for (int _rg2 = ew; _rg2 < EPI_ROW_GROUPS; _rg2 += NUM_EPI_WARPS) {
 #ifdef SELF_LOAD
-                    EPI_STORE(stage, nc_base, prev_n, prev_m);
+                    { const int row_group = _rg2; EPI_STORE(stage, nc_base, prev_n, prev_m); }
 #elif DELAY_TMA_STORE
                     have_pending = 1;
                     pend_nc = nc_base;
                     pend_stage = stage;
 #else
-                    EPI_STORE(stage, nc_base, prev_n, prev_m);
+                    { const int row_group = _rg2; EPI_STORE(stage, nc_base, prev_n, prev_m); }
+#endif
+                  }
+#if !defined(SELF_LOAD) && !defined(DELAY_TMA_STORE)
                     EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
                     if (si > 0)
                         mbar_arrive(consumed_mbar[(si - 1) % NUM_EPI_STAGES]);
@@ -1447,7 +1454,7 @@ fc2_w3_kernel(
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
 #endif
             }
-#endif /* STRIP_EPILOGUE W3-W6 */
+#endif /* STRIP_EPILOGUE W3+ */
         }
 #if TILE_DISPATCH >= 1
         _prev_tile = tile_idx;
@@ -1526,17 +1533,14 @@ fc2_w3_kernel(
             ml_phase[last_buf] ^= 1;
             mbar_arrive(epi_mbar_masked + last_buf * 8);
 #else
-            /* W3-W6: epilogue for last tile (ReuseSmemC) */
+            /* W3+: epilogue for last tile (ReuseSmemC) */
             const int ew = warp - 3;
-            const int row_group = ew;
             const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
             const uint32_t xor_val = (lane & 7) << 4;
             const uint32_t sw0 = 0 ^ xor_val, sw1 = 16 ^ xor_val;
             const uint32_t sw2 = 32 ^ xor_val, sw3 = 48 ^ xor_val;
             const uint32_t sw4 = 64 ^ xor_val, sw5 = 80 ^ xor_val;
             const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
-            const int gm_base = last_m + row_group * 32;
-            const int taddr_base = last_buf * TN + ((cta_rank * 128 + row_group * 32) << 16);
 
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
@@ -1604,6 +1608,9 @@ fc2_w3_kernel(
                 mbar_wait(load_mbar[stage], load_phase[stage]);
                 load_phase[stage] ^= 1;
 #endif
+
+              for (int row_group = ew; row_group < EPI_ROW_GROUPS; row_group += NUM_EPI_WARPS) {
+                const int taddr_base = last_buf * TN + ((cta_rank * 128 + row_group * 32) << 16);
 
                 float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
                 float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
@@ -1774,18 +1781,23 @@ fc2_w3_kernel(
 #endif /* CUTLASS_EPILOGUE */
 #endif /* CUTLASS_LOOP >= 3 */
                 }
+              } /* row_group loop */
 
 #ifdef LDS_DRAIN
+                { const uint32_t drain_base = smem_to_uint(smem + OFF_STAGING
+                    + stage * EPI_STAGE_BYTES + ew * STAGING_REGION_BYTES + lane * 128);
                 asm volatile(
                     "{  .reg .b32 __d;\n\t"
                     "   @%%p5 ld.shared.b32 __d, [%0];\n\t"
                     "   @%%p5 ld.shared.b32 __d, [%0];\n\t"
                     "   @%%p5 ld.shared.b32 __d, [%0];\n\t"
                     "   @%%p5 ld.shared.b32 __d, [%0];\n\t"
-                    "}" :: "r"(stage_base) : "memory");
+                    "}" :: "r"(drain_base) : "memory"); }
 #endif
 #ifdef CUTLASS_EPILOGUE
-                LDS_DRAIN_AND_FENCE(stage_base);
+                { const uint32_t drain_base = smem_to_uint(smem + OFF_STAGING
+                    + stage * EPI_STAGE_BYTES + ew * STAGING_REGION_BYTES + lane * 128);
+                LDS_DRAIN_AND_FENCE(drain_base); }
 #else
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 #endif
@@ -1793,14 +1805,18 @@ fc2_w3_kernel(
                 asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 #endif
 
+              for (int _rg2 = ew; _rg2 < EPI_ROW_GROUPS; _rg2 += NUM_EPI_WARPS) {
 #ifdef SELF_LOAD
-                EPI_STORE(stage, nc_base, last_n, last_m);
+                { const int row_group = _rg2; EPI_STORE(stage, nc_base, last_n, last_m); }
 #elif DELAY_TMA_STORE
                 have_pending = 1;
                 pend_nc = nc_base;
                 pend_stage = stage;
 #else
-                EPI_STORE(stage, nc_base, last_n, last_m);
+                { const int row_group = _rg2; EPI_STORE(stage, nc_base, last_n, last_m); }
+#endif
+              }
+#if !defined(SELF_LOAD) && !defined(DELAY_TMA_STORE)
                 EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
                 if (si > 0)
                     mbar_arrive(consumed_mbar[(si - 1) % NUM_EPI_STAGES]);
@@ -1826,7 +1842,7 @@ fc2_w3_kernel(
 #else
             mbar_arrive(epi_mbar_masked + last_buf * 8);
 #endif
-#endif /* STRIP_EPILOGUE drain W3-W6 */
+#endif /* STRIP_EPILOGUE drain W3+ */
             } /* close brace for idle-warp else */
         }
     }
