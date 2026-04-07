@@ -1,13 +1,15 @@
 #!/bin/bash
 # FC2 ncu diagnosis — targeted metric collection for comparison pairs.
 #
-# Profiles: w3 (ours), atomic (work-stealing), CUTLASS, hybrid, Phase 4
+# Profiles: w3 (static), atomic (cluster barrier), spin (flag spin),
+#           grid (non-persistent), CUTLASS, hybrid, Phase 4
 # Each in fused + strip variants.
 #
-# Q1: Epilogue overhead (fused vs strip) for w3, atomic, and CUTLASS
+# Q1: Epilogue overhead (fused vs strip) for each dispatch mode
 # Q2: Architecture gap (w3 vs CUTLASS) for both fused and strip
 # Q3: Phase 4 broken (2.77ms vs 1.22ms)
 # Q4: L2 locality (w3 vs atomic, atomic vs CUTLASS)
+# Dispatch: spin vs atomic, grid vs CUTLASS (dispatch overhead isolation)
 #
 # Usage:
 #   ./tools/fc2_ncu_bench.sh                # full run
@@ -114,6 +116,10 @@ if [ "$ONLY_PHASE4" = "0" ]; then
         "w3_fused|make -B fc2-w3|./fc2-w3|fc2_w3_kernel"
         "atomic_strip|make -B fc2-w3-atomic DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-w3-atomic:fc2-w3-atomic-strip|fc2_w3_kernel"
         "atomic_fused|make -B fc2-w3-atomic|./fc2-w3-atomic|fc2_w3_kernel"
+        "spin_strip|make -B fc2-w3-spin DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-w3-spin:fc2-w3-spin-strip|fc2_w3_kernel"
+        "spin_fused|make -B fc2-w3-spin|./fc2-w3-spin|fc2_w3_kernel"
+        "grid_strip|make -B fc2-w3-grid DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-w3-grid:fc2-w3-grid-strip|fc2_w3_kernel"
+        "grid_fused|make -B fc2-w3-grid|./fc2-w3-grid|fc2_w3_kernel"
         "cutlass_fused|make fc2-cutlass|./fc2-cutlass|regex:^(?!init)"
         "cutlass_strip|make fc2-cutlass-strip|./fc2-cutlass-strip|regex:^(?!init)"
         "hybrid_fused|make fc2-hybrid|./fc2-hybrid|regex:fc2_hybrid_kernel"
@@ -278,13 +284,20 @@ if [ "$DRY_RUN" = "0" ]; then
     if [ "$ONLY_PHASE4" = "0" ]; then
         run_diff "diff_q1"            "$OUTDIR/w3_strip.csv"      "$OUTDIR/w3_fused.csv"
         run_diff "diff_q1_cutlass"    "$OUTDIR/cutlass_strip.csv" "$OUTDIR/cutlass_fused.csv"
-        run_diff "diff_q1_atomic"      "$OUTDIR/atomic_strip.csv"  "$OUTDIR/atomic_fused.csv"
+        run_diff "diff_q1_atomic"     "$OUTDIR/atomic_strip.csv"  "$OUTDIR/atomic_fused.csv"
+        run_diff "diff_q1_spin"       "$OUTDIR/spin_strip.csv"    "$OUTDIR/spin_fused.csv"
+        run_diff "diff_q1_grid"       "$OUTDIR/grid_strip.csv"    "$OUTDIR/grid_fused.csv"
         run_diff "diff_q2"            "$OUTDIR/w3_fused.csv"      "$OUTDIR/cutlass_fused.csv"
         run_diff "diff_q2_strip"      "$OUTDIR/w3_strip.csv"      "$OUTDIR/cutlass_strip.csv"
         run_diff "diff_q2_hybrid"     "$OUTDIR/w3_fused.csv"      "$OUTDIR/hybrid_fused.csv"
         run_diff "diff_q4_fused"      "$OUTDIR/w3_fused.csv"      "$OUTDIR/atomic_fused.csv"
         run_diff "diff_q4_strip"      "$OUTDIR/w3_strip.csv"      "$OUTDIR/atomic_strip.csv"
         run_diff "diff_q4_vs_cutlass" "$OUTDIR/atomic_fused.csv"  "$OUTDIR/cutlass_fused.csv"
+        # Cross-dispatch comparison: all dispatch modes strip + fused
+        run_diff "diff_disp_spin_vs_atomic_fused"  "$OUTDIR/atomic_fused.csv"  "$OUTDIR/spin_fused.csv"
+        run_diff "diff_disp_spin_vs_atomic_strip"  "$OUTDIR/atomic_strip.csv"  "$OUTDIR/spin_strip.csv"
+        run_diff "diff_disp_grid_vs_cutlass_fused" "$OUTDIR/grid_fused.csv"    "$OUTDIR/cutlass_fused.csv"
+        run_diff "diff_disp_grid_vs_cutlass_strip" "$OUTDIR/grid_strip.csv"    "$OUTDIR/cutlass_strip.csv"
     fi
     if [ "$QUICK" = "0" ]; then
         run_diff "diff_q3"       "$OUTDIR/hybrid_fused.csv" "$OUTDIR/phase4_fused.csv"
@@ -472,11 +485,10 @@ log "Key outputs:"
 log "  $OUTDIR/results.txt       — wall times"
 log "  $OUTDIR/summary.txt       — stall metrics side-by-side"
 if [ "$ONLY_PHASE4" = "0" ]; then
-    log "  $OUTDIR/diff_q1.txt       — Q1: w3 strip vs fused"
-    log "  $OUTDIR/diff_q1_atomic.txt — Q1: atomic strip vs fused"
+    log "  $OUTDIR/diff_q1*.txt      — Q1: epilogue overhead per dispatch mode"
     log "  $OUTDIR/diff_q2.txt       — Q2: w3 vs CUTLASS"
-    log "  $OUTDIR/diff_q4_fused.txt — Q4: w3 vs atomic (L2 locality)"
-    log "  $OUTDIR/diff_q4_vs_cutlass.txt — Q4: atomic vs CUTLASS"
+    log "  $OUTDIR/diff_q4*.txt      — Q4: L2 locality (w3 vs atomic vs CUTLASS)"
+    log "  $OUTDIR/diff_disp*.txt    — Dispatch overhead (spin vs atomic, grid vs CUTLASS)"
 fi
 if [ "$QUICK" = "0" ]; then
     log "  $OUTDIR/diff_q3.txt       — Q3: Phase 1 vs Phase 4"

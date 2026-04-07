@@ -161,7 +161,20 @@ Compile-time flags:
 #define _MBAR_END          (OFF_LOAD_CONSUMED + NUM_EPI_STAGES * 8)
 #endif
 
+/* TILE_DISPATCH: work-stealing tile dispatch mode.
+   0 = static contiguous (default)
+   1 = atomic + cluster barrier (heavy sync)
+   2 = atomic + flag spin (CTA0 writes, CTA1 spins ld.shared::cluster)
+   3 = grid-based non-persistent (blockIdx.y = tile, zero dispatch cost) */
+#ifndef TILE_DISPATCH
 #ifdef ATOMIC_TILES
+#define TILE_DISPATCH 1
+#else
+#define TILE_DISPATCH 0
+#endif
+#endif
+
+#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2
 #define OFF_TILE_SLOT      _MBAR_END
 #define _LAYOUT_END        (OFF_TILE_SLOT + 8)
 #else
@@ -669,7 +682,7 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 } while(0)
 
 
-#ifdef ATOMIC_TILES
+#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2
 __device__ int g_tile_ctr;
 #endif
 
@@ -689,14 +702,21 @@ fc2_w3_kernel(
     const __grid_constant__ CUtensorMap tma_res
 ) {
     extern __shared__ __align__(128) char smem[];
+#if TILE_DISPATCH == 3
+    /* Grid-based: blockIdx.x = CTA rank (0..1), blockIdx.y = tile index */
+    const int cta_rank = blockIdx.x;
+#else
     const int sm_id = blockIdx.x;
+    const int cta_rank = sm_id & 1;
+#endif
     const int tid   = threadIdx.x;
     const int warp  = tid / 32;
     const int lane  = tid % 32;
 
-    const int cta_rank = sm_id & 1;
+#if TILE_DISPATCH == 0
     const int cluster_id = sm_id / 2;
     const int num_clusters = SM_COUNT / 2;
+#endif
 
     /* ── Mbarrier init ── */
     if (tid == 0) {
@@ -751,9 +771,11 @@ fc2_w3_kernel(
        arrive on CTA 0's epilogue mbar (W1 runs on CTA 0 only). */
     const uint32_t epi_mbar_masked = epilogue_mbar_addr & 0xFEFFFFFF;
 
-#ifdef ATOMIC_TILES
+#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2
     /* Tile slot address: CTA1 reads from CTA0's SMEM (clear bit 24) */
     const uint32_t tile_slot_addr = (smem_to_uint(smem + OFF_TILE_SLOT)) & (cta_rank ? 0xFEFFFFFFU : 0xFFFFFFFFU);
+#endif
+#if TILE_DISPATCH >= 1
     int _iter = 0;
     int _prev_tile = -1;
 #else
@@ -770,7 +792,7 @@ fc2_w3_kernel(
         desc_b_base[s] = make_smem_desc(smem_b[s]);
     }
 
-#ifdef ATOMIC_TILES
+#if TILE_DISPATCH >= 1
     const int start_buf = 0;
 #else
     const int start_buf = tile_start & 1;
@@ -837,16 +859,23 @@ fc2_w3_kernel(
        ════════════════════════════════════════════ */
 
     /*
-     * ATOMIC_TILES: CLC-like dispatch via global atomic counter.
-     * Static dispatch spreads 74 clusters across 74 different M-tiles
-     * simultaneously → 57 MB L2 footprint for A matrix. CLC keeps clusters
-     * clumped in a ~25 M-tile window → 19 MB footprint. Atomic counter
-     * mimics CLC: all clusters pull tiles in global order, staying clumped.
-     * Cluster barrier broadcasts tile_idx from CTA0 to CTA1 per iteration.
+     * Tile dispatch modes:
+     *   0: Static contiguous — each cluster gets [start, end) range
+     *   1: Atomic + cluster barrier — CTA0 atomicAdds, barrier broadcasts
+     *   2: Atomic + flag spin — CTA0 atomicAdds + st, CTA1 spins ld.shared::cluster
+     *   3: Grid-based — blockIdx.y = tile_idx, non-persistent, zero dispatch cost
      */
-#ifdef ATOMIC_TILES
+#if TILE_DISPATCH == 3
+    /* Non-persistent: one tile per cluster, blockIdx.y = tile index */
+    {
+        const int tile_idx = (int)blockIdx.y;
+        const int buf = 0;
+        const bool has_prev = false;
+#elif TILE_DISPATCH >= 1
     while (true) {
         int tile_idx;
+#if TILE_DISPATCH == 1
+        /* Cluster barrier: CTA0 atomicAdds, stores to SMEM, full barrier broadcasts */
         if (cta_rank == 0 && tid == 0) {
             int t = atomicAdd(&g_tile_ctr, 1);
             asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_to_uint(smem + OFF_TILE_SLOT)), "r"(t));
@@ -854,6 +883,33 @@ fc2_w3_kernel(
         asm volatile("barrier.cluster.arrive.relaxed.aligned;");
         asm volatile("barrier.cluster.wait.acquire.aligned;");
         asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(tile_idx) : "r"(tile_slot_addr));
+#elif TILE_DISPATCH == 2
+        /* Flag spin: CTA0 atomicAdds + writes tile_idx with epoch to SMEM.
+           CTA1 thread 0 spins via ld.shared::cluster until epoch matches.
+           Epoch = _iter+1 (never 0, so initial SMEM zero means "not ready"). */
+        if (cta_rank == 0 && tid == 0) {
+            int t = atomicAdd(&g_tile_ctr, 1);
+            asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_to_uint(smem + OFF_TILE_SLOT)), "r"(t));
+            /* Write epoch AFTER tile_idx so CTA1 sees consistent data.
+               fence ensures st ordering within CTA0's SMEM. */
+            asm volatile("fence.acq_rel.cluster;");
+            asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_to_uint(smem + OFF_TILE_SLOT + 4)), "r"(_iter + 1));
+        }
+        if (cta_rank == 1 && tid == 0) {
+            /* Spin until epoch matches — typically resolves in ~20-30 cycles */
+            int epoch;
+            do {
+                asm volatile("ld.acquire.cluster.shared::cluster.b32 %0, [%1];"
+                    : "=r"(epoch) : "r"(tile_slot_addr + 4));
+            } while (epoch != _iter + 1);
+        }
+        __syncthreads();
+        if (cta_rank == 0) {
+            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(tile_idx) : "r"(smem_to_uint(smem + OFF_TILE_SLOT)));
+        } else {
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(tile_idx) : "r"(tile_slot_addr));
+        }
+#endif
         if (tile_idx >= TOTAL_TILES) break;
         const int buf = _iter & 1;
 #else
@@ -865,11 +921,12 @@ fc2_w3_kernel(
         if (SNAKE_ORDER && (tm & 1)) tn = TILES_N - 1 - tn;
         const int m_start = tm * TM * 2 + cta_rank * TM;
         const int n_start = tn * TN;
-#ifdef ATOMIC_TILES
+#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2
         const bool has_prev = (_iter > 0);
-#else
+#elif TILE_DISPATCH == 0
         const bool has_prev = (tile_idx > tile_start);
 #endif
+        /* TILE_DISPATCH==3: has_prev already set to false above */
 
         if (warp == 0) {
             /* ── W0: TMA A/B loads ── */
@@ -966,7 +1023,7 @@ fc2_w3_kernel(
             /* ── W2: EpilogueLoad — circular producer for PREVIOUS tile ──
                Stream four 64-col slices through a 2-stage shared pipe. */
             if (has_prev) {
-                #ifdef ATOMIC_TILES
+#if TILE_DISPATCH >= 1
                 const int prev_idx = _prev_tile;
 #else
                 const int prev_idx = tile_idx - 1;
@@ -1029,7 +1086,7 @@ fc2_w3_kernel(
             const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
 
             if (has_prev) {
-                #ifdef ATOMIC_TILES
+#if TILE_DISPATCH >= 1
                 const int prev_idx = _prev_tile;
 #else
                 const int prev_idx = tile_idx - 1;
@@ -1358,7 +1415,7 @@ fc2_w3_kernel(
             }
 #endif /* STRIP_EPILOGUE W3-W6 */
         }
-#ifdef ATOMIC_TILES
+#if TILE_DISPATCH >= 1
         _prev_tile = tile_idx;
         _iter++;
 #endif
@@ -1366,7 +1423,10 @@ fc2_w3_kernel(
 
     /* ── Drain: last tile epilogue ── */
     {
-#ifdef ATOMIC_TILES
+#if TILE_DISPATCH == 3
+        const int last_idx = (int)blockIdx.y;
+        const int last_buf = 0;
+#elif TILE_DISPATCH >= 1
         const int last_idx = _prev_tile;
         const int last_buf = (_iter - 1) & 1;
 #else
@@ -1878,7 +1938,7 @@ int main() {
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     printf("  TMA descriptors + func attr done (SMEM=%d B)\n", SMEM_BYTES);
 
-#ifdef ATOMIC_TILES
+#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2
     int* d_tile_ctr_ptr;
     CUDA_CHECK(cudaGetSymbolAddress((void**)&d_tile_ctr_ptr, g_tile_ctr));
 #define LAUNCH_KERNEL() do { \
@@ -1886,6 +1946,13 @@ int main() {
     fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
         h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual, h_tma_res); \
 } while(0)
+#elif TILE_DISPATCH == 3
+    /* Grid-based: x=CTA rank (0..1), y=tile index. cluster_dims(2,1,1)
+       pairs CTAs 0,1 per tile into a cluster. */
+    dim3 grid_dim(2, TOTAL_TILES, 1);
+#define LAUNCH_KERNEL() \
+    fc2_w3_kernel<<<grid_dim, THREADS, SMEM_BYTES>>>( \
+        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual, h_tma_res)
 #else
 #define LAUNCH_KERNEL() \
     fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
