@@ -779,8 +779,8 @@ fc2_w3_kernel(
     int _iter = 0;
     int _prev_tile = -1;
 #else
-    const int tile_start = (int)((long long)cluster_id * TOTAL_TILES / num_clusters);
-    const int tile_end   = (int)((long long)(cluster_id + 1) * TOTAL_TILES / num_clusters);
+    const int tile_stride = num_clusters;  /* strided: cluster 0 gets 0,74,148,... */
+    const int tile_count  = (TOTAL_TILES - cluster_id + tile_stride - 1) / tile_stride;
 #endif
 
     int tma_phase[N_STAGES] = {0};
@@ -795,7 +795,7 @@ fc2_w3_kernel(
 #if TILE_DISPATCH >= 1
     const int start_buf = 0;
 #else
-    const int start_buf = tile_start & 1;
+    const int start_buf = 0;
 #endif
     int epi_phase[2] = {1, 1};
     int ml_phase[2]  = {start_buf, 1 - start_buf};
@@ -913,8 +913,9 @@ fc2_w3_kernel(
         if (tile_idx >= TOTAL_TILES) break;
         const int buf = _iter & 1;
 #else
-    for (int tile_idx = tile_start; tile_idx < tile_end; tile_idx++) {
-        const int buf = tile_idx & 1;
+    for (int _ti = 0; _ti < tile_count; _ti++) {
+        const int tile_idx = cluster_id + _ti * tile_stride;
+        const int buf = _ti & 1;
 #endif
         const int tm = tile_idx / TILES_N;
         int tn = tile_idx % TILES_N;
@@ -924,7 +925,7 @@ fc2_w3_kernel(
 #if TILE_DISPATCH == 1 || TILE_DISPATCH == 2
         const bool has_prev = (_iter > 0);
 #elif TILE_DISPATCH == 0
-        const bool has_prev = (tile_idx > tile_start);
+        const bool has_prev = (_ti > 0);
 #endif
         /* TILE_DISPATCH==3: has_prev already set to false above */
 
@@ -1026,7 +1027,7 @@ fc2_w3_kernel(
 #if TILE_DISPATCH >= 1
                 const int prev_idx = _prev_tile;
 #else
-                const int prev_idx = tile_idx - 1;
+                const int prev_idx = tile_idx - tile_stride;
 #endif
                 const int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
@@ -1089,7 +1090,7 @@ fc2_w3_kernel(
 #if TILE_DISPATCH >= 1
                 const int prev_idx = _prev_tile;
 #else
-                const int prev_idx = tile_idx - 1;
+                const int prev_idx = tile_idx - tile_stride;
 #endif
                 const int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
@@ -1430,8 +1431,8 @@ fc2_w3_kernel(
         const int last_idx = _prev_tile;
         const int last_buf = (_iter - 1) & 1;
 #else
-        const int last_idx = tile_end - 1;
-        const int last_buf = last_idx & 1;
+        const int last_idx = cluster_id + (tile_count - 1) * tile_stride;
+        const int last_buf = (tile_count - 1) & 1;
 #endif
         const int ltm = last_idx / TILES_N;
         int ltn = last_idx % TILES_N;
