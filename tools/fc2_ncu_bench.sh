@@ -1,34 +1,22 @@
 #!/bin/bash
-# FC2 ncu diagnosis — targeted metric collection for comparison pairs.
+# FC2 ncu diagnosis v2 — focused on the 17us fused gap and epilogue overhead.
 #
-# Profiles: w3 (static), atomic (cluster barrier), spin (flag spin),
-#           grid (non-persistent), CUTLASS, hybrid, Phase 4
+# Profiles: w3 (strided dispatch, 4 epi warps), w3-epi1 (1 epi warp), CUTLASS
 # Each in fused + strip variants.
 #
-# Q1: Epilogue overhead (fused vs strip) for each dispatch mode
-# Q2: Architecture gap (w3 vs CUTLASS) for both fused and strip
-# Q3: Phase 4 broken (2.77ms vs 1.22ms)
-# Q4: L2 locality (w3 vs atomic, atomic vs CUTLASS)
-# Dispatch: spin vs atomic, grid vs CUTLASS (dispatch overhead isolation)
+# Q1: Epilogue overhead — w3 fused vs strip (226us — what is it?)
+# Q2: Head-to-head — w3 fused vs CUTLASS fused (17us gap)
+# Q3: Mainloop comparison — w3 strip vs CUTLASS strip (we should win)
+# Q4: DRAM amplification — do we read/write more DRAM bytes?
+# Q5: Warp count — epi1 vs epi4 (should be identical, ncu can show why)
 #
 # Usage:
-#   ./tools/fc2_ncu_bench.sh                # full run
+#   ./tools/fc2_ncu_bench.sh                # full run (5 variants)
 #   ./tools/fc2_ncu_bench.sh --dry-run      # print commands
-#   ./tools/fc2_ncu_bench.sh --quick        # skip Phase 4 (Q1+Q2 only)
+#   ./tools/fc2_ncu_bench.sh --quick        # skip epi1 (Q1-Q4 only)
 #   ./tools/fc2_ncu_bench.sh --full         # also collect --set full profiles
-#   ./tools/fc2_ncu_bench.sh --only-phase4  # Phase 4 vs Phase 1 only (Q3)
 #
 # Output: data/ncu_YYYYMMDD_HHMMSS/
-#
-# After running, key outputs:
-#   results.txt            — wall time sanity checks
-#   diff_q1.txt            — Q1: w3 strip vs fused (our epilogue overhead)
-#   diff_q1_cutlass.txt    — Q1: CUTLASS strip vs fused (CUTLASS epilogue overhead)
-#   diff_q2.txt            — Q2: w3 fused vs CUTLASS fused (architecture gap)
-#   diff_q2_strip.txt      — Q2: w3 strip vs CUTLASS strip (mainloop gap)
-#   diff_q3.txt            — Q3: hybrid fused vs phase4 fused (Phase 4 broken)
-#   diff_q3_strip.txt      — Q3: hybrid strip vs phase4 strip
-#   summary.txt            — all stall metrics side-by-side
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -36,13 +24,11 @@ cd "$(dirname "$0")/.."
 DRY_RUN=0
 QUICK=0
 FULL=0
-ONLY_PHASE4=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dry-run)      DRY_RUN=1; shift ;;
-        --quick)        QUICK=1; shift ;;
-        --full)         FULL=1; shift ;;
-        --only-phase4)  ONLY_PHASE4=1; shift ;;
+        --dry-run)  DRY_RUN=1; shift ;;
+        --quick)    QUICK=1; shift ;;
+        --full)     FULL=1; shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -54,7 +40,7 @@ mkdir -p "$OUTDIR"
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUTDIR/session.log"; }
 
 log "========================================"
-log "  FC2 NCU DIAGNOSIS  $TIMESTAMP"
+log "  FC2 NCU DIAGNOSIS v2  $TIMESTAMP"
 log "  Output: $OUTDIR"
 log "========================================"
 
@@ -64,6 +50,8 @@ if [ "$DRY_RUN" = "0" ]; then
 fi
 
 # ── Metrics ──
+
+# Stall reasons
 METRICS_STALL="\
 smsp__warps_issue_stalled_long_scoreboard.avg,\
 smsp__warps_issue_stalled_short_scoreboard.avg,\
@@ -74,15 +62,21 @@ smsp__warps_issue_stalled_not_selected.avg,\
 smsp__warps_issue_stalled_mio_throttle.avg,\
 smsp__warps_issue_stalled_math_pipe_throttle.avg"
 
+# Memory throughput + DRAM amplification
 METRICS_MEM="\
 dram__throughput.avg.pct_of_peak_sustained_elapsed,\
 dram__bytes_read.sum,\
 dram__bytes_write.sum,\
+dram__sectors_read.sum,\
+dram__sectors_write.sum,\
 lts__throughput.avg.pct_of_peak_sustained_elapsed,\
+lts__t_sectors.sum,\
 lts__t_sectors_op_read.sum,\
 lts__t_sectors_op_write.sum,\
+lts__t_sector_hit_rate.pct,\
 l1tex__throughput.avg.pct_of_peak_sustained_elapsed"
 
+# Pipe utilization
 METRICS_PIPE="\
 sm__throughput.avg.pct_of_peak_sustained_elapsed,\
 sm__pipe_shared_cycles_active.avg.pct_of_peak_sustained_elapsed,\
@@ -93,52 +87,39 @@ sm__warps_active.avg.per_cycle_active,\
 smsp__cycles_active.avg,\
 smsp__inst_executed.sum"
 
+# Scheduler + occupancy
 METRICS_SCHED="\
 smsp__warps_eligible.avg.per_cycle_active,\
 launch__registers_per_thread,\
 launch__occupancy"
 
+# SMEM + global wavefronts
 METRICS_SMEM="\
 l1tex__data_pipe_lsu_wavefronts_mem_shared.sum,\
 l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum,\
 l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum,\
 l1tex__data_pipe_lsu_wavefronts_mem_global_op_ld.sum"
 
-METRICS_ALL="${METRICS_STALL},${METRICS_MEM},${METRICS_PIPE},${METRICS_SCHED},${METRICS_SMEM}"
+# TMA activity
+METRICS_TMA="\
+l1tex__t_requests_pipe_tma_opc_read.sum,\
+l1tex__t_requests_pipe_tma_opc_write.sum,\
+l1tex__t_bytes_pipe_tma_opc_read.sum,\
+l1tex__t_bytes_pipe_tma_opc_write.sum"
+
+METRICS_ALL="${METRICS_STALL},${METRICS_MEM},${METRICS_PIPE},${METRICS_SCHED},${METRICS_SMEM},${METRICS_TMA}"
 
 # ── Binary definitions: label|build_cmd|binary|kernel_filter ──
-BINARIES=()
-
-if [ "$ONLY_PHASE4" = "0" ]; then
-    # Strip builds FIRST (they overwrite the base binary), then fused rebuilds restore it
-    BINARIES+=(
-        "w3_strip|make -B fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-w3:fc2-w3-strip|fc2_w3_kernel"
-        "w3_fused|make -B fc2-w3|./fc2-w3|fc2_w3_kernel"
-        "atomic_strip|make -B fc2-w3-atomic DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-w3-atomic:fc2-w3-atomic-strip|fc2_w3_kernel"
-        "atomic_fused|make -B fc2-w3-atomic|./fc2-w3-atomic|fc2_w3_kernel"
-        "spin_strip|make -B fc2-w3-spin DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-w3-spin:fc2-w3-spin-strip|fc2_w3_kernel"
-        "spin_fused|make -B fc2-w3-spin|./fc2-w3-spin|fc2_w3_kernel"
-        "grid_strip|make -B fc2-w3-grid DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-w3-grid:fc2-w3-grid-strip|fc2_w3_kernel"
-        "grid_fused|make -B fc2-w3-grid|./fc2-w3-grid|fc2_w3_kernel"
-        "cutlass_fused|make fc2-cutlass|./fc2-cutlass|regex:^(?!init)"
-        "cutlass_strip|make fc2-cutlass-strip|./fc2-cutlass-strip|regex:^(?!init)"
-        "hybrid_fused|make fc2-hybrid|./fc2-hybrid|regex:fc2_hybrid_kernel"
-        "hybrid_strip|make fc2-hybrid-strip|./fc2-hybrid-strip|regex:fc2_hybrid_kernel"
-    )
-fi
+BINARIES=(
+    "w3_strip|make -B fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-w3:fc2-w3-strip|fc2_w3_kernel"
+    "w3_fused|make -B fc2-w3|./fc2-w3|fc2_w3_kernel"
+    "cutlass_strip|make fc2-cutlass-strip|./fc2-cutlass-strip|regex:^(?!init)"
+    "cutlass_fused|make fc2-cutlass|./fc2-cutlass|regex:^(?!init)"
+)
 
 if [ "$QUICK" = "0" ]; then
     BINARIES+=(
-        "phase4_strip|make -B fc2-hybrid-phase4 DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-hybrid-phase4:fc2-hybrid-phase4-strip|regex:fc2_phase4"
-        "phase4_fused|make -B fc2-hybrid-phase4|./fc2-hybrid-phase4|regex:fc2_phase4"
-    )
-fi
-
-# Always include hybrid as Phase 4 reference point
-if [ "$ONLY_PHASE4" = "1" ]; then
-    BINARIES+=(
-        "hybrid_fused|make fc2-hybrid|./fc2-hybrid|regex:fc2_hybrid_kernel"
-        "hybrid_strip|make fc2-hybrid-strip|./fc2-hybrid-strip|regex:fc2_hybrid_kernel"
+        "epi1_fused|make -B fc2-w3-epi1|./fc2-w3-epi1|fc2_w3_kernel"
     )
 fi
 
@@ -188,7 +169,6 @@ log "── Phase 2: Wall time sanity checks ──"
 for entry in "${BINARIES[@]}"; do
     IFS='|' read -r label build_cmd binary kfilter <<< "$entry"
 
-    # Resolve binary path
     if [[ "$binary" == COPY:* ]]; then
         binary="./${binary##*:}"
     fi
@@ -230,7 +210,6 @@ log "── Phase 3: Targeted ncu metric collection ──"
 for entry in "${BINARIES[@]}"; do
     IFS='|' read -r label build_cmd binary kfilter <<< "$entry"
 
-    # Resolve binary path
     if [[ "$binary" == COPY:* ]]; then
         binary="./${binary##*:}"
     fi
@@ -264,7 +243,7 @@ for entry in "${BINARIES[@]}"; do
 done
 
 # ══════════════════════════════════════════════════════════════════
-#  PHASE 4: Diffs (the actual diagnosis)
+#  PHASE 4: Diffs
 # ══════════════════════════════════════════════════════════════════
 
 log ""
@@ -281,46 +260,36 @@ run_diff() {
 }
 
 if [ "$DRY_RUN" = "0" ]; then
-    if [ "$ONLY_PHASE4" = "0" ]; then
-        run_diff "diff_q1"            "$OUTDIR/w3_strip.csv"      "$OUTDIR/w3_fused.csv"
-        run_diff "diff_q1_cutlass"    "$OUTDIR/cutlass_strip.csv" "$OUTDIR/cutlass_fused.csv"
-        run_diff "diff_q1_atomic"     "$OUTDIR/atomic_strip.csv"  "$OUTDIR/atomic_fused.csv"
-        run_diff "diff_q1_spin"       "$OUTDIR/spin_strip.csv"    "$OUTDIR/spin_fused.csv"
-        run_diff "diff_q1_grid"       "$OUTDIR/grid_strip.csv"    "$OUTDIR/grid_fused.csv"
-        run_diff "diff_q2"            "$OUTDIR/w3_fused.csv"      "$OUTDIR/cutlass_fused.csv"
-        run_diff "diff_q2_strip"      "$OUTDIR/w3_strip.csv"      "$OUTDIR/cutlass_strip.csv"
-        run_diff "diff_q2_hybrid"     "$OUTDIR/w3_fused.csv"      "$OUTDIR/hybrid_fused.csv"
-        run_diff "diff_q4_fused"      "$OUTDIR/w3_fused.csv"      "$OUTDIR/atomic_fused.csv"
-        run_diff "diff_q4_strip"      "$OUTDIR/w3_strip.csv"      "$OUTDIR/atomic_strip.csv"
-        run_diff "diff_q4_vs_cutlass" "$OUTDIR/atomic_fused.csv"  "$OUTDIR/cutlass_fused.csv"
-        # Cross-dispatch comparison: all dispatch modes strip + fused
-        run_diff "diff_disp_spin_vs_atomic_fused"  "$OUTDIR/atomic_fused.csv"  "$OUTDIR/spin_fused.csv"
-        run_diff "diff_disp_spin_vs_atomic_strip"  "$OUTDIR/atomic_strip.csv"  "$OUTDIR/spin_strip.csv"
-        run_diff "diff_disp_grid_vs_cutlass_fused" "$OUTDIR/grid_fused.csv"    "$OUTDIR/cutlass_fused.csv"
-        run_diff "diff_disp_grid_vs_cutlass_strip" "$OUTDIR/grid_strip.csv"    "$OUTDIR/cutlass_strip.csv"
-    fi
-    if [ "$QUICK" = "0" ]; then
-        run_diff "diff_q3"       "$OUTDIR/hybrid_fused.csv" "$OUTDIR/phase4_fused.csv"
-        run_diff "diff_q3_strip" "$OUTDIR/hybrid_strip.csv" "$OUTDIR/phase4_strip.csv"
+    # Q1: Epilogue overhead
+    run_diff "diff_q1_w3"         "$OUTDIR/w3_strip.csv"      "$OUTDIR/w3_fused.csv"
+    run_diff "diff_q1_cutlass"    "$OUTDIR/cutlass_strip.csv" "$OUTDIR/cutlass_fused.csv"
+
+    # Q2: Head-to-head fused
+    run_diff "diff_q2_fused"      "$OUTDIR/w3_fused.csv"      "$OUTDIR/cutlass_fused.csv"
+
+    # Q3: Mainloop comparison
+    run_diff "diff_q3_strip"      "$OUTDIR/w3_strip.csv"      "$OUTDIR/cutlass_strip.csv"
+
+    # Q5: Epi warp count
+    if [ "$QUICK" = "0" ] && [ -f "$OUTDIR/epi1_fused.csv" ]; then
+        run_diff "diff_q5_epi1_vs_epi4" "$OUTDIR/epi1_fused.csv" "$OUTDIR/w3_fused.csv"
     fi
 fi
 
 # ══════════════════════════════════════════════════════════════════
-#  PHASE 5: Side-by-side summary table
+#  PHASE 5: Summary table
 # ══════════════════════════════════════════════════════════════════
 
 log ""
 log "── Phase 5: Summary table ──"
 
 if [ "$DRY_RUN" = "0" ]; then
-    # Extract key stall metrics from each CSV into a summary
     python3 - "$OUTDIR" "${BINARIES[@]}" << 'PYEOF' 2>&1 | tee "$OUTDIR/summary.txt" | tee -a "$OUTDIR/session.log"
 import sys, csv, os
 
 outdir = sys.argv[1]
 entries = sys.argv[2:]
 
-# Key metrics to extract (short names for display)
 KEY_METRICS = [
     # ── Stall reasons ──
     ("long_scoreboard",   "smsp__warps_issue_stalled_long_scoreboard.avg"),
@@ -331,11 +300,18 @@ KEY_METRICS = [
     ("not_selected",      "smsp__warps_issue_stalled_not_selected.avg"),
     ("mio_throttle",      "smsp__warps_issue_stalled_mio_throttle.avg"),
     ("math_throttle",     "smsp__warps_issue_stalled_math_pipe_throttle.avg"),
-    # ── Memory throughput ──
+    # ── DRAM (amplification check) ──
     ("dram_read_bytes",   "dram__bytes_read.sum"),
     ("dram_write_bytes",  "dram__bytes_write.sum"),
+    ("dram_read_sectors", "dram__sectors_read.sum"),
+    ("dram_write_sectors","dram__sectors_write.sum"),
     ("dram_pct",          "dram__throughput.avg.pct_of_peak_sustained_elapsed"),
+    # ── L2 cache ──
     ("lts_pct",           "lts__throughput.avg.pct_of_peak_sustained_elapsed"),
+    ("lts_sectors",       "lts__t_sectors.sum"),
+    ("lts_read_sectors",  "lts__t_sectors_op_read.sum"),
+    ("lts_write_sectors", "lts__t_sectors_op_write.sum"),
+    ("lts_hit_rate",      "lts__t_sector_hit_rate.pct"),
     ("l1tex_pct",         "l1tex__throughput.avg.pct_of_peak_sustained_elapsed"),
     # ── Pipe utilization ──
     ("sm_pct",            "sm__throughput.avg.pct_of_peak_sustained_elapsed"),
@@ -343,19 +319,24 @@ KEY_METRICS = [
     ("warps_active",      "sm__warps_active.avg.per_cycle_active"),
     ("cycles_active",     "smsp__cycles_active.avg"),
     ("inst_executed",     "smsp__inst_executed.sum"),
-    # ── Scheduler + registers ──
+    # ── Scheduler ──
     ("warps_eligible",    "smsp__warps_eligible.avg.per_cycle_active"),
     ("regs_per_thread",   "launch__registers_per_thread"),
     ("occupancy",         "launch__occupancy"),
-    # ── SMEM + global wavefronts ──
+    # ── SMEM wavefronts ──
     ("smem_wavefronts",   "l1tex__data_pipe_lsu_wavefronts_mem_shared.sum"),
     ("smem_ld_wf",        "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum"),
     ("smem_st_wf",        "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum"),
     ("global_ld_wf",      "l1tex__data_pipe_lsu_wavefronts_mem_global_op_ld.sum"),
+    # ── TMA ──
+    ("tma_read_reqs",     "l1tex__t_requests_pipe_tma_opc_read.sum"),
+    ("tma_write_reqs",    "l1tex__t_requests_pipe_tma_opc_write.sum"),
+    ("tma_read_bytes",    "l1tex__t_bytes_pipe_tma_opc_read.sum"),
+    ("tma_write_bytes",   "l1tex__t_bytes_pipe_tma_opc_write.sum"),
 ]
 
 labels = []
-data = {}  # label -> {metric_name: value}
+data = {}
 
 for entry in entries:
     parts = entry.split('|')
@@ -370,13 +351,13 @@ for entry in entries:
         for row in reader:
             name = row.get("Metric Name", "")
             val = row.get("Metric Value", "")
-            data[label][name] = val
+            unit = row.get("Metric Unit", "")
+            data[label][name] = (val, unit)
 
 if not labels:
     print("No CSV data found.")
     sys.exit(0)
 
-# Print table
 col_w = 16
 hdr = f"{'metric':<22}"
 for l in labels:
@@ -384,25 +365,70 @@ for l in labels:
 print(hdr)
 print("-" * len(hdr))
 
+UNIT_SCALE = {"Gbyte": 1e9, "Mbyte": 1e6, "Kbyte": 1e3, "byte": 1,
+              "Gsector": 1e9, "Msector": 1e6, "Ksector": 1e3, "sector": 1}
+
+def to_base(val_str, unit_str):
+    """Convert ncu value+unit to base units (bytes, sectors, etc)."""
+    try:
+        v = float(val_str.replace(",", ""))
+    except (ValueError, AttributeError):
+        return None
+    scale = UNIT_SCALE.get(unit_str, 1.0)
+    return v * scale
+
+def fmt_val(val_str, unit_str):
+    """Convert ncu value to base units, then auto-format with G/M/K suffix."""
+    bv = to_base(val_str, unit_str)
+    if bv is None:
+        return val_str  # "—" or "n/a"
+    if abs(bv) >= 1e9:
+        return f"{bv/1e9:.2f}G"
+    elif abs(bv) >= 1e6:
+        return f"{bv/1e6:.2f}M"
+    elif abs(bv) >= 1e3:
+        return f"{bv/1e3:.1f}K"
+    else:
+        return f"{bv:.2f}"
+
 for short, full in KEY_METRICS:
     row = f"{short:<22}"
     for l in labels:
-        v = data[l].get(full, "—")
-        # Truncate long numbers
-        try:
-            fv = float(v.replace(",", ""))
-            if fv > 1e9:
-                v = f"{fv/1e9:.2f}G"
-            elif fv > 1e6:
-                v = f"{fv/1e6:.2f}M"
-            elif fv > 1e3:
-                v = f"{fv/1e3:.1f}K"
-            else:
-                v = f"{fv:.2f}"
-        except (ValueError, AttributeError):
-            pass
+        entry = data[l].get(full, ("—", ""))
+        if isinstance(entry, tuple):
+            v = fmt_val(entry[0], entry[1])
+        else:
+            v = entry
         row += f"  {v:>{col_w}}"
     print(row)
+
+# ── DRAM amplification analysis ──
+print()
+print("=" * 80)
+print("DRAM AMPLIFICATION ANALYSIS")
+print("=" * 80)
+
+# Theoretical minimum bytes for FC2
+# Read: A[M,K] + B[K,N] + residual[M,N] + bias[N] (all in appropriate types)
+M, K, N = 928256, 3072, 768
+theoretical_read = M * K * 1 + K * N * 1 + M * N * 2 + N * 2  # FP8 + BF16
+theoretical_write = M * N * 2  # BF16 output
+print(f"Theoretical minimum DRAM (FC2 {M}x{K}x{N}):")
+print(f"  Read:  {theoretical_read/1e9:.3f} GB (A:FP8 + B:FP8 + residual:BF16 + bias:BF16)")
+print(f"  Write: {theoretical_write/1e9:.3f} GB (output:BF16)")
+print()
+
+for l in labels:
+    dr_entry = data[l].get("dram__bytes_read.sum", ("", ""))
+    dw_entry = data[l].get("dram__bytes_write.sum", ("", ""))
+    dr_val = to_base(dr_entry[0], dr_entry[1]) if isinstance(dr_entry, tuple) else None
+    dw_val = to_base(dw_entry[0], dw_entry[1]) if isinstance(dw_entry, tuple) else None
+    if dr_val is not None and dw_val is not None:
+        read_amp = dr_val / theoretical_read if theoretical_read > 0 else 0
+        write_amp = dw_val / theoretical_write if theoretical_write > 0 else 0
+        print(f"  {l:20s}: read={dr_val/1e9:.3f}GB ({read_amp:.2f}x)  write={dw_val/1e9:.3f}GB ({write_amp:.2f}x)")
+    else:
+        print(f"  {l:20s}: read=n/a  write=n/a")
 
 PYEOF
 fi
@@ -415,15 +441,10 @@ if [ "$FULL" = "1" ]; then
     log ""
     log "── Phase 6: Full ncu profiles (--set full) ──"
 
-    FULL_TARGETS=()
-    if [ "$ONLY_PHASE4" = "0" ]; then
-        FULL_TARGETS+=("w3_fused|./fc2-w3|fc2_w3_kernel")
-        FULL_TARGETS+=("cutlass_fused|./fc2-cutlass|regex:^(?!init)")
-    fi
-    FULL_TARGETS+=("hybrid_fused|./fc2-hybrid|regex:fc2_hybrid_kernel")
-    if [ "$QUICK" = "0" ]; then
-        FULL_TARGETS+=("phase4_fused|./fc2-hybrid-phase4|regex:fc2_phase4")
-    fi
+    FULL_TARGETS=(
+        "w3_fused|./fc2-w3|fc2_w3_kernel"
+        "cutlass_fused|./fc2-cutlass|regex:^(?!init)"
+    )
 
     for entry in "${FULL_TARGETS[@]}"; do
         IFS='|' read -r label binary kfilter <<< "$entry"
@@ -445,10 +466,8 @@ if [ "$FULL" = "1" ]; then
                "$binary" \
                > "$OUTDIR/full_${label}_stdout.txt" 2>"$OUTDIR/full_${label}_stderr.txt"; then
 
-            # Export source counters
             ncu --import "$OUTDIR/full_${label}.ncu-rep" --csv --page source \
                 > "$OUTDIR/full_${label}_source.csv" 2>/dev/null
-            # Export all metrics
             ncu --import "$OUTDIR/full_${label}.ncu-rep" --csv \
                 > "$OUTDIR/full_${label}.csv" 2>/dev/null
 
@@ -458,18 +477,6 @@ if [ "$FULL" = "1" ]; then
             cat "$OUTDIR/full_${label}_stderr.txt" >> "$OUTDIR/session.log"
         fi
     done
-
-    # Source counter analysis
-    if [ "$DRY_RUN" = "0" ]; then
-        log ""
-        log "── Source counter analysis ──"
-        for f in "$OUTDIR"/full_*_source.csv; do
-            [ -f "$f" ] || continue
-            label=$(basename "$f" _source.csv)
-            log "  $label:"
-            python3 tools/analyze_source_counters.py "$f" 2>&1 | head -40 | tee -a "$OUTDIR/session.log"
-        done
-    fi
 fi
 
 # ══════════════════════════════════════════════════════════════════
@@ -483,20 +490,15 @@ log "═════════════════════════
 log ""
 log "Key outputs:"
 log "  $OUTDIR/results.txt       — wall times"
-log "  $OUTDIR/summary.txt       — stall metrics side-by-side"
-if [ "$ONLY_PHASE4" = "0" ]; then
-    log "  $OUTDIR/diff_q1*.txt      — Q1: epilogue overhead per dispatch mode"
-    log "  $OUTDIR/diff_q2.txt       — Q2: w3 vs CUTLASS"
-    log "  $OUTDIR/diff_q4*.txt      — Q4: L2 locality (w3 vs atomic vs CUTLASS)"
-    log "  $OUTDIR/diff_disp*.txt    — Dispatch overhead (spin vs atomic, grid vs CUTLASS)"
-fi
+log "  $OUTDIR/summary.txt       — all metrics side-by-side + DRAM amplification"
+log "  $OUTDIR/diff_q1*.txt      — Q1: epilogue overhead (fused - strip)"
+log "  $OUTDIR/diff_q2*.txt      — Q2: head-to-head fused (w3 vs CUTLASS)"
+log "  $OUTDIR/diff_q3*.txt      — Q3: mainloop strip comparison"
 if [ "$QUICK" = "0" ]; then
-    log "  $OUTDIR/diff_q3.txt       — Q3: Phase 1 vs Phase 4"
-    log "  $OUTDIR/diff_q3_strip.txt — Q3: strip comparison"
+    log "  $OUTDIR/diff_q5*.txt      — Q5: epi1 vs epi4"
 fi
 if [ "$FULL" = "1" ]; then
     log "  $OUTDIR/full_*.csv        — full profiles + source counters"
 fi
 log ""
-log "To interpret: read summary.txt first, then diff_q*.txt for specifics."
-log "See docs/ncu_diagnosis_guide.txt for what each metric means."
+log "Analysis: python3 tools/ncu_anova.py $OUTDIR"

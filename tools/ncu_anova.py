@@ -91,12 +91,11 @@ def main():
     # === Comparison analyses ===
 
     comparisons = [
-        ("Q1: w3 fused vs strip (epilogue overhead)", "w3_fused", "w3_strip"),
-        ("Q1b: cutlass fused vs strip", "cutlass_fused", "cutlass_strip"),
-        ("Q2: w3 fused vs cutlass fused (head-to-head)", "w3_fused", "cutlass_fused"),
-        ("Q2b: w3 strip vs cutlass strip (mainloop only)", "w3_strip", "cutlass_strip"),
-        ("Q3: hybrid fused vs cutlass fused", "hybrid_fused", "cutlass_fused"),
-        ("Q3b: phase4 fused vs cutlass fused", "phase4_fused", "cutlass_fused"),
+        ("Q1: w3 epilogue overhead (fused - strip)", "w3_fused", "w3_strip"),
+        ("Q1b: CUTLASS epilogue overhead (fused - strip)", "cutlass_fused", "cutlass_strip"),
+        ("Q2: w3 vs CUTLASS fused (17us gap)", "w3_fused", "cutlass_fused"),
+        ("Q3: w3 vs CUTLASS strip (mainloop)", "w3_strip", "cutlass_strip"),
+        ("Q5: epi1 vs epi4 fused (warp count)", "epi1_fused", "w3_fused"),
     ]
 
     for title, a, b in comparisons:
@@ -176,7 +175,7 @@ def main():
     print("=" * 120)
 
     pairs = [("w3", "w3_fused", "w3_strip"), ("cutlass", "cutlass_fused", "cutlass_strip"),
-             ("hybrid", "hybrid_fused", "hybrid_strip"), ("phase4", "phase4_fused", "phase4_strip")]
+             ("epi1", "epi1_fused", "w3_strip")]
 
     hdr3 = f"{'Stall type':<30}"
     for label, _, _ in pairs:
