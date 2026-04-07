@@ -43,11 +43,6 @@ fc2-w3-epi1: fc2_w3.cu
 fc2-w3-epi2: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNUM_EPI_WARPS=2 $< -o $@ $(LDFLAGS)
 
-fc2-w3-epi3: fc2_w3.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DNUM_EPI_WARPS=3 $< -o $@ $(LDFLAGS)
-
-fc2-w3-epi5: fc2_w3.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DNUM_EPI_WARPS=5 $< -o $@ $(LDFLAGS)
 
 fc2-w3-fp32: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DFP32_EPILOGUE $< -o $@ $(LDFLAGS)
