@@ -90,6 +90,9 @@ Compile-time flags:
 #ifndef NUM_EPI_WARPS
 #define NUM_EPI_WARPS  4
 #endif
+#ifndef NUM_ACTIVE_EPI_WARPS
+#define NUM_ACTIVE_EPI_WARPS  NUM_EPI_WARPS
+#endif
 #ifndef NUM_IDLE_WARPS
 #define NUM_IDLE_WARPS 0
 #endif
@@ -1198,7 +1201,8 @@ fc2_w3_kernel(
                     load_phase[stage] ^= 1;
 #endif
 
-                  for (int row_group = ew; row_group < EPI_ROW_GROUPS; row_group += NUM_EPI_WARPS) {
+                  for (int row_group = ew; row_group < EPI_ROW_GROUPS; row_group += NUM_ACTIVE_EPI_WARPS) {
+                    if (ew >= NUM_ACTIVE_EPI_WARPS) break;
                     const int taddr_base = prev_buf * TN + ((cta_rank * 128 + row_group * 32) << 16);
 
                     /* Process 2 chunks of 32 cols each */
@@ -1414,7 +1418,8 @@ fc2_w3_kernel(
                     asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 #endif
 
-                  for (int _rg2 = ew; _rg2 < EPI_ROW_GROUPS; _rg2 += NUM_EPI_WARPS) {
+                  for (int _rg2 = ew; _rg2 < EPI_ROW_GROUPS; _rg2 += NUM_ACTIVE_EPI_WARPS) {
+                    if (ew >= NUM_ACTIVE_EPI_WARPS) break;
 #ifdef SELF_LOAD
                     { const int row_group = _rg2; EPI_STORE(stage, nc_base, prev_n, prev_m); }
 #elif DELAY_TMA_STORE
@@ -1609,7 +1614,8 @@ fc2_w3_kernel(
                 load_phase[stage] ^= 1;
 #endif
 
-              for (int row_group = ew; row_group < EPI_ROW_GROUPS; row_group += NUM_EPI_WARPS) {
+              for (int row_group = ew; row_group < EPI_ROW_GROUPS; row_group += NUM_ACTIVE_EPI_WARPS) {
+                if (ew >= NUM_ACTIVE_EPI_WARPS) break;
                 const int taddr_base = last_buf * TN + ((cta_rank * 128 + row_group * 32) << 16);
 
                 float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
@@ -1805,7 +1811,8 @@ fc2_w3_kernel(
                 asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
 #endif
 
-              for (int _rg2 = ew; _rg2 < EPI_ROW_GROUPS; _rg2 += NUM_EPI_WARPS) {
+              for (int _rg2 = ew; _rg2 < EPI_ROW_GROUPS; _rg2 += NUM_ACTIVE_EPI_WARPS) {
+                if (ew >= NUM_ACTIVE_EPI_WARPS) break;
 #ifdef SELF_LOAD
                 { const int row_group = _rg2; EPI_STORE(stage, nc_base, last_n, last_m); }
 #elif DELAY_TMA_STORE
@@ -1881,8 +1888,9 @@ int main() {
 #endif
     printf("  GEMM: [%d,%d] x [%d,%d]^T  %d-stage pipeline  SMEM: %d bytes\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, N_STAGES, SMEM_BYTES);
-    printf("  EPI: stages=%d  SWS=%d  DTS=%d  FP32=%d  CPP=%d\n",
-           NUM_EPI_STAGES, SINGLE_WARP_STORE, DELAY_TMA_STORE,
+    printf("  EPI: stages=%d  active=%d/%d  SWS=%d  DTS=%d  FP32=%d  CPP=%d\n",
+           NUM_EPI_STAGES, NUM_ACTIVE_EPI_WARPS, NUM_EPI_WARPS,
+           SINGLE_WARP_STORE, DELAY_TMA_STORE,
 #ifdef FP32_EPILOGUE
            1,
 #else
