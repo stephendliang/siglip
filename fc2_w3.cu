@@ -96,6 +96,26 @@ Compile-time flags:
 #define NUM_WARPS      (3 + NUM_EPI_WARPS + NUM_IDLE_WARPS)  /* W0+W1+W2 + epi + idle */
 #define THREADS        (32 * NUM_WARPS)
 
+/*
+ * ptxas has a bug where `bar.sync 1, %0` with a register operand gets
+ * constant-folded to the WRONG immediate (128) regardless of the actual
+ * register value.  PTX immediate form (`bar.sync 1, 32;`) is handled
+ * correctly.  Use this macro instead of a register operand.
+ */
+#define _STR(x)  #x
+#define _XSTR(x) _STR(x)
+#define _EPI_THR_1 32
+#define _EPI_THR_2 64
+#define _EPI_THR_3 96
+#define _EPI_THR_4 128
+#define _EPI_THR_5 160
+#define _EPI_THR_6 192
+#define _EPI_THR_7 224
+#define _EPI_THR_8 256
+#define _EPI_THR_X(n) _EPI_THR_##n
+#define _EPI_THR(n)   _EPI_THR_X(n)
+#define BAR_EPI_SYNC  "bar.sync 1, " _XSTR(_EPI_THR(NUM_EPI_WARPS)) ";"
+
 /* ── SMEM layout ── */
 #define STAGE_BYTES    32768                                    /* 16KB A + 16KB B */
 #define OFF_TMEM           (N_STAGES * STAGE_BYTES)
@@ -656,7 +676,7 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
             asm volatile("cp.async.bulk.wait_group 1;" ::: "memory"); \
     } \
     __syncwarp(); \
-    asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory"); \
+    asm volatile(BAR_EPI_SYNC ::: "memory"); \
 } while(0)
 #endif
 
@@ -1411,7 +1431,7 @@ fc2_w3_kernel(
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 #endif
 #if !NO_PRE_STORE_BAR
-                    asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
+                    asm volatile(BAR_EPI_SYNC ::: "memory");
 #endif
 
                   for (int _rg2 = ew; _rg2 < EPI_ROW_GROUPS; _rg2 += NUM_EPI_WARPS) {
