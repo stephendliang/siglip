@@ -814,16 +814,15 @@ fc2_w3_kernel(
     int _iter = 0;
     int _prev_tile = -1;
 #else
-    /* N-batched dispatch: all TILES_N of each M-row before advancing M.
-       Ensures A-matrix data loaded once per M-row stays in L2 for all N-tiles. */
+    const int tile_stride = num_clusters;  /* strided: cluster 0 gets 0,74,148,... */
 #ifdef BIDIR_SNAKE
+    /* Even clusters go forward (0,74,148,...), odd clusters go backward (10877,10803,...) */
     const bool reverse = (cluster_id & 1);
     const int fwd_id = reverse ? (num_clusters - 1 - cluster_id) : cluster_id;
-    const int m_per_cluster = (TILES_M - fwd_id + num_clusters - 1) / num_clusters;
+    const int tile_count = (TOTAL_TILES - fwd_id + tile_stride - 1) / tile_stride;
 #else
-    const int m_per_cluster = (TILES_M - cluster_id + num_clusters - 1) / num_clusters;
+    const int tile_count  = (TOTAL_TILES - cluster_id + tile_stride - 1) / tile_stride;
 #endif
-    const int tile_count = m_per_cluster * TILES_N;
 #endif
 
     int tma_phase[N_STAGES] = {0};
@@ -914,8 +913,6 @@ fc2_w3_kernel(
         const int tile_idx = (int)blockIdx.y;
         const int buf = 0;
         const bool has_prev = false;
-        int tm = tile_idx / TILES_N;
-        int tn = tile_idx % TILES_N;
 #elif TILE_DISPATCH >= 1
     while (true) {
         int tile_idx;
@@ -957,20 +954,18 @@ fc2_w3_kernel(
 #endif
         if (tile_idx >= TOTAL_TILES) break;
         const int buf = _iter & 1;
-        int tm = tile_idx / TILES_N;
-        int tn = tile_idx % TILES_N;
 #else
     for (int _ti = 0; _ti < tile_count; _ti++) {
-        /* N-batched: tm strides across clusters, tn cycles 0..TILES_N-1 */
 #ifdef BIDIR_SNAKE
-        int fwd_m = fwd_id + (_ti / TILES_N) * num_clusters;
-        int tm = reverse ? (TILES_M - 1 - fwd_m) : fwd_m;
+        const int fwd_tile = fwd_id + _ti * tile_stride;
+        const int tile_idx = reverse ? (TOTAL_TILES - 1 - fwd_tile) : fwd_tile;
 #else
-        int tm = cluster_id + (_ti / TILES_N) * num_clusters;
+        const int tile_idx = cluster_id + _ti * tile_stride;
 #endif
-        int tn = _ti % TILES_N;
         const int buf = _ti & 1;
 #endif
+        int tm = tile_idx / TILES_N;
+        int tn = tile_idx % TILES_N;
         M_SNAKE_REMAP(tm);
         if (SNAKE_ORDER && (tm & 1)) tn = TILES_N - 1 - tn;
         const int m_start = tm * TM * 2 + cta_rank * TM;
@@ -1079,16 +1074,14 @@ fc2_w3_kernel(
             if (has_prev) {
 #if TILE_DISPATCH >= 1
                 const int prev_idx = _prev_tile;
+#elif defined(BIDIR_SNAKE)
+                const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
+                const int prev_idx = reverse ? (TOTAL_TILES - 1 - prev_fwd) : prev_fwd;
+#else
+                const int prev_idx = tile_idx - tile_stride;
+#endif
                 int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
-#elif defined(BIDIR_SNAKE)
-                int pfm = fwd_id + ((_ti - 1) / TILES_N) * num_clusters;
-                int ptm = reverse ? (TILES_M - 1 - pfm) : pfm;
-                int ptn = (_ti - 1) % TILES_N;
-#else
-                int ptm = cluster_id + ((_ti - 1) / TILES_N) * num_clusters;
-                int ptn = (_ti - 1) % TILES_N;
-#endif
                 M_SNAKE_REMAP(ptm);
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
                 const int prev_m = ptm * TM * 2 + cta_rank * TM;
@@ -1147,16 +1140,14 @@ fc2_w3_kernel(
             if (has_prev) {
 #if TILE_DISPATCH >= 1
                 const int prev_idx = _prev_tile;
+#elif defined(BIDIR_SNAKE)
+                const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
+                const int prev_idx = reverse ? (TOTAL_TILES - 1 - prev_fwd) : prev_fwd;
+#else
+                const int prev_idx = tile_idx - tile_stride;
+#endif
                 int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
-#elif defined(BIDIR_SNAKE)
-                int pfm = fwd_id + ((_ti - 1) / TILES_N) * num_clusters;
-                int ptm = reverse ? (TILES_M - 1 - pfm) : pfm;
-                int ptn = (_ti - 1) % TILES_N;
-#else
-                int ptm = cluster_id + ((_ti - 1) / TILES_N) * num_clusters;
-                int ptn = (_ti - 1) % TILES_N;
-#endif
                 M_SNAKE_REMAP(ptm);
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
                 const int prev_m = ptm * TM * 2 + cta_rank * TM;
@@ -1533,23 +1524,20 @@ fc2_w3_kernel(
 #if TILE_DISPATCH == 3
         const int last_idx = (int)blockIdx.y;
         const int last_buf = 0;
-        int ltm = last_idx / TILES_N;
-        int ltn = last_idx % TILES_N;
 #elif TILE_DISPATCH >= 1
         const int last_idx = _prev_tile;
         const int last_buf = (_iter - 1) & 1;
-        int ltm = last_idx / TILES_N;
-        int ltn = last_idx % TILES_N;
 #else
 #ifdef BIDIR_SNAKE
-        int lfm = fwd_id + ((tile_count - 1) / TILES_N) * num_clusters;
-        int ltm = reverse ? (TILES_M - 1 - lfm) : lfm;
+        const int last_fwd = fwd_id + (tile_count - 1) * tile_stride;
+        const int last_idx = reverse ? (TOTAL_TILES - 1 - last_fwd) : last_fwd;
 #else
-        int ltm = cluster_id + ((tile_count - 1) / TILES_N) * num_clusters;
+        const int last_idx = cluster_id + (tile_count - 1) * tile_stride;
 #endif
-        int ltn = (tile_count - 1) % TILES_N;
         const int last_buf = (tile_count - 1) & 1;
 #endif
+        int ltm = last_idx / TILES_N;
+        int ltn = last_idx % TILES_N;
         M_SNAKE_REMAP(ltm);
         if (SNAKE_ORDER && (ltm & 1)) ltn = TILES_N - 1 - ltn;
         const int last_m = ltm * TM * 2 + cta_rank * TM;
