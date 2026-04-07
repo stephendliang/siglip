@@ -163,7 +163,7 @@ Compile-time flags:
 
 /* Bias SMEM: 256 BF16 = 512 B */
 #define OFF_BIAS_SMEM      ((_MBAR_END + 15) & ~15)
-#define BIAS_SMEM_BYTES    (TN * 2)
+#define BIAS_SMEM_BYTES    (N_DIM * 2)
 
 /* Epilogue staging: ReuseSmemC — 2-stage circular pipe.
    Each stage holds 128 rows × 64 cols × 2B = 16 KB, used for BOTH residual
@@ -775,7 +775,7 @@ fc2_w3_kernel(
     {
         const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
         /* 256 BF16 = 128 uint32_t. Spread across all threads (224 threads, each loads ~0-1). */
-        for (int i = tid; i < TN / 2; i += THREADS) {
+        for (int i = tid; i < N_DIM / 2; i += THREADS) {
             /* Load 2 BF16 as uint32_t, store to SMEM */
             uint32_t val;
             asm volatile("ld.global.b32 %0, [%1];" : "=r"(val) : "l"(bias + i * 2));
@@ -1096,7 +1096,7 @@ fc2_w3_kernel(
                                 + lane * 128;
 
                             /* C++ reads: bias from linear SMEM */
-                            const char* bp = smem + OFF_BIAS_SMEM + nc * 2;
+                            const char* bp = smem + OFF_BIAS_SMEM + (prev_n + nc) * 2;
                             uint4 bv0 = *(const uint4*)(bp);
                             uint4 bv1 = *(const uint4*)(bp + 16);
                             uint4 bv2 = *(const uint4*)(bp + 32);
@@ -1118,7 +1118,7 @@ fc2_w3_kernel(
                         }
 #else
                         /* LDS bias from SMEM (linear, not swizzled) */
-                        const uint32_t bs = bias_saddr + nc * 2;
+                        const uint32_t bs = bias_saddr + (prev_n + nc) * 2;
                         uint4 bv0, bv1, bv2, bv3;
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(bv0.x),"=r"(bv0.y),"=r"(bv0.z),"=r"(bv0.w) : "r"(bs));
@@ -1481,7 +1481,7 @@ fc2_w3_kernel(
                             + row_group * STAGING_REGION_BYTES
                             + lane * 128;
 
-                        const char* bp = smem + OFF_BIAS_SMEM + nc * 2;
+                        const char* bp = smem + OFF_BIAS_SMEM + (last_n + nc) * 2;
                         uint4 bv0 = *(const uint4*)(bp);
                         uint4 bv1 = *(const uint4*)(bp + 16);
                         uint4 bv2 = *(const uint4*)(bp + 32);
@@ -1500,7 +1500,7 @@ fc2_w3_kernel(
                         CPP_FP32_GROUP(a24,a25,a26,a27,a28,a29,a30,a31, bv3, rv3, sptr, rsw3);
                     }
 #else
-                    const uint32_t bs = bias_saddr + nc * 2;
+                    const uint32_t bs = bias_saddr + (last_n + nc) * 2;
                     uint4 bv0, bv1, bv2, bv3;
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(bv0.x),"=r"(bv0.y),"=r"(bv0.z),"=r"(bv0.w) : "r"(bs));
