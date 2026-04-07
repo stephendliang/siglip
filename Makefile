@@ -38,13 +38,13 @@ fc2-w3-8w: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNUM_IDLE_WARPS=1 $< -o $@ $(LDFLAGS)
 
 fc2-w3-epi1: fc2_w3.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DNUM_ACTIVE_EPI_WARPS=1 $< -o $@ $(LDFLAGS)
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DNUM_EPI_WARPS=1 $< -o $@ $(LDFLAGS)
 
 fc2-w3-epi2: fc2_w3.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DNUM_ACTIVE_EPI_WARPS=2 $< -o $@ $(LDFLAGS)
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DNUM_EPI_WARPS=2 $< -o $@ $(LDFLAGS)
 
 fc2-w3-epi3: fc2_w3.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DNUM_ACTIVE_EPI_WARPS=3 $< -o $@ $(LDFLAGS)
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DNUM_EPI_WARPS=3 $< -o $@ $(LDFLAGS)
 
 fc2-w3-epi5: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNUM_EPI_WARPS=5 $< -o $@ $(LDFLAGS)
