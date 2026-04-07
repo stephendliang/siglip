@@ -1,0 +1,110 @@
+[07:48:15] ========================================
+[07:48:15]   FC2 NCU DIAGNOSIS v2  20260407_074815
+[07:48:15]   Output: data/ncu_20260407_074815
+[07:48:15] ========================================
+NVIDIA B200, 120 MHz
+[07:48:16] 
+[07:48:16] ── Phase 1: Building binaries ──
+[07:48:16]   [w3_strip] make -B fc2-w3 DFLAGS=-DSTRIP_EPILOGUE
+[07:48:17]   [w3_strip] copied fc2-w3 -> fc2-w3-strip
+[07:48:17]   [w3_strip] built (regs=48, bars=1)
+[07:48:17]   [w3_fused] make -B fc2-w3
+[07:48:19]   [w3_fused] built (regs=124, bars=2)
+[07:48:19]   [cutlass_strip] make fc2-cutlass-strip
+[07:48:46]   [cutlass_strip] built (regs=16, bars=0)
+[07:48:46]   [cutlass_fused] make fc2-cutlass
+[07:49:14]   [cutlass_fused] built (regs=16, bars=0)
+[07:49:14]   [epi1_fused] make -B fc2-w3-epi1
+[07:49:16]   [epi1_fused] built (regs=122, bars=2)
+[07:49:16] 
+[07:49:16] ── Phase 2: Wall time sanity checks ──
+[07:49:17]   [w3_strip] 1.016ms  4310.64 TFLOPS  valid=0
+[07:49:19]   [w3_fused] 1.242ms  3527.26 TFLOPS  valid=1
+[07:49:20]   [cutlass_strip] 1.151ms  3804.92 TFLOPS  valid=1
+[07:49:22]   [cutlass_fused] 1.225ms  3576.45 TFLOPS  valid=1
+[07:49:23]   [epi1_fused] 1.244ms  3519.93 TFLOPS  valid=1
+[07:49:23] 
+[07:49:23] ── Phase 3: Targeted ncu metric collection ──
+[07:49:23]   [w3_strip] collecting ncu metrics...
+[07:49:35]   [w3_strip] ncu done (495 CSV lines)
+[07:49:35]   [w3_fused] collecting ncu metrics...
+[07:49:47]   [w3_fused] ncu done (495 CSV lines)
+[07:49:47]   [cutlass_strip] collecting ncu metrics...
+[07:49:59]   [cutlass_strip] ncu done (495 CSV lines)
+[07:49:59]   [cutlass_fused] collecting ncu metrics...
+[07:50:11]   [cutlass_fused] ncu done (495 CSV lines)
+[07:50:11]   [epi1_fused] collecting ncu metrics...
+[07:50:23]   [epi1_fused] ncu done (495 CSV lines)
+[07:50:23] 
+[07:50:23] ── Phase 4: Metric diffs ──
+[07:50:23]   diff_q1_w3: w3_strip.csv vs w3_fused.csv
+[07:50:23]   diff_q1_cutlass: cutlass_strip.csv vs cutlass_fused.csv
+[07:50:23]   diff_q2_fused: w3_fused.csv vs cutlass_fused.csv
+[07:50:23]   diff_q3_strip: w3_strip.csv vs cutlass_strip.csv
+[07:50:23]   diff_q5_epi1_vs_epi4: epi1_fused.csv vs w3_fused.csv
+[07:50:23] 
+[07:50:23] ── Phase 5: Summary table ──
+metric                          w3_strip          w3_fused     cutlass_strip     cutlass_fused        epi1_fused
+----------------------------------------------------------------------------------------------------------------
+long_scoreboard                    2.54M             2.25M             2.41M             2.70M             1.09M
+short_scoreboard                    1.2K            138.1K             30.3K            134.8K             44.1K
+wait                              258.9K            379.3K            141.0K            228.1K            348.6K
+barrier                           226.6K            273.1K             93.1K             32.0K            262.8K
+sleeping                           14.0K             22.4K              0.00              0.00             31.0K
+not_selected                      806.46              6.4K             25.7K             22.0K              0.00
+mio_throttle                       16.05             16.08              2.2K              3.8K             15.98
+math_throttle                     370.77              2.2K            571.92              2.6K              0.00
+dram_read_bytes                    4.33G             4.99G             2.85G             4.28G             5.93G
+dram_write_bytes                  10.52M             1.42G             1.40G             1.40G             1.42G
+dram_read_sectors                135.33M           155.79M            89.21M           133.77M           185.21M
+dram_write_sectors                328.8K            44.48M            43.74M            43.86M            44.26M
+dram_pct                           31.81             43.50             30.59             40.40             47.94
+lts_pct                            68.07             70.07             63.33             67.43             67.63
+lts_sectors                      615.58M           746.57M           625.28M           690.68M           761.09M
+lts_read_sectors                 614.58M           677.93M           558.16M           623.41M           692.71M
+lts_write_sectors                 701.6K            67.55M            66.84M            66.84M            67.14M
+lts_hit_rate                       62.13             55.59             62.84             55.85             50.96
+l1tex_pct                          47.82             51.92             52.28             54.34             49.52
+sm_pct                             96.05             90.55             95.39             94.93             86.72
+shared_pct                         95.64             88.89             94.13             93.42             84.81
+warps_active                        7.00              7.00              6.50              7.50              4.00
+cycles_active                      1.82M             1.90M             1.91M             1.92M             2.02M
+inst_executed                     43.73M           101.10M           141.73M           163.09M            92.31M
+warps_eligible                      0.04              0.09              0.14              0.15              0.08
+regs_per_thread                    48.00            124.00            186.00            252.00            122.00
+occupancy                            n/a               n/a               n/a               n/a               n/a
+smem_wavefronts                   102.2K            40.24M            19.99M            60.11M            35.31M
+smem_ld_wf                          2.1K            24.05M            431.8K            37.64M            20.93M
+smem_st_wf                          2.6K            14.70M            16.54M            18.99M            13.54M
+global_ld_wf                         n/a               n/a               n/a               n/a               n/a
+tma_read_reqs                        n/a               n/a               n/a               n/a               n/a
+tma_write_reqs                       n/a               n/a               n/a               n/a               n/a
+tma_read_bytes                       n/a               n/a               n/a               n/a               n/a
+tma_write_bytes                      n/a               n/a               n/a               n/a               n/a
+
+================================================================================
+DRAM AMPLIFICATION ANALYSIS
+================================================================================
+Theoretical minimum DRAM (FC2 928256x3072x768):
+  Read:  4.280 GB (A:FP8 + B:FP8 + residual:BF16 + bias:BF16)
+  Write: 1.426 GB (output:BF16)
+
+  w3_strip            : read=4.330GB (1.01x)  write=0.011GB (0.01x)
+  w3_fused            : read=4.990GB (1.17x)  write=1.420GB (1.00x)
+  cutlass_strip       : read=2.850GB (0.67x)  write=1.400GB (0.98x)
+  cutlass_fused       : read=4.280GB (1.00x)  write=1.400GB (0.98x)
+  epi1_fused          : read=5.930GB (1.39x)  write=1.420GB (1.00x)
+[07:50:23] 
+[07:50:23] ════════════════════════════════════════
+[07:50:23]   DONE
+[07:50:23] ════════════════════════════════════════
+[07:50:23] 
+[07:50:23] Key outputs:
+[07:50:23]   data/ncu_20260407_074815/results.txt       — wall times
+[07:50:23]   data/ncu_20260407_074815/summary.txt       — all metrics side-by-side + DRAM amplification
+[07:50:23]   data/ncu_20260407_074815/diff_q1*.txt      — Q1: epilogue overhead (fused - strip)
+[07:50:23]   data/ncu_20260407_074815/diff_q2*.txt      — Q2: head-to-head fused (w3 vs CUTLASS)
+[07:50:23]   data/ncu_20260407_074815/diff_q3*.txt      — Q3: mainloop strip comparison
+[07:50:23]   data/ncu_20260407_074815/diff_q5*.txt      — Q5: epi1 vs epi4
+[07:50:23] 
+[07:50:23] Analysis: python3 tools/ncu_anova.py data/ncu_20260407_074815
