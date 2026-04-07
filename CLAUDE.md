@@ -37,19 +37,44 @@ Both use identical tile/cluster config: 256x256x128, 2x1 cluster, cta_group::2, 
 
 **Both kernels have a dedicated EpilogueLoad warp and LDS from SMEM.** The architecture is structurally the same. Barriers are identical (2 BAR.SYNC.DEFER_BLOCKING per sub-iter each; removing ours = zero effect). The 5.4x per-warp epilogue cost difference is dominated by **STS clustering**:
 
-**STS clustering is the #1 suspect for the 388us epilogue overhead.** Both kernels issue exactly 32 STS.128 per tile per thread — same total work. But the temporal distribution is completely different:
-- **CUTLASS**: FP32 math (64 FFMA per 32-col sub-iter) creates a long compute chain. ptxas naturally interleaves STS into this chain with 6-12 ops (12-24 cyc) between each STS. Each STS's SMEM write latency (27 cyc) is fully hidden by the next compute burst.
-- **Ours**: BF16 math (HFMA2/HADD2) finishes in ~1/4 the cycles. By the time compute ends, all 4 STS fire back-to-back with 0-2 ops between them. This creates a ~108 cyc burst of SMEM write pressure (4×27 cyc) per chunk, 8 chunks per sub-iter, across 4 warps simultaneously.
+**CROSS-WARP STS clustering is the proven root cause of the 388us epilogue overhead.** Both kernels issue exactly 32 STS.128 per tile per thread — same total work. The problem is NOT how each warp schedules its own STS instructions internally. The problem is that all 4 epilogue warps (W3-W6) blast STS at the same time, creating synchronized SMEM write pressure bursts.
 
-**Why this might cause K-loop inflation**: The K-loop's W0 TMA loads and W1 MMA both need SMEM ports. Clustered STS bursts from 4 epilogue warps could saturate SMEM write ports, stalling W0's TMA loads (which also write SMEM) or W1's MMA (which reads SMEM). CUTLASS's spread-out STS avoids this burst pattern.
+**Why warps synchronize (the real problem):**
+- Our BF16 math (HFMA2/HADD2) finishes in ~1/4 the cycles of CUTLASS's FP32 (FFMA).
+- All 4 warps start each chunk at roughly the same time (after BAR.SYNC).
+- With so little compute, all 4 warps reach their STS stores nearly simultaneously.
+- Result: 4 warps × 4 STS.128 = 16 concurrent SMEM writes per chunk, repeated 8 chunks per sub-iter.
+- CUTLASS: FP32 compute is 4x longer, so warps naturally drift apart. STS stores from different warps are temporally spread across the compute window.
+
+**Why this kills K-loop throughput:** W0 TMA loads and W1 MMA both need SMEM ports. Synchronized STS bursts from 4 epilogue warps saturate SMEM write ports, stalling W0's TMA loads (which also write SMEM). ncu confirms: barrier stalls +860%, short_scoreboard +11,261% — all from SMEM port contention across warps.
+
+**What does NOT matter (proven):**
+- Intra-warp STS ordering: CP-SAT finds 75-83% better schedules per-warp, but CUTLASS has the same 5x intra-warp scheduling gap and doesn't care. The issue is inter-warp temporal alignment.
+- Instruction class: stmatrix (STSM) has identical throughput to STS.128 at all warp counts (B200-verified 2026-04-05). Contention is architectural, not instruction-dependent.
+- Barrier count: removing barriers = zero perf effect. Barrier stalls are a SYMPTOM (uneven warp progress from STS bursts), not a cause.
+- @!PT LDS pipeline drain fences: CUTLASS has 4 per sub-iter, we have 0, ptxas DCE's all attempts to add them.
 
 **Why we can't fix it from source**: ptxas controls STS scheduling. We've tried 6+ source-level approaches (FP32 epilogue, CUTLASS-style C++, per-group STS, different loop structures) — all produce identical STS clustering in SASS. The BF16 compute chain is simply too short to give ptxas room to spread STS apart. The only known way to get CUTLASS-quality STS scheduling is to use CUTLASS's actual FP32 epilogue code path.
 
-The other known difference is @!PT LDS pipeline drain fences (CUTLASS has 4 per sub-iter, we have 0, ptxas DCE's all attempts to add them).
+## Remaining approaches
 
-## Current approach: fc2_hybrid.cu
+### SASS binary patching (tools/sass_edit.py, tools/interwarp_stagger.py)
 
-Trying to combine our fast PTX mainloop with CUTLASS's efficient epilogue.
+The only remaining path to beat CUTLASS. Directly attacks STS clustering at the binary level.
+
+**Intra-warp scheduling (tools/sass_edit.py CP-SAT):** Works locally (75-83% stall reduction), bisection test levels 0-5 pass on B200, level 6 (full epilogue) crashes. But **intra-warp scheduling is futile** — the problem is cross-warp STS temporal alignment, not per-warp instruction ordering. CUTLASS has the same 5x intra-warp scheduling gap and doesn't care.
+
+**Inter-warp stagger (tools/interwarp_stagger.py):** Replaces epilogue NOPs with YIELD instructions to create temporal phase offset between warp pairs {W3,W5} and {W4,W6}. Two modes: yield-only (all warps) and predicated (@P6 = warp parity). Test harness at tools/test_interwarp.sh. **Never tested on B200** — tools committed but `data/interwarp_*` doesn't exist.
+
+**LDS_DRAIN (fc2_w3.cu ifdef):** 4x LDS drain loads after STS to keep LSU pipeline busy and prevent STS clustering. Committed (bc121f9). **Never tested on B200.**
+
+### stmatrix migration (DEAD, 2026-04-05)
+
+`bench/stmatrix_bench.cu` proved stmatrix has identical throughput to STS.128 at all warp counts. Contention is architectural (SMEM ports), not instruction-class-dependent. See `docs/stmatrix_migration.md`.
+
+## fc2_hybrid.cu (ALL PHASES DEAD)
+
+All attempts to combine our PTX mainloop with CUTLASS's epilogue have failed.
 
 ### Phase 1 / Phase 3a — Pure CUTLASS (WORKS, 1.222ms)
 
@@ -178,15 +203,17 @@ Calling CUTLASS's `collective_mainloop.load()/mma()` from our own dispatch loop 
 
 - CUTLASS_LOOP=1/2/3: changes SASS interleaving, zero perf
 - FP32_EPILOGUE: zero perf
-- CUTLASS_EPILOGUE (FP32 per-group STS, 113 regs): identical STS clustering in SASS
+- CUTLASS_EPILOGUE (FP32 per-group STS, 113 regs): identical STS clustering
 - CPP_EPILOGUE: byte-identical SASS to asm volatile
 - CUTE_STORE (C++ pointer stores): byte-identical SASS
 - @!PT LDS fences (3 approaches): all DCE'd by ptxas
 - cvta.shared + generic store: ptxas DCEs all 64 stores
-- NO_PRE_STORE_BAR + NO_POST_STORE_BAR: 17->1 BAR.SYNC, zero perf (we already HAVE 2 BAR.SYNC.DEFER_BLOCKING per sub-iter, same as CUTLASS — removing them changes nothing)
+- NO_PRE_STORE_BAR + NO_POST_STORE_BAR: 17->1 BAR.SYNC, zero perf
 - NUM_EPI_STAGES=3/4: -6 to -23us (noise)
+- stmatrix (STSM.16.M88.4): identical throughput to STS.128 at all warp counts (B200-verified)
 - All combinations of above: noise
 - **ptxas STS scheduling is immutable from any source-level approach**
+- **Intra-warp STS reordering is futile** — problem is cross-warp temporal alignment
 
 ### Architectural attempts on fc2 (old kernel, all ~1.635ms at 4 warps)
 
@@ -197,7 +224,8 @@ Calling CUTLASS's `collective_mainloop.load()/mma()` from our own dispatch loop 
 - W0_RES_FULL (+15% catastrophic), W0_RES_PREFETCH (neutral)
 - STAGES_C=2 (neutral), STAGES_C+EPI_REUSE_SMEM (broken), STAGES_C+PRE_COMBINE (broken)
 - NOP_EPILOGUE, EPI_DELAY, REG_PAD: all ruled out individual causes
-- SASS fatbin-patch: CP-SAT schedules fine, patched binaries crash (illegal instruction)
+- SASS intra-warp reorder: level 5 (single chunk) passes B200, level 6 (full epilogue) crashes. But intra-warp scheduling is the wrong target anyway.
+- stmatrix (STSM): identical throughput to STS.128 at all warp counts (B200 2026-04-05)
 
 ### Hypothesis isolation (all ruled out)
 
@@ -214,6 +242,26 @@ Calling CUTLASS's `collective_mainloop.load()/mma()` from our own dispatch loop 
 - Phase 4 8-warp static dispatch: same 2.77ms despite matching all init
 - CUTLASS stage count sweep (3-7): all identical. Do NOT repeat.
 - StaticPersistentScheduler: CLC is NOT the mainloop gap (+7us noise)
+
+## Key Learnings
+
+### The root cause: cross-warp STS synchronization
+- **The problem is INTER-WARP, not INTRA-WARP.** All 4 epilogue warps hit their STS stores at the same time because BF16 compute is too short to create natural phase drift. CUTLASS's FP32 compute is 4x longer, so warps drift apart naturally.
+- **Intra-warp instruction scheduling is irrelevant.** CP-SAT finds 75-83% better per-warp schedules, but CUTLASS has the same 5x intra-warp gap and doesn't care. Reordering STS within one warp doesn't fix 4 warps hitting SMEM ports simultaneously.
+- **stmatrix = STS.128 at the SMEM port level.** Instruction class doesn't matter.
+- **Barrier stalls are a SYMPTOM, not a cause.** Removing barriers = zero effect.
+
+### Architecture
+- **fc2_w3 ALREADY has CUTLASS-style architecture**: W2=EpilogueLoad, W3-W6 LDS from SMEM.
+- **STRIP_EPILOGUE is THE diagnostic** — K-loop inflates +36%
+- **Overhead linear at ~98us/warp** — no single epilogue operation matters individually
+- **Microbenchmarks MISLEADING** — single-tile +0.1%, persistent kernel +36%
+- **ptxas STS scheduling immutable from source** — 6+ approaches, all identical
+
+### Hardware
+- **N_STAGES=5 mandatory**: 10% gap vs NS4. **BIAS_SMEM=1 default**: -15us free.
+- **4 sub-partitions on SM100a** — warp i%4. **MAX_STALL = 7** (3-bit, bits 53-55).
+- **STS scaling: 10→37 cyc at 8 warps (3.65x)** — SMEM port contention is real and measured.
 
 ## Kernel structure (fc2_w3.cu)
 
@@ -267,18 +315,21 @@ python3 tools/sass_analysis.py --cubin fc2 --deps
 ## Key files
 
 ```
-fc2_w3.cu               # Our hand-tuned PTX kernel (ACTIVE)
-fc2_hybrid.cu           # CUTLASS integration experiments (Phases 1-4)
-fc2_cutlass.cu          # Pure CUTLASS GemmUniversal wrapper
-fc2.cu                  # Old FC2 kernel (predecessor to fc2_w3)
-kernel_common.cuh       # Shared infrastructure (pipeline, TMEM, TMA, mbarriers)
-kernel_body.cuh         # Shared kernel body (epilogue_store, persistent_gemm)
-Makefile                # Build rules (sm_100a)
-tools/                  # Sweep scripts, SASS tools, benchmarks
-bench/                  # Microbenchmarks (TMA, MMA, warp scaling, calibration)
-data/                   # All benchmark results
-docs/                   # Experiment logs, proposals
-CLAUDE.md.mothballed    # Full docs for PE/FC1 (done), grid search, calibration suites
+fc2_w3.cu                       # Our hand-tuned PTX kernel (ACTIVE)
+fc2_hybrid.cu                   # CUTLASS integration experiments (Phases 1-4, ALL DEAD)
+fc2_cutlass.cu                  # Pure CUTLASS GemmUniversal wrapper (1.224ms reference)
+fc2.cu                          # Old FC2 kernel (predecessor to fc2_w3)
+kernel_common.cuh               # Shared infrastructure (pipeline, TMEM, TMA, mbarriers)
+kernel_body.cuh                 # Shared kernel body (epilogue_store, persistent_gemm)
+Makefile                        # Build rules (sm_100a)
+tools/sass_edit.py              # SASS binary editor + CP-SAT intra-warp scheduler (~5500 lines)
+tools/interwarp_stagger.py      # Inter-warp YIELD patching (UNTESTED on B200)
+tools/test_interwarp.sh         # Inter-warp B200 test harness (UNTESTED)
+tools/test_sass_patch.sh        # Intra-warp SASS patch bisection (levels 0-5 pass, 6 crashes)
+tools/                          # Sweep scripts, SASS tools, benchmarks
+bench/                          # Microbenchmarks (TMA, MMA, stmatrix, warp scaling, calibration)
+data/                           # All benchmark results
+docs/                           # Experiment logs, proposals
 ```
 
 ## Code style

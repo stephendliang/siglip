@@ -161,8 +161,15 @@ Compile-time flags:
 #define _MBAR_END          (OFF_LOAD_CONSUMED + NUM_EPI_STAGES * 8)
 #endif
 
+#ifdef ATOMIC_TILES
+#define OFF_TILE_SLOT      _MBAR_END
+#define _LAYOUT_END        (OFF_TILE_SLOT + 8)
+#else
+#define _LAYOUT_END        _MBAR_END
+#endif
+
 /* Bias SMEM: 256 BF16 = 512 B */
-#define OFF_BIAS_SMEM      ((_MBAR_END + 15) & ~15)
+#define OFF_BIAS_SMEM      ((_LAYOUT_END + 15) & ~15)
 #define BIAS_SMEM_BYTES    (N_DIM * 2)
 
 /* Epilogue staging: ReuseSmemC — 2-stage circular pipe.
@@ -662,6 +669,10 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 } while(0)
 
 
+#ifdef ATOMIC_TILES
+__device__ int g_tile_ctr;
+#endif
+
 /* ════════════════════════════════════════════════════════════════
    KERNEL
    ════════════════════════════════════════════════════════════════ */
@@ -740,8 +751,15 @@ fc2_w3_kernel(
        arrive on CTA 0's epilogue mbar (W1 runs on CTA 0 only). */
     const uint32_t epi_mbar_masked = epilogue_mbar_addr & 0xFEFFFFFF;
 
+#ifdef ATOMIC_TILES
+    /* Tile slot address: CTA1 reads from CTA0's SMEM (clear bit 24) */
+    const uint32_t tile_slot_addr = (smem_to_uint(smem + OFF_TILE_SLOT)) & (cta_rank ? 0xFEFFFFFFU : 0xFFFFFFFFU);
+    int _iter = 0;
+    int _prev_tile = -1;
+#else
     const int tile_start = (int)((long long)cluster_id * TOTAL_TILES / num_clusters);
     const int tile_end   = (int)((long long)(cluster_id + 1) * TOTAL_TILES / num_clusters);
+#endif
 
     int tma_phase[N_STAGES] = {0};
     int mma_phase[N_STAGES] = {0};
@@ -752,7 +770,11 @@ fc2_w3_kernel(
         desc_b_base[s] = make_smem_desc(smem_b[s]);
     }
 
+#ifdef ATOMIC_TILES
+    const int start_buf = 0;
+#else
     const int start_buf = tile_start & 1;
+#endif
     int epi_phase[2] = {1, 1};
     int ml_phase[2]  = {start_buf, 1 - start_buf};
 
@@ -814,13 +836,40 @@ fc2_w3_kernel(
        MAIN TILE LOOP
        ════════════════════════════════════════════ */
 
+    /*
+     * ATOMIC_TILES: CLC-like dispatch via global atomic counter.
+     * Static dispatch spreads 74 clusters across 74 different M-tiles
+     * simultaneously → 57 MB L2 footprint for A matrix. CLC keeps clusters
+     * clumped in a ~25 M-tile window → 19 MB footprint. Atomic counter
+     * mimics CLC: all clusters pull tiles in global order, staying clumped.
+     * Cluster barrier broadcasts tile_idx from CTA0 to CTA1 per iteration.
+     */
+#ifdef ATOMIC_TILES
+    while (true) {
+        int tile_idx;
+        if (cta_rank == 0 && tid == 0) {
+            int t = atomicAdd(&g_tile_ctr, 1);
+            asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_to_uint(smem + OFF_TILE_SLOT)), "r"(t));
+        }
+        asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+        asm volatile("barrier.cluster.wait.acquire.aligned;");
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(tile_idx) : "r"(tile_slot_addr));
+        if (tile_idx >= TOTAL_TILES) break;
+        const int buf = _iter & 1;
+#else
     for (int tile_idx = tile_start; tile_idx < tile_end; tile_idx++) {
         const int buf = tile_idx & 1;
+#endif
         const int tm = tile_idx / TILES_N;
         int tn = tile_idx % TILES_N;
         if (SNAKE_ORDER && (tm & 1)) tn = TILES_N - 1 - tn;
         const int m_start = tm * TM * 2 + cta_rank * TM;
         const int n_start = tn * TN;
+#ifdef ATOMIC_TILES
+        const bool has_prev = (_iter > 0);
+#else
+        const bool has_prev = (tile_idx > tile_start);
+#endif
 
         if (warp == 0) {
             /* ── W0: TMA A/B loads ── */
@@ -831,7 +880,7 @@ fc2_w3_kernel(
                 const uint32_t mma_mbar_s = smem_base + OFF_MMA_MBAR + s * 8;
                 const uint32_t tma_mbar_s = (smem_base + OFF_TMA_MBAR + s * 8) & 0xFEFFFFFF;
 
-                if (tile_idx > tile_start || ki >= N_STAGES) {
+                if (has_prev || ki >= N_STAGES) {
                     mbar_wait(mma_mbar_s, mma_phase[s]);
                     mma_phase[s] ^= 1;
                 }
@@ -911,13 +960,17 @@ fc2_w3_kernel(
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             ml_phase[prev_buf] ^= 1;
 #if defined(STRIP_EPILOGUE) || defined(SELF_LOAD)
-            if (tile_idx > tile_start)
+            if (has_prev)
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
 #else
             /* ── W2: EpilogueLoad — circular producer for PREVIOUS tile ──
                Stream four 64-col slices through a 2-stage shared pipe. */
-            if (tile_idx > tile_start) {
+            if (has_prev) {
+                #ifdef ATOMIC_TILES
+                const int prev_idx = _prev_tile;
+#else
                 const int prev_idx = tile_idx - 1;
+#endif
                 const int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
@@ -954,13 +1007,13 @@ fc2_w3_kernel(
 #if NUM_IDLE_WARPS > 0
             if (warp >= 3 + NUM_EPI_WARPS) {
                 /* Idle warps: just arrive at epi_mbar, no epilogue work */
-                if (tile_idx > tile_start)
+                if (has_prev)
                     mbar_arrive(epi_mbar_masked + prev_buf * 8);
                 continue;
             }
 #endif
 #ifdef STRIP_EPILOGUE
-            if (tile_idx > tile_start)
+            if (has_prev)
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
 #else
             /* ── W3-W6: Epilogue compute — ReuseSmemC, BAR.SYNC coordinated ── */
@@ -975,8 +1028,12 @@ fc2_w3_kernel(
             const uint32_t sw4 = 64 ^ xor_val, sw5 = 80 ^ xor_val;
             const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
 
-            if (tile_idx > tile_start) {
+            if (has_prev) {
+                #ifdef ATOMIC_TILES
+                const int prev_idx = _prev_tile;
+#else
                 const int prev_idx = tile_idx - 1;
+#endif
                 const int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
@@ -1301,12 +1358,21 @@ fc2_w3_kernel(
             }
 #endif /* STRIP_EPILOGUE W3-W6 */
         }
+#ifdef ATOMIC_TILES
+        _prev_tile = tile_idx;
+        _iter++;
+#endif
     }
 
     /* ── Drain: last tile epilogue ── */
     {
+#ifdef ATOMIC_TILES
+        const int last_idx = _prev_tile;
+        const int last_buf = (_iter - 1) & 1;
+#else
         const int last_idx = tile_end - 1;
         const int last_buf = last_idx & 1;
+#endif
         const int ltm = last_idx / TILES_N;
         int ltn = last_idx % TILES_N;
         if (SNAKE_ORDER && (ltm & 1)) ltn = TILES_N - 1 - ltn;
@@ -1812,11 +1878,24 @@ int main() {
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     printf("  TMA descriptors + func attr done (SMEM=%d B)\n", SMEM_BYTES);
 
+#ifdef ATOMIC_TILES
+    int* d_tile_ctr_ptr;
+    CUDA_CHECK(cudaGetSymbolAddress((void**)&d_tile_ctr_ptr, g_tile_ctr));
+#define LAUNCH_KERNEL() do { \
+    cudaMemsetAsync(d_tile_ctr_ptr, 0, sizeof(int)); \
+    fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
+        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual, h_tma_res); \
+} while(0)
+#else
+#define LAUNCH_KERNEL() \
+    fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
+        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual, h_tma_res)
+#endif
+
     /* Warmup */
     printf("Launching warmup (2 iters)...\n");
     for (int i = 0; i < 2; i++) {
-        fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>(
-            h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual, h_tma_res);
+        LAUNCH_KERNEL();
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     printf("  Warmup done.\n");
@@ -1828,8 +1907,7 @@ int main() {
     cudaEventCreate(&t1);
     cudaEventRecord(t0);
     for (int i = 0; i < 10; i++) {
-        fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>(
-            h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual, h_tma_res);
+        LAUNCH_KERNEL();
     }
     cudaEventRecord(t1);
     cudaEventSynchronize(t1);
@@ -1842,8 +1920,7 @@ int main() {
     cudaEventDestroy(t1);
 
     /* Checksum run */
-    fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>(
-        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual, h_tma_res);
+    LAUNCH_KERNEL();
     CUDA_CHECK(cudaDeviceSynchronize());
 
     __nv_bfloat16* h_C = (__nv_bfloat16*)malloc((size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16));

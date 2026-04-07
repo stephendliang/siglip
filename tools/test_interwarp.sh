@@ -360,6 +360,51 @@ else
     fi
 fi
 
+# ── Experiment 5: ATOMIC_TILES (CLC-like dispatch) ───────────────
+
+log ""
+log "════════════════════════════════════════"
+log "  EXP 5: ATOMIC_TILES"
+log "  (global atomic tile counter, CLC-like L2 locality)"
+log "════════════════════════════════════════"
+
+if [ "$DRY_RUN" = "1" ]; then
+    echo "  make fc2-w3-atomic && run N=$N_RUNS"
+else
+    log "Building fc2-w3 with ATOMIC_TILES (fused)..."
+    if make fc2-w3-atomic > "$OUTDIR/atomic_fused_build.log" 2>&1; then
+        verify_sass "./fc2-w3-atomic" "atomic_fused" "$BASELINE_SASS"
+
+        ATOMIC_RESULT=$(run_n_times "./fc2-w3-atomic" "atomic_fused" "$N_RUNS")
+        if ! echo "$ATOMIC_RESULT" | grep -qE 'RUN_FAIL|NO_RESULT'; then
+            echo "$ATOMIC_RESULT" >> "$OUTDIR/results.txt"
+            ATOMIC_MS=$(parse_result "$ATOMIC_RESULT" "median")
+            ATOMIC_CS=$(parse_result "$ATOMIC_RESULT" "checksum")
+            log "  atomic_fused: median=${ATOMIC_MS}ms"
+
+            if [ "$ATOMIC_CS" != "$BASE_CHECKSUM" ]; then
+                log "  WARNING: checksum mismatch! atomic=$ATOMIC_CS baseline=$BASE_CHECKSUM"
+            fi
+        else
+            log "  atomic_fused: FAILED ($ATOMIC_RESULT)"
+        fi
+
+        # Strip variant
+        log "Building fc2-w3 strip+ATOMIC_TILES..."
+        if make fc2-w3 DFLAGS="-DSTRIP_EPILOGUE -DATOMIC_TILES" > "$OUTDIR/atomic_strip_build.log" 2>&1; then
+            ATOMIC_STRIP_RESULT=$(run_n_times "./fc2-w3" "atomic_strip" "$N_RUNS")
+            if ! echo "$ATOMIC_STRIP_RESULT" | grep -qE 'RUN_FAIL|NO_RESULT'; then
+                echo "$ATOMIC_STRIP_RESULT" >> "$OUTDIR/results.txt"
+                ATOMIC_STRIP_MS=$(parse_result "$ATOMIC_STRIP_RESULT" "median")
+                log "  atomic_strip: median=${ATOMIC_STRIP_MS}ms"
+            fi
+        fi
+    else
+        log "  Build failed"
+        tail -5 "$OUTDIR/atomic_fused_build.log"
+    fi
+fi
+
 # ── Summary ────────────────────────────────────────────────────────
 
 log ""
@@ -402,6 +447,10 @@ if [ "$DRY_RUN" = "0" ] && [ -f "$OUTDIR/results.txt" ]; then
     if [ -n "${DRAIN_MS:-}" ] && [ -n "${DRAIN_STRIP_MS:-}" ]; then
         epi_drain=$(echo "$DRAIN_MS - $DRAIN_STRIP_MS" | bc 2>/dev/null || echo "n/a")
         log "  LDS_DRAIN epilogue overhead: ${epi_drain}ms (${DRAIN_MS} - ${DRAIN_STRIP_MS})"
+    fi
+    if [ -n "${ATOMIC_MS:-}" ] && [ -n "${ATOMIC_STRIP_MS:-}" ]; then
+        epi_atomic=$(echo "$ATOMIC_MS - $ATOMIC_STRIP_MS" | bc 2>/dev/null || echo "n/a")
+        log "  ATOMIC_TILES epilogue overhead: ${epi_atomic}ms (${ATOMIC_MS} - ${ATOMIC_STRIP_MS})"
     fi
 
     log ""

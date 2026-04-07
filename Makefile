@@ -52,6 +52,9 @@ fc2-w3-reorder: fc2_w3.cu
 fc2-w3-self: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSELF_LOAD $< -o $@ $(LDFLAGS)
 
+fc2-w3-atomic: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DATOMIC_TILES $< -o $@ $(LDFLAGS)
+
 # ── FC2 CUTLASS kernel (CUTLASS GemmUniversal, reference epilogue) ──
 fc2-cutlass: fc2_cutlass.cu
 	$(NVCC) $(CFLAGS) $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)
