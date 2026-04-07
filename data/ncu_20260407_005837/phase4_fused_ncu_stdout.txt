@@ -1,0 +1,33 @@
+FC2 HYBRID Phase 4 — 8-warp, our PTX mainloop + CUTLASS epilogue
+  MODE: Fused (bias + residual)
+  [928256, 3072] x [3072, 768]^T  FP8E4M3 -> BF16
+  Tile: 256x256x128, Cluster: 2x1, Schedule: 2SM
+  SMEM: 231424 bytes
+==PROF== Connected to process 4150 (/root/siglip/fc2-hybrid-phase4)
+  Device: NVIDIA B200 (SM 10.0, SMs=148)
+
+  Alloc + init done
+  CUTLASS initialized (workspace=0, grid=6x3626, block=256, smem=231424)
+Launching warmup (2 iters)...
+==PROF== Profiling "fc2_phase4_kernel_impl": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_phase4_kernel_impl": 0%....50%....100% - 12 passes
+  Warmup done.
+Timing: 10 iterations...
+==PROF== Profiling "fc2_phase4_kernel_impl": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_phase4_kernel_impl": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_phase4_kernel_impl": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_phase4_kernel_impl": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_phase4_kernel_impl": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_phase4_kernel_impl": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_phase4_kernel_impl": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_phase4_kernel_impl": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_phase4_kernel_impl": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_phase4_kernel_impl": 0%....50%....100% - 12 passes
+FC2-HYBRID: 709.990 ms  6.17 TFLOPS
+==PROF== Profiling "fc2_phase4_kernel_impl": 0%....50%....100% - 12 passes
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 7316096.000000
+D[0,0..3] = 6912.0 4608.0 6912.0 4608.0
+@@RESULT ms=709.990 tflops=6.17 checksum=7316096.000000 valid=1 c0=6912.0
+==PROF== Disconnected from process 4150
+==PROF== Report: /root/siglip/data/ncu_20260407_005837/phase4_fused.ncu-rep
