@@ -821,7 +821,12 @@ fc2_w3_kernel(
     const int fwd_id = reverse ? (num_clusters - 1 - cluster_id) : cluster_id;
     const int tile_count = (TOTAL_TILES - fwd_id + tile_stride - 1) / tile_stride;
 #else
-    const int tile_count  = (TOTAL_TILES - cluster_id + tile_stride - 1) / tile_stride;
+    /* Group-3: each cluster handles a fixed N-tile, strides through M-rows.
+       25 clusters on tn=0, 25 on tn=1, 24 on tn=2. Wavefront = ~25 M-rows. */
+    const int tn_fixed = cluster_id % TILES_N;
+    const int m_rank = cluster_id / TILES_N;
+    const int my_m_stride = (num_clusters - tn_fixed + TILES_N - 1) / TILES_N;
+    const int tile_count  = (TILES_M - m_rank + my_m_stride - 1) / my_m_stride;
 #endif
 #endif
 
@@ -960,7 +965,10 @@ fc2_w3_kernel(
         const int fwd_tile = fwd_id + _ti * tile_stride;
         const int tile_idx = reverse ? (TOTAL_TILES - 1 - fwd_tile) : fwd_tile;
 #else
-        const int tile_idx = cluster_id + _ti * tile_stride;
+        /* Group-3: fixed tn per cluster, stride through M-rows */
+        const int _tm = m_rank + _ti * my_m_stride;
+        if (_tm >= TILES_M) break;
+        const int tile_idx = _tm * TILES_N + tn_fixed;
 #endif
         const int buf = _ti & 1;
 #endif
@@ -1078,7 +1086,7 @@ fc2_w3_kernel(
                 const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
                 const int prev_idx = reverse ? (TOTAL_TILES - 1 - prev_fwd) : prev_fwd;
 #else
-                const int prev_idx = tile_idx - tile_stride;
+                const int prev_idx = (m_rank + (_ti - 1) * my_m_stride) * TILES_N + tn_fixed;
 #endif
                 int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
@@ -1144,7 +1152,7 @@ fc2_w3_kernel(
                 const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
                 const int prev_idx = reverse ? (TOTAL_TILES - 1 - prev_fwd) : prev_fwd;
 #else
-                const int prev_idx = tile_idx - tile_stride;
+                const int prev_idx = (m_rank + (_ti - 1) * my_m_stride) * TILES_N + tn_fixed;
 #endif
                 int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
@@ -1532,7 +1540,7 @@ fc2_w3_kernel(
         const int last_fwd = fwd_id + (tile_count - 1) * tile_stride;
         const int last_idx = reverse ? (TOTAL_TILES - 1 - last_fwd) : last_fwd;
 #else
-        const int last_idx = cluster_id + (tile_count - 1) * tile_stride;
+        const int last_idx = (m_rank + (tile_count - 1) * my_m_stride) * TILES_N + tn_fixed;
 #endif
         const int last_buf = (tile_count - 1) & 1;
 #endif
