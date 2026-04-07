@@ -1822,7 +1822,7 @@ fc2_w3_kernel(
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 #endif
 #if !NO_PRE_STORE_BAR
-                asm volatile("bar.sync 1, %0;" :: "r"(NUM_EPI_WARPS * 32) : "memory");
+                asm volatile(BAR_EPI_SYNC ::: "memory");
 #endif
 
               for (int _rg2 = ew; _rg2 < EPI_ROW_GROUPS; _rg2 += NUM_EPI_WARPS) {
