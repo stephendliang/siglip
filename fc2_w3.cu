@@ -66,6 +66,18 @@ Compile-time flags:
 #define MMA_PER_KI     (TK / MMA_K)                           /* 4 */
 #define SNAKE_ORDER    1
 
+#ifdef M_SNAKE
+/* M-directional snake: reverse every other band of ~25 M-rows.
+   Band size = num_clusters / TILES_N = wavefront width in M-rows. */
+#define M_SNAKE_BAND   ((SM_COUNT / 2 + TILES_N - 1) / TILES_N)
+#define M_SNAKE_REMAP(tm) do { \
+    int _mb = (tm) / M_SNAKE_BAND; \
+    if (_mb & 1) (tm) = _mb * M_SNAKE_BAND + (M_SNAKE_BAND - 1 - ((tm) % M_SNAKE_BAND)); \
+} while(0)
+#else
+#define M_SNAKE_REMAP(tm) ((void)0)
+#endif
+
 /* ── Pipeline ── */
 #ifndef N_STAGES
 #define N_STAGES       5
@@ -929,8 +941,9 @@ fc2_w3_kernel(
 #endif
         const int buf = _ti & 1;
 #endif
-        const int tm = tile_idx / TILES_N;
+        int tm = tile_idx / TILES_N;
         int tn = tile_idx % TILES_N;
+        M_SNAKE_REMAP(tm);
         if (SNAKE_ORDER && (tm & 1)) tn = TILES_N - 1 - tn;
         const int m_start = tm * TM * 2 + cta_rank * TM;
         const int n_start = tn * TN;
@@ -1044,8 +1057,9 @@ fc2_w3_kernel(
 #else
                 const int prev_idx = tile_idx - tile_stride;
 #endif
-                const int ptm = prev_idx / TILES_N;
+                int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
+                M_SNAKE_REMAP(ptm);
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
                 const int prev_m = ptm * TM * 2 + cta_rank * TM;
                 const int prev_n = ptn * TN;
@@ -1110,8 +1124,9 @@ fc2_w3_kernel(
 #else
                 const int prev_idx = tile_idx - tile_stride;
 #endif
-                const int ptm = prev_idx / TILES_N;
+                int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
+                M_SNAKE_REMAP(ptm);
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
                 const int prev_m = ptm * TM * 2 + cta_rank * TM;
                 const int prev_n = ptn * TN;
@@ -1457,8 +1472,9 @@ fc2_w3_kernel(
 #endif
         const int last_buf = (tile_count - 1) & 1;
 #endif
-        const int ltm = last_idx / TILES_N;
+        int ltm = last_idx / TILES_N;
         int ltn = last_idx % TILES_N;
+        M_SNAKE_REMAP(ltm);
         if (SNAKE_ORDER && (ltm & 1)) ltn = TILES_N - 1 - ltn;
         const int last_m = ltm * TM * 2 + cta_rank * TM;
         const int last_n = ltn * TN;
