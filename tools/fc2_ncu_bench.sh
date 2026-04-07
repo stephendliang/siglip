@@ -1,12 +1,13 @@
 #!/bin/bash
 # FC2 ncu diagnosis — targeted metric collection for comparison pairs.
 #
-# Profiles: w3 (ours), CUTLASS (standalone), hybrid (CUTLASS wrapper), Phase 4
+# Profiles: w3 (ours), atomic (work-stealing), CUTLASS, hybrid, Phase 4
 # Each in fused + strip variants.
 #
-# Q1: Epilogue overhead (fused vs strip) for both w3 and CUTLASS
+# Q1: Epilogue overhead (fused vs strip) for w3, atomic, and CUTLASS
 # Q2: Architecture gap (w3 vs CUTLASS) for both fused and strip
 # Q3: Phase 4 broken (2.77ms vs 1.22ms)
+# Q4: L2 locality (w3 vs atomic, atomic vs CUTLASS)
 #
 # Usage:
 #   ./tools/fc2_ncu_bench.sh                # full run
@@ -111,6 +112,8 @@ if [ "$ONLY_PHASE4" = "0" ]; then
     BINARIES+=(
         "w3_strip|make -B fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-w3:fc2-w3-strip|fc2_w3_kernel"
         "w3_fused|make -B fc2-w3|./fc2-w3|fc2_w3_kernel"
+        "atomic_strip|make -B fc2-w3-atomic DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-w3-atomic:fc2-w3-atomic-strip|fc2_w3_kernel"
+        "atomic_fused|make -B fc2-w3-atomic|./fc2-w3-atomic|fc2_w3_kernel"
         "cutlass_fused|make fc2-cutlass|./fc2-cutlass|regex:^(?!init)"
         "cutlass_strip|make fc2-cutlass-strip|./fc2-cutlass-strip|regex:^(?!init)"
         "hybrid_fused|make fc2-hybrid|./fc2-hybrid|regex:fc2_hybrid_kernel"
@@ -275,9 +278,13 @@ if [ "$DRY_RUN" = "0" ]; then
     if [ "$ONLY_PHASE4" = "0" ]; then
         run_diff "diff_q1"            "$OUTDIR/w3_strip.csv"      "$OUTDIR/w3_fused.csv"
         run_diff "diff_q1_cutlass"    "$OUTDIR/cutlass_strip.csv" "$OUTDIR/cutlass_fused.csv"
+        run_diff "diff_q1_atomic"      "$OUTDIR/atomic_strip.csv"  "$OUTDIR/atomic_fused.csv"
         run_diff "diff_q2"            "$OUTDIR/w3_fused.csv"      "$OUTDIR/cutlass_fused.csv"
         run_diff "diff_q2_strip"      "$OUTDIR/w3_strip.csv"      "$OUTDIR/cutlass_strip.csv"
         run_diff "diff_q2_hybrid"     "$OUTDIR/w3_fused.csv"      "$OUTDIR/hybrid_fused.csv"
+        run_diff "diff_q4_fused"      "$OUTDIR/w3_fused.csv"      "$OUTDIR/atomic_fused.csv"
+        run_diff "diff_q4_strip"      "$OUTDIR/w3_strip.csv"      "$OUTDIR/atomic_strip.csv"
+        run_diff "diff_q4_vs_cutlass" "$OUTDIR/atomic_fused.csv"  "$OUTDIR/cutlass_fused.csv"
     fi
     if [ "$QUICK" = "0" ]; then
         run_diff "diff_q3"       "$OUTDIR/hybrid_fused.csv" "$OUTDIR/phase4_fused.csv"
@@ -466,7 +473,10 @@ log "  $OUTDIR/results.txt       — wall times"
 log "  $OUTDIR/summary.txt       — stall metrics side-by-side"
 if [ "$ONLY_PHASE4" = "0" ]; then
     log "  $OUTDIR/diff_q1.txt       — Q1: w3 strip vs fused"
+    log "  $OUTDIR/diff_q1_atomic.txt — Q1: atomic strip vs fused"
     log "  $OUTDIR/diff_q2.txt       — Q2: w3 vs CUTLASS"
+    log "  $OUTDIR/diff_q4_fused.txt — Q4: w3 vs atomic (L2 locality)"
+    log "  $OUTDIR/diff_q4_vs_cutlass.txt — Q4: atomic vs CUTLASS"
 fi
 if [ "$QUICK" = "0" ]; then
     log "  $OUTDIR/diff_q3.txt       — Q3: Phase 1 vs Phase 4"
