@@ -97,6 +97,10 @@ def main():
         ("Q3: w3 vs CUTLASS GEMM (46us gap)", "w3_gemm", "cutlass_strip"),
         ("Q5: epi1 vs epi4 fused (warp count)", "epi1_fused", "w3_fused"),
         ("Q6: w3 output cost (gemm - strip)", "w3_gemm", "w3_strip"),
+        ("Q8: inline vs sched (TD=6 vs TD=4)", "w3_inline", "w3_sched"),
+        ("Q9: inline vs cutlass fused", "w3_inline", "cutlass_fused"),
+        ("Q10: prefill vs baseline fused", "w3_prefill", "w3_fused"),
+        ("Q11: inline+prefill vs cutlass fused", "w3_inline_prefill", "cutlass_fused"),
     ]
 
     for title, a, b in comparisons:

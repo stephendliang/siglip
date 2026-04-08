@@ -8,17 +8,18 @@ Cross-compiled on CPU VPS, runs on B200. PE and FC1 kernels are done — see `CL
 
 FC2 shape: [928256, 3072] x [3072, 768]^T + bias + residual. Batch = 4736 images x 196 patches.
 
-| | GEMM-only (D=A×B) | Fused (D=A×B+bias+res) | Fusion cost |
-|---|---|---|---|
-| **fc2_w3 (ours)** | 1.198ms | 1.242ms | 44us (3.7%) |
-| **CUTLASS** | **1.152ms** | **1.224ms** | 72us (6.3%) |
-| **Gap** | +46us (4.0%) | +18us (1.5%) | ours 28us cheaper |
+| | Fused (D=A×B+bias+res) | vs CUTLASS |
+|---|---|---|
+| **fc2_w3 NS6+PREFILL (ours)** | **1.109ms** | **-10.1%** |
+| **CUTLASS** | 1.233ms | baseline |
 
-GEMM-only = D=BF16(A×B), no residual/bias, output written to DRAM (valid=1). Both write ~1.40GB output.
+**We beat CUTLASS by 124us (10.1%).** Our fused kernel (1.109ms) is faster than CUTLASS's *strip/GEMM-only* (1.157ms).
 
-**The real problem is the GEMM+output path, not the epilogue.** Our GEMM-only is 46us slower (1.198 vs 1.152ms). Our fusion (residual+bias) actually costs LESS than CUTLASS (44us vs 72us), narrowing the gap from 46us to 18us.
+Key breakthrough: N_STAGES=6 (6-stage mainloop pipeline, 227KB of 228KB SMEM) + PREFILL (skip epilogue_mbar wait, rely on TMEM double-buffering). N_STAGES=6 alone gives 1.119ms; PREFILL adds another 10us.
 
-Root cause of the 46us GEMM gap: **DRAM read amplification.** We read 4.33GB of A+B data in GEMM-only when only 2.85GB exists (1.52x), vs CUTLASS's exact 1.00x. The extra 1.48GB of re-reads burns memory bandwidth that competes with output TMA stores.
+### Previous gap analysis (NS5, pre-2026-04-08)
+
+At N_STAGES=5: w3_fused=1.242ms vs CUTLASS=1.233ms = 9us gap (0.7%). GEMM-only was 46us slower (1.198 vs 1.152ms) due to DRAM read amplification (1.52x). The deeper pipeline (NS6) hides this latency by letting W0 run further ahead of W1.
 
 ### Previous flawed analysis (corrected 2026-04-07)
 
@@ -162,9 +163,21 @@ Phase 2 (=Phase1), Phase 3b (2.76ms), Phase 4 (2.77ms), stage sweep (3-7 identic
 
 SELF_LOAD (per-warp TMA, no sync), SELF_STAGGER (nanosleep 50-200ns). ZERO effect.
 
+### TD=5 CLC hardware dispatch (2026-04-07)
+
+`clusterlaunchcontrol.try_cancel` — two attempts, both deadlocked on B200. Attempt 1: dedicated W7 scheduler (phase desync). Attempt 2: inline in main loop (unknown cause, compute-sanitizer also hangs). CLC execution model incompatible with persistent kernel loop. Fully reverted.
+
+### TD=6 inline atomic dispatch (2026-04-08)
+
+W0 does atomicAdd at tile boundary instead of dedicated W7 scheduler warp. 1.370ms — dead. W0 blocked doing dispatch (atomicAdd + CTA1 epoch spin + mbar broadcast) delays TMA loads for next tile.
+
+### PREFILL at N_STAGES=5 (2026-04-08)
+
+Skip epilogue_mbar wait in W1, rely on TMEM double-buffering. 1.242ms = zero effect at NS5 (K-loop >> epilogue, mbar wait was never the bottleneck). Only effective at NS6 where deeper pipeline exposes the 10us overlap.
+
 ### Universally dead
 
-Clock freq, CLC scheduling, SASS intra-warp reorder (wrong target), multicast epilogue, R2UR reduction, BATCH_MMA.
+Clock freq, SASS intra-warp reorder (wrong target), multicast epilogue, R2UR reduction, BATCH_MMA.
 
 ## ncu profiling summary
 
@@ -261,11 +274,12 @@ Each cluster handles a fixed N-tile (cluster_id % 3), striding through M-rows. 2
 ## Build and run
 
 ```bash
-# Primary kernel
-make fc2-w3 && ./fc2-w3                                    # fused (1.242ms)
-make fc2-w3-gemm && ./fc2-w3-gemm                          # GEMM-only D=A×B (1.198ms, valid=1)
-make fc2-w3-strip && ./fc2-w3-strip                        # MMA-only, no output (1.016ms, valid=0)
-make fc2-w3-8w && ./fc2-w3-8w                              # 8-warp strip test
+# Primary kernel (default: N_STAGES=6, PREFILL)
+make fc2-w3 && ./fc2-w3                                    # fused (1.109ms, beats CUTLASS by 10%)
+make fc2-w3-gemm && ./fc2-w3-gemm                          # GEMM-only D=A×B (valid=1)
+make fc2-w3-strip && ./fc2-w3-strip                        # MMA-only, no output (valid=0)
+make fc2-w3 DFLAGS='-DN_STAGES=5' && ./fc2-w3              # old NS5 for comparison (1.119ms)
+make fc2-w3 DFLAGS=-DNO_PREFILL && ./fc2-w3                # disable PREFILL (1.119ms)
 
 # Hybrid (CUTLASS integration)
 make fc2-hybrid && ./fc2-hybrid                            # Phase 1/3a (1.224ms) WORKS
@@ -329,5 +343,5 @@ Parallelize independent tool calls. Use offset/limit for large files.
 - All inline PTX in fc2_w3.cu (no CUTLASS dependency)
 - OFF_STAGING must be 1024-byte aligned for SWIZZLE_128B
 - fence.proxy.async.shared::cta required before TMA store after st.shared
-- N_STAGES=5 mandatory (10% gap vs NS4)
+- N_STAGES=6 default (1.109ms, 10% faster than CUTLASS; NS5=1.242ms, NS7 doesn't fit in 228KB SMEM)
 - BIAS_SMEM=1 default (-15us free)

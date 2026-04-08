@@ -39,6 +39,11 @@ Compile-time flags:
   -DSELF_LOAD           Per-warp TMA residual load (no W2, no cross-warp sync in epilogue)
   -DSELF_STAGGER=N      With SELF_LOAD: warp ew sleeps ew*N nanoseconds before first sub-iter
                         (0=disabled, ~50=non-overlapping STS, ~200=full isolation)
+  -DTILE_DISPATCH=6     Inline atomic dispatch: W0 does atomicAdd at tile boundary, no W7, 7 warps.
+                        Ordered dispatch (1.00x DRAM) without wasting a scheduler warp.
+  -DNO_PREFILL          Restore epilogue_mbar wait in W1 (default: skipped via PREFILL).
+                        PREFILL relies on TMEM double-buffering — epilogue reads prev_buf
+                        while MMA writes buf. Removing it re-adds tile-level pipeline bubble.
 */
 
 #include <cuda.h>
@@ -81,7 +86,7 @@ Compile-time flags:
 
 /* ── Pipeline ── */
 #ifndef N_STAGES
-#define N_STAGES       5
+#define N_STAGES       6
 #endif
 #ifndef K_LOOP_UNROLL
 #define K_LOOP_UNROLL  N_STAGES
@@ -223,7 +228,15 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #endif
 #endif
 
-#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2
+#if TILE_DISPATCH == 6
+/* TD=6: inline atomic in W0. CTA0 W0 atomicAdds, writes tile+epoch to SMEM.
+   CTA1 W0 spins on epoch via ld.shared::cluster. All other warps read broadcast. */
+#define OFF_TD6_TILE        _MBAR_END                              /* 2 × 4B tile_idx (double-buf) */
+#define OFF_TD6_EPOCH       (OFF_TD6_TILE + 8)                     /* 2 × 4B epoch */
+#define OFF_TD6_BCAST       (OFF_TD6_EPOCH + 8)                    /* 2 × 4B broadcast to W1-W6 */
+#define OFF_TD6_BCAST_MBAR  (OFF_TD6_BCAST + 8)                   /* 2 × 8B: W0 arrives → W1-W6 wait */
+#define _LAYOUT_END         (OFF_TD6_BCAST_MBAR + 16)
+#elif TILE_DISPATCH == 1 || TILE_DISPATCH == 2
 #define OFF_TILE_SLOT      _MBAR_END
 #define _LAYOUT_END        (OFF_TILE_SLOT + 8)
 #elif TILE_DISPATCH == 4
@@ -758,7 +771,7 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 } while(0)
 
 
-#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4
+#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4 || TILE_DISPATCH == 6
 __device__ int g_tile_ctr;
 #endif
 
@@ -830,6 +843,12 @@ fc2_w3_kernel(
         /* Clear epoch slots so CTA1 spin-wait works */
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH)));
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH + 4)));
+#elif TILE_DISPATCH == 6
+        for (int i = 0; i < 2; i++)
+            mbar_init(smem_to_uint(smem + OFF_TD6_BCAST_MBAR + i * 8), 32);   /* W0 arrives → W1-W6 wait */
+        /* Clear epoch+tile slots */
+        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_TD6_EPOCH)));
+        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_TD6_EPOCH + 4)));
 #endif
 
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -876,6 +895,16 @@ fc2_w3_kernel(
     int sched_cons_phase[2] = {0, 0};
     int tile_ready_phase[2] = {0, 0};
 #endif
+#if TILE_DISPATCH == 6
+    /* TD=6: inline atomic addresses. CTA1 reads from CTA0's SMEM (clear bit 24). */
+    const uint32_t td6_tile_addr   = smem_to_uint(smem + OFF_TD6_TILE);
+    const uint32_t td6_epoch_addr  = smem_to_uint(smem + OFF_TD6_EPOCH);
+    const uint32_t td6_bcast_addr  = smem_to_uint(smem + OFF_TD6_BCAST);
+    const uint32_t td6_bcast_mbar  = smem_to_uint(smem + OFF_TD6_BCAST_MBAR);
+    const uint32_t td6_cta0_epoch  = smem_to_uint(smem + OFF_TD6_EPOCH) & 0xFEFFFFFFU;
+    const uint32_t td6_cta0_tile   = smem_to_uint(smem + OFF_TD6_TILE) & 0xFEFFFFFFU;
+    int td6_bcast_phase[2] = {0, 0};
+#endif
 #if TILE_DISPATCH >= 1
     int _iter = 0;
     int _prev_tile = -1;
@@ -911,6 +940,7 @@ fc2_w3_kernel(
     const int start_buf = 0;
 #endif
     int epi_phase[2] = {1, 1};
+    (void)epi_phase;  /* used only without PREFILL */
     int ml_phase[2]  = {start_buf, 1 - start_buf};
 
 #ifndef SELF_LOAD
@@ -1066,6 +1096,57 @@ fc2_w3_kernel(
         }
         if (tile_idx >= TOTAL_TILES) break;
         const int buf = _iter & 1;
+#elif TILE_DISPATCH == 6
+    while (true) {
+        int tile_idx;
+        {
+            /* TD=6: W0 does atomicAdd inline at tile boundary, broadcasts to W1-W6.
+               CTA0 W0 lane 0: atomicAdd → st tile+epoch to SMEM.
+               CTA1 W0 lane 0: spin on epoch via ld.shared::cluster, read tile.
+               All W0 lanes: shfl to get tile_idx, then mbar signal W1-W6.
+               W1-W6: mbar wait, read broadcast slot. */
+            const int _buf = _iter & 1;
+            if (warp == 0) {
+                if (cta_rank == 0) {
+                    if (lane == 0) {
+                        asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
+                            : "=r"(tile_idx) : "l"(&g_tile_ctr));
+                        asm volatile("st.shared.b32 [%0], %1;"
+                            :: "r"(td6_tile_addr + _buf * 4), "r"(tile_idx));
+                        asm volatile("fence.acq_rel.cluster;");
+                        asm volatile("st.shared.b32 [%0], %1;"
+                            :: "r"(td6_epoch_addr + _buf * 4), "r"(_iter + 1));
+                    }
+                } else {
+                    if (lane == 0) {
+                        int epoch;
+                        do {
+                            asm volatile("ld.acquire.cluster.shared::cluster.b32 %0, [%1];"
+                                : "=r"(epoch) : "r"(td6_cta0_epoch + _buf * 4));
+                        } while (epoch != _iter + 1);
+                        asm volatile("ld.shared::cluster.b32 %0, [%1];"
+                            : "=r"(tile_idx) : "r"(td6_cta0_tile + _buf * 4));
+                    }
+                }
+                /* Broadcast tile_idx from lane 0 to all W0 lanes */
+                asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+                    : "=r"(tile_idx) : "r"(tile_idx));
+                /* Write broadcast slot and signal W1-W6 */
+                if (lane == 0) {
+                    asm volatile("st.shared.b32 [%0], %1;"
+                        :: "r"(td6_bcast_addr + _buf * 4), "r"(tile_idx));
+                }
+                mbar_arrive(td6_bcast_mbar + _buf * 8);
+            } else {
+                /* W1-W6: wait for W0's broadcast */
+                mbar_wait(td6_bcast_mbar + _buf * 8, td6_bcast_phase[_buf]);
+                td6_bcast_phase[_buf] ^= 1;
+                asm volatile("ld.shared.b32 %0, [%1];"
+                    : "=r"(tile_idx) : "r"(td6_bcast_addr + _buf * 4));
+            }
+        }
+        if (tile_idx >= TOTAL_TILES) break;
+        const int buf = _iter & 1;
 #elif TILE_DISPATCH >= 1
     while (true) {
         int tile_idx;
@@ -1126,7 +1207,7 @@ fc2_w3_kernel(
         if (SNAKE_ORDER && (tm & 1)) tn = TILES_N - 1 - tn;
         const int m_start = tm * TM * 2 + cta_rank * TM;
         const int n_start = tn * TN;
-#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4
+#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4 || TILE_DISPATCH == 6
         const bool has_prev = (_iter > 0);
 #elif TILE_DISPATCH == 0
         const bool has_prev = (_ti > 0);
@@ -1167,8 +1248,16 @@ fc2_w3_kernel(
         } else if (warp == 1) {
             /* ── W1: MMA ── */
             if (lane == 0 && cta_rank == 0) {
+#ifdef NO_PREFILL
                 mbar_wait(epilogue_mbar_addr + buf * 8, epi_phase[buf]);
                 epi_phase[buf] ^= 1;
+#else
+                /* PREFILL (default): skip the epilogue_mbar wait.
+                   TMEM is double-buffered: epilogue reads prev_buf while MMA
+                   writes buf. They don't conflict. Removes tile-level pipeline
+                   bubble — W1 starts MMA for tile N+1 while epilogue stores tile N.
+                   Safe as long as epilogue keeps up (K-loop ≈ 525us >> epilogue ≈ 44us). */
+#endif
 
                 mbar_wait(tma_mbar[0], tma_phase[0]);
                 tma_phase[0] ^= 1;
@@ -2425,7 +2514,7 @@ int main() {
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     printf("  TMA descriptors + func attr done (SMEM=%d B)\n", SMEM_BYTES);
 
-#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4
+#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4 || TILE_DISPATCH == 6
     int* d_tile_ctr_ptr;
     CUDA_CHECK(cudaGetSymbolAddress((void**)&d_tile_ctr_ptr, g_tile_ctr));
 #define LAUNCH_KERNEL() do { \
