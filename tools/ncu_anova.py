@@ -91,11 +91,12 @@ def main():
     # === Comparison analyses ===
 
     comparisons = [
-        ("Q1: w3 epilogue overhead (fused - strip)", "w3_fused", "w3_strip"),
-        ("Q1b: CUTLASS epilogue overhead (fused - strip)", "cutlass_fused", "cutlass_strip"),
-        ("Q2: w3 vs CUTLASS fused (17us gap)", "w3_fused", "cutlass_fused"),
-        ("Q3: w3 vs CUTLASS strip (mainloop)", "w3_strip", "cutlass_strip"),
+        ("Q1: w3 fusion cost (fused - gemm)", "w3_fused", "w3_gemm"),
+        ("Q1b: CUTLASS fusion cost (fused - strip)", "cutlass_fused", "cutlass_strip"),
+        ("Q2: w3 vs CUTLASS fused (18us gap)", "w3_fused", "cutlass_fused"),
+        ("Q3: w3 vs CUTLASS GEMM (46us gap)", "w3_gemm", "cutlass_strip"),
         ("Q5: epi1 vs epi4 fused (warp count)", "epi1_fused", "w3_fused"),
+        ("Q6: w3 output cost (gemm - strip)", "w3_gemm", "w3_strip"),
     ]
 
     for title, a, b in comparisons:

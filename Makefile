@@ -77,6 +77,9 @@ fc2-w3-spin: fc2_w3.cu
 fc2-w3-grid: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=3 $< -o $@ $(LDFLAGS)
 
+fc2-w3-sched: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 $< -o $@ $(LDFLAGS)
+
 # ── FC2 CUTLASS kernel (CUTLASS GemmUniversal, reference epilogue) ──
 fc2-cutlass: fc2_cutlass.cu
 	$(NVCC) $(CFLAGS) $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)
