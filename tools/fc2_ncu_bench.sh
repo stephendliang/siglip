@@ -10,6 +10,7 @@
 # Q4: DRAM amplification — do we read/write more DRAM bytes?
 # Q5: Warp count — epi1 vs epi4
 # Q6: MMA-only baseline — w3 strip (no output, valid=0) for reference
+# Q7: Scheduler warp (TD=4) — w3_sched vs w3_fused and CUTLASS
 #
 # Usage:
 #   ./tools/fc2_ncu_bench.sh                # full run (6 variants)
@@ -117,6 +118,11 @@ BINARIES=(
     "w3_fused|make -B fc2-w3|./fc2-w3|fc2_w3_kernel"
     "cutlass_strip|make fc2-cutlass-strip|./fc2-cutlass-strip|regex:^(?!init)"
     "cutlass_fused|make fc2-cutlass|./fc2-cutlass|regex:^(?!init)"
+)
+
+BINARIES+=(
+    "w3_atomic|make -B fc2-w3-atomic|./fc2-w3-atomic|fc2_w3_kernel"
+    "w3_sched|make -B fc2-w3-sched|./fc2-w3-sched|fc2_w3_kernel"
 )
 
 if [ "$QUICK" = "0" ]; then
@@ -279,6 +285,17 @@ if [ "$DRY_RUN" = "0" ]; then
 
     # Q6: MMA-only baseline (w3 strip vs w3 gemm = output write cost)
     run_diff "diff_q6_output_cost" "$OUTDIR/w3_strip.csv"     "$OUTDIR/w3_gemm.csv"
+
+    # Q7: Atomic dispatch variants vs static and CUTLASS
+    if [ -f "$OUTDIR/w3_atomic.csv" ]; then
+        run_diff "diff_q7_atomic_vs_fused"   "$OUTDIR/w3_atomic.csv"  "$OUTDIR/w3_fused.csv"
+        run_diff "diff_q7_atomic_vs_cutlass" "$OUTDIR/w3_atomic.csv"  "$OUTDIR/cutlass_fused.csv"
+    fi
+    if [ -f "$OUTDIR/w3_sched.csv" ]; then
+        run_diff "diff_q7_sched_vs_fused"    "$OUTDIR/w3_sched.csv"   "$OUTDIR/w3_fused.csv"
+        run_diff "diff_q7_sched_vs_cutlass"  "$OUTDIR/w3_sched.csv"   "$OUTDIR/cutlass_fused.csv"
+        run_diff "diff_q7_sched_vs_atomic"   "$OUTDIR/w3_sched.csv"   "$OUTDIR/w3_atomic.csv"
+    fi
 fi
 
 # ══════════════════════════════════════════════════════════════════

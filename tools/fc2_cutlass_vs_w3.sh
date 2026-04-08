@@ -50,6 +50,8 @@ EXPERIMENTS=(
     "w3_fused|make fc2-w3|./fc2-w3"
     "w3_gemm|make fc2-w3-gemm|./fc2-w3-gemm"
     "w3_strip|make fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|./fc2-w3"
+    "w3_atomic|make fc2-w3-atomic|./fc2-w3-atomic"
+    "w3_sched|make fc2-w3-sched|./fc2-w3-sched"
 )
 
 for exp in "${EXPERIMENTS[@]}"; do
