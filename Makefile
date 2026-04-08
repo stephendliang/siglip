@@ -50,6 +50,9 @@ fc2-w3-fp32: fc2_w3.cu
 fc2-w3-strip: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
 
+fc2-w3-gemm: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY $< -o $@ $(LDFLAGS)
+
 fc2-w3-drain: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DLDS_DRAIN $< -o $@ $(LDFLAGS)
 

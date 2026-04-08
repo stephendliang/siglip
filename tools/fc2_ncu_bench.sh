@@ -1,17 +1,18 @@
 #!/bin/bash
-# FC2 ncu diagnosis v2 — focused on the 17us fused gap and epilogue overhead.
+# FC2 ncu diagnosis v3 — focused on 46us GEMM gap and DRAM amplification.
 #
 # Profiles: w3 (strided dispatch, 4 epi warps), w3-epi1 (1 epi warp), CUTLASS
-# Each in fused + strip variants.
+# Each in fused + gemm/strip variants.
 #
-# Q1: Epilogue overhead — w3 fused vs strip (226us — what is it?)
-# Q2: Head-to-head — w3 fused vs CUTLASS fused (17us gap)
-# Q3: Mainloop comparison — w3 strip vs CUTLASS strip (we should win)
+# Q1: Fusion cost — w3 fused vs w3 gemm (44us), cutlass fused vs cutlass strip (72us)
+# Q2: Head-to-head fused — w3 fused vs CUTLASS fused (18us gap)
+# Q3: GEMM comparison (apples-to-apples) — w3 gemm vs cutlass strip (46us gap)
 # Q4: DRAM amplification — do we read/write more DRAM bytes?
-# Q5: Warp count — epi1 vs epi4 (should be identical, ncu can show why)
+# Q5: Warp count — epi1 vs epi4
+# Q6: MMA-only baseline — w3 strip (no output, valid=0) for reference
 #
 # Usage:
-#   ./tools/fc2_ncu_bench.sh                # full run (5 variants)
+#   ./tools/fc2_ncu_bench.sh                # full run (6 variants)
 #   ./tools/fc2_ncu_bench.sh --dry-run      # print commands
 #   ./tools/fc2_ncu_bench.sh --quick        # skip epi1 (Q1-Q4 only)
 #   ./tools/fc2_ncu_bench.sh --full         # also collect --set full profiles
@@ -112,6 +113,7 @@ METRICS_ALL="${METRICS_STALL},${METRICS_MEM},${METRICS_PIPE},${METRICS_SCHED},${
 # ── Binary definitions: label|build_cmd|binary|kernel_filter ──
 BINARIES=(
     "w3_strip|make -B fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-w3:fc2-w3-strip|fc2_w3_kernel"
+    "w3_gemm|make -B fc2-w3-gemm|./fc2-w3-gemm|fc2_w3_kernel"
     "w3_fused|make -B fc2-w3|./fc2-w3|fc2_w3_kernel"
     "cutlass_strip|make fc2-cutlass-strip|./fc2-cutlass-strip|regex:^(?!init)"
     "cutlass_fused|make fc2-cutlass|./fc2-cutlass|regex:^(?!init)"
@@ -260,20 +262,23 @@ run_diff() {
 }
 
 if [ "$DRY_RUN" = "0" ]; then
-    # Q1: Epilogue overhead
-    run_diff "diff_q1_w3"         "$OUTDIR/w3_strip.csv"      "$OUTDIR/w3_fused.csv"
+    # Q1: Fusion cost (fused - gemm/strip)
+    run_diff "diff_q1_w3"         "$OUTDIR/w3_gemm.csv"       "$OUTDIR/w3_fused.csv"
     run_diff "diff_q1_cutlass"    "$OUTDIR/cutlass_strip.csv" "$OUTDIR/cutlass_fused.csv"
 
     # Q2: Head-to-head fused
     run_diff "diff_q2_fused"      "$OUTDIR/w3_fused.csv"      "$OUTDIR/cutlass_fused.csv"
 
-    # Q3: Mainloop comparison
-    run_diff "diff_q3_strip"      "$OUTDIR/w3_strip.csv"      "$OUTDIR/cutlass_strip.csv"
+    # Q3: GEMM comparison (apples-to-apples: both write output, no residual/bias)
+    run_diff "diff_q3_gemm"       "$OUTDIR/w3_gemm.csv"       "$OUTDIR/cutlass_strip.csv"
 
     # Q5: Epi warp count
     if [ "$QUICK" = "0" ] && [ -f "$OUTDIR/epi1_fused.csv" ]; then
         run_diff "diff_q5_epi1_vs_epi4" "$OUTDIR/epi1_fused.csv" "$OUTDIR/w3_fused.csv"
     fi
+
+    # Q6: MMA-only baseline (w3 strip vs w3 gemm = output write cost)
+    run_diff "diff_q6_output_cost" "$OUTDIR/w3_strip.csv"     "$OUTDIR/w3_gemm.csv"
 fi
 
 # ══════════════════════════════════════════════════════════════════
@@ -491,9 +496,10 @@ log ""
 log "Key outputs:"
 log "  $OUTDIR/results.txt       — wall times"
 log "  $OUTDIR/summary.txt       — all metrics side-by-side + DRAM amplification"
-log "  $OUTDIR/diff_q1*.txt      — Q1: epilogue overhead (fused - strip)"
+log "  $OUTDIR/diff_q1*.txt      — Q1: fusion cost (fused - gemm/strip)"
 log "  $OUTDIR/diff_q2*.txt      — Q2: head-to-head fused (w3 vs CUTLASS)"
-log "  $OUTDIR/diff_q3*.txt      — Q3: mainloop strip comparison"
+log "  $OUTDIR/diff_q3*.txt      — Q3: GEMM comparison (w3_gemm vs cutlass_strip)"
+log "  $OUTDIR/diff_q6*.txt      — Q6: output write cost (w3_strip vs w3_gemm)"
 if [ "$QUICK" = "0" ]; then
     log "  $OUTDIR/diff_q5*.txt      — Q5: epi1 vs epi4"
 fi

@@ -48,6 +48,7 @@ EXPERIMENTS=(
     "phase3_fused|make fc2-hybrid-phase3|./fc2-hybrid-phase3"
     "phase3_strip|make fc2-hybrid-phase3 DFLAGS=-DSTRIP_EPILOGUE|./fc2-hybrid-phase3"
     "w3_fused|make fc2-w3|./fc2-w3"
+    "w3_gemm|make fc2-w3-gemm|./fc2-w3-gemm"
     "w3_strip|make fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|./fc2-w3"
 )
 

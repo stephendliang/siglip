@@ -27,6 +27,7 @@ Compile-time flags:
   -DCUTE_STORE          C++ pointer stores (no asm STS) — tests CuTe store pattern vs asm volatile
   -DCUTLASS_LOOP=N      Loop structure: 1=nounroll si, 2=+nounroll chunk, 3=+C++ FP32 compute
   -DSTRIP_EPILOGUE      Skip epilogue (benchmark GEMM core only, valid=0)
+  -DGEMM_ONLY           Write D=BF16(A×B), no residual/bias (apples-to-apples vs cutlass strip)
   -DSINGLE_WARP_STORE=1 Only ew==0 issues TMA stores (4 per sub-iter, 1 commit group)
   -DDELAY_TMA_STORE=1   Issue TMA store from sub-iter N at start of sub-iter N+1
   -DNUM_EPI_STAGES=N    Epilogue staging depth (default 2, try 3/4)
@@ -167,6 +168,10 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 
 #if defined(GROUP_REORDER) && (defined(CUTLASS_EPILOGUE) || defined(CUTE_STORE) || CUTLASS_LOOP >= 3)
 #error "GROUP_REORDER only supported with default BF16 epilogue path"
+#endif
+
+#if defined(STRIP_EPILOGUE) && defined(GEMM_ONLY)
+#error "STRIP_EPILOGUE and GEMM_ONLY are mutually exclusive"
 #endif
 
 #ifdef SELF_LOAD
@@ -428,6 +433,22 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
         : "memory")
 
 #endif /* FP32_EPILOGUE */
+
+/* GEMM_ONLY: CVT FP32→BF16 + STS, no bias, no residual */
+#define GEMM_CVT_STS(f0,f1,f2,f3,f4,f5,f6,f7, SADDR) \
+    asm volatile( \
+        "{\n\t" \
+        ".reg .b32 o0, o1, o2, o3;\n\t" \
+        "cvt.rn.bf16x2.f32 o0, %1, %0;\n\t" \
+        "cvt.rn.bf16x2.f32 o1, %3, %2;\n\t" \
+        "cvt.rn.bf16x2.f32 o2, %5, %4;\n\t" \
+        "cvt.rn.bf16x2.f32 o3, %7, %6;\n\t" \
+        "st.shared.v4.b32 [%8], {o0,o1,o2,o3};\n\t" \
+        "}" \
+        :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
+           "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
+           "r"(SADDR) \
+        : "memory")
 
 #if CPP_EPILOGUE
 /*
@@ -1073,7 +1094,7 @@ fc2_w3_kernel(
             const int prev_buf = buf ^ 1;
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             ml_phase[prev_buf] ^= 1;
-#if defined(STRIP_EPILOGUE) || defined(SELF_LOAD)
+#if defined(STRIP_EPILOGUE) || defined(SELF_LOAD) || defined(GEMM_ONLY)
             if (has_prev)
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
 #else
@@ -1133,6 +1154,106 @@ fc2_w3_kernel(
 #ifdef STRIP_EPILOGUE
             if (has_prev)
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
+#elif defined(GEMM_ONLY)
+            /* ── W3-W6: GEMM-only epilogue — TMEM→CVT→STS→TMA store, no residual/bias ── */
+            {
+            const int ew = warp - 3;
+            const uint32_t xor_val = (lane & 7) << 4;
+            const uint32_t sw0 = 0 ^ xor_val, sw1 = 16 ^ xor_val;
+            const uint32_t sw2 = 32 ^ xor_val, sw3 = 48 ^ xor_val;
+            const uint32_t sw4 = 64 ^ xor_val, sw5 = 80 ^ xor_val;
+            const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
+
+            if (has_prev) {
+#if TILE_DISPATCH >= 1
+                const int prev_idx = _prev_tile;
+#elif defined(BIDIR_SNAKE)
+                const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
+                const int prev_idx = reverse ? (TOTAL_TILES - 1 - prev_fwd) : prev_fwd;
+#else
+                const int prev_idx = (m_rank + (_ti - 1) * my_m_stride) * TILES_N + tn_fixed;
+#endif
+                int ptm = prev_idx / TILES_N;
+                int ptn = prev_idx % TILES_N;
+                M_SNAKE_REMAP(ptm);
+                if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
+                const int prev_m = ptm * TM * 2 + cta_rank * TM;
+                const int prev_n = ptn * TN;
+
+                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+
+                for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
+                    const int stage = si % NUM_EPI_STAGES;
+                    const int nc_base = si * 64;
+
+#if GROUPS_PER_WARP > 1
+                    #pragma unroll
+                    for (int _rg = 0; _rg < GROUPS_PER_WARP; _rg++) {
+                    const int row_group = ew * GROUPS_PER_WARP + _rg;
+#else
+                    { const int row_group = ew;
+#endif
+                    const int taddr_base = prev_buf * TN + ((cta_rank * 128 + row_group * 32) << 16);
+                    float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
+                    float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
+
+                    const uint32_t stage_base = smem_to_uint(smem + OFF_STAGING
+                        + stage * EPI_STAGE_BYTES
+                        + row_group * STAGING_REGION_BYTES
+                        + lane * 128);
+
+                    for (int _ci = 0; _ci < 2; _ci++) {
+                        const int chunk = _ci;
+                        const int nc = nc_base + chunk * 32;
+
+                        TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,
+                                      a8,a9,a10,a11,a12,a13,a14,a15,
+                                      a16,a17,a18,a19,a20,a21,a22,a23,
+                                      a24,a25,a26,a27,a28,a29,a30,a31,
+                                      taddr_base + nc);
+
+                        const uint32_t rsw0 = chunk ? sw4 : sw0;
+                        const uint32_t rsw1 = chunk ? sw5 : sw1;
+                        const uint32_t rsw2 = chunk ? sw6 : sw2;
+                        const uint32_t rsw3 = chunk ? sw7 : sw3;
+
+                        TMEM_WAIT();
+
+                        GEMM_CVT_STS(a0,a1,a2,a3,a4,a5,a6,a7, stage_base + rsw0);
+                        GEMM_CVT_STS(a8,a9,a10,a11,a12,a13,a14,a15, stage_base + rsw1);
+                        GEMM_CVT_STS(a16,a17,a18,a19,a20,a21,a22,a23, stage_base + rsw2);
+                        GEMM_CVT_STS(a24,a25,a26,a27,a28,a29,a30,a31, stage_base + rsw3);
+                    }
+                    } /* close row_group */
+
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile(BAR_EPI_SYNC ::: "memory");
+
+#if GROUPS_PER_WARP > 1
+                    if (lane == 0) {
+                        #pragma unroll
+                        for (int _rg = 0; _rg < GROUPS_PER_WARP; _rg++) {
+                            const int rg = ew * GROUPS_PER_WARP + _rg;
+                            const uint32_t s_ = smem_to_uint(smem + OFF_STAGING
+                                + stage * EPI_STAGE_BYTES + rg * STAGING_REGION_BYTES);
+                            asm volatile(
+                                "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group"
+                                " [%0, {%1, %2}], [%3];"
+                                :: "l"(&tma_c), "r"(prev_n + nc_base), "r"(prev_m + rg * 32),
+                                   "r"(s_) : "memory");
+                        }
+                        asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+                    }
+#else
+                    { const int row_group = ew;
+                    EPI_STORE(stage, nc_base, prev_n, prev_m); }
+#endif
+                    EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
+                }
+
+                mbar_arrive(epi_mbar_masked + prev_buf * 8);
+            }
+            }
 #else
             /* ── W3-W6: Epilogue compute — ReuseSmemC, BAR.SYNC coordinated ── */
             const int ew = warp - 3;                           /* 0..NUM_EPI_WARPS-1 */
@@ -1556,7 +1677,7 @@ fc2_w3_kernel(
         } else if (warp == 1) {
             /* W1: nothing — already committed mainloop_mbar */
         } else if (warp == 2) {
-#if defined(STRIP_EPILOGUE) || defined(SELF_LOAD)
+#if defined(STRIP_EPILOGUE) || defined(SELF_LOAD) || defined(GEMM_ONLY)
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
             ml_phase[last_buf] ^= 1;
             mbar_arrive(epi_mbar_masked + last_buf * 8);
@@ -1597,6 +1718,91 @@ fc2_w3_kernel(
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
             ml_phase[last_buf] ^= 1;
             mbar_arrive(epi_mbar_masked + last_buf * 8);
+#elif defined(GEMM_ONLY)
+            /* W3-W6: GEMM-only drain — last tile */
+            {
+            const int ew = warp - 3;
+            const uint32_t xor_val = (lane & 7) << 4;
+            const uint32_t sw0 = 0 ^ xor_val, sw1 = 16 ^ xor_val;
+            const uint32_t sw2 = 32 ^ xor_val, sw3 = 48 ^ xor_val;
+            const uint32_t sw4 = 64 ^ xor_val, sw5 = 80 ^ xor_val;
+            const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
+
+            mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
+            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+            ml_phase[last_buf] ^= 1;
+
+            for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
+                const int stage = si % NUM_EPI_STAGES;
+                const int nc_base = si * 64;
+
+#if GROUPS_PER_WARP > 1
+                #pragma unroll
+                for (int _rg = 0; _rg < GROUPS_PER_WARP; _rg++) {
+                const int row_group = ew * GROUPS_PER_WARP + _rg;
+#else
+                { const int row_group = ew;
+#endif
+                const int taddr_base = last_buf * TN + ((cta_rank * 128 + row_group * 32) << 16);
+                float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
+                float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
+
+                const uint32_t stage_base = smem_to_uint(smem + OFF_STAGING
+                    + stage * EPI_STAGE_BYTES
+                    + row_group * STAGING_REGION_BYTES
+                    + lane * 128);
+
+                for (int _ci = 0; _ci < 2; _ci++) {
+                    const int chunk = _ci;
+                    const int nc = nc_base + chunk * 32;
+
+                    TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,
+                                  a8,a9,a10,a11,a12,a13,a14,a15,
+                                  a16,a17,a18,a19,a20,a21,a22,a23,
+                                  a24,a25,a26,a27,a28,a29,a30,a31,
+                                  taddr_base + nc);
+
+                    const uint32_t rsw0 = chunk ? sw4 : sw0;
+                    const uint32_t rsw1 = chunk ? sw5 : sw1;
+                    const uint32_t rsw2 = chunk ? sw6 : sw2;
+                    const uint32_t rsw3 = chunk ? sw7 : sw3;
+
+                    TMEM_WAIT();
+
+                    GEMM_CVT_STS(a0,a1,a2,a3,a4,a5,a6,a7, stage_base + rsw0);
+                    GEMM_CVT_STS(a8,a9,a10,a11,a12,a13,a14,a15, stage_base + rsw1);
+                    GEMM_CVT_STS(a16,a17,a18,a19,a20,a21,a22,a23, stage_base + rsw2);
+                    GEMM_CVT_STS(a24,a25,a26,a27,a28,a29,a30,a31, stage_base + rsw3);
+                }
+                } /* close row_group */
+
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                asm volatile(BAR_EPI_SYNC ::: "memory");
+
+#if GROUPS_PER_WARP > 1
+                if (lane == 0) {
+                    #pragma unroll
+                    for (int _rg = 0; _rg < GROUPS_PER_WARP; _rg++) {
+                        const int rg = ew * GROUPS_PER_WARP + _rg;
+                        const uint32_t s_ = smem_to_uint(smem + OFF_STAGING
+                            + stage * EPI_STAGE_BYTES + rg * STAGING_REGION_BYTES);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group"
+                            " [%0, {%1, %2}], [%3];"
+                            :: "l"(&tma_c), "r"(last_n + nc_base), "r"(last_m + rg * 32),
+                               "r"(s_) : "memory");
+                    }
+                    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+                }
+#else
+                { const int row_group = ew;
+                EPI_STORE(stage, nc_base, last_n, last_m); }
+#endif
+                EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
+            }
+
+            mbar_arrive(epi_mbar_masked + last_buf * 8);
+            }
 #else
             /* W3-W6: epilogue for last tile (ReuseSmemC) */
             const int ew = warp - 3;
@@ -1967,7 +2173,10 @@ __global__ void init_residual(__nv_bfloat16* __restrict__ res, int n_dim, long l
 
 int main() {
     setbuf(stdout, NULL);
-#ifdef SELF_LOAD
+#ifdef GEMM_ONLY
+    printf("FC2 W3 kernel — %d warps (%d idle), GEMM_ONLY (D=BF16(A*B), no residual/bias)\n",
+           NUM_WARPS, NUM_IDLE_WARPS);
+#elif defined(SELF_LOAD)
     printf("FC2 W3 kernel — %d warps (%d idle), SELF_LOAD epilogue (per-warp TMA)\n",
            NUM_WARPS, NUM_IDLE_WARPS);
 #else
@@ -2162,7 +2371,10 @@ int main() {
         float res_bf16_f = __bfloat162float(__float2bfloat16(
             (float)((int)row % 128) * 0.25f + (float)col * 0.125f));
         float bias_bf16_f = __bfloat162float(__float2bfloat16((float)(col + 1)));
-#ifdef FP32_EPILOGUE
+#ifdef GEMM_ONLY
+        /* GEMM-only: D = BF16(A×B), no bias/residual */
+        __nv_bfloat16 expected = __float2bfloat16(gemm);
+#elif defined(FP32_EPILOGUE)
         /* FP32 path: bf16(gemm + bias_fp32 + residual_fp32) — single final rounding */
         __nv_bfloat16 expected = __float2bfloat16(gemm + bias_bf16_f + res_bf16_f);
 #else
