@@ -1,0 +1,17 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |       2,443.0 |    15,924,585 | 651745.5% | 
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |     101,980.0 |    17,124,439 |  16692.0% | 
+dram__sectors_write.sum                                                |     348,072.0 |    44,376,080 |  12649.1% | sector
+lts__t_sectors_op_write.sum                                            |     713,902.0 |    67,528,346 |   9359.0% | sector
+smsp__warps_issue_stalled_short_scoreboard.avg                         |       1,247.2 |      26,234.4 |   2003.5% | warp
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |         377.9 |       2,292.0 |    506.4% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |         912.4 |       4,189.6 |    359.2% | warp
+launch__registers_per_thread                                           |         47.00 |         110.0 |    134.0% | register/thread
+smsp__warps_issue_stalled_sleeping.avg                                 |      14,141.8 |      26,084.8 |     84.5% | warp
+smsp__inst_executed.sum                                                |    44,225,537 |    71,152,786 |     60.9% | inst
+smsp__warps_issue_stalled_wait.avg                                     |     264,250.2 |     338,437.9 |     28.1% | warp
+smsp__warps_issue_stalled_barrier.avg                                  |     226,974.5 |     280,080.8 |     23.4% | warp
+dram__sectors_read.sum                                                 |   142,320,888 |   118,851,008 |    -16.5% | sector
+lts__t_sectors.sum                                                     |   614,652,140 |   679,508,158 |     10.6% | sector
+smsp__cycles_active.avg                                                |     1,831,763 |     1,985,542 |      8.4% | cycle

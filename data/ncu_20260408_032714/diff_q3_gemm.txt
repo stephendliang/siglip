@@ -1,0 +1,17 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |       2,066.0 |     434,148.0 |  20913.9% | 
+smsp__warps_issue_stalled_mio_throttle.avg                             |         15.88 |       2,178.1 |  13616.1% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |       4,189.6 |      25,683.7 |    513.0% | warp
+smsp__warps_issue_stalled_sleeping.avg                                 |      26,084.8 |          0.00 |   -100.0% | warp
+smsp__inst_executed.sum                                                |    71,152,786 |   141,729,604 |     99.2% | inst
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |       2,292.0 |         595.1 |    -74.0% | warp
+launch__registers_per_thread                                           |         110.0 |         186.0 |     69.1% | register/thread
+smsp__warps_issue_stalled_barrier.avg                                  |     280,080.8 |      92,130.6 |    -67.1% | warp
+smsp__warps_issue_stalled_wait.avg                                     |     338,437.9 |     140,962.0 |    -58.3% | warp
+dram__sectors_read.sum                                                 |   118,851,008 |    89,193,768 |    -25.0% | sector
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |    17,124,439 |    19,955,327 |     16.5% | 
+smsp__warps_issue_stalled_short_scoreboard.avg                         |      26,234.4 |      30,503.2 |     16.3% | warp
+lts__t_sectors_op_read.sum                                             |   611,199,060 |   554,531,529 |     -9.3% | sector
+lts__t_sectors.sum                                                     |   679,508,158 |   621,621,886 |     -8.5% | sector
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     2,569,543 |     2,427,075 |     -5.5% | warp
