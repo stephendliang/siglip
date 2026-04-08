@@ -254,8 +254,25 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define _LAYOUT_END        _MBAR_END
 #endif
 
-/* Bias SMEM: 256 BF16 = 512 B */
-#define OFF_BIAS_SMEM      ((_LAYOUT_END + 15) & ~15)
+/*
+EPI_REUSE_SMEM: borrow the last mainloop stage for epilogue staging.
+Epilogue uses 2×16KB = 32KB, which fits in one 32KB mainloop stage.
+W0 waits on epi_done_mbar before loading ki=EPI_FIRST_BORROW_KI.
+Auto-enabled when N_STAGES >= 7 (NS6 fits without reuse, NS7+ doesn't).
+*/
+#if N_STAGES >= 7
+#define EPI_REUSE_SMEM     1
+#define EPI_BORROW_STAGES  1
+#define EPI_FIRST_BORROW_KI (N_STAGES - EPI_BORROW_STAGES)
+#define OFF_EPI_DONE_MBAR  _LAYOUT_END
+#define _CTRL_END          (OFF_EPI_DONE_MBAR + 8)
+#else
+#define EPI_REUSE_SMEM     0
+#define _CTRL_END          _LAYOUT_END
+#endif
+
+/* Bias SMEM: all N_DIM BF16 bias values */
+#define OFF_BIAS_SMEM      ((_CTRL_END + 15) & ~15)
 #define BIAS_SMEM_BYTES    (N_DIM * 2)
 
 /* Epilogue staging: ReuseSmemC — 2-stage circular pipe.
@@ -264,12 +281,17 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define STAGING_REGION_BYTES  (32 * 128)                        /* 4096 B: 32 rows × 64 cols × 2B */
 #define EPI_STAGE_BYTES    (4 * STAGING_REGION_BYTES)           /* 16384: 128 rows × 64 cols × 2B */
 
+#if EPI_REUSE_SMEM
+/* Staging overlaps with last mainloop stage. SMEM ends at bias region. */
+#define OFF_STAGING        (EPI_FIRST_BORROW_KI * STAGE_BYTES)
+#define SMEM_BYTES         ((OFF_BIAS_SMEM + BIAS_SMEM_BYTES + 127) & ~127)
+#else
 #define OFF_STAGING        ((OFF_BIAS_SMEM + BIAS_SMEM_BYTES + 1023) & ~1023)  /* 1024-align */
+#define SMEM_BYTES         ((OFF_STAGING + NUM_EPI_STAGES * EPI_STAGE_BYTES + 127) & ~127)
+#endif
 /* Stage si: OFF_STAGING + si * EPI_STAGE_BYTES
    Within stage si (ReuseSmemC — same region for load and store):
      data[rg]: OFF_STAGING + si*EPI_STAGE_BYTES + rg*STAGING_REGION_BYTES */
-
-#define SMEM_BYTES         ((OFF_STAGING + NUM_EPI_STAGES * EPI_STAGE_BYTES + 127) & ~127)
 
 /* ── WGMMA / TMEM ── */
 #define TMEM_COLS      512
@@ -851,6 +873,13 @@ fc2_w3_kernel(
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_TD6_EPOCH + 4)));
 #endif
 
+#if EPI_REUSE_SMEM
+        /* epi_done_mbar: epilogue warps arrive when staging SMEM is free.
+           W0 waits on this before loading into the borrowed mainloop stage.
+           Count = 1: warp 3 lane 0 is the designated signaler. */
+        mbar_init(smem_to_uint(smem + OFF_EPI_DONE_MBAR), 1);
+#endif
+
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
@@ -927,6 +956,10 @@ fc2_w3_kernel(
 
     int tma_phase[N_STAGES] = {0};
     int mma_phase[N_STAGES] = {0};
+#if EPI_REUSE_SMEM
+    int epi_done_phase = 0;
+    const uint32_t epi_done_mbar_addr = smem_to_uint(smem + OFF_EPI_DONE_MBAR);
+#endif
 
     uint64_t desc_a_base[N_STAGES], desc_b_base[N_STAGES];
     for (int s = 0; s < N_STAGES; s++) {
@@ -1227,6 +1260,14 @@ fc2_w3_kernel(
                     mbar_wait(mma_mbar_s, mma_phase[s]);
                     mma_phase[s] ^= 1;
                 }
+#if EPI_REUSE_SMEM
+                /* Wait for previous tile's epilogue to release borrowed stage.
+                   Only at ki=EPI_FIRST_BORROW_KI (first use of borrowed stage per tile). */
+                if (has_prev && ki == EPI_FIRST_BORROW_KI) {
+                    mbar_wait(epi_done_mbar_addr, epi_done_phase);
+                    epi_done_phase ^= 1;
+                }
+#endif
 
                 if (lane == 0) {
                     const uint32_t a_dst = smem_base + s * STAGE_BYTES;
@@ -1467,6 +1508,10 @@ fc2_w3_kernel(
                     EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
                 }
 
+#if EPI_REUSE_SMEM
+                if (warp == 3 && lane == 0)
+                    mbar_arrive(epi_done_mbar_addr);
+#endif
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
             }
             }
@@ -1849,6 +1894,12 @@ fc2_w3_kernel(
                 mbar_arrive(consumed_mbar[pend_stage]);
 #endif
 
+#if EPI_REUSE_SMEM
+                /* Signal W0: epilogue done with borrowed staging SMEM.
+                   W0 can now load into the borrowed mainloop stage. */
+                if (warp == 3 && lane == 0)
+                    mbar_arrive(epi_done_mbar_addr);
+#endif
                 /* Signal W1: TMEM buffer free for the next user of prev_buf. */
 #ifdef LDS_DRAIN
                 mbar_arrive((epi_mbar_masked ^ drain_acc) + prev_buf * 8);
@@ -2399,8 +2450,8 @@ int main() {
     printf("FC2 W3 kernel — %d warps (%d idle), shared-SMEM epilogue\n",
            NUM_WARPS, NUM_IDLE_WARPS);
 #endif
-    printf("  GEMM: [%d,%d] x [%d,%d]^T  %d-stage pipeline  SMEM: %d bytes\n",
-           M_TOTAL, K_DIM, N_DIM, K_DIM, N_STAGES, SMEM_BYTES);
+    printf("  GEMM: [%d,%d] x [%d,%d]^T  %d-stage pipeline  SMEM: %d bytes  EPI_REUSE=%d\n",
+           M_TOTAL, K_DIM, N_DIM, K_DIM, N_STAGES, SMEM_BYTES, EPI_REUSE_SMEM);
     printf("  EPI: stages=%d  SWS=%d  DTS=%d  FP32=%d  CPP=%d\n",
            NUM_EPI_STAGES, SINGLE_WARP_STORE, DELAY_TMA_STORE,
 #ifdef FP32_EPILOGUE

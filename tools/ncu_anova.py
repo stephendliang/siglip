@@ -101,6 +101,8 @@ def main():
         ("Q9: inline vs cutlass fused", "w3_inline", "cutlass_fused"),
         ("Q10: prefill vs baseline fused", "w3_prefill", "w3_fused"),
         ("Q11: inline+prefill vs cutlass fused", "w3_inline_prefill", "cutlass_fused"),
+        ("Q12: NS7 vs NS6 fused", "w3_ns7", "w3_fused"),
+        ("Q13: NS7 vs cutlass fused", "w3_ns7", "cutlass_fused"),
     ]
 
     for title, a, b in comparisons:

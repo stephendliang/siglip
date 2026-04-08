@@ -53,6 +53,8 @@ EXPERIMENTS=(
     "w3_noprefill|make fc2-w3 DFLAGS=-DNO_PREFILL|./fc2-w3"
     "w3_ns5|make fc2-w3 DFLAGS='-DN_STAGES=5'|./fc2-w3"
     "w3_ns5_noprefill|make fc2-w3 DFLAGS='-DN_STAGES=5 -DNO_PREFILL'|./fc2-w3"
+    "w3_ns7|make fc2-w3-ns7|./fc2-w3-ns7"
+    "w3_ns7_noprefill|make fc2-w3 DFLAGS='-DN_STAGES=7 -DNO_PREFILL'|./fc2-w3"
     "w3_atomic|make fc2-w3-atomic|./fc2-w3-atomic"
     "w3_sched|make fc2-w3-sched|./fc2-w3-sched"
     "w3_inline|make fc2-w3-inline|./fc2-w3-inline"
