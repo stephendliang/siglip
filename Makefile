@@ -104,10 +104,10 @@ fc2-ldg-gemm: fc2_ldg.cu
 
 # ── FC2 CUTLASS kernel (CUTLASS GemmUniversal, reference epilogue) ──
 fc2-cutlass: fc2_cutlass.cu
-	$(NVCC) $(CFLAGS) $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)
+	$(NVCC) $(CFLAGS) $(DFLAGS) $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)
 
 fc2-cutlass-strip: fc2_cutlass.cu
-	$(NVCC) $(CFLAGS) -DSTRIP_EPILOGUE $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)
 
 fc2-cutlass-static: fc2_cutlass.cu
 	$(NVCC) $(CFLAGS) -DSTATIC_SCHED $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)

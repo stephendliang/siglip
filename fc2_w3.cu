@@ -59,10 +59,16 @@ Compile-time flags:
 /* ── Hardware ── */
 #define SM_COUNT       148
 
-/* ── Problem dims ── */
+/* ── Problem dims (overridable via -D flags) ── */
+#ifndef M_TOTAL
 #define M_TOTAL        928256   /* 4736 images × 196 patches */
+#endif
+#ifndef N_DIM
 #define N_DIM          768
+#endif
+#ifndef K_DIM
 #define K_DIM          3072
+#endif
 
 /* ── Tile ── */
 #define TM             128

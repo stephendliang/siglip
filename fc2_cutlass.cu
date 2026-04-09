@@ -35,11 +35,17 @@ using namespace cute;
     } \
 } while(0)
 
-/* Problem dimensions — identical to fc2_w3.cu */
+/* Problem dimensions — identical to fc2_w3.cu (overridable via -D flags) */
 #define SM_COUNT  148
+#ifndef M_TOTAL
 #define M_TOTAL   928256   /* 4736 images × 196 patches */
+#endif
+#ifndef N_DIM
 #define N_DIM     768
+#endif
+#ifndef K_DIM
 #define K_DIM     3072
+#endif
 
 /* FP8 E4M3 inputs, BF16 C/D, FP32 accumulator */
 using ElementA   = cutlass::float_e4m3_t;
