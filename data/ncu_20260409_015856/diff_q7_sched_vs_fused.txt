@@ -1,0 +1,17 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+smsp__warps_issue_stalled_barrier.avg                                  |      45,954.6 |     280,368.1 |    510.1% | warp
+smsp__warps_issue_stalled_sleeping.avg                                 |       4,187.4 |      24,108.3 |    475.7% | warp
+dram__sectors_read.sum                                                 |   133,746,888 |   220,178,568 |     64.6% | sector
+dram__throughput.avg.pct_of_peak_sustained_elapsed                     |         43.61 |         58.45 |     34.0% | %
+launch__registers_per_thread                                           |         163.0 |         126.0 |    -22.7% | register/thread
+lts__t_sector_hit_rate.pct                                             |         56.55 |         44.24 |    -21.8% | %
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     2,689,473 |     2,226,002 |    -17.2% | warp
+smsp__warps_issue_stalled_short_scoreboard.avg                         |     197,927.9 |     164,131.3 |    -17.1% | warp
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |    30,712,001 |    25,973,407 |    -15.4% | 
+lts__t_sectors_op_read.sum                                             |   616,280,861 |   687,143,051 |     11.5% | sector
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |       2,470.7 |       2,217.6 |    -10.2% | warp
+lts__t_sectors.sum                                                     |   688,822,399 |   756,006,586 |      9.8% | sector
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |    18,665,321 |    20,161,151 |      8.0% | 
+smsp__warps_issue_stalled_not_selected.avg                             |       7,062.4 |       6,527.4 |     -7.6% | warp
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |    51,112,264 |    47,653,767 |     -6.8% | 

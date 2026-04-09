@@ -1,0 +1,29 @@
+FC2 W3 kernel — 7 warps (0 idle), shared-SMEM epilogue
+  GEMM: [928256,3072] x [768,3072]^T  6-stage pipeline  SMEM: 231424 bytes  EPI_REUSE=0
+  EPI: stages=2  SWS=0  DTS=0  FP32=0  CPP=0
+==PROF== Connected to process 5597 (/root/siglip/fc2-w3)
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=231424 B)
+Launching warmup (2 iters)...
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+  Warmup done.
+Timing: 10 iterations...
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+FC2-W3 kernel: 690.827 ms  6.34 TFLOPS
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 7315328.000000
+C[0,0..3] = 6912.0 4608.0 6912.0 4608.0
+@@RESULT ms=690.827 tflops=6.34 checksum=7315328.000000 valid=1 c0=6912.0
+==PROF== Disconnected from process 5597
+==PROF== Report: /root/siglip/data/ncu_20260409_015856/w3_fused.ncu-rep
