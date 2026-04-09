@@ -1104,23 +1104,27 @@ fc2_w3_kernel(
         const int buf = 0;
         const bool has_prev = false;
 #elif TILE_DISPATCH == 4
+    /* Software-pipelined dispatch: prefetch next tile from W7's FIFO at
+       end of K-loop so mbar_wait is hidden behind mainloop latency.
+       At loop top W0 already has tile_idx in registers — zero stall. */
+    int _pf_tile = TOTAL_TILES;
+    int _pf_slot = 1;
+    if (warp == 0) {
+        mbar_wait(sched_prod_mbar, sched_prod_phase[0]);
+        sched_prod_phase[0] ^= 1;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_pf_tile) : "r"(fifo_addr));
+        mbar_arrive(sched_cons_mbar);
+    }
     while (true) {
         int tile_idx;
         {
-            /* W0: read from scheduler pipe */
             const int _buf = _iter & 1;
             if (warp == 0) {
-                mbar_wait(sched_prod_mbar + _buf * 8, sched_prod_phase[_buf]);
-                sched_prod_phase[_buf] ^= 1;
-                asm volatile("ld.shared.b32 %0, [%1];"
-                    : "=r"(tile_idx) : "r"(fifo_addr + _buf * 4));
-                mbar_arrive(sched_cons_mbar + _buf * 8);
-                /* Broadcast tile_idx for W1-W6 */
+                tile_idx = _pf_tile;
                 asm volatile("st.shared.b32 [%0], %1;"
                     :: "r"(bcast_addr + _buf * 4), "r"(tile_idx));
                 mbar_arrive(tile_ready_mbar + _buf * 8);
             } else {
-                /* W1-W6: wait for W0 to write bcast_tile, then read */
                 mbar_wait(tile_ready_mbar + _buf * 8, tile_ready_phase[_buf]);
                 tile_ready_phase[_buf] ^= 1;
                 asm volatile("ld.shared.b32 %0, [%1];"
@@ -1285,6 +1289,17 @@ fc2_w3_kernel(
                         : "memory");
                 }
             }
+
+#if TILE_DISPATCH == 4
+            /* Prefetch next tile from scheduler FIFO.
+               mbar_wait overlaps with W1's MMA / W2-W6's epilogue. */
+            mbar_wait(sched_prod_mbar + _pf_slot * 8, sched_prod_phase[_pf_slot]);
+            sched_prod_phase[_pf_slot] ^= 1;
+            asm volatile("ld.shared.b32 %0, [%1];"
+                : "=r"(_pf_tile) : "r"(fifo_addr + _pf_slot * 4));
+            mbar_arrive(sched_cons_mbar + _pf_slot * 8);
+            _pf_slot ^= 1;
+#endif
 
         } else if (warp == 1) {
             /* ── W1: MMA ── */
