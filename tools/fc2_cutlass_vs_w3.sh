@@ -58,6 +58,10 @@ EXPERIMENTS=(
     "w3_atomic|make fc2-w3-atomic|./fc2-w3-atomic"
     "w3_sched|make fc2-w3-sched|./fc2-w3-sched"
     "w3_inline|make fc2-w3-inline|./fc2-w3-inline"
+    "ldg_fused|make fc2-ldg|./fc2-ldg"
+    "ldg_gemm|make fc2-ldg-gemm|./fc2-ldg-gemm"
+    "ldg_strip|make fc2-ldg-strip|./fc2-ldg-strip"
+    "ldg_ns6|make fc2-ldg DFLAGS='-DN_STAGES=6'|./fc2-ldg"
 )
 
 for exp in "${EXPERIMENTS[@]}"; do

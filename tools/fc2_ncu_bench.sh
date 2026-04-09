@@ -125,11 +125,6 @@ BINARIES+=(
     "w3_sched|make -B fc2-w3-sched|./fc2-w3-sched|fc2_w3_kernel"
 )
 
-if [ "$QUICK" = "0" ]; then
-    BINARIES+=(
-        "epi1_fused|make -B fc2-w3-epi1|./fc2-w3-epi1|fc2_w3_kernel"
-    )
-fi
 
 # ══════════════════════════════════════════════════════════════════
 #  PHASE 1: Build all binaries
@@ -277,11 +272,6 @@ if [ "$DRY_RUN" = "0" ]; then
 
     # Q3: GEMM comparison (apples-to-apples: both write output, no residual/bias)
     run_diff "diff_q3_gemm"       "$OUTDIR/w3_gemm.csv"       "$OUTDIR/cutlass_strip.csv"
-
-    # Q5: Epi warp count
-    if [ "$QUICK" = "0" ] && [ -f "$OUTDIR/epi1_fused.csv" ]; then
-        run_diff "diff_q5_epi1_vs_epi4" "$OUTDIR/epi1_fused.csv" "$OUTDIR/w3_fused.csv"
-    fi
 
     # Q6: MMA-only baseline (w3 strip vs w3 gemm = output write cost)
     run_diff "diff_q6_output_cost" "$OUTDIR/w3_strip.csv"     "$OUTDIR/w3_gemm.csv"
@@ -517,9 +507,6 @@ log "  $OUTDIR/diff_q1*.txt      — Q1: fusion cost (fused - gemm/strip)"
 log "  $OUTDIR/diff_q2*.txt      — Q2: head-to-head fused (w3 vs CUTLASS)"
 log "  $OUTDIR/diff_q3*.txt      — Q3: GEMM comparison (w3_gemm vs cutlass_strip)"
 log "  $OUTDIR/diff_q6*.txt      — Q6: output write cost (w3_strip vs w3_gemm)"
-if [ "$QUICK" = "0" ]; then
-    log "  $OUTDIR/diff_q5*.txt      — Q5: epi1 vs epi4"
-fi
 if [ "$FULL" = "1" ]; then
     log "  $OUTDIR/full_*.csv        — full profiles + source counters"
 fi
