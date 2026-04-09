@@ -44,6 +44,10 @@ Compile-time flags:
   -DNO_PREFILL          Restore epilogue_mbar wait in W1 (default: skipped via PREFILL).
                         PREFILL relies on TMEM double-buffering — epilogue reads prev_buf
                         while MMA writes buf. Removing it re-adds tile-level pipeline bubble.
+  -DL2_HINTS[=N]        Add .L2::cache_hint to TMA loads. Strategy:
+                        1 (default): A/B=EVICT_NORMAL, residual=EVICT_FIRST
+                        2: A=EVICT_FIRST, B=EVICT_LAST, residual=EVICT_FIRST
+                        3: A=EVICT_LAST, B=EVICT_NORMAL, residual=EVICT_FIRST
 */
 
 #include <cuda.h>
@@ -203,6 +207,25 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #if NO_PRE_STORE_BAR && SINGLE_WARP_STORE
 #error "NO_PRE_STORE_BAR requires SINGLE_WARP_STORE=0 (each warp stores its own region)"
 #endif
+/* L2 cache hints for TMA loads (64-bit operands, PTX .L2::cache_hint qualifier) */
+#ifdef L2_HINTS
+#if !defined(L2_HINTS) || L2_HINTS == 0
+#undef L2_HINTS
+#define L2_HINTS 1
+#endif
+#if L2_HINTS == 2
+#define L2_A_HINT   0x12F0000000000000ULL  /* EVICT_FIRST: stream A through */
+#define L2_B_HINT   0x14F0000000000000ULL  /* EVICT_LAST:  keep B in L2 */
+#elif L2_HINTS == 3
+#define L2_A_HINT   0x14F0000000000000ULL  /* EVICT_LAST:  cache A for cross-group reuse */
+#define L2_B_HINT   0x1000000000000000ULL  /* EVICT_NORMAL */
+#else /* L2_HINTS == 1 */
+#define L2_A_HINT   0x1000000000000000ULL  /* EVICT_NORMAL */
+#define L2_B_HINT   0x1000000000000000ULL  /* EVICT_NORMAL */
+#endif
+#define L2_RES_HINT 0x12F0000000000000ULL  /* EVICT_FIRST: stream residual through */
+#endif
+
 #define NUM_EPI_SUBITERS   4
 #ifdef SELF_LOAD
 /* Per-warp TMA load barriers replace W2's shared circular pipe */
@@ -391,11 +414,19 @@ void tma_load_2d(uint32_t smem_dst, const void* tma_desc,
 static __device__ __forceinline__
 void tma_load_2d_cta(uint32_t smem_dst, const void* tma_desc,
                       int32_t c0, int32_t c1, uint32_t mbar) {
+#ifdef L2_HINTS
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
+        " [%0], [%1, {%2, %3}], [%4], %5;"
+        :: "r"(smem_dst), "l"(tma_desc), "r"(c0), "r"(c1), "r"(mbar), "l"(L2_RES_HINT)
+        : "memory");
+#else
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3}], [%4];"
         :: "r"(smem_dst), "l"(tma_desc), "r"(c0), "r"(c1), "r"(mbar)
         : "memory");
+#endif
 }
 
 static __device__ __forceinline__
@@ -1275,6 +1306,21 @@ fc2_w3_kernel(
 
                 if (lane == 0) {
                     const uint32_t a_dst = smem_base + s * STAGE_BYTES;
+#ifdef L2_HINTS
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                        ".mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;\n\t"
+                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                        ".mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                        " [%6], [%7, {%2, %8}], [%4], %9;\n\t"
+                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %10;"
+                        :: "r"(a_dst), "l"(&tma_a), "r"(k_start), "r"(m_start),
+                           "r"(tma_mbar_s), "l"(L2_A_HINT),
+                           "r"(a_dst + 16384), "l"(&tma_b),
+                           "r"(n_start + cta_rank * (TN/2)), "l"(L2_B_HINT),
+                           "r"(TMA_BYTES)
+#else
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
                         ".mbarrier::complete_tx::bytes.cta_group::2"
@@ -1286,6 +1332,7 @@ fc2_w3_kernel(
                         :: "r"(a_dst), "l"(&tma_a), "r"(k_start), "r"(m_start),
                            "r"(tma_mbar_s), "r"(a_dst + 16384), "l"(&tma_b),
                            "r"(n_start + cta_rank * (TN/2)), "r"(TMA_BYTES)
+#endif
                         : "memory");
                 }
             }

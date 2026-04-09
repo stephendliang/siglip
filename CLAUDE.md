@@ -78,11 +78,14 @@ STRIP_EPILOGUE skips W2 residual loads and ALL output writes (valid=0, 0.01GB wr
 
 **CLC vs static dispatch:** CUTLASS StaticPersistentScheduler = +7us noise vs CLC. Strict ordering is NOT why CUTLASS gets 1.00x.
 
+### What does NOT explain it (INVESTIGATED)
+
+- **TMA descriptor cache policy hints (2026-04-08):** Tested EVICT_FIRST/EVICT_LAST/EVICT_NORMAL on A, B, and residual TMA loads. Zero effect (strategies 1/3 neutral, strategy 2 regression). CUTLASS also uses EVICT_NORMAL default. Amplification is L2 capacity, not eviction policy.
+
 ### What might explain it (UNINVESTIGATED)
 
-- **TMA descriptor cache policy hints** — CUTLASS may set L2 eviction/streaming policies we don't
 - **TMA load scheduling** — CUTLASS W2 loads A/B (separate warp from scheduler), our W0 loads A/B (also does mbarrier waits). Different TMA issue timing could affect L2 hit patterns
-- **Pipeline depth interaction** — 5-stage pipeline means 5 K-iters of A in flight (5 × 32KB = 160KB/cluster, 11.5MB total). L2 sector conflicts from concurrent TMA streams?
+- **Pipeline depth interaction** — 6-stage pipeline means 6 K-iters of A in flight (6 × 32KB = 192KB/cluster, 27.7MB total across 148 CTAs). L2 sector conflicts from concurrent TMA streams?
 - **8 vs 7 warp effect on TMA scheduling** — more warps = different SM scheduling of TMA load warp
 
 ### Why amplification matters for epilogue too
@@ -174,6 +177,10 @@ W0 does atomicAdd at tile boundary instead of dedicated W7 scheduler warp. 1.370
 ### PREFILL at N_STAGES=5 (2026-04-08)
 
 Skip epilogue_mbar wait in W1, rely on TMEM double-buffering. 1.242ms = zero effect at NS5 (K-loop >> epilogue, mbar wait was never the bottleneck). Only effective at NS6 where deeper pipeline exposes the 10us overlap.
+
+### L2 cache hints (2026-04-08)
+
+Added `.L2::cache_hint` to TMA loads (`-DL2_HINTS=N`). Three strategies: (1) residual EVICT_FIRST = neutral, (2) A EVICT_FIRST + B EVICT_LAST = regression, (3) A EVICT_LAST + residual EVICT_FIRST = neutral. DRAM amplification is a tile-ordering capacity problem, not L2 eviction policy. Hints can't fix capacity misses.
 
 ### Universally dead
 
