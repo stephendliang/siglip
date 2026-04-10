@@ -2092,6 +2092,286 @@ extern "C" __global__ void k35_ffma_lop3_conflict(long long* out) {
     out[2] = la+lb+lc+ld+le+lf+lg+lh;
 }
 
+extern "C" __global__ void k36a_mufu_tanh_throughput(long long* out) {
+    /* 16 independent MUFU.TANH feedback chains: tanh output feeds back as input.
+       tanh.approx.f32 maps to MUFU.TANH in SASS. Self-feeding prevents elimination. */
+    volatile float* gin = (volatile float*)out;
+    float a=gin[0]+.1f, b=gin[1]+.2f, c=gin[2]+.3f, d=gin[3]+.4f;
+    float e=gin[4]+.5f, f=gin[5]+.6f, g=gin[6]+.7f, h=gin[7]+.8f;
+    float i0=gin[8]+.9f, j=gin[9]+1.f, k=gin[10]+1.1f, l=gin[11]+1.2f;
+    float m=gin[12]+1.3f, n=gin[13]+1.4f, o=gin[14]+1.5f, p=gin[15]+1.6f;
+
+    for (int i = 0; i < WARMUP; i++)
+        asm volatile("tanh.approx.f32 %0, %0;" : "+f"(a));
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "tanh.approx.f32 %0,  %0;\n\t"
+            "tanh.approx.f32 %1,  %1;\n\t"
+            "tanh.approx.f32 %2,  %2;\n\t"
+            "tanh.approx.f32 %3,  %3;\n\t"
+            "tanh.approx.f32 %4,  %4;\n\t"
+            "tanh.approx.f32 %5,  %5;\n\t"
+            "tanh.approx.f32 %6,  %6;\n\t"
+            "tanh.approx.f32 %7,  %7;\n\t"
+            "tanh.approx.f32 %8,  %8;\n\t"
+            "tanh.approx.f32 %9,  %9;\n\t"
+            "tanh.approx.f32 %10, %10;\n\t"
+            "tanh.approx.f32 %11, %11;\n\t"
+            "tanh.approx.f32 %12, %12;\n\t"
+            "tanh.approx.f32 %13, %13;\n\t"
+            "tanh.approx.f32 %14, %14;\n\t"
+            "tanh.approx.f32 %15, %15;\n\t"
+            : "+f"(a), "+f"(b), "+f"(c), "+f"(d),
+              "+f"(e), "+f"(f), "+f"(g), "+f"(h),
+              "+f"(i0), "+f"(j), "+f"(k), "+f"(l),
+              "+f"(m), "+f"(n), "+f"(o), "+f"(p)
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    volatile float* fout = (volatile float*)(out + 1);
+    fout[0] = a+b+c+d+e+f+g+h+i0+j+k+l+m+n+o+p;
+}
+
+extern "C" __global__ void k36b_mufu_tanh_latency(long long* out) {
+    /* Dependent MUFU.TANH chain: output feeds back as input. */
+    volatile float* gin = (volatile float*)out;
+    float a = gin[threadIdx.x] + 0.5f;
+
+    for (int i = 0; i < WARMUP; i++)
+        asm volatile("tanh.approx.f32 %0, %0;" : "+f"(a));
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            : "+f"(a)
+        );
+    }
+    long long t1 = clock64();
+
+    if (threadIdx.x == 0) {
+        out[0] = t1 - t0;
+        volatile float* fout = (volatile float*)(out + 1);
+        fout[0] = a;
+    }
+}
+
+extern "C" __global__ void k37_mufu_ffma_conflict(long long* out) {
+    /* Interleaved MUFU.TANH and FFMA — key test: does MUFU share ALU pipe?
+       8 MUFU + 8 FFMA = 16 instructions per iteration.
+       If cyc/instr ≈ max(K36a, K29a) → separate pipes (SFU vs ALU).
+       If cyc/instr ≈ K36a + K29a → same pipe (serialized). */
+    volatile float* gin = (volatile float*)out;
+    float ta=gin[0]+.1f, tb=gin[1]+.2f, tc=gin[2]+.3f, td=gin[3]+.4f;
+    float te=gin[4]+.5f, tf=gin[5]+.6f, tg=gin[6]+.7f, th=gin[7]+.8f;
+    float fa=gin[8]+1, fb=gin[9]+2, fc=gin[10]+3, fd=gin[11]+4;
+    float fe=gin[12]+5, ff=gin[13]+6, fg=gin[14]+7, fh=gin[15]+8;
+    float scale = gin[threadIdx.x] + 1.0001f;
+    float bias = gin[threadIdx.x + 32];
+
+    long long t0 = clock64();
+    #pragma unroll 1
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "tanh.approx.f32 %0, %0;\n\t"
+            "fma.rn.f32 %8,  %8,  %16, %17;\n\t"
+            "tanh.approx.f32 %1, %1;\n\t"
+            "fma.rn.f32 %9,  %9,  %16, %17;\n\t"
+            "tanh.approx.f32 %2, %2;\n\t"
+            "fma.rn.f32 %10, %10, %16, %17;\n\t"
+            "tanh.approx.f32 %3, %3;\n\t"
+            "fma.rn.f32 %11, %11, %16, %17;\n\t"
+            "tanh.approx.f32 %4, %4;\n\t"
+            "fma.rn.f32 %12, %12, %16, %17;\n\t"
+            "tanh.approx.f32 %5, %5;\n\t"
+            "fma.rn.f32 %13, %13, %16, %17;\n\t"
+            "tanh.approx.f32 %6, %6;\n\t"
+            "fma.rn.f32 %14, %14, %16, %17;\n\t"
+            "tanh.approx.f32 %7, %7;\n\t"
+            "fma.rn.f32 %15, %15, %16, %17;\n\t"
+            : "+f"(ta), "+f"(tb), "+f"(tc), "+f"(td),
+              "+f"(te), "+f"(tf), "+f"(tg), "+f"(th),
+              "+f"(fa), "+f"(fb), "+f"(fc), "+f"(fd),
+              "+f"(fe), "+f"(ff), "+f"(fg), "+f"(fh)
+            : "f"(scale), "f"(bias)
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    volatile float* fout = (volatile float*)(out + 1);
+    fout[0] = ta+tb+tc+td+te+tf+tg+th;
+    fout[1] = fa+fb+fc+fd+fe+ff+fg+fh;
+}
+
+extern "C" __global__ void k38_mufu_sts_conflict(long long* out) {
+    /* Interleaved MUFU.TANH and STS.v4 — can tanh overlap with stores?
+       8 MUFU + 8 STS.v4 = 16 instructions per iteration. */
+    __shared__ int smem[1024];
+    volatile float* gin = (volatile float*)out;
+    float ta=gin[0]+.1f, tb=gin[1]+.2f, tc=gin[2]+.3f, td=gin[3]+.4f;
+    float te=gin[4]+.5f, tf=gin[5]+.6f, tg=gin[6]+.7f, th=gin[7]+.8f;
+    int tid = threadIdx.x;
+    uint32_t saddr = (uint32_t)(uint64_t)(&smem[tid * 16]);
+    unsigned v0 = 0xdeadbeef, v1 = 0xcafebabe, v2 = 0x12345678, v3 = 0x9abcdef0;
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "tanh.approx.f32 %0, %0;\n\t"
+            "st.shared.v4.b32 [%8],    {%9,%10,%11,%12};\n\t"
+            "tanh.approx.f32 %1, %1;\n\t"
+            "st.shared.v4.b32 [%8+16], {%9,%10,%11,%12};\n\t"
+            "tanh.approx.f32 %2, %2;\n\t"
+            "st.shared.v4.b32 [%8+32], {%9,%10,%11,%12};\n\t"
+            "tanh.approx.f32 %3, %3;\n\t"
+            "st.shared.v4.b32 [%8+48], {%9,%10,%11,%12};\n\t"
+            "tanh.approx.f32 %4, %4;\n\t"
+            "st.shared.v4.b32 [%8],    {%9,%10,%11,%12};\n\t"
+            "tanh.approx.f32 %5, %5;\n\t"
+            "st.shared.v4.b32 [%8+16], {%9,%10,%11,%12};\n\t"
+            "tanh.approx.f32 %6, %6;\n\t"
+            "st.shared.v4.b32 [%8+32], {%9,%10,%11,%12};\n\t"
+            "tanh.approx.f32 %7, %7;\n\t"
+            "st.shared.v4.b32 [%8+48], {%9,%10,%11,%12};\n\t"
+            : "+f"(ta), "+f"(tb), "+f"(tc), "+f"(td),
+              "+f"(te), "+f"(tf), "+f"(tg), "+f"(th)
+            : "r"(saddr),
+              "r"(v0), "r"(v1), "r"(v2), "r"(v3)
+            : "memory"
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    volatile float* fout = (volatile float*)(out + 1);
+    fout[0] = ta+tb+tc+td+te+tf+tg+th;
+}
+
+extern "C" __global__ void k39_mufu_f2fp_conflict(long long* out) {
+    /* Interleaved MUFU.TANH and F2FP — can tanh overlap with BF16 conversion?
+       8 MUFU + 8 F2FP = 16 instructions per iteration.
+       F2FP uses feedback chains (output bitcast back as input) to prevent DCE. */
+    volatile float* gin = (volatile float*)out;
+    float ta=gin[0]+.1f, tb=gin[1]+.2f, tc=gin[2]+.3f, td=gin[3]+.4f;
+    float te=gin[4]+.5f, tf=gin[5]+.6f, tg=gin[6]+.7f, th=gin[7]+.8f;
+
+    volatile unsigned* uin = (volatile unsigned*)(out + 16);
+    unsigned f0=uin[0], f1=uin[1], f2=uin[2], f3=uin[3];
+    unsigned c0=uin[4], c1=uin[5], c2=uin[6], c3=uin[7];
+    unsigned c4=uin[8], c5=uin[9], c6=uin[10], c7=uin[11];
+
+    long long t0 = clock64();
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "{ .reg .f32 va, vb;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "mov.b32 va, %8;  mov.b32 vb, %16; cvt.rn.bf16x2.f32 %8,  va, vb;\n\t"
+            "tanh.approx.f32 %1, %1;\n\t"
+            "mov.b32 va, %9;  mov.b32 vb, %17; cvt.rn.bf16x2.f32 %9,  va, vb;\n\t"
+            "tanh.approx.f32 %2, %2;\n\t"
+            "mov.b32 va, %10; mov.b32 vb, %18; cvt.rn.bf16x2.f32 %10, va, vb;\n\t"
+            "tanh.approx.f32 %3, %3;\n\t"
+            "mov.b32 va, %11; mov.b32 vb, %19; cvt.rn.bf16x2.f32 %11, va, vb;\n\t"
+            "tanh.approx.f32 %4, %4;\n\t"
+            "mov.b32 va, %12; mov.b32 vb, %16; cvt.rn.bf16x2.f32 %12, va, vb;\n\t"
+            "tanh.approx.f32 %5, %5;\n\t"
+            "mov.b32 va, %13; mov.b32 vb, %17; cvt.rn.bf16x2.f32 %13, va, vb;\n\t"
+            "tanh.approx.f32 %6, %6;\n\t"
+            "mov.b32 va, %14; mov.b32 vb, %18; cvt.rn.bf16x2.f32 %14, va, vb;\n\t"
+            "tanh.approx.f32 %7, %7;\n\t"
+            "mov.b32 va, %15; mov.b32 vb, %19; cvt.rn.bf16x2.f32 %15, va, vb;\n\t"
+            "}\n\t"
+            : "+f"(ta), "+f"(tb), "+f"(tc), "+f"(td),
+              "+f"(te), "+f"(tf), "+f"(tg), "+f"(th),
+              "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3),
+              "+r"(c4), "+r"(c5), "+r"(c6), "+r"(c7)
+            : "r"(f0), "r"(f1), "r"(f2), "r"(f3)
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    volatile float* fout = (volatile float*)(out + 1);
+    fout[0] = ta+tb+tc+td+te+tf+tg+th;
+    out[2] = c0+c1+c2+c3+c4+c5+c6+c7;
+}
+
+extern "C" __global__ void k40_mufu_lds_conflict(long long* out) {
+    /* Interleaved MUFU.TANH and LDS — can tanh overlap with shared loads?
+       8 MUFU + 8 LDS = 16 instructions per iteration. */
+    __shared__ int smem[1024];
+    int tid = threadIdx.x;
+    for (int k = 0; k < 32; k++)
+        smem[tid + k * 32] = tid + k;
+    __syncthreads();
+
+    uint32_t base = (uint32_t)(uint64_t)(&smem[tid]);
+
+    volatile float* gin = (volatile float*)out;
+    float ta=gin[0]+.1f, tb=gin[1]+.2f, tc=gin[2]+.3f, td=gin[3]+.4f;
+    float te=gin[4]+.5f, tf=gin[5]+.6f, tg=gin[6]+.7f, th=gin[7]+.8f;
+
+    volatile int* iin = (volatile int*)out;
+    int r0=iin[0], r1=iin[1], r2=iin[2], r3=iin[3];
+    int r4=iin[4], r5=iin[5], r6=iin[6], r7=iin[7];
+
+    long long t0 = clock64();
+    #pragma unroll 1
+    for (int i = 0; i < REPS; i++) {
+        asm volatile(
+            "{ .reg .s32 t;\n\t"
+            "tanh.approx.f32 %0, %0;\n\t"
+            "ld.volatile.shared.b32 t, [%16 + 0];    xor.b32 %8,  %8,  t;\n\t"
+            "tanh.approx.f32 %1, %1;\n\t"
+            "ld.volatile.shared.b32 t, [%16 + 128];  xor.b32 %9,  %9,  t;\n\t"
+            "tanh.approx.f32 %2, %2;\n\t"
+            "ld.volatile.shared.b32 t, [%16 + 256];  xor.b32 %10, %10, t;\n\t"
+            "tanh.approx.f32 %3, %3;\n\t"
+            "ld.volatile.shared.b32 t, [%16 + 384];  xor.b32 %11, %11, t;\n\t"
+            "tanh.approx.f32 %4, %4;\n\t"
+            "ld.volatile.shared.b32 t, [%16 + 512];  xor.b32 %12, %12, t;\n\t"
+            "tanh.approx.f32 %5, %5;\n\t"
+            "ld.volatile.shared.b32 t, [%16 + 640];  xor.b32 %13, %13, t;\n\t"
+            "tanh.approx.f32 %6, %6;\n\t"
+            "ld.volatile.shared.b32 t, [%16 + 768];  xor.b32 %14, %14, t;\n\t"
+            "tanh.approx.f32 %7, %7;\n\t"
+            "ld.volatile.shared.b32 t, [%16 + 896];  xor.b32 %15, %15, t;\n\t"
+            "}\n\t"
+            : "+f"(ta), "+f"(tb), "+f"(tc), "+f"(td),
+              "+f"(te), "+f"(tf), "+f"(tg), "+f"(th),
+              "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3),
+              "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7)
+            : "r"(base)
+        );
+    }
+    long long t1 = clock64();
+
+    out[0] = t1 - t0;
+    volatile float* fout = (volatile float*)(out + 1);
+    fout[0] = ta+tb+tc+td+te+tf+tg+th;
+    out[2] = r0+r1+r2+r3+r4+r5+r6+r7;
+}
+
 struct Bench {
     const char* name;
     int instrs_per_iter;
@@ -2151,6 +2431,12 @@ int main() {
         {"K33:  FFMA+F2FP conflict (CUTLASS mix)", 16, k33_ffma_f2fp_conflict},
         {"K34:  HADD2+STS conflict (our mix)",     16, k34_hadd2_sts_conflict},
         {"K35:  FFMA+LOP3 conflict (CUTLASS mix)", 16, k35_ffma_lop3_conflict},
+        {"K36a: MUFU.TANH throughput (16 indep)",  16, k36a_mufu_tanh_throughput},
+        {"K36b: MUFU.TANH latency (dep chain)",    16, k36b_mufu_tanh_latency},
+        {"K37:  MUFU+FFMA conflict (SFU vs ALU)",  16, k37_mufu_ffma_conflict},
+        {"K38:  MUFU+STS conflict (SFU vs store)", 16, k38_mufu_sts_conflict},
+        {"K39:  MUFU+F2FP conflict (SFU vs BF16)", 16, k39_mufu_f2fp_conflict},
+        {"K40:  MUFU+LDS conflict (SFU vs load)",  16, k40_mufu_lds_conflict},
     };
     int n_benches = sizeof(benches) / sizeof(benches[0]);
 
@@ -2215,6 +2501,11 @@ int main() {
     printf("  K33  vs K29a+K1:  if ≈max → FFMA/F2FP different ports (CUTLASS combo)\n");
     printf("  K34  vs K10+K6:   if ≈max → HADD2/STS different ports (our combo)\n");
     printf("  K35  vs K29a+K15a: if ≈max → FFMA/LOP3 different ports (CUTLASS combo)\n");
+    printf("  K36  MUFU.TANH throughput/latency — SFU pipe (FC1 GELU critical path)\n");
+    printf("  K37  vs K36a+K29a: if ≈max → MUFU/FFMA different pipes (SFU vs ALU, key for GELU)\n");
+    printf("  K38  vs K36a+K6:  if ≈max → MUFU/STS different pipes (can tanh overlap stores)\n");
+    printf("  K39  vs K36a+K1:  if ≈max → MUFU/F2FP different pipes (tanh vs BF16 cvt)\n");
+    printf("  K40  vs K36a+K22a: if ≈max → MUFU/LDS different pipes (tanh vs shared loads)\n");
 
     cudaFree(d_out);
     return 0;

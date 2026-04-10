@@ -2420,6 +2420,7 @@ PIPE_ALU = 'ALU'
 PIPE_FAST_INT = 'FAST_INT'
 PIPE_LOAD = 'LOAD'
 PIPE_SPECIAL = 'SPECIAL'
+PIPE_MUFU = 'MUFU'
 PIPE_NONE = 'NONE'
 
 _PIPE_MAP = {
@@ -2458,6 +2459,7 @@ _PIPE_MAP = {
     'S2R':    PIPE_FAST_INT,
     'UMOV':   PIPE_FAST_INT,
     'UFLO':   PIPE_SPECIAL,
+    'MUFU':   PIPE_MUFU,
 }
 
 # Per-pipe throughput: minimum cycles between two instructions on the same pipe.
@@ -2470,6 +2472,7 @@ _PIPE_THROUGHPUT = {
     PIPE_FAST_INT: 2,
     PIPE_LOAD:     4,   # LDS=4 throughput
     PIPE_SPECIAL:  10,  # REDUX=11, SHFL=10, conservative
+    PIPE_MUFU:     4,   # PLACEHOLDER — update from K36a calibration on B200
     PIPE_NONE:     1,
 }
 
@@ -2483,6 +2486,14 @@ _CROSS_PIPE_MIN_GAP = {
     (PIPE_STORE, PIPE_ALU): 1,
     (PIPE_FAST_INT, PIPE_STORE): 0,  # IADD3 is free everywhere
     (PIPE_STORE, PIPE_FAST_INT): 0,
+    (PIPE_MUFU, PIPE_ALU): 0,       # PLACEHOLDER — update from K37 calibration
+    (PIPE_ALU, PIPE_MUFU): 0,
+    (PIPE_MUFU, PIPE_STORE): 0,     # PLACEHOLDER — update from K38 calibration
+    (PIPE_STORE, PIPE_MUFU): 0,
+    (PIPE_MUFU, PIPE_BF16): 0,      # PLACEHOLDER — update from K39 calibration
+    (PIPE_BF16, PIPE_MUFU): 0,
+    (PIPE_MUFU, PIPE_LOAD): 0,      # PLACEHOLDER — update from K40 calibration
+    (PIPE_LOAD, PIPE_MUFU): 0,
 }
 
 
