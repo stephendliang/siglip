@@ -28,38 +28,34 @@ fi
 # --- Build baselines ---
 log "Building baselines..."
 make fc2-w3 2>&1 | tail -1
-make fc2-w3-sched 2>&1 | tail -1
 make fc2-w3-strip 2>&1 | tail -1
-make -B fc2-w3-sched DFLAGS='-DTILE_DISPATCH=4 -DSTRIP_EPILOGUE' 2>&1 | tail -1
-cp fc2-w3-sched fc2-w3-sched-strip  # save strip variant before rebuild
-make fc2-w3-sched 2>&1 | tail -1    # rebuild fused
+make fc2-w3-sched 2>&1 | tail -1
 
-# --- Dump SASS ---
+# Build sched-strip separately (need -B since same target name)
+make -B fc2-w3-sched DFLAGS='-DTILE_DISPATCH=4 -DSTRIP_EPILOGUE' 2>&1 | tail -1
+cp fc2-w3-sched fc2-w3-sched-strip
+make fc2-w3-sched 2>&1 | tail -1
+
+# --- Dump SASS from fused binaries (they have the epilogue) ---
 log "Dumping SASS..."
 cuobjdump --dump-sass fc2-w3 > "$OUTDIR/sass_default.txt" 2>/dev/null
 cuobjdump --dump-sass fc2-w3-sched > "$OUTDIR/sass_sched.txt" 2>/dev/null
 
-# --- Patch: yield-only (all warps, @PT) ---
-log "Patching yield-only (all warps)..."
+# --- Patch fused binaries (they have LDTM epilogue) ---
+log "Patching fused binaries with YIELD..."
 python3 tools/interwarp_stagger.py fc2-w3 \
     --sass "$OUTDIR/sass_default.txt" \
     --mode yield-only \
-    -o fc2-w3-yield 2>&1 | tee "$OUTDIR/patch_default_yield.log"
-
-python3 tools/interwarp_stagger.py fc2-w3-strip \
-    --sass "$OUTDIR/sass_default.txt" \
-    --mode yield-only \
-    -o fc2-w3-yield-strip 2>&1 | tee "$OUTDIR/patch_default_yield_strip.log"
+    -o fc2-w3-yield 2>&1 | tee "$OUTDIR/patch_default.log"
 
 python3 tools/interwarp_stagger.py fc2-w3-sched \
     --sass "$OUTDIR/sass_sched.txt" \
     --mode yield-only \
-    -o fc2-w3-sched-yield 2>&1 | tee "$OUTDIR/patch_sched_yield.log"
+    -o fc2-w3-sched-yield 2>&1 | tee "$OUTDIR/patch_sched.log"
 
-python3 tools/interwarp_stagger.py fc2-w3-sched-strip \
-    --sass "$OUTDIR/sass_sched.txt" \
-    --mode yield-only \
-    -o fc2-w3-sched-yield-strip 2>&1 | tee "$OUTDIR/patch_sched_yield_strip.log"
+# Strip binaries: no epilogue to patch, just copy as controls
+cp fc2-w3-strip fc2-w3-yield-strip
+cp fc2-w3-sched-strip fc2-w3-sched-yield-strip
 
 if [ "$DRY" = "1" ]; then
     log "Dry run — not executing binaries"
@@ -77,10 +73,8 @@ run_exp() {
     local out
     out=$(./"$bin" 2>&1)
     echo "$out" > "$OUTDIR/${name}.txt"
-    # Extract timing line
-    local ms
+    local ms valid
     ms=$(echo "$out" | grep -oP '[\d.]+\s*ms' | head -1)
-    local valid
     valid=$(echo "$out" | grep -oP 'valid=\d' | head -1)
     log "  $name: $ms  $valid"
 }
@@ -111,6 +105,21 @@ for f in "$OUTDIR"/*.txt; do
     valid=$(grep -oP 'valid=\d' "$f" | head -1)
     printf "%-25s| %-9s| %s\n" "$name" "$ms" "$valid" | tee -a "$OUTDIR/session.log"
 done
+
+log ""
+log "=== DELTA ==="
+# Extract key numbers for quick comparison
+get_ms() { grep -oP '[\d.]+(?=\s*ms)' "$OUTDIR/$1.txt" 2>/dev/null | head -1; }
+d_fused=$(get_ms default_fused)
+d_yield=$(get_ms default_yield_fused)
+s_fused=$(get_ms sched_fused)
+s_yield=$(get_ms sched_yield_fused)
+if [ -n "$d_fused" ] && [ -n "$d_yield" ]; then
+    log "Default: ${d_fused}ms -> ${d_yield}ms (yield)"
+fi
+if [ -n "$s_fused" ] && [ -n "$s_yield" ]; then
+    log "Sched:   ${s_fused}ms -> ${s_yield}ms (yield)"
+fi
 
 log ""
 log "Done. Full output in $OUTDIR/"
