@@ -585,6 +585,10 @@ fc1_w3_kernel(
         const uint32_t epoch_addr = smem_to_uint(smem + OFF_SCHED_EPOCH);
         int _s_iter = 0;
         int _s_buf = 0;
+#ifdef ROW_STEAL
+        int _rs_row = -1;
+        int _rs_tn = TILES_N;
+#endif
         while (true) {
             if (_s_iter >= 2) {
                 mbar_wait(sched_cons_mbar + _s_buf * 8, sched_cons_phase[_s_buf]);
@@ -592,6 +596,44 @@ fc1_w3_kernel(
             }
 
             int tile_idx;
+#ifdef ROW_STEAL
+            if (_rs_tn >= TILES_N) {
+                int _rs_tile0;
+                if (cta_rank == 0) {
+                    if (lane == 0) {
+                        asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
+                            : "=r"(_rs_row) : "l"(&g_tile_ctr));
+                        _rs_tile0 = (_rs_row < TILES_M)
+                            ? _rs_row * TILES_N : TOTAL_TILES;
+                        asm volatile("st.shared.b32 [%0], %1;"
+                            :: "r"(fifo_addr + _s_buf * 4), "r"(_rs_tile0));
+                        asm volatile("fence.acq_rel.cluster;");
+                        asm volatile("st.shared.b32 [%0], %1;"
+                            :: "r"(epoch_addr + _s_buf * 4), "r"(_s_iter + 1));
+                    }
+                } else {
+                    if (lane == 0) {
+                        int epoch;
+                        do {
+                            asm volatile("ld.acquire.cluster.shared::cluster.b32 %0, [%1];"
+                                : "=r"(epoch) : "r"(cta0_epoch + _s_buf * 4));
+                        } while (epoch != _s_iter + 1);
+                        asm volatile("ld.shared::cluster.b32 %0, [%1];"
+                            : "=r"(_rs_tile0) : "r"(cta0_fifo + _s_buf * 4));
+                    }
+                }
+                asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+                    : "=r"(_rs_tile0) : "r"(_rs_tile0));
+                _rs_row = (_rs_tile0 >= TOTAL_TILES) ? TILES_M : _rs_tile0 / TILES_N;
+                _rs_tn = 0;
+            }
+            tile_idx = (_rs_row < TILES_M) ? _rs_row * TILES_N + _rs_tn : TOTAL_TILES;
+            _rs_tn++;
+            if (lane == 0) {
+                asm volatile("st.shared.b32 [%0], %1;"
+                    :: "r"(fifo_addr + _s_buf * 4), "r"(tile_idx));
+            }
+#else
             if (cta_rank == 0) {
                 if (lane == 0) {
                     asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
@@ -615,6 +657,7 @@ fc1_w3_kernel(
                         :: "r"(fifo_addr + _s_buf * 4), "r"(tile_idx));
                 }
             }
+#endif
 
             mbar_arrive(sched_prod_mbar + _s_buf * 8);
 

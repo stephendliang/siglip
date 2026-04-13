@@ -1075,6 +1075,16 @@ fc2_w3_kernel(
         const uint32_t epoch_addr = smem_to_uint(smem + OFF_SCHED_EPOCH);
         int _s_iter = 0;
         int _s_buf = 0;
+#ifdef ROW_STEAL
+        /*
+         * Row-granularity work stealing: atomicAdd counts M-rows,
+         * then dispatch TILES_N tiles from that row one at a time.
+         * Reduces atomic frequency by TILES_N and guarantees each
+         * cluster processes a complete A-row before moving on.
+         */
+        int _rs_row = -1;
+        int _rs_tn = TILES_N;   /* force row fetch on first iteration */
+#endif
         while (true) {
             /* Wait for W0 to consume this slot (skip first 2 prefills) */
             if (_s_iter >= 2) {
@@ -1084,6 +1094,51 @@ fc2_w3_kernel(
 
             /* Dispatch: CTA0 atomicAdds, CTA1 reads via cluster SMEM */
             int tile_idx;
+#ifdef ROW_STEAL
+            if (_rs_tn >= TILES_N) {
+                /*
+                 * Row boundary: fetch next row via atomicAdd.
+                 * Send first tile_idx (not _rs_row) through FIFO so the
+                 * value W0 needs is already there — no second write that
+                 * could race with CTA1's cross-cluster read.
+                 */
+                int _rs_tile0;
+                if (cta_rank == 0) {
+                    if (lane == 0) {
+                        asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
+                            : "=r"(_rs_row) : "l"(&g_tile_ctr));
+                        _rs_tile0 = (_rs_row < TILES_M)
+                            ? _rs_row * TILES_N : TOTAL_TILES;
+                        asm volatile("st.shared.b32 [%0], %1;"
+                            :: "r"(fifo_addr + _s_buf * 4), "r"(_rs_tile0));
+                        asm volatile("fence.acq_rel.cluster;");
+                        asm volatile("st.shared.b32 [%0], %1;"
+                            :: "r"(epoch_addr + _s_buf * 4), "r"(_s_iter + 1));
+                    }
+                } else {
+                    if (lane == 0) {
+                        int epoch;
+                        do {
+                            asm volatile("ld.acquire.cluster.shared::cluster.b32 %0, [%1];"
+                                : "=r"(epoch) : "r"(cta0_epoch + _s_buf * 4));
+                        } while (epoch != _s_iter + 1);
+                        asm volatile("ld.shared::cluster.b32 %0, [%1];"
+                            : "=r"(_rs_tile0) : "r"(cta0_fifo + _s_buf * 4));
+                    }
+                }
+                asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+                    : "=r"(_rs_tile0) : "r"(_rs_tile0));
+                _rs_row = (_rs_tile0 >= TOTAL_TILES) ? TILES_M : _rs_tile0 / TILES_N;
+                _rs_tn = 0;
+            }
+            tile_idx = (_rs_row < TILES_M) ? _rs_row * TILES_N + _rs_tn : TOTAL_TILES;
+            _rs_tn++;
+            /* Write tile_idx to local FIFO for W0 */
+            if (lane == 0) {
+                asm volatile("st.shared.b32 [%0], %1;"
+                    :: "r"(fifo_addr + _s_buf * 4), "r"(tile_idx));
+            }
+#else
             if (cta_rank == 0) {
                 if (lane == 0) {
                     asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
@@ -1107,6 +1162,7 @@ fc2_w3_kernel(
                         :: "r"(fifo_addr + _s_buf * 4), "r"(tile_idx));
                 }
             }
+#endif
 
             /* Signal W0: tile ready in sched_fifo[buf] */
             mbar_arrive(sched_prod_mbar + _s_buf * 8);
