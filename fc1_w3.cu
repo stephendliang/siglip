@@ -125,8 +125,9 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define OFF_TILE_READY_MBAR (OFF_BCAST_TILE + 8)
 #define OFF_SCHED_EPOCH     (OFF_TILE_READY_MBAR + 16)
 #ifdef BIAS_PRELOAD
-#define OFF_BIAS_MBAR       (OFF_SCHED_EPOCH + 8)   /* 2 mbarriers for double-buffered bias */
-#define _LAYOUT_END         (OFF_BIAS_MBAR + 16)
+#define OFF_BIAS_MBAR       (OFF_SCHED_EPOCH + 8)   /* 2 mbarriers for W0→epi: TMA done */
+#define OFF_BIAS_DONE_MBAR  (OFF_BIAS_MBAR + 16)    /* 2 mbarriers for epi→W0: reads done */
+#define _LAYOUT_END         (OFF_BIAS_DONE_MBAR + 16)
 #else
 #define _LAYOUT_END         (OFF_SCHED_EPOCH + 8)
 #endif
@@ -458,8 +459,10 @@ fc1_w3_kernel(
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH)));
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH + 4)));
 #ifdef BIAS_PRELOAD
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < 2; i++) {
             mbar_init(smem_to_uint(smem + OFF_BIAS_MBAR + i * 8), 1);
+            mbar_init(smem_to_uint(smem + OFF_BIAS_DONE_MBAR + i * 8), NUM_EPI_WARPS * 32);
+        }
 #endif
 #endif
 
@@ -629,7 +632,9 @@ fc1_w3_kernel(
 #if !defined(LDG_BIAS) && defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
 #ifdef BIAS_PRELOAD
     int bias_phase[2] = {0, 0};
+    int bias_done_phase[2] = {1, 1};
     const uint32_t bias_mbar_addr = smem_to_uint(smem + OFF_BIAS_MBAR);
+    const uint32_t bias_done_mbar_addr = smem_to_uint(smem + OFF_BIAS_DONE_MBAR);
     const int bias_buf_bytes = BIAS_BATCH * TN * 2;
 #else
     int batch_start_tn = 0;   /* first N-tile index of current batch */
@@ -721,15 +726,15 @@ fc1_w3_kernel(
             /*
              * W0 preloads bias batch for THIS tile's epilogue (runs next iteration).
              * Double-buffered: current epilogue reads buf (_iter-1)&1, we write buf _iter&1.
-             * Always TMA-load (even same batch) to ensure target buf has valid data.
-             * Safe: NO_PREFILL limits pipeline to 1 in-flight epilogue, so
-             * buf[N&1] is never read concurrently with this write.
+             * Wait for epilogue to finish reading from target buf before overwriting.
              */
             {
                 int w0_tn = tile_idx % TILES_N;
                 if (SNAKE_ORDER && ((tile_idx / TILES_N) & 1)) w0_tn = TILES_N - 1 - w0_tn;
                 const int need_batch = w0_tn / BIAS_BATCH;
                 const int new_buf = _iter & 1;
+                mbar_wait(bias_done_mbar_addr + new_buf * 8, bias_done_phase[new_buf]);
+                bias_done_phase[new_buf] ^= 1;
                 const uint32_t dst = smem_to_uint(smem + OFF_BIAS_SMEM)
                     + new_buf * bias_buf_bytes;
                 if (lane == 0) {
@@ -942,8 +947,8 @@ fc1_w3_kernel(
 
 #if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
                 /* W0 already TMA-preloaded the bias batch; wait for it */
+                const int rd_buf = (_iter - 1) & 1;
                 {
-                    const int rd_buf = (_iter - 1) & 1;
                     mbar_wait(bias_mbar_addr + rd_buf * 8, bias_phase[rd_buf]);
                     bias_phase[rd_buf] ^= 1;
                 }
@@ -1054,6 +1059,12 @@ fc1_w3_kernel(
                             bv3.x,bv3.y,bv3.z,bv3.w, stage_base + rsw3);
                     }
                     } /* close row_group */
+
+#if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
+                    /* All bias LDS done — signal W0 it's safe to overwrite this buf */
+                    if (si == NUM_EPI_SUBITERS - 1)
+                        mbar_arrive(bias_done_mbar_addr + rd_buf * 8);
+#endif
 
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile(BAR_EPI_SYNC ::: "memory");
@@ -1217,8 +1228,8 @@ fc1_w3_kernel(
 
 #if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
             /* W0 preloaded last tile's bias; wait for TMA to complete */
+            const int rd_buf = (_iter - 1) & 1;
             {
-                const int rd_buf = (_iter - 1) & 1;
                 mbar_wait(bias_mbar_addr + rd_buf * 8, bias_phase[rd_buf]);
                 bias_phase[rd_buf] ^= 1;
             }
@@ -1325,6 +1336,11 @@ fc1_w3_kernel(
                         bv3.x,bv3.y,bv3.z,bv3.w, stage_base + rsw3);
                 }
                 } /* close row_group */
+
+#if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
+                if (si == NUM_EPI_SUBITERS - 1)
+                    mbar_arrive(bias_done_mbar_addr + rd_buf * 8);
+#endif
 
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(BAR_EPI_SYNC ::: "memory");
