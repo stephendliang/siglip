@@ -124,7 +124,12 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define OFF_BCAST_TILE      (OFF_SCHED_CONS_MBAR + 16)
 #define OFF_TILE_READY_MBAR (OFF_BCAST_TILE + 8)
 #define OFF_SCHED_EPOCH     (OFF_TILE_READY_MBAR + 16)
+#ifdef BIAS_PRELOAD
+#define OFF_BIAS_MBAR       (OFF_SCHED_EPOCH + 8)   /* 2 mbarriers for double-buffered bias */
+#define _LAYOUT_END         (OFF_BIAS_MBAR + 16)
+#else
 #define _LAYOUT_END         (OFF_SCHED_EPOCH + 8)
+#endif
 #else
 #define _LAYOUT_END        _MBAR_END
 #endif
@@ -133,10 +138,25 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define NUM_EPI_STAGES     2
 
 /*
- * Bias SMEM: compact per-tile when N_STAGES >= 6 (full bias exceeds 228KB).
- * Group-3: 2 N-tiles loaded once at startup (snake order uses 2 N-tiles).
- * TD=4: 1 N-tile reloaded per tile in epilogue (dynamic tile assignment).
+ * Bias loading strategy:
+ *
+ * LDG_BIAS: load bias directly from L1-cached global memory (no SMEM).
+ *   Eliminates all bias SMEM, batch tracking, and startup loading.
+ *   Bias is 6KB — fits entirely in L1 after first touch.
+ *
+ * BIAS_PER_TILE: compact per-tile SMEM when N_STAGES >= 6 (full bias exceeds 228KB).
+ *   Group-3: 2 N-tiles loaded once at startup (snake order uses 2 N-tiles).
+ *   TD=4: BIAS_BATCH N-tiles cached, reload on batch switch.
+ *
+ * BIAS_PRELOAD: W0 TMA-preloads bias batches during K-loop idle time.
+ *   Double-buffered SMEM, epilogue warps never reload.  Requires TD=4.
+ *   Max bb3 at NS6 (0 headroom), bb2 preferred (power-of-2 + 1KB headroom).
  */
+#ifdef LDG_BIAS
+/* No SMEM for bias — direct LDG from L1-cached global */
+#define BIAS_SMEM_BYTES    0
+#else /* !LDG_BIAS */
+
 #ifndef BIAS_PER_TILE
 #if N_STAGES >= 6
 #define BIAS_PER_TILE 1
@@ -145,13 +165,22 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 
 #ifdef BIAS_PER_TILE
 #if TILE_DISPATCH == 4
-#define BIAS_SMEM_BYTES    (TN * 2)              /* 512B — reload per tile */
+#ifndef BIAS_BATCH
+#define BIAS_BATCH         6                      /* N-tiles cached per batch */
+#endif
+#ifdef BIAS_PRELOAD
+#define BIAS_SMEM_BYTES    (BIAS_BATCH * TN * 2 * 2)  /* double-buffered for W0 TMA */
+#else
+#define BIAS_SMEM_BYTES    (BIAS_BATCH * TN * 2)  /* 3072B — reload on batch switch */
+#endif
 #else
 #define BIAS_SMEM_BYTES    (TN * 2 * 2)          /* 1024B — 2 N-tiles for snake */
 #endif
 #else
 #define BIAS_SMEM_BYTES    (N_DIM * 2)            /* 6144B — all bias columns */
 #endif
+
+#endif /* LDG_BIAS */
 #define OFF_BIAS_SMEM      ((_LAYOUT_END + 15) & ~15)
 
 /* Epilogue staging: 2-stage double-buffer for STS → TMA store */
@@ -428,6 +457,10 @@ fc1_w3_kernel(
         }
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH)));
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH + 4)));
+#ifdef BIAS_PRELOAD
+        for (int i = 0; i < 2; i++)
+            mbar_init(smem_to_uint(smem + OFF_BIAS_MBAR + i * 8), 1);
+#endif
 #endif
 
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -494,8 +527,28 @@ fc1_w3_kernel(
     int ml_phase[2]  = {0, 1};
 
     /* ── Load bias into SMEM ── */
-#if defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
-    /* TD=4: bias reloaded per-tile in epilogue — skip startup load */
+#ifdef LDG_BIAS
+    /* LDG_BIAS: no SMEM bias — direct LDG from L1-cached global in epilogue */
+#elif defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
+    /* BIAS_PRELOAD: W0 will TMA-preload batches during K-loop; load batch 0 at startup */
+    {
+        const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
+        for (int i = tid; i < BIAS_BATCH * TN / 2; i += THREADS) {
+            uint32_t val;
+            asm volatile("ld.global.b32 %0, [%1];" : "=r"(val) : "l"(bias + i * 2));
+            asm volatile("st.shared.b32 [%0], %1;" :: "r"(bias_saddr + i * 4), "r"(val));
+        }
+    }
+#elif defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
+    /* TD=4 mini-batch: load first batch (N-tiles 0..BIAS_BATCH-1) at startup */
+    {
+        const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
+        for (int i = tid; i < BIAS_BATCH * TN / 2; i += THREADS) {
+            uint32_t val;
+            asm volatile("ld.global.b32 %0, [%1];" : "=r"(val) : "l"(bias + i * 2));
+            asm volatile("st.shared.b32 [%0], %1;" :: "r"(bias_saddr + i * 4), "r"(val));
+        }
+    }
 #elif defined(BIAS_PER_TILE)
     /* Group-3: load 2 N-tiles' bias for snake ordering */
     {
@@ -571,6 +624,16 @@ fc1_w3_kernel(
         }
         return;
     }
+#endif
+
+#if !defined(LDG_BIAS) && defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
+    int batch_start_tn = 0;   /* first N-tile index of current batch */
+#ifdef BIAS_PRELOAD
+    int loaded_batch = 0;     /* which bias batch is in SMEM (for W0 preload check) */
+    int bias_phase[2] = {0, 0};
+    const uint32_t bias_mbar_addr = smem_to_uint(smem + OFF_BIAS_MBAR);
+    const int bias_buf_bytes = BIAS_BATCH * TN * 2;
+#endif
 #endif
 
     /* ════════════════════════════════════════════
@@ -654,6 +717,43 @@ fc1_w3_kernel(
             }
 
 #if TILE_DISPATCH == 4
+#ifdef BIAS_PRELOAD
+            /*
+             * W0 preloads bias batch for THIS tile's epilogue (runs next iteration).
+             * Double-buffered: current epilogue reads buf (_iter-1)&1, we write buf _iter&1.
+             * Must ALWAYS signal bias_mbar so epilogue warps don't deadlock.
+             */
+            {
+                int w0_tn = tile_idx % TILES_N;
+                if (SNAKE_ORDER && ((tile_idx / TILES_N) & 1)) w0_tn = TILES_N - 1 - w0_tn;
+                const int need_batch = w0_tn / BIAS_BATCH;
+                const int new_buf = _iter & 1;
+                if (need_batch != loaded_batch) {
+                    const uint32_t dst = smem_to_uint(smem + OFF_BIAS_SMEM)
+                        + new_buf * bias_buf_bytes;
+                    if (lane == 0) {
+                        asm volatile(
+                            "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
+                            " [%0], [%1], %2, [%3];"
+                            :: "r"(dst),
+                               "l"(bias + need_batch * BIAS_BATCH * TN),
+                               "r"(bias_buf_bytes),
+                               "r"(bias_mbar_addr + new_buf * 8)
+                            : "memory");
+                        asm volatile(
+                            "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                            :: "r"(bias_mbar_addr + new_buf * 8),
+                               "r"(bias_buf_bytes)
+                            : "memory");
+                    }
+                    loaded_batch = need_batch;
+                    batch_start_tn = need_batch * BIAS_BATCH;
+                } else {
+                    /* Same batch — manual arrive (no TMA needed) */
+                    mbar_arrive(bias_mbar_addr + new_buf * 8);
+                }
+            }
+#endif
             /* Prefetch next tile from scheduler FIFO */
             mbar_wait(sched_prod_mbar + _pf_slot * 8, sched_prod_phase[_pf_slot]);
             sched_prod_phase[_pf_slot] ^= 1;
@@ -823,7 +923,9 @@ fc1_w3_kernel(
 #else
             /* ── W2-W5: GELU epilogue — TMEM→bias+GELU→CVT→STS→TMA store ── */
             const int ew = warp - 2;
+#ifndef LDG_BIAS
             const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
+#endif
 
             const uint32_t xor_val = (lane & 7) << 4;
             const uint32_t sw0 = 0 ^ xor_val, sw1 = 16 ^ xor_val;
@@ -843,19 +945,30 @@ fc1_w3_kernel(
                 const int prev_m = ptm * TM * 2 + cta_rank * TM;
                 const int prev_n = ptn * TN;
 
-#if defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
-                /* Reload bias for this N-tile into SMEM */
+#if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
+                /* W0 already TMA-preloaded the bias batch; wait for it */
                 {
-                    const int epi_tid = (warp - 2) * 32 + lane;
-                    for (int i = epi_tid; i < TN / 2; i += NUM_EPI_WARPS * 32) {
-                        uint32_t val;
-                        asm volatile("ld.global.b32 %0, [%1];" : "=r"(val)
-                            : "l"(bias + prev_n + i * 2));
-                        asm volatile("st.shared.b32 [%0], %1;"
-                            :: "r"(bias_saddr + i * 4), "r"(val));
+                    const int rd_buf = (_iter - 1) & 1;
+                    mbar_wait(bias_mbar_addr + rd_buf * 8, bias_phase[rd_buf]);
+                    bias_phase[rd_buf] ^= 1;
+                }
+#elif !defined(LDG_BIAS) && defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
+                /* Reload bias batch if needed (use batch_start_tn to avoid hot-path modulo) */
+                {
+                    if (ptn < batch_start_tn || ptn >= batch_start_tn + BIAS_BATCH) {
+                        batch_start_tn = (ptn / BIAS_BATCH) * BIAS_BATCH;
+                        const int epi_tid = (warp - 2) * 32 + lane;
+                        const int batch_col = batch_start_tn * TN;
+                        for (int i = epi_tid; i < BIAS_BATCH * TN / 2; i += NUM_EPI_WARPS * 32) {
+                            uint32_t val;
+                            asm volatile("ld.global.b32 %0, [%1];" : "=r"(val)
+                                : "l"(bias + batch_col + i * 2));
+                            asm volatile("st.shared.b32 [%0], %1;"
+                                :: "r"(bias_saddr + i * 4), "r"(val));
+                        }
+                        asm volatile(BAR_EPI_SYNC ::: "memory");
                     }
                 }
-                asm volatile(BAR_EPI_SYNC ::: "memory");
 #endif
 
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
@@ -890,14 +1003,30 @@ fc1_w3_kernel(
                                       a24,a25,a26,a27,a28,a29,a30,a31,
                                       taddr_base + nc);
 
-#ifdef BIAS_PER_TILE
-#if TILE_DISPATCH == 4
-                        const uint32_t bs = bias_saddr + nc * 2;
+#ifdef LDG_BIAS
+                        /* LDG bias directly from L1-cached global memory */
+                        const __nv_bfloat16* bp = bias + prev_n + nc;
+                        uint4 bv0, bv1, bv2, bv3;
+                        asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(bv0.x),"=r"(bv0.y),"=r"(bv0.z),"=r"(bv0.w) : "l"(bp));
+                        asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(bv1.x),"=r"(bv1.y),"=r"(bv1.z),"=r"(bv1.w) : "l"(bp + 8));
+                        asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(bv2.x),"=r"(bv2.y),"=r"(bv2.z),"=r"(bv2.w) : "l"(bp + 16));
+                        asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "l"(bp + 24));
 #else
+#if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
+                        const uint32_t bs = bias_saddr
+                            + ((_iter - 1) & 1) * bias_buf_bytes
+                            + ((ptn - batch_start_tn) * TN + nc) * 2;
+#elif defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
+                        const uint32_t bs = bias_saddr
+                            + ((ptn - batch_start_tn) * TN + nc) * 2;
+#elif defined(BIAS_PER_TILE)
                         const uint32_t bs = bias_saddr
                             + ((ptn == tn_fixed) ? 0u : (unsigned)(TN * 2))
                             + nc * 2;
-#endif
 #else
                         /* LDS bias from SMEM (linear, not swizzled) */
                         const uint32_t bs = bias_saddr + (prev_n + nc) * 2;
@@ -911,6 +1040,7 @@ fc1_w3_kernel(
                             : "=r"(bv2.x),"=r"(bv2.y),"=r"(bv2.z),"=r"(bv2.w) : "r"(bs + 32));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
+#endif
 
                         const uint32_t rsw0 = chunk ? sw4 : sw0;
                         const uint32_t rsw1 = chunk ? sw5 : sw1;
@@ -1077,7 +1207,9 @@ fc1_w3_kernel(
 #else
             /* GELU drain — last tile */
             const int ew = warp - 2;
+#ifndef LDG_BIAS
             const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
+#endif
             const uint32_t xor_val = (lane & 7) << 4;
             const uint32_t sw0 = 0 ^ xor_val, sw1 = 16 ^ xor_val;
             const uint32_t sw2 = 32 ^ xor_val, sw3 = 48 ^ xor_val;
@@ -1088,19 +1220,30 @@ fc1_w3_kernel(
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             ml_phase[last_buf] ^= 1;
 
-#if defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
-            /* Reload bias for last tile's N-tile */
+#if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
+            /* W0 preloaded last tile's bias; wait for TMA to complete */
             {
-                const int epi_tid = (warp - 2) * 32 + lane;
-                for (int i = epi_tid; i < TN / 2; i += NUM_EPI_WARPS * 32) {
-                    uint32_t val;
-                    asm volatile("ld.global.b32 %0, [%1];" : "=r"(val)
-                        : "l"(bias + last_n + i * 2));
-                    asm volatile("st.shared.b32 [%0], %1;"
-                        :: "r"(bias_saddr + i * 4), "r"(val));
+                const int rd_buf = (_iter - 1) & 1;
+                mbar_wait(bias_mbar_addr + rd_buf * 8, bias_phase[rd_buf]);
+                bias_phase[rd_buf] ^= 1;
+            }
+#elif !defined(LDG_BIAS) && defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
+            /* Reload bias batch if needed */
+            {
+                if (ltn < batch_start_tn || ltn >= batch_start_tn + BIAS_BATCH) {
+                    batch_start_tn = (ltn / BIAS_BATCH) * BIAS_BATCH;
+                    const int epi_tid = (warp - 2) * 32 + lane;
+                    const int batch_col = batch_start_tn * TN;
+                    for (int i = epi_tid; i < BIAS_BATCH * TN / 2; i += NUM_EPI_WARPS * 32) {
+                        uint32_t val;
+                        asm volatile("ld.global.b32 %0, [%1];" : "=r"(val)
+                            : "l"(bias + batch_col + i * 2));
+                        asm volatile("st.shared.b32 [%0], %1;"
+                            :: "r"(bias_saddr + i * 4), "r"(val));
+                    }
+                    asm volatile(BAR_EPI_SYNC ::: "memory");
                 }
             }
-            asm volatile(BAR_EPI_SYNC ::: "memory");
 #endif
 
             for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
@@ -1133,14 +1276,29 @@ fc1_w3_kernel(
                                   a24,a25,a26,a27,a28,a29,a30,a31,
                                   taddr_base + nc);
 
-#ifdef BIAS_PER_TILE
-#if TILE_DISPATCH == 4
-                    const uint32_t bs = bias_saddr + nc * 2;
+#ifdef LDG_BIAS
+                    const __nv_bfloat16* bp = bias + last_n + nc;
+                    uint4 bv0, bv1, bv2, bv3;
+                    asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(bv0.x),"=r"(bv0.y),"=r"(bv0.z),"=r"(bv0.w) : "l"(bp));
+                    asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(bv1.x),"=r"(bv1.y),"=r"(bv1.z),"=r"(bv1.w) : "l"(bp + 8));
+                    asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(bv2.x),"=r"(bv2.y),"=r"(bv2.z),"=r"(bv2.w) : "l"(bp + 16));
+                    asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "l"(bp + 24));
 #else
+#if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
+                    const uint32_t bs = bias_saddr
+                        + ((_iter - 1) & 1) * bias_buf_bytes
+                        + ((ltn - batch_start_tn) * TN + nc) * 2;
+#elif defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
+                    const uint32_t bs = bias_saddr
+                        + ((ltn - batch_start_tn) * TN + nc) * 2;
+#elif defined(BIAS_PER_TILE)
                     const uint32_t bs = bias_saddr
                         + ((ltn == tn_fixed) ? 0u : (unsigned)(TN * 2))
                         + nc * 2;
-#endif
 #else
                     const uint32_t bs = bias_saddr + (last_n + nc) * 2;
 #endif
@@ -1153,6 +1311,7 @@ fc1_w3_kernel(
                         : "=r"(bv2.x),"=r"(bv2.y),"=r"(bv2.z),"=r"(bv2.w) : "r"(bs + 32));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
+#endif
 
                     const uint32_t rsw0 = chunk ? sw4 : sw0;
                     const uint32_t rsw1 = chunk ? sw5 : sw1;

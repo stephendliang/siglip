@@ -8,15 +8,21 @@
 # Q3: TD=4 vs default — DRAM amplification at 43K tiles
 # Q4: NS6 vs NS5 — pipeline depth (6/6 vs 5/6)
 # Q5: NS6+TD=4 — best of both?
-# Q6: Strip baseline — pure compute utilization floor
+# Q6: Bias strategy sweep (NS6+TD=4):
+#       LDG_BIAS — direct LDG from L1, no SMEM (124 regs)
+#       bb6 — batch_start_tn fix, no modulo in hot path (128 regs)
+#       bb4 — power-of-2 (& 3), single-buffered (128 regs)
+#       PRELOAD+bb2 — W0 TMA double-buffered (126 regs)
+# Q7: NS5+TD=4+LDG — does LDG_BIAS help even at NS5?
+# Q8: NS6 strip — does NS6 help MMA core at K_ITERS=6?
 #
 # FC1 shape: [928256, 768] × [768, 3072]^T + bias + GELU
 # 43512 tiles (8× FC2), K_ITERS=6 (4× shorter than FC2)
 #
 # Usage:
-#   ./tools/fc1_ncu_bench.sh                # full run (6 variants)
+#   ./tools/fc1_ncu_bench.sh                # full run (9 variants)
 #   ./tools/fc1_ncu_bench.sh --dry-run      # print commands
-#   ./tools/fc1_ncu_bench.sh --quick        # skip NS6 variants
+#   ./tools/fc1_ncu_bench.sh --quick        # skip NS6 + BIAS_BATCH variants
 #   ./tools/fc1_ncu_bench.sh --full         # also collect --set full profiles
 #
 # Output: data/fc1_ncu_YYYYMMDD_HHMMSS/
@@ -118,6 +124,18 @@ if [ "$QUICK" = "0" ]; then
     BINARIES+=(
         "fc1_ns6|make -B fc1-w3 'DFLAGS=-DN_STAGES=6'|COPY:fc1-w3:fc1-w3-ns6|fc1_w3_kernel"
         "fc1_ns6_sched|make -B fc1-w3 'DFLAGS=-DN_STAGES=6 -DTILE_DISPATCH=4'|COPY:fc1-w3:fc1-w3-ns6-sched|fc1_w3_kernel"
+        # New bias strategies (NS6+TD=4):
+        #  LDG_BIAS:    direct LDG from L1 cache, zero SMEM for bias
+        #  bb6 default:  batch_start_tn fix eliminates hot-path modulo
+        #  bb4:          power-of-2 batch (& 3 instead of % 6)
+        #  PRELOAD+bb2:  W0 TMA preloads, double-buffered, epilogue never reloads
+        "fc1_ns6_ldg|make -B fc1-w3 'DFLAGS=-DN_STAGES=6 -DTILE_DISPATCH=4 -DLDG_BIAS'|COPY:fc1-w3:fc1-w3-ns6-ldg|fc1_w3_kernel"
+        "fc1_ns6_bb4|make -B fc1-w3 'DFLAGS=-DN_STAGES=6 -DTILE_DISPATCH=4 -DBIAS_BATCH=4'|COPY:fc1-w3:fc1-w3-ns6-bb4|fc1_w3_kernel"
+        "fc1_ns6_preload|make -B fc1-w3 'DFLAGS=-DN_STAGES=6 -DTILE_DISPATCH=4 -DBIAS_PRELOAD -DBIAS_BATCH=2'|COPY:fc1-w3:fc1-w3-ns6-preload|fc1_w3_kernel"
+        # NS5+TD=4+LDG as baseline comparison
+        "fc1_sched_ldg|make -B fc1-w3 'DFLAGS=-DTILE_DISPATCH=4 -DLDG_BIAS'|COPY:fc1-w3:fc1-w3-sched-ldg|fc1_w3_kernel"
+        # NS6 strip — diagnostic: does NS6 help MMA core?
+        "fc1_ns6_strip|make -B fc1-w3 'DFLAGS=-DN_STAGES=6 -DSTRIP_EPILOGUE'|COPY:fc1-w3:fc1-w3-ns6-strip|fc1_w3_kernel"
     )
 fi
 
@@ -280,6 +298,14 @@ if [ "$DRY_RUN" = "0" ]; then
         run_diff "diff_q5_ns6sched_vs_ns6"   "$OUTDIR/fc1_ns6_sched.csv" "$OUTDIR/fc1_ns6.csv"
         run_diff "diff_q5_ns6sched_vs_sched" "$OUTDIR/fc1_ns6_sched.csv" "$OUTDIR/fc1_sched.csv"
     fi
+
+    # Q6: BIAS_BATCH sweep (2/3/4 vs default 6)
+    for bb in 2 3 4; do
+        bb_csv="$OUTDIR/fc1_ns6_sched_bb${bb}.csv"
+        if [ -f "$bb_csv" ] && [ -f "$OUTDIR/fc1_ns6_sched.csv" ]; then
+            run_diff "diff_q6_bb${bb}_vs_bb6" "$bb_csv" "$OUTDIR/fc1_ns6_sched.csv"
+        fi
+    done
 fi
 
 # ══════════════════════════════════════════════════════════════════
@@ -510,6 +536,7 @@ log "  $OUTDIR/diff_q2*.txt      — Q2: output write cost (gemm - strip)"
 log "  $OUTDIR/diff_q3*.txt      — Q3: TD=4 vs default dispatch"
 log "  $OUTDIR/diff_q4*.txt      — Q4: NS6 vs NS5"
 log "  $OUTDIR/diff_q5*.txt      — Q5: NS6+TD=4 combinations"
+log "  $OUTDIR/diff_q6*.txt      — Q6: BIAS_BATCH sweep (2/3/4 vs 6)"
 if [ "$FULL" = "1" ]; then
     log "  $OUTDIR/full_*.csv        — full profiles + source counters"
 fi
