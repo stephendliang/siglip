@@ -116,7 +116,7 @@ METRICS_ALL="${METRICS_STALL},${METRICS_MEM},${METRICS_PIPE},${METRICS_SCHED},${
 BINARIES=(
     "fc1_strip|make -B fc1-w3 DFLAGS=-DSTRIP_EPILOGUE|COPY:fc1-w3:fc1-w3-strip|fc1_w3_kernel"
     "fc1_gemm|make -B fc1-w3-gemm|./fc1-w3-gemm|fc1_w3_kernel"
-    "fc1_fused|make -B fc1-w3|./fc1-w3|fc1_w3_kernel"
+    "fc1_fused|make -B fc1-w3|COPY:fc1-w3:fc1-w3-fused|fc1_w3_kernel"
     "fc1_sched|make -B fc1-w3-sched|./fc1-w3-sched|fc1_w3_kernel"
 )
 

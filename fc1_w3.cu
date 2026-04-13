@@ -627,12 +627,12 @@ fc1_w3_kernel(
 #endif
 
 #if !defined(LDG_BIAS) && defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
-    int batch_start_tn = 0;   /* first N-tile index of current batch */
 #ifdef BIAS_PRELOAD
-    int loaded_batch = 0;     /* which bias batch is in SMEM (for W0 preload check) */
     int bias_phase[2] = {0, 0};
     const uint32_t bias_mbar_addr = smem_to_uint(smem + OFF_BIAS_MBAR);
     const int bias_buf_bytes = BIAS_BATCH * TN * 2;
+#else
+    int batch_start_tn = 0;   /* first N-tile index of current batch */
 #endif
 #endif
 
@@ -721,37 +721,31 @@ fc1_w3_kernel(
             /*
              * W0 preloads bias batch for THIS tile's epilogue (runs next iteration).
              * Double-buffered: current epilogue reads buf (_iter-1)&1, we write buf _iter&1.
-             * Must ALWAYS signal bias_mbar so epilogue warps don't deadlock.
+             * Always TMA-load (even same batch) to ensure target buf has valid data.
+             * Safe: NO_PREFILL limits pipeline to 1 in-flight epilogue, so
+             * buf[N&1] is never read concurrently with this write.
              */
             {
                 int w0_tn = tile_idx % TILES_N;
                 if (SNAKE_ORDER && ((tile_idx / TILES_N) & 1)) w0_tn = TILES_N - 1 - w0_tn;
                 const int need_batch = w0_tn / BIAS_BATCH;
                 const int new_buf = _iter & 1;
-                if (need_batch != loaded_batch) {
-                    const uint32_t dst = smem_to_uint(smem + OFF_BIAS_SMEM)
-                        + new_buf * bias_buf_bytes;
-                    if (lane == 0) {
-                        asm volatile(
-                            "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-                            :: "r"(bias_mbar_addr + new_buf * 8),
-                               "r"(bias_buf_bytes)
-                            : "memory");
-                        asm volatile(
-                            "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
-                            " [%0], [%1], %2, [%3];"
-                            :: "r"(dst),
-                               "l"(bias + need_batch * BIAS_BATCH * TN),
-                               "r"(bias_buf_bytes),
-                               "r"(bias_mbar_addr + new_buf * 8)
-                            : "memory");
-                    }
-                    loaded_batch = need_batch;
-                    batch_start_tn = need_batch * BIAS_BATCH;
-                } else {
-                    /* Same batch — manual arrive, lane 0 only (mbar init count=1) */
-                    if (lane == 0)
-                        mbar_arrive(bias_mbar_addr + new_buf * 8);
+                const uint32_t dst = smem_to_uint(smem + OFF_BIAS_SMEM)
+                    + new_buf * bias_buf_bytes;
+                if (lane == 0) {
+                    asm volatile(
+                        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                        :: "r"(bias_mbar_addr + new_buf * 8),
+                           "r"(bias_buf_bytes)
+                        : "memory");
+                    asm volatile(
+                        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
+                        " [%0], [%1], %2, [%3];"
+                        :: "r"(dst),
+                           "l"(bias + need_batch * BIAS_BATCH * TN),
+                           "r"(bias_buf_bytes),
+                           "r"(bias_mbar_addr + new_buf * 8)
+                        : "memory");
                 }
             }
 #endif
@@ -1020,7 +1014,7 @@ fc1_w3_kernel(
 #if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
                         const uint32_t bs = bias_saddr
                             + ((_iter - 1) & 1) * bias_buf_bytes
-                            + ((ptn - batch_start_tn) * TN + nc) * 2;
+                            + ((ptn & (BIAS_BATCH - 1)) * TN + nc) * 2;
 #elif defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
                         const uint32_t bs = bias_saddr
                             + ((ptn - batch_start_tn) * TN + nc) * 2;
@@ -1292,7 +1286,7 @@ fc1_w3_kernel(
 #if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
                     const uint32_t bs = bias_saddr
                         + ((_iter - 1) & 1) * bias_buf_bytes
-                        + ((ltn - batch_start_tn) * TN + nc) * 2;
+                        + ((ltn & (BIAS_BATCH - 1)) * TN + nc) * 2;
 #elif defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
                     const uint32_t bs = bias_saddr
                         + ((ltn - batch_start_tn) * TN + nc) * 2;
