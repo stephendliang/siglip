@@ -124,14 +124,14 @@ if [ "$QUICK" = "0" ]; then
     BINARIES+=(
         "fc1_ns6|make -B fc1-w3 'DFLAGS=-DN_STAGES=6'|COPY:fc1-w3:fc1-w3-ns6|fc1_w3_kernel"
         "fc1_ns6_sched|make -B fc1-w3 'DFLAGS=-DN_STAGES=6 -DTILE_DISPATCH=4'|COPY:fc1-w3:fc1-w3-ns6-sched|fc1_w3_kernel"
-        # New bias strategies (NS6+TD=4):
-        #  LDG_BIAS:    direct LDG from L1 cache, zero SMEM for bias
-        #  bb6 default:  batch_start_tn fix eliminates hot-path modulo
-        #  bb4:          power-of-2 batch (& 3 instead of % 6)
+        # Bias strategies (NS6+TD=4, default is now bb4=power-of-2):
+        #  ns6_sched above = bb4 (default BIAS_BATCH=4, 227KB SMEM)
+        #  LDG_BIAS:     direct LDG from L1 cache, zero SMEM for bias
         #  PRELOAD+bb2:  W0 TMA preloads, double-buffered, epilogue never reloads
+        #  bb6:          6 N-tiles (228KB exactly, may hit SMEM limit)
         "fc1_ns6_ldg|make -B fc1-w3 'DFLAGS=-DN_STAGES=6 -DTILE_DISPATCH=4 -DLDG_BIAS'|COPY:fc1-w3:fc1-w3-ns6-ldg|fc1_w3_kernel"
-        "fc1_ns6_bb4|make -B fc1-w3 'DFLAGS=-DN_STAGES=6 -DTILE_DISPATCH=4 -DBIAS_BATCH=4'|COPY:fc1-w3:fc1-w3-ns6-bb4|fc1_w3_kernel"
         "fc1_ns6_preload|make -B fc1-w3 'DFLAGS=-DN_STAGES=6 -DTILE_DISPATCH=4 -DBIAS_PRELOAD -DBIAS_BATCH=2'|COPY:fc1-w3:fc1-w3-ns6-preload|fc1_w3_kernel"
+        "fc1_ns6_bb6|make -B fc1-w3 'DFLAGS=-DN_STAGES=6 -DTILE_DISPATCH=4 -DBIAS_BATCH=6'|COPY:fc1-w3:fc1-w3-ns6-bb6|fc1_w3_kernel"
         # NS5+TD=4+LDG as baseline comparison
         "fc1_sched_ldg|make -B fc1-w3 'DFLAGS=-DTILE_DISPATCH=4 -DLDG_BIAS'|COPY:fc1-w3:fc1-w3-sched-ldg|fc1_w3_kernel"
         # NS6 strip — diagnostic: does NS6 help MMA core?

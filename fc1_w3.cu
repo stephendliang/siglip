@@ -166,7 +166,7 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #ifdef BIAS_PER_TILE
 #if TILE_DISPATCH == 4
 #ifndef BIAS_BATCH
-#define BIAS_BATCH         6                      /* N-tiles cached per batch */
+#define BIAS_BATCH         4                      /* N-tiles cached per batch (power-of-2) */
 #endif
 #ifdef BIAS_PRELOAD
 #define BIAS_SMEM_BYTES    (BIAS_BATCH * TN * 2 * 2)  /* double-buffered for W0 TMA */
@@ -749,8 +749,9 @@ fc1_w3_kernel(
                     loaded_batch = need_batch;
                     batch_start_tn = need_batch * BIAS_BATCH;
                 } else {
-                    /* Same batch — manual arrive (no TMA needed) */
-                    mbar_arrive(bias_mbar_addr + new_buf * 8);
+                    /* Same batch — manual arrive, lane 0 only (mbar init count=1) */
+                    if (lane == 0)
+                        mbar_arrive(bias_mbar_addr + new_buf * 8);
                 }
             }
 #endif
