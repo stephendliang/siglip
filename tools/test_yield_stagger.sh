@@ -31,10 +31,10 @@ make fc2-w3 2>&1 | tail -1
 make fc2-w3-strip 2>&1 | tail -1
 make fc2-w3-sched 2>&1 | tail -1
 
-# Build sched-strip separately (need -B since same target name)
+# Build sched-strip separately (need -B since same target, Make won't rebuild)
 make -B fc2-w3-sched DFLAGS='-DTILE_DISPATCH=4 -DSTRIP_EPILOGUE' 2>&1 | tail -1
 cp fc2-w3-sched fc2-w3-sched-strip
-make fc2-w3-sched 2>&1 | tail -1
+make -B fc2-w3-sched 2>&1 | tail -1
 
 # --- Dump SASS from fused binaries (they have the epilogue) ---
 log "Dumping SASS..."
@@ -99,11 +99,13 @@ log ""
 log "=== SUMMARY ==="
 log "Variant                  | ms       | valid"
 log "-------------------------|----------|------"
-for f in "$OUTDIR"/*.txt; do
-    name=$(basename "$f" .txt)
+for name in default_fused default_strip sched_fused sched_strip \
+            default_yield_fused default_yield_strip sched_yield_fused sched_yield_strip; do
+    f="$OUTDIR/${name}.txt"
+    [ -f "$f" ] || continue
     ms=$(grep -oP '[\d.]+\s*ms' "$f" | head -1)
     valid=$(grep -oP 'valid=\d' "$f" | head -1)
-    printf "%-25s| %-9s| %s\n" "$name" "$ms" "$valid" | tee -a "$OUTDIR/session.log"
+    printf "%-25s| %-9s| %s\n" "$name" "${ms:-N/A}" "${valid:-N/A}" | tee -a "$OUTDIR/session.log"
 done
 
 log ""
