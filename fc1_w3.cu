@@ -733,17 +733,17 @@ fc1_w3_kernel(
                         + new_buf * bias_buf_bytes;
                     if (lane == 0) {
                         asm volatile(
+                            "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                            :: "r"(bias_mbar_addr + new_buf * 8),
+                               "r"(bias_buf_bytes)
+                            : "memory");
+                        asm volatile(
                             "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
                             " [%0], [%1], %2, [%3];"
                             :: "r"(dst),
                                "l"(bias + need_batch * BIAS_BATCH * TN),
                                "r"(bias_buf_bytes),
                                "r"(bias_mbar_addr + new_buf * 8)
-                            : "memory");
-                        asm volatile(
-                            "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-                            :: "r"(bias_mbar_addr + new_buf * 8),
-                               "r"(bias_buf_bytes)
                             : "memory");
                     }
                     loaded_batch = need_batch;
