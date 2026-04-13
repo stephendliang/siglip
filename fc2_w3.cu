@@ -436,6 +436,14 @@ void tma_load_2d_cta(uint32_t smem_dst, const void* tma_desc,
 }
 
 static __device__ __forceinline__
+void tma_prefetch_2d(const void* tma_desc, int32_t c0, int32_t c1) {
+    asm volatile(
+        "cp.async.bulk.prefetch.tensor.2d.L2.global [%0, {%1, %2}];"
+        :: "l"(tma_desc), "r"(c0), "r"(c1)
+        : "memory");
+}
+
+static __device__ __forceinline__
 void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
     asm volatile(
         "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;"
@@ -1470,6 +1478,23 @@ fc2_w3_kernel(
             }
 
         } else if (warp == 2) {
+#ifdef RES_PREFETCH
+            /*
+             * Prefetch CURRENT tile's residual into L2. Next iteration this
+             * tile becomes prev_tile and the actual TMA load hits L2 instead
+             * of DRAM. Zero SMEM cost — prefetch only touches L2.
+             */
+            if (lane == 0) {
+                int pf_tm = tile_idx / TILES_N;
+                int pf_tn = tile_idx % TILES_N;
+                M_SNAKE_REMAP(pf_tm);
+                if (SNAKE_ORDER && (pf_tm & 1)) pf_tn = TILES_N - 1 - pf_tn;
+                const int pf_m = pf_tm * TM * 2 + cta_rank * TM;
+                const int pf_n = pf_tn * TN;
+                for (int si = 0; si < NUM_EPI_SUBITERS; si++)
+                    tma_prefetch_2d(&tma_res, pf_n + si * 64, pf_m);
+            }
+#endif
             /* W2 must wait on mainloop_mbar EVERY tile (including tile_start)
                to consume the free-pass phase. Only epilogue work is conditional. */
             const int prev_buf = buf ^ 1;

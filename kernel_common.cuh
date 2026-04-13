@@ -495,6 +495,14 @@ void tma_load_2d_cta(uint32_t smem_dst, const void* tma_desc,
         : "memory");
 }
 
+static __device__ __forceinline__
+void tma_prefetch_2d(const void* tma_desc, int32_t c0, int32_t c1) {
+    asm volatile(
+        "cp.async.bulk.prefetch.tensor.2d.L2.global [%0, {%1, %2}];"
+        :: "l"(tma_desc), "r"(c0), "r"(c1)
+        : "memory");
+}
+
 /*
 Predicated TMA helpers — lane-0-only operations without divergent branches.
 All lanes execute but only lane 0's predicate is true, so the TMA/mbar
