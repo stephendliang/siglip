@@ -41,6 +41,9 @@ Compile-time flags:
                         (0=disabled, ~50=non-overlapping STS, ~200=full isolation)
   -DTILE_DISPATCH=6     Inline atomic dispatch: W0 does atomicAdd at tile boundary, no W7, 7 warps.
                         Ordered dispatch (1.00x DRAM) without wasting a scheduler warp.
+  -DCOL_LOCK            With TD=4: column-locked dynamic dispatch. Each cluster keeps fixed tn,
+                        dynamically grabs M-rows via per-column atomicAdd. Combines default's
+                        B-tile L2 reuse with TD=4's zero DRAM amplification.
   -DNO_PREFILL          Restore epilogue_mbar wait in W1 (default: skipped via PREFILL).
                         PREFILL relies on TMEM double-buffering — epilogue reads prev_buf
                         while MMA writes buf. Removing it re-adds tile-level pipeline bubble.
@@ -841,6 +844,15 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 #if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4 || TILE_DISPATCH == 6
 __device__ int g_tile_ctr;
 #endif
+#ifdef COL_LOCK
+#if TILE_DISPATCH != 4
+#error "COL_LOCK requires TILE_DISPATCH=4"
+#endif
+#ifdef ROW_STEAL
+#error "COL_LOCK and ROW_STEAL are mutually exclusive"
+#endif
+__device__ int g_col_ctr[4]; /* per-tn-group M-row counter, padded */
+#endif
 
 #ifdef CLOCK_TIMING
 #define CT_MAX_TILES 80
@@ -1184,8 +1196,23 @@ fc2_w3_kernel(
 #else
             if (cta_rank == 0) {
                 if (lane == 0) {
+#ifdef COL_LOCK
+                    /*
+                     * Column-locked dispatch: each cluster keeps its tn,
+                     * dynamically grabs M-rows from per-column counter.
+                     * B stays warm in L2 (fixed tn), zero DRAM amplification
+                     * (dynamic M-row avoids wavefront edge effects).
+                     */
+                    int _cl_tn = (sm_id / 2) % TILES_N;
+                    int _cl_tm;
+                    asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
+                        : "=r"(_cl_tm) : "l"(&g_col_ctr[_cl_tn]));
+                    tile_idx = (_cl_tm < TILES_M)
+                        ? _cl_tm * TILES_N + _cl_tn : TOTAL_TILES;
+#else
                     asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
                         : "=r"(tile_idx) : "l"(&g_tile_ctr));
+#endif
                     asm volatile("st.shared.b32 [%0], %1;"
                         :: "r"(fifo_addr + _s_buf * 4), "r"(tile_idx));
                     asm volatile("fence.acq_rel.cluster;");
@@ -2829,11 +2856,22 @@ int main() {
 #if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4 || TILE_DISPATCH == 6
     int* d_tile_ctr_ptr;
     CUDA_CHECK(cudaGetSymbolAddress((void**)&d_tile_ctr_ptr, g_tile_ctr));
+#ifdef COL_LOCK
+    int* d_col_ctr_ptr;
+    CUDA_CHECK(cudaGetSymbolAddress((void**)&d_col_ctr_ptr, g_col_ctr));
+#define LAUNCH_KERNEL() do { \
+    cudaMemsetAsync(d_tile_ctr_ptr, 0, sizeof(int)); \
+    cudaMemsetAsync(d_col_ctr_ptr, 0, 4 * sizeof(int)); \
+    fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
+        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual, h_tma_res); \
+} while(0)
+#else
 #define LAUNCH_KERNEL() do { \
     cudaMemsetAsync(d_tile_ctr_ptr, 0, sizeof(int)); \
     fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
         h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual, h_tma_res); \
 } while(0)
+#endif
 #elif TILE_DISPATCH == 3
     /* Grid-based: x=CTA rank (0..1), y=tile index. cluster_dims(2,1,1)
        pairs CTAs 0,1 per tile into a cluster. */
@@ -2937,14 +2975,13 @@ int main() {
         CUDA_CHECK(cudaMemcpyFromSymbol(&ct, g_clock, sizeof(ct)));
         int n = ct.tiles;
         printf("\n=== CLOCK TIMING (cluster 0, %d tiles) ===\n", n);
-        printf("%-22s %12s %10s %8s\n", "Phase", "Cycles", "us/tile", "%total");
+        printf("%-22s %12s %10s %8s\n", "Phase", "Cycles", "cyc/tile", "%total");
         printf("--------------------------------------------------------------\n");
 
         auto row = [&](const char* label, int64_t cyc, int64_t ref) {
-            double us = cyc / 1813.0 / 1000.0;
             double pct = ref > 0 ? 100.0 * cyc / ref : 0.0;
-            printf("%-22s %12ld %10.1f %7.1f%%\n", label, (long)cyc,
-                   n > 0 ? us / n : 0.0, pct);
+            printf("%-22s %12ld %10ld %7.1f%%\n", label, (long)cyc,
+                   n > 0 ? (long)(cyc / n) : 0L, pct);
         };
 
         row("W0 total",           ct.w0_total,     ct.w0_total);

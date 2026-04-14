@@ -1,22 +1,25 @@
 #!/bin/bash
-# Compare clock timing between default dispatch and TD=4 scheduler.
-# Builds both variants with CLOCK_TIMING, runs them, saves output.
+# Compare clock timing between dispatch modes: default, TD=4, COL_LOCK.
+# Builds all variants with CLOCK_TIMING, runs them, saves output.
 #
 # Usage:
-#   bash tools/clock_compare.sh           # default dims
-#   bash tools/clock_compare.sh K=4096    # custom K (tests crossover)
-#   bash tools/clock_compare.sh K=6144    # where TD=4 wins
+#   bash tools/clock_compare.sh                # default dims (K=3072)
+#   bash tools/clock_compare.sh K=4096         # custom K (tests crossover)
+#   bash tools/clock_compare.sh K=6144         # where TD=4 wins
+#   bash tools/clock_compare.sh --strip-only   # skip fused builds
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 DFLAGS=""
 K_LABEL=""
+STRIP_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         K=*) val="${arg#K=}"; DFLAGS="$DFLAGS -DK_DIM=$val"; K_LABEL="_K${val}";;
         M=*) val="${arg#M=}"; DFLAGS="$DFLAGS -DM_TOTAL=$val";;
         N=*) val="${arg#N=}"; DFLAGS="$DFLAGS -DN_DIM=$val";;
+        --strip-only) STRIP_ONLY=1;;
     esac
 done
 
@@ -30,19 +33,29 @@ log "DFLAGS: ${DFLAGS:-none}"
 
 nvidia-smi --query-gpu=gpu_name,clocks.sm --format=csv,noheader 2>/dev/null | tee -a "$OUTDIR/session.log"
 
-# Build
-log "Building default fused (clock)..."
-make -B fc2-w3-clock ${DFLAGS:+DFLAGS="$DFLAGS"} 2>&1 | tail -1
-log "Building default strip (clock)..."
-make -B fc2-w3-strip-clock ${DFLAGS:+DFLAGS="$DFLAGS"} 2>&1 | tail -1
-log "Building sched fused (clock)..."
-make -B fc2-w3-sched-clock ${DFLAGS:+DFLAGS="$DFLAGS"} 2>&1 | tail -1
+# Build all variants
+build() {
+    local name="$1"; shift
+    log "Building $name..."
+    "$@" 2>&1 | tail -1
+}
 
-# Sched strip needs manual build (strip + TD=4 + clock)
-log "Building sched strip (clock)..."
-make -B fc2-w3-sched-clock DFLAGS="-DTILE_DISPATCH=4 -DSTRIP_EPILOGUE -DCLOCK_TIMING ${DFLAGS}" 2>&1 | tail -1
+build "default fused (clock)"   make -B fc2-w3-clock ${DFLAGS:+DFLAGS="$DFLAGS"}
+build "default strip (clock)"   make -B fc2-w3-strip-clock ${DFLAGS:+DFLAGS="$DFLAGS"}
+build "sched fused (clock)"     make -B fc2-w3-sched-clock ${DFLAGS:+DFLAGS="$DFLAGS"}
+
+# Sched strip: TD=4 + STRIP + CLOCK
+build "sched strip (clock)"     make -B fc2-w3-sched-clock DFLAGS="-DTILE_DISPATCH=4 -DSTRIP_EPILOGUE -DCLOCK_TIMING ${DFLAGS}"
 cp fc2-w3-sched-clock fc2-w3-sched-strip-clock
-make -B fc2-w3-sched-clock ${DFLAGS:+DFLAGS="$DFLAGS"} 2>&1 | tail -1
+build "sched fused (clock, rebuild)" make -B fc2-w3-sched-clock ${DFLAGS:+DFLAGS="$DFLAGS"}
+
+# COL_LOCK variants
+build "collock fused (clock)"   make -B fc2-w3-collock-clock ${DFLAGS:+DFLAGS="$DFLAGS"}
+
+# Collock strip: TD=4 + COL_LOCK + STRIP + CLOCK
+build "collock strip (clock)"   make -B fc2-w3-collock-clock DFLAGS="-DTILE_DISPATCH=4 -DCOL_LOCK -DSTRIP_EPILOGUE -DCLOCK_TIMING ${DFLAGS}"
+cp fc2-w3-collock-clock fc2-w3-collock-strip-clock
+build "collock fused (clock, rebuild)" make -B fc2-w3-collock-clock ${DFLAGS:+DFLAGS="$DFLAGS"}
 
 # Run
 run_exp() {
@@ -65,26 +78,30 @@ run_exp "default_fused"       "fc2-w3-clock"
 run_exp "default_strip"       "fc2-w3-strip-clock"
 run_exp "sched_fused"         "fc2-w3-sched-clock"
 run_exp "sched_strip"         "fc2-w3-sched-strip-clock"
+run_exp "collock_fused"       "fc2-w3-collock-clock"
+run_exp "collock_strip"       "fc2-w3-collock-strip-clock"
 
 log ""
 log "=== TIMING DATA ==="
-for name in default_fused default_strip sched_fused sched_strip; do
+for name in default_fused default_strip sched_fused sched_strip collock_fused collock_strip; do
     f="$OUTDIR/${name}.txt"
     [ -f "$f" ] || continue
     log ""
     log "--- $name ---"
-    # Print the CLOCK TIMING section
-    sed -n '/=== CLOCK TIMING/,/^$/p' "$f" | tee -a "$OUTDIR/session.log"
+    # Capture from CLOCK TIMING to end of output
+    sed -n '/=== CLOCK TIMING/,$p' "$f" | tee -a "$OUTDIR/session.log"
 done
 
 log ""
 log "=== SUMMARY ==="
-for name in default_fused default_strip sched_fused sched_strip; do
+printf "%-20s %10s %10s\n" "Variant" "ms" "valid" | tee -a "$OUTDIR/session.log"
+printf "%-20s %10s %10s\n" "-------" "--" "-----" | tee -a "$OUTDIR/session.log"
+for name in default_fused default_strip sched_fused sched_strip collock_fused collock_strip; do
     f="$OUTDIR/${name}.txt"
     [ -f "$f" ] || continue
     ms=$(grep -oP '[\d.]+(?=\s*ms)' "$f" | head -1)
     valid=$(grep -oP 'valid=\d' "$f" | head -1)
-    printf "%-20s %s ms  %s\n" "$name" "${ms:-N/A}" "${valid:-N/A}" | tee -a "$OUTDIR/session.log"
+    printf "%-20s %10s %10s\n" "$name" "${ms:-N/A}" "${valid:-N/A}" | tee -a "$OUTDIR/session.log"
 done
 
 log ""
