@@ -10,13 +10,14 @@ Default FC2 shape: [928256, 3072] x [3072, 768]^T + bias + residual. Batch = 473
 
 | Variant | ms | TFLOPS | vs CUTLASS fused |
 |---|---|---|---|
-| **w3_fused (NS6+PREFILL)** | **1.111** | **3943** | **-9.4%** |
+| **w3_lean (TD=4+LEAN_DISPATCH)** | **1.074** | **4078** | **-12.4%** |
+| w3_fused (NS6+PREFILL, default) | 1.113 | 3936 | -9.2% |
 | w3_gemm (GEMM-only) | 1.100 | 3981 | — |
 | w3_sched (TD=4 dispatch) | 1.147 | 3819 | -6.4% |
 | CUTLASS fused | 1.226 | 3573 | baseline |
 | CUTLASS strip | 1.152 | 3801 | — |
 
-Key: N_STAGES=6 (6-stage pipeline, 227KB of 228KB SMEM) + PREFILL (skip epilogue_mbar wait, rely on TMEM double-buffering). Tile/cluster: 256x256x128, 2x1 cluster, cta_group::2, 74 clusters.
+Key: LEAN_DISPATCH = TD=4 (zero DRAM amplification) + W2-W6 skip tile_ready_mbar (piggyback on mainloop_mbar). NS6 + PREFILL. Tile/cluster: 256x256x128, 2x1 cluster, cta_group::2, 74 clusters.
 
 ## Dimension sweep (B200-verified, 2026-04-09)
 
@@ -89,8 +90,9 @@ Tile: 256x256x128, TMEM 512 cols double-buffered, 6-stage SMEM pipeline (default
 
 | Mode | Flag | Status |
 |---|---|---|
-| Default (Group-3) | none | Active. Fixed tn per cluster, stride M. Best at K<=4096 |
-| Sched (TD=4) | TILE_DISPATCH=4 | Active. Dedicated W7, atomicAdd. Best at K>=5120, 0 DRAM amplification |
+| Default (Group-3) | none | Active. Fixed tn per cluster, stride M. 1.113ms fused |
+| Sched (TD=4) | TILE_DISPATCH=4 | Active. Dedicated W7, atomicAdd. 0 DRAM amplification |
+| **Lean (TD=4+LEAN)** | **TILE_DISPATCH=4 LEAN_DISPATCH** | **Active. Best overall: 1.074ms. W2-W6 piggyback on mainloop_mbar** |
 | Atomic (TD=1) | TILE_DISPATCH=1 | Dead (1.370ms overhead) |
 | Inline atomic (TD=6) | TILE_DISPATCH=6 | Dead (W0 blocked at tile boundary) |
 | Inline K-loop (TD=7) | TILE_DISPATCH=7 | Dead (atomicAdd in K-loop disrupts TMA pipeline, +41% tma_issue) |
@@ -154,8 +156,9 @@ STS clustering proven immutable from source level: 6+ approaches all produce ide
 ## Build and run
 
 ```bash
-# Primary kernel (default: NS6, PREFILL, Group-3 dispatch)
-make fc2-w3 && ./fc2-w3                          # fused 1.110ms
+# Primary kernel (best: LEAN_DISPATCH = TD=4 + piggyback mbar)
+make fc2-w3-lean && ./fc2-w3-lean                # fused 1.074ms (best)
+make fc2-w3 && ./fc2-w3                          # fused 1.113ms (default Group-3)
 make fc2-w3-gemm && ./fc2-w3-gemm                # GEMM-only (valid=1)
 make fc2-w3-strip && ./fc2-w3-strip               # MMA-only (valid=0)
 make fc2-w3-sched && ./fc2-w3-sched               # TD=4 scheduler dispatch
