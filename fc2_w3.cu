@@ -1760,13 +1760,21 @@ fc2_w3_kernel(
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             ml_phase[prev_buf] ^= 1;
 #ifdef LEAN_DISPATCH
-            /* Deferred read: mainloop_mbar acquire guarantees W0's bcast write visible
-               (W0 → tma_mbar release → W1 acquire → mainloop_mbar release → here acquire) */
+            /* Deferred read: mainloop_mbar[prev_buf] acquire guarantees W0's bcast
+               write for the PREVIOUS tile (bcast[prev_buf]) is visible. Read it to
+               get the correct prev_tile value for this iteration's epilogue. */
             if (lane == 0)
                 asm volatile("ld.shared.b32 %0, [%1];"
-                    : "=r"(tile_idx) : "r"(bcast_addr + buf * 4));
+                    : "=r"(tile_idx) : "r"(bcast_addr + prev_buf * 4));
             asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
                 : "=r"(tile_idx) : "r"(tile_idx));
+            _prev_tile = tile_idx;
+            /* Termination: W0 wrote TOTAL_TILES to bcast at the termination iter.
+               W1's termination arrive unblocked us. Skip epilogue, break. */
+            if (tile_idx >= TOTAL_TILES) {
+                mbar_arrive(epi_mbar_masked + prev_buf * 8);
+                goto _lean_done;
+            }
 #endif
 #if defined(STRIP_EPILOGUE) || defined(SELF_LOAD) || defined(GEMM_ONLY)
             if (has_prev)
@@ -1824,12 +1832,18 @@ fc2_w3_kernel(
 #endif
             ml_phase[prev_buf] ^= 1;
 #ifdef LEAN_DISPATCH
-            /* Deferred read: mainloop_mbar acquire provides transitivity */
+            /* Deferred read: mainloop_mbar[prev_buf] acquire guarantees bcast[prev_buf]
+               visible. This is the PREVIOUS tile's tile_idx — correct prev_tile. */
             if (lane == 0)
                 asm volatile("ld.shared.b32 %0, [%1];"
-                    : "=r"(tile_idx) : "r"(bcast_addr + buf * 4));
+                    : "=r"(tile_idx) : "r"(bcast_addr + prev_buf * 4));
             asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
                 : "=r"(tile_idx) : "r"(tile_idx));
+            _prev_tile = tile_idx;
+            if (tile_idx >= TOTAL_TILES) {
+                mbar_arrive(epi_mbar_masked + prev_buf * 8);
+                goto _lean_done;
+            }
 #endif
 #ifdef CLOCK_TIMING
             if (_ct && warp == 3) CT_READ(_ct_t);
@@ -2362,12 +2376,15 @@ fc2_w3_kernel(
         _prev_tile = tile_idx;
         _iter++;
 #ifdef LEAN_DISPATCH
-        /* W2-W6 deferred break: they did epilogue for prev tile,
-           now check if this was the termination iter */
-        if (warp >= 2 && tile_idx >= TOTAL_TILES) break;
+        /* W2-W6 termination handled via goto _lean_done inside tile body
+           (after detecting bcast[prev_buf] >= TOTAL_TILES) */
 #endif
 #endif
     }
+
+#ifdef LEAN_DISPATCH
+_lean_done:
+#endif
 
     /* ── Drain: last tile epilogue ── */
     {
