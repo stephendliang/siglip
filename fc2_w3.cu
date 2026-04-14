@@ -270,14 +270,15 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define OFF_TD6_BCAST_MBAR  (OFF_TD6_BCAST + 8)                   /* 2 × 8B: W0 arrives → W1-W6 wait */
 #define _LAYOUT_END         (OFF_TD6_BCAST_MBAR + 16)
 #elif TILE_DISPATCH == 7
-/* TD=7: inline atomic in K-loop, epoch-based broadcast.
-   No W7 warp, no dispatch mbarriers. CTA0 W0 issues atomicAdd at ki=0,
-   writes result to CTA1 FIFO mid-K-loop. W0 broadcasts to W1-W6 via epoch poll. */
-#define OFF_TD7_FIFO    _MBAR_END                    /* 2 × 4B: CTA0→CTA1 tile FIFO */
-#define OFF_TD7_EPOCH   (OFF_TD7_FIFO + 8)           /* 2 × 4B: CTA0→CTA1 epoch */
-#define OFF_TD7_BCAST   (OFF_TD7_EPOCH + 8)          /* 2 × 4B: W0→W1-W6 tile broadcast */
-#define OFF_TD7_BEPOCH  (OFF_TD7_BCAST + 8)          /* 2 × 4B: W0→W1-W6 broadcast epoch */
-#define _LAYOUT_END     (OFF_TD7_BEPOCH + 8)
+/* TD=7: inline atomic in K-loop, lightweight mbarrier broadcast.
+   No W7 warp, no sched/cons mbarriers. CTA0 W0 issues atomicAdd at ki=0,
+   writes result to CTA1 FIFO mid-K-loop. W0 broadcasts to W1-W6 via
+   mbarrier (count=1, only W0 lane 0 arrives — lighter than TD=4's count=32). */
+#define OFF_TD7_FIFO       _MBAR_END                 /* 2 × 4B: CTA0→CTA1 tile FIFO */
+#define OFF_TD7_EPOCH      (OFF_TD7_FIFO + 8)        /* 2 × 4B: CTA0→CTA1 epoch */
+#define OFF_TD7_BCAST      (OFF_TD7_EPOCH + 8)       /* 2 × 4B: W0→W1-W6 tile broadcast */
+#define OFF_TD7_BCAST_MBAR (OFF_TD7_BCAST + 8)       /* 2 × 8B: W0 lane 0 arrives → W1-W6 wait */
+#define _LAYOUT_END        (OFF_TD7_BCAST_MBAR + 16)
 #elif TILE_DISPATCH == 1 || TILE_DISPATCH == 2
 #define OFF_TILE_SLOT      _MBAR_END
 #define _LAYOUT_END        (OFF_TILE_SLOT + 8)
@@ -962,11 +963,12 @@ fc2_w3_kernel(
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_TD6_EPOCH)));
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_TD6_EPOCH + 4)));
 #elif TILE_DISPATCH == 7
-        /* Clear CTA0→CTA1 epoch and W0→W1-W6 broadcast epoch slots */
+        /* W0→W1-W6 broadcast mbar: count=1, only W0 lane 0 arrives */
+        for (int i = 0; i < 2; i++)
+            mbar_init(smem_to_uint(smem + OFF_TD7_BCAST_MBAR + i * 8), 1);
+        /* Clear CTA0→CTA1 epoch slots */
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_TD7_EPOCH)));
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_TD7_EPOCH + 4)));
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_TD7_BEPOCH)));
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_TD7_BEPOCH + 4)));
 #endif
 
 #if EPI_REUSE_SMEM
@@ -1035,9 +1037,10 @@ fc2_w3_kernel(
     const uint32_t td7_fifo_addr   = smem_to_uint(smem + OFF_TD7_FIFO);
     const uint32_t td7_epoch_addr  = smem_to_uint(smem + OFF_TD7_EPOCH);
     const uint32_t td7_bcast_addr  = smem_to_uint(smem + OFF_TD7_BCAST);
-    const uint32_t td7_bepoch_addr = smem_to_uint(smem + OFF_TD7_BEPOCH);
+    const uint32_t td7_bcast_mbar  = smem_to_uint(smem + OFF_TD7_BCAST_MBAR);
     const uint32_t td7_cta0_epoch  = td7_epoch_addr & 0xFEFFFFFFU;
     const uint32_t td7_cta0_fifo   = td7_fifo_addr & 0xFEFFFFFFU;
+    int td7_bcast_phase[2] = {0, 0};
 #endif
 #if TILE_DISPATCH >= 1
     int _iter = 0;
@@ -1412,24 +1415,20 @@ fc2_w3_kernel(
             const int _buf = _iter & 1;
             if (warp == 0) {
                 tile_idx = _pf_tile;
-                /* Broadcast to W1-W6 via epoch: write tile, then epoch */
+                /* Broadcast to W1-W6 via mbar: write tile, then arrive */
                 if (lane == 0) {
                     asm volatile("st.shared.b32 [%0], %1;"
                         :: "r"(td7_bcast_addr + _buf * 4), "r"(tile_idx));
-                    asm volatile("st.shared.b32 [%0], %1;"
-                        :: "r"(td7_bepoch_addr + _buf * 4), "r"(_iter + 1));
+                    mbar_arrive(td7_bcast_mbar + _buf * 8);
                 }
             } else {
-                /* W1-W6: poll broadcast epoch, then read tile_idx */
+                /* W1-W6: wait on broadcast mbar, then read tile_idx */
 #ifdef CLOCK_TIMING
                 int64_t _ct_ds; if (_ct) CT_READ(_ct_ds);
 #endif
+                mbar_wait(td7_bcast_mbar + _buf * 8, td7_bcast_phase[_buf]);
+                td7_bcast_phase[_buf] ^= 1;
                 if (lane == 0) {
-                    int bep;
-                    do {
-                        asm volatile("ld.shared.b32 %0, [%1];"
-                            : "=r"(bep) : "r"(td7_bepoch_addr + _buf * 4));
-                    } while (bep != _iter + 1);
                     asm volatile("ld.shared.b32 %0, [%1];"
                         : "=r"(tile_idx) : "r"(td7_bcast_addr + _buf * 4));
                 }
