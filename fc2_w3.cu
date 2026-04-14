@@ -842,6 +842,29 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 __device__ int g_tile_ctr;
 #endif
 
+#ifdef CLOCK_TIMING
+#define CT_MAX_TILES 80
+struct ClockData {
+    int64_t w0_total;      /* W0 wall time */
+    int64_t w0_kloop;      /* W0 K-loop total (TMA issue + mma_mbar stalls) */
+    int64_t w0_mma_stall;  /* W0 mbar_wait(mma_mbar) */
+    int64_t w0_sched;      /* W0 mbar_wait(sched_prod_mbar) — TD=4 */
+    int64_t w1_total;      /* W1 wall time */
+    int64_t w1_kloop;      /* W1 K-loop (tma wait + MMA + commit) */
+    int64_t w1_dispatch;   /* W1 tile_ready_mbar wait — TD=4 */
+    int64_t w3_total;      /* W3 wall time */
+    int64_t w3_ml_stall;   /* W3 mainloop_mbar wait */
+    int64_t w3_epi;        /* W3 epilogue compute+store */
+    int tiles;
+    int pad;
+    int64_t w0_tile[CT_MAX_TILES];
+    int64_t w1_tile[CT_MAX_TILES];
+};
+__device__ ClockData g_clock;
+
+#define CT_READ(var) asm volatile("mov.u64 %0, %%clock64;" : "=l"(var))
+#endif
+
 /* ════════════════════════════════════════════════════════════════
    KERNEL
    ════════════════════════════════════════════════════════════════ */
@@ -1049,6 +1072,18 @@ fc2_w3_kernel(
     }
     __syncthreads();
 
+#ifdef CLOCK_TIMING
+#if TILE_DISPATCH == 3
+    const bool _ct = false;
+#else
+    const bool _ct = (sm_id == 0);  /* cluster 0, CTA 0 */
+#endif
+    int64_t _ct_start = 0, _ct_t = 0;
+    int64_t _ct_a = 0, _ct_b = 0, _ct_c = 0;
+    int _ct_n = 0;
+    if (_ct) CT_READ(_ct_start);
+#endif
+
 #ifdef WARP_STAGGER
     /*
      * Set P6 = (warp_id & 1) for inter-warp stagger.
@@ -1226,7 +1261,13 @@ fc2_w3_kernel(
                     :: "r"(bcast_addr + _buf * 4), "r"(tile_idx));
                 mbar_arrive(tile_ready_mbar + _buf * 8);
             } else {
+#ifdef CLOCK_TIMING
+                int64_t _ct_ds; if (_ct) CT_READ(_ct_ds);
+#endif
                 mbar_wait(tile_ready_mbar + _buf * 8, tile_ready_phase[_buf]);
+#ifdef CLOCK_TIMING
+                if (_ct && warp == 1) { int64_t _ct_de; CT_READ(_ct_de); _ct_b += _ct_de - _ct_ds; }
+#endif
                 tile_ready_phase[_buf] ^= 1;
                 asm volatile("ld.shared.b32 %0, [%1];"
                     : "=r"(tile_idx) : "r"(bcast_addr + _buf * 4));
@@ -1355,6 +1396,9 @@ fc2_w3_kernel(
         if (warp == 0) {
             /* ── W0: TMA A/B loads ── */
             const uint32_t smem_base = warp_uniform(smem_to_uint(smem));
+#ifdef CLOCK_TIMING
+            int64_t _ct_kl; if (_ct) CT_READ(_ct_kl);
+#endif
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
                 const int k_start = ki * TK;
@@ -1362,7 +1406,13 @@ fc2_w3_kernel(
                 const uint32_t tma_mbar_s = (smem_base + OFF_TMA_MBAR + s * 8) & 0xFEFFFFFF;
 
                 if (has_prev || ki >= N_STAGES) {
+#ifdef CLOCK_TIMING
+                    int64_t _ct_s; if (_ct) CT_READ(_ct_s);
+#endif
                     mbar_wait(mma_mbar_s, mma_phase[s]);
+#ifdef CLOCK_TIMING
+                    if (_ct) { int64_t _ct_e; CT_READ(_ct_e); _ct_a += _ct_e - _ct_s; }
+#endif
                     mma_phase[s] ^= 1;
                 }
 #if EPI_REUSE_SMEM
@@ -1406,11 +1456,20 @@ fc2_w3_kernel(
                         : "memory");
                 }
             }
+#ifdef CLOCK_TIMING
+            if (_ct) { int64_t _ct_ke; CT_READ(_ct_ke); _ct_c += _ct_ke - _ct_kl; }
+#endif
 
 #if TILE_DISPATCH == 4
             /* Prefetch next tile from scheduler FIFO.
                mbar_wait overlaps with W1's MMA / W2-W6's epilogue. */
+#ifdef CLOCK_TIMING
+            int64_t _ct_pf; if (_ct) CT_READ(_ct_pf);
+#endif
             mbar_wait(sched_prod_mbar + _pf_slot * 8, sched_prod_phase[_pf_slot]);
+#ifdef CLOCK_TIMING
+            if (_ct) { int64_t _ct_pe; CT_READ(_ct_pe); _ct_b += _ct_pe - _ct_pf; }
+#endif
             sched_prod_phase[_pf_slot] ^= 1;
             asm volatile("ld.shared.b32 %0, [%1];"
                 : "=r"(_pf_tile) : "r"(fifo_addr + _pf_slot * 4));
@@ -1432,6 +1491,9 @@ fc2_w3_kernel(
                    Safe as long as epilogue keeps up (K-loop ≈ 525us >> epilogue ≈ 44us). */
 #endif
 
+#ifdef CLOCK_TIMING
+                if (_ct) CT_READ(_ct_t);
+#endif
                 mbar_wait(tma_mbar[0], tma_phase[0]);
                 tma_phase[0] ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1475,6 +1537,9 @@ fc2_w3_kernel(
 
                 /* Signal epilogue: MMA done for this tile */
                 tcgen05_commit_mcast(mainloop_mbar_addr + buf * 8, 0x3);
+#ifdef CLOCK_TIMING
+                if (_ct) { int64_t _ct_e; CT_READ(_ct_e); _ct_a += _ct_e - _ct_t; }
+#endif
             }
 
         } else if (warp == 2) {
@@ -1547,8 +1612,17 @@ fc2_w3_kernel(
             /* W3+ must wait on mainloop_mbar EVERY tile (including tile_start)
                to consume the free-pass phase. Only epilogue work is conditional. */
             const int prev_buf = buf ^ 1;
+#ifdef CLOCK_TIMING
+            int64_t _ct_ms; if (_ct && warp == 3) CT_READ(_ct_ms);
+#endif
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
+#ifdef CLOCK_TIMING
+            if (_ct && warp == 3) { int64_t _ct_me; CT_READ(_ct_me); _ct_a += _ct_me - _ct_ms; }
+#endif
             ml_phase[prev_buf] ^= 1;
+#ifdef CLOCK_TIMING
+            if (_ct && warp == 3) CT_READ(_ct_t);
+#endif
 #if NUM_IDLE_WARPS > 0
             if (warp >= 3 + NUM_EPI_WARPS) {
                 /* Idle warps: just arrive at epi_mbar, no epilogue work */
@@ -1662,6 +1736,9 @@ fc2_w3_kernel(
                     mbar_arrive(epi_done_mbar_addr);
 #endif
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
+#ifdef CLOCK_TIMING
+                if (_ct && warp == 3) { int64_t _ct_ee; CT_READ(_ct_ee); _ct_b += _ct_ee - _ct_t; }
+#endif
             }
             }
 #else
@@ -2055,9 +2132,21 @@ fc2_w3_kernel(
 #else
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
 #endif
+#ifdef CLOCK_TIMING
+                if (_ct && warp == 3) { int64_t _ct_ee; CT_READ(_ct_ee); _ct_b += _ct_ee - _ct_t; }
+#endif
             }
 #endif /* STRIP_EPILOGUE W3-W6 */
         }
+#ifdef CLOCK_TIMING
+        if (_ct && lane == 0 && _ct_n < CT_MAX_TILES) {
+            if (warp == 0)
+                g_clock.w0_tile[_ct_n] = _ct_c;  /* cumulative W0 K-loop time */
+            else if (warp == 1)
+                g_clock.w1_tile[_ct_n] = _ct_a;  /* cumulative W1 K-loop time */
+        }
+        if (_ct) _ct_n++;
+#endif
 #if TILE_DISPATCH >= 1
         _prev_tile = tile_idx;
         _iter++;
@@ -2564,6 +2653,29 @@ fc2_w3_kernel(
         }
     }
 
+#ifdef CLOCK_TIMING
+    /* Write timing results from cluster 0 CTA 0 */
+    if (_ct && lane == 0) {
+        int64_t _ct_end; CT_READ(_ct_end);
+        int64_t total = _ct_end - _ct_start;
+        if (warp == 0) {
+            g_clock.w0_total = total;
+            g_clock.w0_kloop = _ct_c;
+            g_clock.w0_mma_stall = _ct_a;
+            g_clock.w0_sched = _ct_b;
+            g_clock.tiles = _ct_n;
+        } else if (warp == 1) {
+            g_clock.w1_total = total;
+            g_clock.w1_kloop = _ct_a;
+            g_clock.w1_dispatch = _ct_b;
+        } else if (warp == 3) {
+            g_clock.w3_total = total;
+            g_clock.w3_ml_stall = _ct_a;
+            g_clock.w3_epi = _ct_b;
+        }
+    }
+#endif
+
     /* ── TMEM dealloc ── */
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
@@ -2818,6 +2930,85 @@ int main() {
     printf("@@RESULT ms=%.3f tflops=%.2f checksum=%f valid=%d c0=%.1f\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9, cksum, valid,
            __bfloat162float(h_C[0]));
+
+#ifdef CLOCK_TIMING
+    {
+        ClockData ct;
+        CUDA_CHECK(cudaMemcpyFromSymbol(&ct, g_clock, sizeof(ct)));
+        int n = ct.tiles;
+        printf("\n=== CLOCK TIMING (cluster 0, %d tiles) ===\n", n);
+        printf("%-22s %12s %10s %8s\n", "Phase", "Cycles", "us/tile", "%total");
+        printf("--------------------------------------------------------------\n");
+
+        auto row = [&](const char* label, int64_t cyc, int64_t ref) {
+            double us = cyc / 1813.0 / 1000.0;
+            double pct = ref > 0 ? 100.0 * cyc / ref : 0.0;
+            printf("%-22s %12ld %10.1f %7.1f%%\n", label, (long)cyc,
+                   n > 0 ? us / n : 0.0, pct);
+        };
+
+        row("W0 total",           ct.w0_total,     ct.w0_total);
+        row("  K-loop",           ct.w0_kloop,     ct.w0_total);
+        row("  mma_mbar stall",   ct.w0_mma_stall, ct.w0_total);
+        row("  sched_prod wait",  ct.w0_sched,     ct.w0_total);
+        int64_t w0_tma = ct.w0_kloop - ct.w0_mma_stall;
+        row("  tma_issue",        w0_tma,          ct.w0_total);
+        int64_t w0_other = ct.w0_total - ct.w0_kloop - ct.w0_sched;
+        row("  other (dispatch)",  w0_other,       ct.w0_total);
+
+        printf("\n");
+        row("W1 total",           ct.w1_total,     ct.w1_total);
+        row("  K-loop",           ct.w1_kloop,     ct.w1_total);
+        row("  tile_ready wait",  ct.w1_dispatch,  ct.w1_total);
+        int64_t w1_other = ct.w1_total - ct.w1_kloop - ct.w1_dispatch;
+        row("  other",            w1_other,        ct.w1_total);
+
+        printf("\n");
+        row("W3 total",           ct.w3_total,     ct.w3_total);
+        row("  mainloop_mbar",    ct.w3_ml_stall,  ct.w3_total);
+        row("  epilogue",         ct.w3_epi,       ct.w3_total);
+        int64_t w3_other = ct.w3_total - ct.w3_ml_stall - ct.w3_epi;
+        row("  other",            w3_other,        ct.w3_total);
+
+        /* Per-tile analysis */
+        int ntile = n < CT_MAX_TILES ? n : CT_MAX_TILES;
+        if (ntile > 1) {
+            printf("\n--- Per-tile K-loop (first %d tiles, delta cycles) ---\n", ntile);
+            printf("%5s %12s %12s\n", "tile", "W0 K-loop", "W1 K-loop");
+            int64_t prev_w0 = 0, prev_w1 = 0;
+            int64_t sum_w0 = 0, sum_w1 = 0;
+            int64_t min_w0 = INT64_MAX, max_w0 = 0;
+            int64_t min_w1 = INT64_MAX, max_w1 = 0;
+            for (int i = 0; i < ntile; i++) {
+                int64_t d0 = ct.w0_tile[i] - prev_w0;
+                int64_t d1 = ct.w1_tile[i] - prev_w1;
+                prev_w0 = ct.w0_tile[i];
+                prev_w1 = ct.w1_tile[i];
+                if (i > 0) {  /* skip first tile (pipeline fill) */
+                    sum_w0 += d0; sum_w1 += d1;
+                    if (d0 < min_w0) min_w0 = d0;
+                    if (d0 > max_w0) max_w0 = d0;
+                    if (d1 < min_w1) min_w1 = d1;
+                    if (d1 > max_w1) max_w1 = d1;
+                }
+                if (i < 10 || i == ntile - 1)
+                    printf("%5d %12ld %12ld\n", i, (long)d0, (long)d1);
+                else if (i == 10)
+                    printf("  ...\n");
+            }
+            if (ntile > 2) {
+                int cnt = ntile - 1;
+                printf("Summary (tiles 1-%d):\n", ntile - 1);
+                printf("  W0 K-loop: avg=%ld  min=%ld  max=%ld  spread=%.1f%%\n",
+                       (long)(sum_w0/cnt), (long)min_w0, (long)max_w0,
+                       100.0*(max_w0-min_w0)/(sum_w0/cnt));
+                printf("  W1 K-loop: avg=%ld  min=%ld  max=%ld  spread=%.1f%%\n",
+                       (long)(sum_w1/cnt), (long)min_w1, (long)max_w1,
+                       100.0*(max_w1-min_w1)/(sum_w1/cnt));
+            }
+        }
+    }
+#endif
 
     free(h_C);
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_bias); cudaFree(d_residual); cudaFree(d_C);
