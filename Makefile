@@ -114,6 +114,12 @@ fc2-w3-rowsteal: fc2_w3.cu
 fc2-w3-inline: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=6 $< -o $@ $(LDFLAGS)
 
+fc2-w3-lean: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 -DLEAN_DISPATCH $< -o $@ $(LDFLAGS)
+
+fc2-w3-lean-clock: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 -DLEAN_DISPATCH -DCLOCK_TIMING $< -o $@ $(LDFLAGS)
+
 fc2-w3-inline7: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=7 $< -o $@ $(LDFLAGS)
 

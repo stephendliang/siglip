@@ -951,7 +951,11 @@ fc2_w3_kernel(
         for (int i = 0; i < 2; i++) {
             mbar_init(smem_to_uint(smem + OFF_SCHED_PROD_MBAR + i * 8), 32);   /* W7 warp arrives */
             mbar_init(smem_to_uint(smem + OFF_SCHED_CONS_MBAR + i * 8), 32);   /* W0 warp arrives */
+#ifdef LEAN_DISPATCH
+            mbar_init(smem_to_uint(smem + OFF_TILE_READY_MBAR + i * 8), 1);    /* W0 lane 0 only */
+#else
             mbar_init(smem_to_uint(smem + OFF_TILE_READY_MBAR + i * 8), 32);   /* W0 warp arrives */
+#endif
         }
         /* Clear epoch slots so CTA1 spin-wait works */
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH)));
@@ -1314,7 +1318,29 @@ fc2_w3_kernel(
                 tile_idx = _pf_tile;
                 asm volatile("st.shared.b32 [%0], %1;"
                     :: "r"(bcast_addr + _buf * 4), "r"(tile_idx));
+#ifdef LEAN_DISPATCH
+                if (lane == 0) mbar_arrive(tile_ready_mbar + _buf * 8);
+#else
                 mbar_arrive(tile_ready_mbar + _buf * 8);
+#endif
+#ifdef LEAN_DISPATCH
+            } else if (warp == 1) {
+                /* W1 only: wait tile_ready_mbar for break check + K-loop sync */
+#ifdef CLOCK_TIMING
+                int64_t _ct_ds; if (_ct) CT_READ(_ct_ds);
+#endif
+                mbar_wait(tile_ready_mbar + _buf * 8, tile_ready_phase[_buf]);
+#ifdef CLOCK_TIMING
+                if (_ct) { int64_t _ct_de; CT_READ(_ct_de); _ct_b += _ct_de - _ct_ds; }
+#endif
+                tile_ready_phase[_buf] ^= 1;
+                asm volatile("ld.shared.b32 %0, [%1];"
+                    : "=r"(tile_idx) : "r"(bcast_addr + _buf * 4));
+            } else {
+                /* W2-W6: skip tile_ready_mbar — read tile_idx from bcast SMEM
+                   after mainloop_mbar (release-acquire transitivity). */
+                tile_idx = 0;  /* placeholder: never triggers break at top */
+#else
             } else {
 #ifdef CLOCK_TIMING
                 int64_t _ct_ds; if (_ct) CT_READ(_ct_ds);
@@ -1326,9 +1352,22 @@ fc2_w3_kernel(
                 tile_ready_phase[_buf] ^= 1;
                 asm volatile("ld.shared.b32 %0, [%1];"
                     : "=r"(tile_idx) : "r"(bcast_addr + _buf * 4));
+#endif
             }
         }
+#ifdef LEAN_DISPATCH
+        /* W0 and W1 break here. W2-W6 have tile_idx=0, continue to tile body. */
+        if (tile_idx >= TOTAL_TILES) {
+            if (warp == 1 && lane == 0) {
+                /* Arrive mainloop_mbar to unblock W2-W6 for last-tile epilogue */
+                asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
+                    :: "r"(mainloop_mbar_addr + (_iter & 1) * 8) : "memory");
+            }
+            break;
+        }
+#else
         if (tile_idx >= TOTAL_TILES) break;
+#endif
         const int buf = _iter & 1;
 #elif TILE_DISPATCH == 6
     while (true) {
@@ -1720,6 +1759,15 @@ fc2_w3_kernel(
             const int prev_buf = buf ^ 1;
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             ml_phase[prev_buf] ^= 1;
+#ifdef LEAN_DISPATCH
+            /* Deferred read: mainloop_mbar acquire guarantees W0's bcast write visible
+               (W0 → tma_mbar release → W1 acquire → mainloop_mbar release → here acquire) */
+            if (lane == 0)
+                asm volatile("ld.shared.b32 %0, [%1];"
+                    : "=r"(tile_idx) : "r"(bcast_addr + buf * 4));
+            asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+                : "=r"(tile_idx) : "r"(tile_idx));
+#endif
 #if defined(STRIP_EPILOGUE) || defined(SELF_LOAD) || defined(GEMM_ONLY)
             if (has_prev)
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
@@ -1775,6 +1823,14 @@ fc2_w3_kernel(
             if (_ct && warp == 3) { int64_t _ct_me; CT_READ(_ct_me); _ct_a += _ct_me - _ct_ms; }
 #endif
             ml_phase[prev_buf] ^= 1;
+#ifdef LEAN_DISPATCH
+            /* Deferred read: mainloop_mbar acquire provides transitivity */
+            if (lane == 0)
+                asm volatile("ld.shared.b32 %0, [%1];"
+                    : "=r"(tile_idx) : "r"(bcast_addr + buf * 4));
+            asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+                : "=r"(tile_idx) : "r"(tile_idx));
+#endif
 #ifdef CLOCK_TIMING
             if (_ct && warp == 3) CT_READ(_ct_t);
 #endif
@@ -2305,6 +2361,11 @@ fc2_w3_kernel(
 #if TILE_DISPATCH >= 1
         _prev_tile = tile_idx;
         _iter++;
+#ifdef LEAN_DISPATCH
+        /* W2-W6 deferred break: they did epilogue for prev tile,
+           now check if this was the termination iter */
+        if (warp >= 2 && tile_idx >= TOTAL_TILES) break;
+#endif
 #endif
     }
 
@@ -2337,6 +2398,11 @@ fc2_w3_kernel(
         } else if (warp == 1) {
             /* W1: nothing — already committed mainloop_mbar */
         } else if (warp == 2) {
+#ifdef LEAN_DISPATCH
+            /* LEAN_DISPATCH: W2 already did last-tile epilogue in the loop */
+            if (last_idx < TOTAL_TILES)
+#endif
+            {
 #if defined(STRIP_EPILOGUE) || defined(SELF_LOAD) || defined(GEMM_ONLY)
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
             ml_phase[last_buf] ^= 1;
@@ -2363,8 +2429,14 @@ fc2_w3_kernel(
 
             mbar_arrive(epi_mbar_masked + last_buf * 8);
 #endif /* STRIP_EPILOGUE/SELF_LOAD drain W2 */
+            } /* LEAN_DISPATCH guard */
 
         } else {
+#ifdef LEAN_DISPATCH
+            /* LEAN_DISPATCH: W3-W6 already did last-tile epilogue in the loop */
+            if (last_idx < TOTAL_TILES)
+#endif
+            {
 #if NUM_IDLE_WARPS > 0 && !defined(STRIP_EPILOGUE)
             if (warp >= 3 + NUM_EPI_WARPS) {
                 /* Idle warps: drain — just arrive at barriers */
@@ -2805,6 +2877,7 @@ fc2_w3_kernel(
 #endif
 #endif /* STRIP_EPILOGUE drain W3-W6 */
             } /* close brace for idle-warp else */
+            } /* LEAN_DISPATCH guard */
         }
     }
 
