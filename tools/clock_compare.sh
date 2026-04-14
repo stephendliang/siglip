@@ -13,15 +13,23 @@ cd "$(dirname "$0")/.."
 
 DFLAGS=""
 K_LABEL=""
+K_VAL=3072
 STRIP_ONLY=0
 for arg in "$@"; do
     case "$arg" in
-        K=*) val="${arg#K=}"; DFLAGS="$DFLAGS -DK_DIM=$val"; K_LABEL="_K${val}";;
+        K=*) K_VAL="${arg#K=}"; DFLAGS="$DFLAGS -DK_DIM=$K_VAL"; K_LABEL="_K${K_VAL}";;
         M=*) val="${arg#M=}"; DFLAGS="$DFLAGS -DM_TOTAL=$val";;
         N=*) val="${arg#N=}"; DFLAGS="$DFLAGS -DN_DIM=$val";;
         --strip-only) STRIP_ONLY=1;;
     esac
 done
+
+# Auto NO_PREFILL for short K-loops (PREFILL deadlocks at K_ITERS<20)
+K_ITERS=$((K_VAL / 128))
+if [ "$K_ITERS" -lt 20 ]; then
+    DFLAGS="$DFLAGS -DNO_PREFILL"
+    echo "Auto-adding -DNO_PREFILL (K_ITERS=$K_ITERS < 20)"
+fi
 
 OUTDIR="data/clock${K_LABEL}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUTDIR"
