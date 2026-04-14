@@ -64,7 +64,7 @@ Compile-time flags:
  * With K_ITERS < 20, the K-loop is too short — W1 races ahead, the mainloop_mbar
  * parity wraps, and the kernel deadlocks.  Auto-force NO_PREFILL for short K-loops.
  */
-#if K_ITERS < 20 && !defined(NO_PREFILL) && !defined(GEMM_ONLY) && !defined(STRIP_EPILOGUE)
+#if K_ITERS < 20 && !defined(NO_PREFILL) && !defined(GEMM_ONLY) && !defined(STRIP_EPILOGUE) && !defined(FORCE_PREFILL)
 #define NO_PREFILL
 #endif
 #ifndef K_LOOP_UNROLL
