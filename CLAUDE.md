@@ -140,7 +140,7 @@ STS clustering proven immutable from source level: 6+ approaches all produce ide
 
 **Cross-warp temporal:** SELF_LOAD (per-warp TMA, no sync), SELF_STAGGER (nanosleep 50-200ns). Zero effect.
 
-**Dispatch dead ends:** TD=1 atomic (1.370ms timing, though 0 amplification — overhead kills it), TD=5 CLC (deadlocks), TD=6 inline atomic (1.370ms, W0 blocked).
+**Dispatch dead ends:** TD=1 atomic (1.370ms timing, though 0 amplification — overhead kills it), TD=5 CLC (deadlocks), TD=6 inline atomic (1.370ms, W0 blocked). COL_LOCK (column-locked dynamic dispatch, 1.137ms fused — TMA penalty is inherent to W7 mbarrier path, not tile ordering; collock_strip 1.060ms = 62us slower than sched due to load imbalance across columns).
 
 **LDG/STG kernel (fc2_ldg.cu):** STG goes through L1TEX (128B/thread), TMA bypasses it. Fundamentally bandwidth-limited, even GEMM-only slower than fc2_w3.
 

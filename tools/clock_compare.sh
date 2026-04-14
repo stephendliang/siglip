@@ -57,13 +57,13 @@ build "sched strip (clock)"     make -B fc2-w3-sched-clock DFLAGS="-DTILE_DISPAT
 cp fc2-w3-sched-clock fc2-w3-sched-strip-clock
 build "sched fused (clock, rebuild)" make -B fc2-w3-sched-clock ${DFLAGS:+DFLAGS="$DFLAGS"}
 
-# COL_LOCK variants
-build "collock fused (clock)"   make -B fc2-w3-collock-clock ${DFLAGS:+DFLAGS="$DFLAGS"}
+# TD=7 inline atomic variants
+build "inline7 fused (clock)"   make -B fc2-w3-inline7-clock ${DFLAGS:+DFLAGS="$DFLAGS"}
 
-# Collock strip: TD=4 + COL_LOCK + STRIP + CLOCK
-build "collock strip (clock)"   make -B fc2-w3-collock-clock DFLAGS="-DTILE_DISPATCH=4 -DCOL_LOCK -DSTRIP_EPILOGUE -DCLOCK_TIMING ${DFLAGS}"
-cp fc2-w3-collock-clock fc2-w3-collock-strip-clock
-build "collock fused (clock, rebuild)" make -B fc2-w3-collock-clock ${DFLAGS:+DFLAGS="$DFLAGS"}
+# Inline7 strip: TD=7 + STRIP + CLOCK
+build "inline7 strip (clock)"   make -B fc2-w3-inline7-clock DFLAGS="-DTILE_DISPATCH=7 -DSTRIP_EPILOGUE -DCLOCK_TIMING ${DFLAGS}"
+cp fc2-w3-inline7-clock fc2-w3-inline7-strip-clock
+build "inline7 fused (clock, rebuild)" make -B fc2-w3-inline7-clock ${DFLAGS:+DFLAGS="$DFLAGS"}
 
 # Run
 run_exp() {
@@ -86,12 +86,12 @@ run_exp "default_fused"       "fc2-w3-clock"
 run_exp "default_strip"       "fc2-w3-strip-clock"
 run_exp "sched_fused"         "fc2-w3-sched-clock"
 run_exp "sched_strip"         "fc2-w3-sched-strip-clock"
-run_exp "collock_fused"       "fc2-w3-collock-clock"
-run_exp "collock_strip"       "fc2-w3-collock-strip-clock"
+run_exp "inline7_fused"       "fc2-w3-inline7-clock"
+run_exp "inline7_strip"       "fc2-w3-inline7-strip-clock"
 
 log ""
 log "=== TIMING DATA ==="
-for name in default_fused default_strip sched_fused sched_strip collock_fused collock_strip; do
+for name in default_fused default_strip sched_fused sched_strip inline7_fused inline7_strip; do
     f="$OUTDIR/${name}.txt"
     [ -f "$f" ] || continue
     log ""
@@ -104,7 +104,7 @@ log ""
 log "=== SUMMARY ==="
 printf "%-20s %10s %10s\n" "Variant" "ms" "valid" | tee -a "$OUTDIR/session.log"
 printf "%-20s %10s %10s\n" "-------" "--" "-----" | tee -a "$OUTDIR/session.log"
-for name in default_fused default_strip sched_fused sched_strip collock_fused collock_strip; do
+for name in default_fused default_strip sched_fused sched_strip inline7_fused inline7_strip; do
     f="$OUTDIR/${name}.txt"
     [ -f "$f" ] || continue
     ms=$(grep -oP '[\d.]+(?=\s*ms)' "$f" | head -1)
