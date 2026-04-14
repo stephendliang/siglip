@@ -4,15 +4,15 @@ Hand-tuned Blackwell (SM100a) persistent GEMM kernel for FC2 layer of `google/si
 FP8 (E4M3) inputs, BF16 output, tcgen05 MMA, TMA, `cta_group::2` with 2-CTA clusters.
 Cross-compiled on CPU VPS, runs on B200. PE and FC1 kernels are done — see `CLAUDE.md.mothballed` for their docs.
 
-## Current status (B200, 2026-04-09)
+## Current status (B200, 2026-04-14)
 
 Default FC2 shape: [928256, 3072] x [3072, 768]^T + bias + residual. Batch = 4736 images x 196 patches.
 
 | Variant | ms | TFLOPS | vs CUTLASS fused |
 |---|---|---|---|
-| **w3_fused (NS6+PREFILL)** | **1.110** | **3947** | **-9.5%** |
+| **w3_fused (NS6+PREFILL)** | **1.111** | **3943** | **-9.4%** |
 | w3_gemm (GEMM-only) | 1.100 | 3981 | — |
-| w3_sched (TD=4 dispatch) | 1.134 | 3862 | -7.5% |
+| w3_sched (TD=4 dispatch) | 1.147 | 3819 | -6.4% |
 | CUTLASS fused | 1.226 | 3573 | baseline |
 | CUTLASS strip | 1.152 | 3801 | — |
 
@@ -56,7 +56,7 @@ Why advantage vanishes: NS6 pipeline depth is 6/K_ITERS of the K-loop. At K=3072
 | 4096 | 1.538 | 1.545 | tied |
 | 6144 | 2.257 | **2.098** | **sched 7% faster** |
 
-TD=4 (dedicated W7 scheduler warp, dynamic tile assignment via atomicAdd) eliminates DRAM amplification (ncu: 4.28GB = 1.00x vs default dispatch 4.85GB = 1.13x). Has ~24us scheduler overhead. At K<=3072, overhead > savings. At K>=4096, savings win.
+TD=4 (dedicated W7 scheduler warp, dynamic tile assignment via atomicAdd) eliminates DRAM amplification (ncu: 4.28GB = 1.00x vs default dispatch 4.85GB = 1.13x). Has ~34us scheduler overhead (300 cyc/tile tile_ready_mbar on W3 critical path). At K<=3072, overhead > savings. K=4096 is the battleground (tied). At K>=5120, savings win clearly.
 
 ### N=256 — advantage shrinks
 
@@ -70,7 +70,7 @@ Large N (>1536) not yet tested. NS5 required for N>1536 (SMEM per stage grows wi
 |---|---|---|
 | N_STAGES | NS6 for N<=1536, NS5 for N>1536 | SMEM per stage grows with N; NS6 needs <=228KB |
 | PREFILL | On for K_ITERS>=20, off otherwise | Short K-loop can't drain epilogue before TMEM reuse |
-| Tile dispatch | Default for K<=3072, TD=4 for K>=4096 | TD=4 overhead vs amplification crossover |
+| Tile dispatch | Default for K<=4096, TD=4 for K>=5120 | TD=4 34us overhead vs amplification crossover; K=4096 is battleground |
 | Tile shape | 256x256x128 fixed | Not yet explored for different N |
 
 ## Kernel structure (fc2_w3.cu)
@@ -89,10 +89,11 @@ Tile: 256x256x128, TMEM 512 cols double-buffered, 6-stage SMEM pipeline (default
 
 | Mode | Flag | Status |
 |---|---|---|
-| Default (Group-3) | none | Active. Fixed tn per cluster, stride M. Best at K<=3072 |
-| Sched (TD=4) | TILE_DISPATCH=4 | Active. Dedicated W7, atomicAdd. Best at K>=4096, 0 DRAM amplification |
+| Default (Group-3) | none | Active. Fixed tn per cluster, stride M. Best at K<=4096 |
+| Sched (TD=4) | TILE_DISPATCH=4 | Active. Dedicated W7, atomicAdd. Best at K>=5120, 0 DRAM amplification |
 | Atomic (TD=1) | TILE_DISPATCH=1 | Dead (1.370ms overhead) |
-| Inline atomic (TD=6) | TILE_DISPATCH=6 | Dead (W0 blocked doing dispatch) |
+| Inline atomic (TD=6) | TILE_DISPATCH=6 | Dead (W0 blocked at tile boundary) |
+| Inline K-loop (TD=7) | TILE_DISPATCH=7 | Dead (atomicAdd in K-loop disrupts TMA pipeline, +41% tma_issue) |
 | CLC (TD=5) | TILE_DISPATCH=5 | Dead (deadlocks, incompatible with persistent kernel) |
 | Spin (TD=2), Grid (TD=3) | TILE_DISPATCH=2/3 | Experimental |
 
@@ -140,7 +141,7 @@ STS clustering proven immutable from source level: 6+ approaches all produce ide
 
 **Cross-warp temporal:** SELF_LOAD (per-warp TMA, no sync), SELF_STAGGER (nanosleep 50-200ns). Zero effect.
 
-**Dispatch dead ends:** TD=1 atomic (1.370ms timing, though 0 amplification — overhead kills it), TD=5 CLC (deadlocks), TD=6 inline atomic (1.370ms, W0 blocked). COL_LOCK (column-locked dynamic dispatch, 1.137ms fused — TMA penalty is inherent to W7 mbarrier path, not tile ordering; collock_strip 1.060ms = 62us slower than sched due to load imbalance across columns).
+**Dispatch dead ends:** TD=1 atomic (1.370ms timing, though 0 amplification — overhead kills it), TD=5 CLC (deadlocks), TD=6 inline atomic (1.370ms, W0 blocked). COL_LOCK (column-locked dynamic dispatch, 1.137ms fused — TMA penalty is inherent to W7 mbarrier path, not tile ordering; collock_strip 1.060ms = 62us slower than sched due to load imbalance across columns). TD=7 inline atomic in K-loop (1.257ms fused, 1.040ms strip — atomicAdd at ki=0 disrupts TMA pipeline, +41% tma_issue in strip, +77% in fused; W0's K-loop is memory-pipeline-sensitive, ANY global atomic degrades TMA throughput).
 
 **LDG/STG kernel (fc2_ldg.cu):** STG goes through L1TEX (128B/thread), TMA bypasses it. Fundamentally bandwidth-limited, even GEMM-only slower than fc2_w3.
 
