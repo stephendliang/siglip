@@ -462,6 +462,13 @@ fc1_w3_kernel(
         }
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH)));
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH + 4)));
+#ifdef LEAN_DISPATCH
+        /* Init bcast slots to 0 — W2-W5 read bcast[prev_buf] after mainloop_mbar
+           free pass at iter 0.  Uninitialized SMEM could be >= TOTAL_TILES, causing
+           premature _lean_done and deadlock on epilogue_mbar (NO_PREFILL). */
+        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_BCAST_TILE)));
+        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_BCAST_TILE + 4)));
+#endif
 #ifdef BIAS_PRELOAD
         for (int i = 0; i < 2; i++) {
             mbar_init(smem_to_uint(smem + OFF_BIAS_MBAR + i * 8), 1);
@@ -906,8 +913,10 @@ fc1_w3_kernel(
                 : "=r"(tile_idx) : "r"(tile_idx));
             _prev_tile = tile_idx;
             /* Termination: W0 wrote TOTAL_TILES to bcast at the termination iter.
-               W1's termination arrive unblocked us. Skip epilogue, break. */
-            if (tile_idx >= TOTAL_TILES) {
+               W1's termination arrive unblocked us. Skip epilogue, break.
+               Guard on has_prev: at iter 0 the free-pass mainloop_mbar gives no
+               ordering for bcast[prev_buf] — the slot may hold stale SMEM. */
+            if (has_prev && tile_idx >= TOTAL_TILES) {
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
                 goto _lean_done;
             }
