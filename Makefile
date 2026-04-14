@@ -36,6 +36,9 @@ fc1-w3-strip: fc1_w3.cu
 fc1-w3-sched: fc1_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 $< -o $@ $(LDFLAGS)
 
+fc1-w3-lean: fc1_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 -DLEAN_DISPATCH $< -o $@ $(LDFLAGS)
+
 # ── FC2 kernel ──
 fc2: fc2.cu kernel_common.cuh kernel_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
