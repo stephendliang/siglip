@@ -252,7 +252,8 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
    2 = atomic + flag spin (CTA0 writes, CTA1 spins ld.shared::cluster)
    3 = grid-based non-persistent (blockIdx.y = tile, zero dispatch cost)
    4 = dedicated W7 scheduler warp (atomicAdd, mbarrier pipe to W0)
-   7 = inline atomic in K-loop, epoch-based broadcast (no W7, no dispatch mbarriers) */
+   7 = inline atomic in K-loop, epoch-based broadcast (no W7, no dispatch mbarriers)
+   8 = DeepGEMM-style 2D swizzle (static, group DG_GROUP_SIZE M-blocks, sweep all N) */
 #ifndef TILE_DISPATCH
 #ifdef ATOMIC_TILES
 #define TILE_DISPATCH 1
@@ -915,7 +916,7 @@ fc2_w3_kernel(
     const int warp  = tid / 32;
     const int lane  = tid % 32;
 
-#if TILE_DISPATCH == 0
+#if TILE_DISPATCH == 0 || TILE_DISPATCH == 8
     const int cluster_id = sm_id / 2;
     const int num_clusters = SM_COUNT / 2;
 #endif
@@ -1046,9 +1047,19 @@ fc2_w3_kernel(
     const uint32_t td7_cta0_fifo   = td7_fifo_addr & 0xFEFFFFFFU;
     int td7_bcast_phase[2] = {0, 0};
 #endif
-#if TILE_DISPATCH >= 1
+#if TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
     int _iter = 0;
     int _prev_tile = -1;
+#else
+#if TILE_DISPATCH == 8
+    /* DeepGEMM swizzle: group DG_GROUP_SIZE M-blocks, sweep all N within each group.
+       Tile order within group: (m0,n0)...(m7,n0), (m0,n1)...(m7,n1), (m0,n2)...(m7,n2).
+       Designed to bound L2 working set: only DG_GROUP_SIZE M-rows + all N active. */
+#ifndef DG_GROUP_SIZE
+#define DG_GROUP_SIZE 8
+#endif
+    const int dg_group_tiles = TILES_N * DG_GROUP_SIZE;  /* 24 tiles per group */
+    const int tile_count = (TOTAL_TILES + num_clusters - 1) / num_clusters;
 #else
     const int tile_stride = num_clusters;  /* strided: cluster 0 gets 0,74,148,... */
 #ifdef BIDIR_SNAKE
@@ -1063,6 +1074,7 @@ fc2_w3_kernel(
     const int m_rank = cluster_id / TILES_N;
     const int my_m_stride = (num_clusters - tn_fixed + TILES_N - 1) / TILES_N;
     const int tile_count  = (TILES_M - m_rank + my_m_stride - 1) / my_m_stride;
+#endif
 #endif
 #endif
 
@@ -1480,7 +1492,7 @@ fc2_w3_kernel(
         }
         if (tile_idx >= TOTAL_TILES) break;
         const int buf = _iter & 1;
-#elif TILE_DISPATCH >= 1
+#elif TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
     while (true) {
         int tile_idx;
 #if TILE_DISPATCH == 1
@@ -1523,7 +1535,17 @@ fc2_w3_kernel(
         const int buf = _iter & 1;
 #else
     for (int _ti = 0; _ti < tile_count; _ti++) {
-#ifdef BIDIR_SNAKE
+#if TILE_DISPATCH == 8
+        /* DeepGEMM 2D swizzle: stride through linear index, then swizzle to (tm, tn) */
+        const int block_idx = _ti * num_clusters + cluster_id;
+        if (block_idx >= TOTAL_TILES) break;
+        const int group_idx = block_idx / dg_group_tiles;
+        const int first_m = group_idx * DG_GROUP_SIZE;
+        const int in_group = block_idx % dg_group_tiles;
+        const int num_in_group = min(DG_GROUP_SIZE, TILES_M - first_m);
+        const int tile_idx = (first_m + in_group % num_in_group) * TILES_N
+                           + in_group / num_in_group;
+#elif defined(BIDIR_SNAKE)
         const int fwd_tile = fwd_id + _ti * tile_stride;
         const int tile_idx = reverse ? (TOTAL_TILES - 1 - fwd_tile) : fwd_tile;
 #else
@@ -1542,7 +1564,7 @@ fc2_w3_kernel(
         const int n_start = tn * TN;
 #if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4 || TILE_DISPATCH == 6 || TILE_DISPATCH == 7
         const bool has_prev = (_iter > 0);
-#elif TILE_DISPATCH == 0
+#elif TILE_DISPATCH == 0 || TILE_DISPATCH == 8
         const bool has_prev = (_ti > 0);
 #endif
         /* TILE_DISPATCH==3: has_prev already set to false above */
@@ -1783,8 +1805,15 @@ fc2_w3_kernel(
             /* ── W2: EpilogueLoad — circular producer for PREVIOUS tile ──
                Stream four 64-col slices through a 2-stage shared pipe. */
             if (has_prev) {
-#if TILE_DISPATCH >= 1
+#if TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
                 const int prev_idx = _prev_tile;
+#elif TILE_DISPATCH == 8
+                const int _pb = (_ti - 1) * num_clusters + cluster_id;
+                const int _pg = _pb / dg_group_tiles;
+                const int _pfm = _pg * DG_GROUP_SIZE;
+                const int _pig = _pb % dg_group_tiles;
+                const int _pnig = min(DG_GROUP_SIZE, TILES_M - _pfm);
+                const int prev_idx = (_pfm + _pig % _pnig) * TILES_N + _pig / _pnig;
 #elif defined(BIDIR_SNAKE)
                 const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
                 const int prev_idx = reverse ? (TOTAL_TILES - 1 - prev_fwd) : prev_fwd;
@@ -1870,8 +1899,15 @@ fc2_w3_kernel(
             const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
 
             if (has_prev) {
-#if TILE_DISPATCH >= 1
+#if TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
                 const int prev_idx = _prev_tile;
+#elif TILE_DISPATCH == 8
+                const int _pb = (_ti - 1) * num_clusters + cluster_id;
+                const int _pg = _pb / dg_group_tiles;
+                const int _pfm = _pg * DG_GROUP_SIZE;
+                const int _pig = _pb % dg_group_tiles;
+                const int _pnig = min(DG_GROUP_SIZE, TILES_M - _pfm);
+                const int prev_idx = (_pfm + _pig % _pnig) * TILES_N + _pig / _pnig;
 #elif defined(BIDIR_SNAKE)
                 const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
                 const int prev_idx = reverse ? (TOTAL_TILES - 1 - prev_fwd) : prev_fwd;
@@ -1979,8 +2015,15 @@ fc2_w3_kernel(
             const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
 
             if (has_prev) {
-#if TILE_DISPATCH >= 1
+#if TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
                 const int prev_idx = _prev_tile;
+#elif TILE_DISPATCH == 8
+                const int _pb = (_ti - 1) * num_clusters + cluster_id;
+                const int _pg = _pb / dg_group_tiles;
+                const int _pfm = _pg * DG_GROUP_SIZE;
+                const int _pig = _pb % dg_group_tiles;
+                const int _pnig = min(DG_GROUP_SIZE, TILES_M - _pfm);
+                const int prev_idx = (_pfm + _pig % _pnig) * TILES_N + _pig / _pnig;
 #elif defined(BIDIR_SNAKE)
                 const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
                 const int prev_idx = reverse ? (TOTAL_TILES - 1 - prev_fwd) : prev_fwd;
@@ -2372,7 +2415,7 @@ fc2_w3_kernel(
         }
         if (_ct) _ct_n++;
 #endif
-#if TILE_DISPATCH >= 1
+#if TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
         _prev_tile = tile_idx;
         _iter++;
 #ifdef LEAN_DISPATCH
@@ -2391,11 +2434,19 @@ _lean_done:
 #if TILE_DISPATCH == 3
         const int last_idx = (int)blockIdx.y;
         const int last_buf = 0;
-#elif TILE_DISPATCH >= 1
+#elif TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
         const int last_idx = _prev_tile;
         const int last_buf = (_iter - 1) & 1;
 #else
-#ifdef BIDIR_SNAKE
+#if TILE_DISPATCH == 8
+        /* DeepGEMM swizzle: recompute last tile from last iteration */
+        const int _lb = (tile_count - 1) * num_clusters + cluster_id;
+        const int _lg = _lb / dg_group_tiles;
+        const int _lfm = _lg * DG_GROUP_SIZE;
+        const int _lig = _lb % dg_group_tiles;
+        const int _lnig = min(DG_GROUP_SIZE, TILES_M - _lfm);
+        const int last_idx = (_lfm + _lig % _lnig) * TILES_N + _lig / _lnig;
+#elif defined(BIDIR_SNAKE)
         const int last_fwd = fwd_id + (tile_count - 1) * tile_stride;
         const int last_idx = reverse ? (TOTAL_TILES - 1 - last_fwd) : last_fwd;
 #else

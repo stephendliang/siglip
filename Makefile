@@ -126,6 +126,9 @@ fc2-w3-lean-clock: fc2_w3.cu
 fc2-w3-inline7: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=7 $< -o $@ $(LDFLAGS)
 
+fc2-w3-dgswizzle: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 $< -o $@ $(LDFLAGS)
+
 fc2-w3-inline7-clock: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=7 -DCLOCK_TIMING $< -o $@ $(LDFLAGS)
 
