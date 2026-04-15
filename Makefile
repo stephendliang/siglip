@@ -261,6 +261,10 @@ calib-all: calib-tput calib-lat calib-conflict calib-warp
 bulk-vs-tensor: bench/bulk_vs_tensor.cu
 	$(NVCC) $(CFLAGS) $< -o $@ -lcuda
 
+# ── 1D multicast + manual mbarrier relay (approach 2) ──
+relay-mbar: bench/relay_mbar.cu
+	$(NVCC) $(CFLAGS) $< -o $@ -lcuda
+
 # ── TMA microbenchmark (latency, throughput, SMEM contention) ──
 tma-bench: bench/tma_bench.cu
 	$(NVCC) $(CFLAGS) $< -o $@ -lcuda
