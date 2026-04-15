@@ -1,21 +1,19 @@
 #!/bin/bash
-# FC2 ncu diagnosis v3 — focused on 46us GEMM gap and DRAM amplification.
+# FC2 ncu diagnosis v4 — dispatch comparison + DRAM amplification.
 #
-# Profiles: w3 (strided dispatch, 4 epi warps), w3-epi1 (1 epi warp), CUTLASS
-# Each in fused + gemm/strip variants.
+# Profiles: w3 (strided), w3-lean (LEAN_DISPATCH), w3-dgswizzle (DeepGEMM 2D),
+#           CUTLASS fused/strip. Each in fused + gemm/strip variants.
 #
-# Q1: Fusion cost — w3 fused vs w3 gemm (44us), cutlass fused vs cutlass strip (72us)
-# Q2: Head-to-head fused — w3 fused vs CUTLASS fused (18us gap)
-# Q3: GEMM comparison (apples-to-apples) — w3 gemm vs cutlass strip (46us gap)
-# Q4: DRAM amplification — do we read/write more DRAM bytes?
-# Q5: Warp count — epi1 vs epi4
-# Q6: MMA-only baseline — w3 strip (no output, valid=0) for reference
-# Q7: Scheduler warp (TD=4) — w3_sched vs w3_fused and CUTLASS
+# Q1: Fusion cost — w3 fused vs w3 gemm, cutlass fused vs cutlass strip
+# Q2: Head-to-head fused — w3_lean vs cutlass_fused
+# Q3: GEMM comparison — w3 gemm vs cutlass strip
+# Q4: DRAM amplification — dispatch method vs theoretical minimum
+# Q5: Dispatch comparison — lean vs striding vs dgswizzle
+# Q6: MMA-only baseline — w3 strip (no output, valid=0)
 #
 # Usage:
-#   ./tools/fc2_ncu_bench.sh                # full run (6 variants)
+#   ./tools/fc2_ncu_bench.sh                # full run (7 variants)
 #   ./tools/fc2_ncu_bench.sh --dry-run      # print commands
-#   ./tools/fc2_ncu_bench.sh --quick        # skip epi1 (Q1-Q4 only)
 #   ./tools/fc2_ncu_bench.sh --full         # also collect --set full profiles
 #
 # Output: data/ncu_YYYYMMDD_HHMMSS/
@@ -24,12 +22,10 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 DRY_RUN=0
-QUICK=0
 FULL=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run)  DRY_RUN=1; shift ;;
-        --quick)    QUICK=1; shift ;;
         --full)     FULL=1; shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
@@ -42,7 +38,7 @@ mkdir -p "$OUTDIR"
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUTDIR/session.log"; }
 
 log "========================================"
-log "  FC2 NCU DIAGNOSIS v2  $TIMESTAMP"
+log "  FC2 NCU DIAGNOSIS v4  $TIMESTAMP"
 log "  Output: $OUTDIR"
 log "========================================"
 
@@ -116,13 +112,10 @@ BINARIES=(
     "w3_strip|make -B fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-w3:fc2-w3-strip|fc2_w3_kernel"
     "w3_gemm|make -B fc2-w3-gemm|./fc2-w3-gemm|fc2_w3_kernel"
     "w3_fused|make -B fc2-w3|./fc2-w3|fc2_w3_kernel"
+    "w3_lean|make -B fc2-w3-lean|./fc2-w3-lean|fc2_w3_kernel"
+    "w3_dgswizzle|make -B fc2-w3-dgswizzle|./fc2-w3-dgswizzle|fc2_w3_kernel"
     "cutlass_strip|make fc2-cutlass-strip|./fc2-cutlass-strip|regex:^(?!init)"
     "cutlass_fused|make fc2-cutlass|./fc2-cutlass|regex:^(?!init)"
-)
-
-BINARIES+=(
-    "w3_atomic|make -B fc2-w3-atomic|./fc2-w3-atomic|fc2_w3_kernel"
-    "w3_sched|make -B fc2-w3-sched|./fc2-w3-sched|fc2_w3_kernel"
 )
 
 
@@ -267,25 +260,19 @@ if [ "$DRY_RUN" = "0" ]; then
     run_diff "diff_q1_w3"         "$OUTDIR/w3_gemm.csv"       "$OUTDIR/w3_fused.csv"
     run_diff "diff_q1_cutlass"    "$OUTDIR/cutlass_strip.csv" "$OUTDIR/cutlass_fused.csv"
 
-    # Q2: Head-to-head fused
-    run_diff "diff_q2_fused"      "$OUTDIR/w3_fused.csv"      "$OUTDIR/cutlass_fused.csv"
+    # Q2: Head-to-head fused (best variant vs CUTLASS)
+    run_diff "diff_q2_lean_vs_cutlass" "$OUTDIR/w3_lean.csv"  "$OUTDIR/cutlass_fused.csv"
 
     # Q3: GEMM comparison (apples-to-apples: both write output, no residual/bias)
     run_diff "diff_q3_gemm"       "$OUTDIR/w3_gemm.csv"       "$OUTDIR/cutlass_strip.csv"
 
+    # Q5: Dispatch comparison — lean vs striding vs dgswizzle
+    run_diff "diff_q5_lean_vs_fused"      "$OUTDIR/w3_lean.csv"      "$OUTDIR/w3_fused.csv"
+    run_diff "diff_q5_dgswizzle_vs_fused" "$OUTDIR/w3_dgswizzle.csv" "$OUTDIR/w3_fused.csv"
+    run_diff "diff_q5_dgswizzle_vs_lean"  "$OUTDIR/w3_dgswizzle.csv" "$OUTDIR/w3_lean.csv"
+
     # Q6: MMA-only baseline (w3 strip vs w3 gemm = output write cost)
     run_diff "diff_q6_output_cost" "$OUTDIR/w3_strip.csv"     "$OUTDIR/w3_gemm.csv"
-
-    # Q7: Atomic dispatch variants vs static and CUTLASS
-    if [ -f "$OUTDIR/w3_atomic.csv" ]; then
-        run_diff "diff_q7_atomic_vs_fused"   "$OUTDIR/w3_atomic.csv"  "$OUTDIR/w3_fused.csv"
-        run_diff "diff_q7_atomic_vs_cutlass" "$OUTDIR/w3_atomic.csv"  "$OUTDIR/cutlass_fused.csv"
-    fi
-    if [ -f "$OUTDIR/w3_sched.csv" ]; then
-        run_diff "diff_q7_sched_vs_fused"    "$OUTDIR/w3_sched.csv"   "$OUTDIR/w3_fused.csv"
-        run_diff "diff_q7_sched_vs_cutlass"  "$OUTDIR/w3_sched.csv"   "$OUTDIR/cutlass_fused.csv"
-        run_diff "diff_q7_sched_vs_atomic"   "$OUTDIR/w3_sched.csv"   "$OUTDIR/w3_atomic.csv"
-    fi
 fi
 
 # ══════════════════════════════════════════════════════════════════
@@ -454,7 +441,7 @@ if [ "$FULL" = "1" ]; then
     log "── Phase 6: Full ncu profiles (--set full) ──"
 
     FULL_TARGETS=(
-        "w3_fused|./fc2-w3|fc2_w3_kernel"
+        "w3_lean|./fc2-w3-lean|fc2_w3_kernel"
         "cutlass_fused|./fc2-cutlass|regex:^(?!init)"
     )
 
@@ -504,8 +491,9 @@ log "Key outputs:"
 log "  $OUTDIR/results.txt       — wall times"
 log "  $OUTDIR/summary.txt       — all metrics side-by-side + DRAM amplification"
 log "  $OUTDIR/diff_q1*.txt      — Q1: fusion cost (fused - gemm/strip)"
-log "  $OUTDIR/diff_q2*.txt      — Q2: head-to-head fused (w3 vs CUTLASS)"
+log "  $OUTDIR/diff_q2*.txt      — Q2: lean vs CUTLASS fused"
 log "  $OUTDIR/diff_q3*.txt      — Q3: GEMM comparison (w3_gemm vs cutlass_strip)"
+log "  $OUTDIR/diff_q5*.txt      — Q5: dispatch comparison (lean vs striding vs dgswizzle)"
 log "  $OUTDIR/diff_q6*.txt      — Q6: output write cost (w3_strip vs w3_gemm)"
 if [ "$FULL" = "1" ]; then
     log "  $OUTDIR/full_*.csv        — full profiles + source counters"

@@ -35,33 +35,16 @@ if [ "$DRY_RUN" = "0" ]; then
     nvidia-smi --query-gpu=gpu_name,clocks.sm --format=csv,noheader | tee -a "$OUTDIR/session.log"
 fi
 
-# Build all 10 variants (CLC vs static vs hybrid P1/P2 vs our kernel)
+# Variants: CUTLASS (reference), w3 dispatch variants, decomposition
 EXPERIMENTS=(
     "cutlass_fused|make fc2-cutlass|./fc2-cutlass"
     "cutlass_strip|make fc2-cutlass-strip|./fc2-cutlass-strip"
-    "static_fused|make fc2-cutlass-static|./fc2-cutlass-static"
-    "static_strip|make fc2-cutlass-static-strip|./fc2-cutlass-static-strip"
-    "hybrid_fused|make fc2-hybrid|./fc2-hybrid"
-    "hybrid_strip|make fc2-hybrid-strip|./fc2-hybrid-strip"
-    "hybrid_mma_fused|make fc2-hybrid-mma|./fc2-hybrid-mma"
-    "hybrid_mma_strip|make fc2-hybrid-mma DFLAGS=-DSTRIP_EPILOGUE|./fc2-hybrid-mma"
-    "phase3_fused|make fc2-hybrid-phase3|./fc2-hybrid-phase3"
-    "phase3_strip|make fc2-hybrid-phase3 DFLAGS=-DSTRIP_EPILOGUE|./fc2-hybrid-phase3"
-    "w3_fused|make fc2-w3|./fc2-w3"
-    "w3_gemm|make fc2-w3-gemm|./fc2-w3-gemm"
-    "w3_strip|make fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|./fc2-w3"
-    "w3_noprefill|make fc2-w3 DFLAGS=-DNO_PREFILL|./fc2-w3"
-    "w3_ns5|make fc2-w3 DFLAGS='-DN_STAGES=5'|./fc2-w3"
-    "w3_ns5_noprefill|make fc2-w3 DFLAGS='-DN_STAGES=5 -DNO_PREFILL'|./fc2-w3"
-    "w3_ns7|make fc2-w3-ns7|./fc2-w3-ns7"
-    "w3_ns7_noprefill|make fc2-w3 DFLAGS='-DN_STAGES=7 -DNO_PREFILL'|./fc2-w3"
-    "w3_atomic|make fc2-w3-atomic|./fc2-w3-atomic"
-    "w3_sched|make fc2-w3-sched|./fc2-w3-sched"
-    "w3_inline|make fc2-w3-inline|./fc2-w3-inline"
-    "ldg_fused|make fc2-ldg|./fc2-ldg"
-    "ldg_gemm|make fc2-ldg-gemm|./fc2-ldg-gemm"
-    "ldg_strip|make fc2-ldg-strip|./fc2-ldg-strip"
-    "ldg_ns6|make fc2-ldg DFLAGS='-DN_STAGES=6'|./fc2-ldg"
+    "w3_fused|make -B fc2-w3|./fc2-w3"
+    "w3_lean|make -B fc2-w3-lean|./fc2-w3-lean"
+    "w3_sched|make -B fc2-w3-sched|./fc2-w3-sched"
+    "w3_dgswizzle|make -B fc2-w3-dgswizzle|./fc2-w3-dgswizzle"
+    "w3_gemm|make -B fc2-w3-gemm|./fc2-w3-gemm"
+    "w3_strip|make -B fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|./fc2-w3"
 )
 
 for exp in "${EXPERIMENTS[@]}"; do
@@ -131,14 +114,16 @@ if [ "$DRY_RUN" = "0" ] && [ -f "$OUTDIR/results.txt" ]; then
     cutlass_fused=$(grep 'label=cutlass_fused' "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
     cutlass_strip=$(grep 'label=cutlass_strip' "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
     w3_fused=$(grep 'label=w3_fused' "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
+    w3_lean=$(grep 'label=w3_lean' "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
     w3_strip=$(grep 'label=w3_strip' "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
 
-    if [ -n "$cutlass_fused" ] && [ -n "$cutlass_strip" ] && [ -n "$w3_fused" ] && [ -n "$w3_strip" ]; then
+    if [ -n "$cutlass_fused" ] && [ -n "$cutlass_strip" ] && [ -n "$w3_lean" ] && [ -n "$w3_strip" ]; then
         log "Decomposition:"
-        log "  CUTLASS: fused=${cutlass_fused}ms  strip=${cutlass_strip}ms  epilogue_overhead=$(echo "$cutlass_fused - $cutlass_strip" | bc)ms"
-        log "  W3:      fused=${w3_fused}ms  strip=${w3_strip}ms  epilogue_overhead=$(echo "$w3_fused - $w3_strip" | bc)ms"
-        log "  Gap (fused): $(echo "$w3_fused - $cutlass_fused" | bc)ms"
-        log "  Gap (strip): $(echo "$w3_strip - $cutlass_strip" | bc)ms"
+        log "  CUTLASS:  fused=${cutlass_fused}ms  strip=${cutlass_strip}ms  epi_overhead=$(echo "$cutlass_fused - $cutlass_strip" | bc)ms"
+        log "  W3 lean:  fused=${w3_lean}ms  strip=${w3_strip}ms  epi_overhead=$(echo "$w3_lean - $w3_strip" | bc)ms"
+        [ -n "$w3_fused" ] && \
+        log "  W3 stride: fused=${w3_fused}ms  epi_overhead=$(echo "$w3_fused - $w3_strip" | bc)ms"
+        log "  Gap (lean vs CUTLASS): $(echo "$w3_lean - $cutlass_fused" | bc)ms"
     fi
 
     log ""
