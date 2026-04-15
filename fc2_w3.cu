@@ -30,6 +30,9 @@ Compile-time flags:
   -DGEMM_ONLY           Write D=BF16(A×B), no residual/bias (apples-to-apples vs cutlass strip)
   -DPACKED_TILES        Tile-contiguous DRAM layout. Each tile is a contiguous block.
                         TMA loads/stores are sequential DRAM bursts (no page misses).
+  -DPRESWIZZLE          Pre-swizzle A/B in DRAM (SWIZZLE_128B applied during packing).
+                        W0 uses cp.async.bulk 1D raw memcpy (no TMA descriptor/swizzle).
+                        Requires PACKED_TILES.
   -DSINGLE_WARP_STORE=1 Only ew==0 issues TMA stores (4 per sub-iter, 1 commit group)
   -DDELAY_TMA_STORE=1   Issue TMA store from sub-iter N at start of sub-iter N+1
   -DNUM_EPI_STAGES=N    Epilogue staging depth (default 2, try 3/4)
@@ -334,6 +337,10 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 
 #if defined(STRIP_EPILOGUE) && defined(GEMM_ONLY)
 #error "STRIP_EPILOGUE and GEMM_ONLY are mutually exclusive"
+#endif
+
+#if defined(PRESWIZZLE) && !defined(PACKED_TILES)
+#error "PRESWIZZLE requires PACKED_TILES (tiles must be contiguous for 1D bulk copy)"
 #endif
 
 #ifdef SELF_LOAD
@@ -1036,8 +1043,13 @@ __device__ ClockData g_clock;
 __global__ void __launch_bounds__(THREADS, 1)
 __cluster_dims__(2, 1, 1)
 fc2_w3_kernel(
+#ifdef PRESWIZZLE
+    const uint8_t* __restrict__ raw_A,
+    const uint8_t* __restrict__ raw_B,
+#else
     const __grid_constant__ CUtensorMap tma_a,
     const __grid_constant__ CUtensorMap tma_b,
+#endif
     const __grid_constant__ CUtensorMap tma_c,
     const __nv_bfloat16* __restrict__ bias,
     __nv_bfloat16* __restrict__ C,
@@ -1715,6 +1727,7 @@ fc2_w3_kernel(
 #endif
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
+#ifndef PRESWIZZLE
 #ifdef PACKED_TILES
                 const int tma_c0    = 0;
                 const int tma_a_c1  = (a_m_tile * K_ITERS + ki) * TM;
@@ -1723,6 +1736,7 @@ fc2_w3_kernel(
                 const int tma_c0    = ki * TK;
                 const int tma_a_c1  = m_start;
                 const int tma_b_c1  = n_start + cta_rank * (TN/2);
+#endif
 #endif
                 const uint32_t mma_mbar_s = smem_base + OFF_MMA_MBAR + s * 8;
                 const uint32_t tma_mbar_s = (smem_base + OFF_TMA_MBAR + s * 8) & 0xFEFFFFFF;
@@ -1756,7 +1770,28 @@ fc2_w3_kernel(
 
                 if (lane == 0) {
                     const uint32_t a_dst = smem_base + s * STAGE_BYTES;
-#ifdef L2_HINTS
+#ifdef PRESWIZZLE
+                    /* 1D raw bulk copy: A/B data pre-swizzled in DRAM */
+                    {
+                        const uint64_t a_addr = (uint64_t)raw_A
+                            + (uint64_t)(a_m_tile * K_ITERS + ki) * (TM * TK);
+                        const uint64_t b_addr = (uint64_t)raw_B
+                            + (uint64_t)(b_n_half * K_ITERS + ki) * ((TN/2) * TK);
+                        asm volatile(
+                            "cp.async.bulk.shared::cluster.global"
+                            ".mbarrier::complete_tx::bytes"
+                            " [%0], [%1], %2, [%3];\n\t"
+                            "cp.async.bulk.shared::cluster.global"
+                            ".mbarrier::complete_tx::bytes"
+                            " [%4], [%5], %6, [%3];\n\t"
+                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%3], %7;"
+                            :: "r"(a_dst), "l"(a_addr), "r"(TM * TK),
+                               "r"(tma_mbar_s),
+                               "r"(a_dst + 16384), "l"(b_addr), "r"((TN/2) * TK),
+                               "r"(TMA_BYTES)
+                            : "memory");
+                    }
+#elif defined(L2_HINTS)
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
                         ".mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
@@ -1783,7 +1818,9 @@ fc2_w3_kernel(
                            "r"(tma_mbar_s), "r"(a_dst + 16384), "l"(&tma_b),
                            "r"(tma_b_c1), "r"(TMA_BYTES)
 #endif
+#ifndef PRESWIZZLE
                         : "memory");
+#endif
                 }
 #if TILE_DISPATCH == 7
                 /* At ki=3, atomic result is ready (~1500 cyc since issue).
@@ -3161,10 +3198,17 @@ __global__ void pack_u8(uint8_t* __restrict__ dst, const uint8_t* __restrict__ s
     if (idx >= total) return;
     int m = (int)(idx / K);
     int k = (int)(idx % K);
+    int local_m = m % tile_m;
+    int local_k = k % tile_k;
+#ifdef PRESWIZZLE
+    /* SWIZZLE_128B: XOR bits [6:4] of byte offset with row[2:0].
+       For FP8 (1B/elem), byte offset = local_k. Involution: apply twice = identity. */
+    local_k ^= (local_m & 7) << 4;
+#endif
     int tiles_k = K / tile_k;
     long long packed = (long long)(m / tile_m) * tiles_k * tile_m * tile_k
                      + (long long)(k / tile_k) * tile_m * tile_k
-                     + (long long)(m % tile_m) * tile_k + (k % tile_k);
+                     + (long long)local_m * tile_k + local_k;
     dst[packed] = src[idx];
 }
 
@@ -3197,6 +3241,17 @@ int main() {
 #endif
     printf("  GEMM: [%d,%d] x [%d,%d]^T  %d-stage pipeline  SMEM: %d bytes  EPI_REUSE=%d\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, N_STAGES, SMEM_BYTES, EPI_REUSE_SMEM);
+    printf("  LOAD: PACKED=%d  PRESWIZZLE=%d\n",
+#ifdef PACKED_TILES
+           1,
+#else
+           0,
+#endif
+#ifdef PRESWIZZLE
+           1);
+#else
+           0);
+#endif
     printf("  EPI: stages=%d  SWS=%d  DTS=%d  FP32=%d  CPP=%d\n",
            NUM_EPI_STAGES, SINGLE_WARP_STORE, DELAY_TMA_STORE,
 #ifdef FP32_EPILOGUE
@@ -3285,8 +3340,11 @@ int main() {
     printf("  Alloc + init done\n");
 
     /* TMA descriptors */
+#ifndef PRESWIZZLE
     CUtensorMap h_tma_a, h_tma_b;
+#endif
 #ifdef PACKED_TILES
+#ifndef PRESWIZZLE
     /* Packed: tiles are contiguous in DRAM. Tensor is "narrow and tall":
        dim0 = tile_width, dim1 = total_tiles * tile_height. Stride = tile_width. */
     {
@@ -3317,6 +3375,7 @@ int main() {
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }
+#endif
 
     CUtensorMap h_tma_c;
     {
@@ -3420,6 +3479,12 @@ int main() {
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     printf("  TMA descriptors + func attr done (SMEM=%d B)\n", SMEM_BYTES);
 
+#ifdef PRESWIZZLE
+#define _KERN_AB_ARGS  d_A, d_B
+#else
+#define _KERN_AB_ARGS  h_tma_a, h_tma_b
+#endif
+
 #if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4 || TILE_DISPATCH == 6 || TILE_DISPATCH == 7
     int* d_tile_ctr_ptr;
     CUDA_CHECK(cudaGetSymbolAddress((void**)&d_tile_ctr_ptr, g_tile_ctr));
@@ -3430,13 +3495,13 @@ int main() {
     cudaMemsetAsync(d_tile_ctr_ptr, 0, sizeof(int)); \
     cudaMemsetAsync(d_col_ctr_ptr, 0, 4 * sizeof(int)); \
     fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
-        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual, h_tma_res); \
+        _KERN_AB_ARGS, h_tma_c, d_bias, d_C, d_residual, h_tma_res); \
 } while(0)
 #else
 #define LAUNCH_KERNEL() do { \
     cudaMemsetAsync(d_tile_ctr_ptr, 0, sizeof(int)); \
     fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
-        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual, h_tma_res); \
+        _KERN_AB_ARGS, h_tma_c, d_bias, d_C, d_residual, h_tma_res); \
 } while(0)
 #endif
 #elif TILE_DISPATCH == 3
@@ -3445,11 +3510,11 @@ int main() {
     dim3 grid_dim(2, TOTAL_TILES, 1);
 #define LAUNCH_KERNEL() \
     fc2_w3_kernel<<<grid_dim, THREADS, SMEM_BYTES>>>( \
-        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual, h_tma_res)
+        _KERN_AB_ARGS, h_tma_c, d_bias, d_C, d_residual, h_tma_res)
 #else
 #define LAUNCH_KERNEL() \
     fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
-        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_residual, h_tma_res)
+        _KERN_AB_ARGS, h_tma_c, d_bias, d_C, d_residual, h_tma_res)
 #endif
 
     /* Warmup */
