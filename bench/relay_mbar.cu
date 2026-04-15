@@ -8,9 +8,10 @@ Proves that CTA0 can:
   3. Issue mbarrier.complete_tx.relaxed.cluster.shared::cluster to PEER mbar
   4. PEER CTA waits on its own local mbar and wakes from the relay
 
-Two benchmarks:
-  A. Correctness: CTA0 loads, CTA1 verifies data after relay-triggered mbar wake
-  B. Latency: measure relay overhead vs cta_group::2 tensor (reference)
+Three test stages:
+  0. Smoke test: just complete_tx to peer mbar (no multicast), verify it works
+  A. Correctness: CTA0 multicast loads + relay → CTA1 verifies data
+  B. Latency: pipelined relay vs cta_group::2 tensor (reference)
 
 Build: make relay-mbar && ./relay-mbar
 
@@ -70,12 +71,51 @@ __device__ __forceinline__ void mb_wait(uint32_t a, int ph) {
     } while (!done);
 }
 
-/* Signal peer CTA's mbar with complete_tx bytes.
-   addr must use shared::cluster addressing (bit 24 selects CTA). */
 __device__ __forceinline__ void mb_complete_tx_cluster(uint32_t addr, int bytes) {
     asm volatile(
         "mbarrier.complete_tx.relaxed.cluster.shared::cluster.b64 [%0], %1;"
         :: "r"(addr), "r"(bytes) : "memory");
+}
+
+__device__ __forceinline__ void cluster_sync() {
+    asm volatile("barrier.cluster.arrive;\n\t"
+                 "barrier.cluster.wait;" ::: "memory");
+}
+
+/* ═══════ Kernel 0: Smoke test — just complete_tx to peer ═══════
+   No multicast, no TMA. CTA0 manually signals CTA1's mbar.
+   Proves mbarrier.complete_tx.shared::cluster works on SM100a. */
+
+__global__ __launch_bounds__(32, 1) __cluster_dims__(2, 1, 1)
+void k_smoke(int *result) {
+    extern __shared__ __align__(128) char smem[];
+    uint32_t sb = to_smem(smem);
+    uint32_t mb_addr = sb + MBAR_OFF;
+    int lane = threadIdx.x;
+
+    uint32_t cta_rank;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+
+    if (lane == 0) mb_init(mb_addr, 1);
+    __syncwarp();
+    cluster_sync();
+
+    if (cta_rank == 0) {
+        /* CTA0: manually signal CTA1's mbar */
+        if (lane == 0) {
+            uint32_t peer_mb = mb_addr ^ (1u << 24);
+            mb_complete_tx_cluster(peer_mb, XFER);
+        }
+    } else {
+        /* CTA1: expect bytes, wait for CTA0's signal */
+        if (lane == 0) {
+            mb_expect_tx(mb_addr, XFER);
+            mb_wait(mb_addr, 0);
+        }
+        __syncwarp();
+        if (lane == 0) *result = 1;  /* reached = success */
+    }
+    cluster_sync();
 }
 
 /* ═══════ Kernel A: Correctness test ═══════
@@ -94,17 +134,13 @@ void k_correctness(const uint8_t *src, int *result) {
     uint32_t cta_rank;
     asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    /* Init mbar: count=1 (one arrive from expect_tx) */
     if (lane == 0) mb_init(mb_addr, 1);
     __syncwarp();
-    asm volatile("barrier.cluster.arrive;\n\t"
-                 "barrier.cluster.wait;");
+    cluster_sync();
 
     if (cta_rank == 0) {
-        /* CTA0: load with multicast, wait local, relay to peer */
         if (lane == 0) {
             mb_expect_tx(mb_addr, XFER);
-            /* 1D multicast: ctamask=0x3 means both CTAs in cluster */
             asm volatile(
                 "cp.async.bulk.shared::cluster.global"
                 ".mbarrier::complete_tx::bytes.multicast::cluster"
@@ -112,39 +148,33 @@ void k_correctness(const uint8_t *src, int *result) {
                 :: "r"(buf), "l"((uint64_t)src), "r"(XFER),
                    "r"(mb_addr), "h"((uint16_t)0x3)
                 : "memory");
-            /* Wait for OWN mbar (HW completion for issuing CTA) */
             mb_wait(mb_addr, 0);
-
-            /* Relay: signal peer CTA's mbar.
-               Peer's mbar is at same SMEM offset but in CTA1 → set bit 24. */
-            uint32_t peer_mb = mb_addr | (1u << 24);
+            /* Fence: ensure async proxy data is committed before relay */
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            uint32_t peer_mb = mb_addr ^ (1u << 24);
             mb_complete_tx_cluster(peer_mb, XFER);
         }
     } else {
-        /* CTA1: expect bytes, wait for relay, verify */
         if (lane == 0) {
             mb_expect_tx(mb_addr, XFER);
-            /* Wait on local mbar — should wake from CTA0's relay */
             mb_wait(mb_addr, 0);
         }
         __syncwarp();
+        /* Fence: data arrived via async proxy (multicast TMA) */
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
-        /* All 32 lanes verify: each checks 512 bytes = 16KB/32 */
         int ok = 1;
         const uint8_t *my_buf = (const uint8_t *)(smem + BUF_OFF);
         for (int i = lane * (XFER / 32); i < (lane + 1) * (XFER / 32); i++) {
             if (my_buf[i] != src[i]) { ok = 0; break; }
         }
-        /* Reduce: all lanes must agree */
         unsigned ballot = __ballot_sync(0xFFFFFFFF, ok);
         if (lane == 0) *result = (ballot == 0xFFFFFFFF) ? 1 : 0;
     }
+    cluster_sync();
 }
 
-/* ═══════ Kernel B: 1D multicast + relay (pipelined latency) ═══════
-   CTA0 issues loads, waits on local mbar, relays to CTA1.
-   CTA1 waits on local mbar (relay).
-   Measures CTA1's observed latency (includes relay overhead). */
+/* ═══════ Kernel B: 1D multicast + relay (pipelined latency) ═══════ */
 
 template <int PIPE>
 __global__ __launch_bounds__(32, 1) __cluster_dims__(2, 1, 1)
@@ -164,16 +194,13 @@ void k_relay(const uint8_t *src, long long *out_cta0, long long *out_cta1) {
         if (lane == 0) mb_init(mb[i], 1);
     }
     __syncwarp();
-    asm volatile("barrier.cluster.arrive;\n\t"
-                 "barrier.cluster.wait;");
+    cluster_sync();
 
-    /* Compute peer mbar addresses (bit 24 flipped) */
     uint32_t peer_mb[MAX_PIPE];
     for (int i = 0; i < PIPE; i++)
         peer_mb[i] = mb[i] ^ (1u << 24);
 
     if (cta_rank == 0) {
-        /* CTA0: load + local wait + relay */
         for (int i = 0; i < WARMUP; i++) {
             int s = i % PIPE;
             if (lane == 0) {
@@ -188,7 +215,6 @@ void k_relay(const uint8_t *src, long long *out_cta0, long long *out_cta1) {
                     : "memory");
             }
             mb_wait(mb[s], ph[s]); ph[s] ^= 1;
-            /* Relay to CTA1 */
             if (lane == 0) mb_complete_tx_cluster(peer_mb[s], XFER);
         }
 
@@ -212,7 +238,6 @@ void k_relay(const uint8_t *src, long long *out_cta0, long long *out_cta1) {
         long long t1 = clk();
         if (lane == 0) *out_cta0 = t1 - t0;
     } else {
-        /* CTA1: just wait on local mbar (relay) */
         for (int i = 0; i < WARMUP; i++) {
             int s = i % PIPE;
             if (lane == 0) mb_expect_tx(mb[s], XFER);
@@ -228,11 +253,10 @@ void k_relay(const uint8_t *src, long long *out_cta0, long long *out_cta1) {
         long long t1 = clk();
         if (lane == 0) *out_cta1 = t1 - t0;
     }
+    cluster_sync();
 }
 
-/* ═══════ Kernel C: tensor.2d + cta_group::2 reference ═══════
-   Same pipelined structure but using the native cta_group::2 path.
-   Measures CTA1's latency for comparison. */
+/* ═══════ Kernel C: tensor.2d + cta_group::2 reference ═══════ */
 
 template <int PIPE>
 __global__ __launch_bounds__(32, 1) __cluster_dims__(2, 1, 1)
@@ -253,16 +277,13 @@ void k_tensor_cg2(const __grid_constant__ CUtensorMap tm, long long *out_cta0, l
         if (lane == 0) mb_init(mb[i], 1);
     }
     __syncwarp();
-    asm volatile("barrier.cluster.arrive;\n\t"
-                 "barrier.cluster.wait;");
+    cluster_sync();
 
-    /* With cta_group::2, target CTA0's mbar from both CTAs */
     uint32_t cta0_mb[MAX_PIPE];
     for (int i = 0; i < PIPE; i++)
-        cta0_mb[i] = mb[i] & 0xFEFFFFFFu;  /* clear bit 24 → CTA0 */
+        cta0_mb[i] = mb[i] & 0xFEFFFFFFu;
 
     if (cta_rank == 0) {
-        /* CTA0: issue tensor loads with cta_group::2 */
         for (int i = 0; i < WARMUP; i++) {
             int s = i % PIPE;
             if (lane == 0) {
@@ -296,7 +317,6 @@ void k_tensor_cg2(const __grid_constant__ CUtensorMap tm, long long *out_cta0, l
         long long t1 = clk();
         if (lane == 0) *out_cta0 = t1 - t0;
     } else {
-        /* CTA1: just wait on mbar (cta_group::2 signals both CTAs) */
         for (int i = 0; i < WARMUP; i++) {
             int s = i % PIPE;
             if (lane == 0) mb_expect_tx(mb[s], XFER);
@@ -312,6 +332,7 @@ void k_tensor_cg2(const __grid_constant__ CUtensorMap tm, long long *out_cta0, l
         long long t1 = clk();
         if (lane == 0) *out_cta1 = t1 - t0;
     }
+    cluster_sync();
 }
 
 /* ═══════ Host ═══════ */
@@ -334,8 +355,7 @@ void make_tmap(CUtensorMap *tm, uint8_t *ptr) {
 int main() {
     CU_CHECK(cuInit(0));
 
-    /* Allocate source data with known pattern */
-    size_t src_bytes = (size_t)XFER * 64;  /* enough for 64 distinct tiles */
+    size_t src_bytes = (size_t)XFER * 64;
     uint8_t *d_src;
     CUDA_CHECK(cudaMalloc(&d_src, src_bytes));
     {
@@ -352,7 +372,6 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_t0, sizeof(long long)));
     CUDA_CHECK(cudaMalloc(&d_t1, sizeof(long long)));
 
-    /* Tensor map for reference kernel */
     CUtensorMap tm;
     make_tmap(&tm, d_src);
 
@@ -361,6 +380,17 @@ int main() {
         CUDA_CHECK(cudaFuncSetAttribute(fn,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     };
+
+    /* ── Test 0: Smoke — just complete_tx to peer ── */
+    printf("═══ Smoke: mbarrier.complete_tx.shared::cluster ═══\n");
+    set_smem((const void*)k_smoke);
+    CUDA_CHECK(cudaMemset(d_result, 0, sizeof(int)));
+    k_smoke<<<2, 32, smem>>>(d_result);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    int h_smoke;
+    CUDA_CHECK(cudaMemcpy(&h_smoke, d_result, sizeof(int), cudaMemcpyDeviceToHost));
+    printf("  complete_tx relay: %s\n\n", h_smoke ? "PASS" : "FAIL");
+    if (!h_smoke) { printf("FATAL: complete_tx to peer mbar broken on this GPU\n"); return 1; }
 
     /* ── Test A: Correctness ── */
     printf("═══ Correctness: 1D multicast + relay ═══\n");
@@ -371,11 +401,7 @@ int main() {
     int h_result;
     CUDA_CHECK(cudaMemcpy(&h_result, d_result, sizeof(int), cudaMemcpyDeviceToHost));
     printf("  CTA1 data verify: %s\n\n", h_result ? "PASS" : "FAIL");
-
-    if (!h_result) {
-        printf("FAIL — aborting latency tests\n");
-        return 1;
-    }
+    if (!h_result) { printf("FAIL — aborting latency tests\n"); return 1; }
 
     /* ── Test B: Latency comparison ── */
     printf("═══ Latency: 1D relay vs tensor cta_group::2 (XFER=%dKB, REPS=%d) ═══\n",
