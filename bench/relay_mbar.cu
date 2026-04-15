@@ -256,7 +256,10 @@ void k_relay(const uint8_t *src, long long *out_cta0, long long *out_cta1) {
     cluster_sync();
 }
 
-/* ═══════ Kernel C: tensor.2d + cta_group::2 reference ═══════ */
+/* ═══════ Kernel C: tensor.2d + cta_group::2 reference ═══════
+   Both CTAs issue loads (cta_group::2 requires both to participate).
+   CTA0 loads tile A, CTA1 loads tile B — each deposited into both CTAs.
+   Uses unified mbar on CTA0 (bit 24 cleared), count=2 (both CTAs arrive). */
 
 template <int PIPE>
 __global__ __launch_bounds__(32, 1) __cluster_dims__(2, 1, 1)
@@ -274,62 +277,57 @@ void k_tensor_cg2(const __grid_constant__ CUtensorMap tm, long long *out_cta0, l
         mb[i] = sb + MBAR_OFF + i * 8;
         buf[i] = sb + BUF_OFF + i * XFER;
         ph[i] = 0;
-        if (lane == 0) mb_init(mb[i], 1);
+        if (lane == 0) mb_init(mb[i], 2);  /* count=2: both CTAs arrive */
     }
     __syncwarp();
     cluster_sync();
 
+    /* Unified mbar on CTA0 — both CTAs use this for expect_tx + load */
     uint32_t cta0_mb[MAX_PIPE];
     for (int i = 0; i < PIPE; i++)
         cta0_mb[i] = mb[i] & 0xFEFFFFFFu;
 
-    if (cta_rank == 0) {
-        for (int i = 0; i < WARMUP; i++) {
-            int s = i % PIPE;
-            if (lane == 0) {
-                mb_expect_tx(mb[s], XFER);
-                asm volatile(
-                    "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                    ".mbarrier::complete_tx::bytes.cta_group::2"
-                    " [%0], [%1, {%2, %3}], [%4];"
-                    :: "r"(buf[s]), "l"(&tm), "r"(0), "r"((i * rows) % GROWS),
-                       "r"(cta0_mb[s])
-                    : "memory");
-            }
-            mb_wait(mb[s], ph[s]); ph[s] ^= 1;
+    /* Both CTAs issue loads + expect_tx. cta_group::2 deposits into both CTAs'
+       SMEM and signals both CTAs' mbars at the same offset. */
+    for (int i = 0; i < WARMUP; i++) {
+        int s = i % PIPE;
+        if (lane == 0) {
+            asm volatile(
+                "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                :: "r"(cta0_mb[s]), "r"(XFER) : "memory");
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                ".mbarrier::complete_tx::bytes.cta_group::2"
+                " [%0], [%1, {%2, %3}], [%4];"
+                :: "r"(buf[s]), "l"(&tm), "r"(0), "r"((i * rows) % GROWS),
+                   "r"(cta0_mb[s])
+                : "memory");
         }
+        mb_wait(mb[s], ph[s]); ph[s] ^= 1;
+    }
 
-        long long t0 = clk();
-        for (int i = 0; i < REPS; i++) {
-            int s = i % PIPE;
-            if (lane == 0) {
-                mb_expect_tx(mb[s], XFER);
-                asm volatile(
-                    "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                    ".mbarrier::complete_tx::bytes.cta_group::2"
-                    " [%0], [%1, {%2, %3}], [%4];"
-                    :: "r"(buf[s]), "l"(&tm), "r"(0), "r"((i * rows) % GROWS),
-                       "r"(cta0_mb[s])
-                    : "memory");
-            }
-            mb_wait(mb[s], ph[s]); ph[s] ^= 1;
+    long long t0 = clk();
+    for (int i = 0; i < REPS; i++) {
+        int s = i % PIPE;
+        if (lane == 0) {
+            asm volatile(
+                "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                :: "r"(cta0_mb[s]), "r"(XFER) : "memory");
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                ".mbarrier::complete_tx::bytes.cta_group::2"
+                " [%0], [%1, {%2, %3}], [%4];"
+                :: "r"(buf[s]), "l"(&tm), "r"(0), "r"((i * rows) % GROWS),
+                   "r"(cta0_mb[s])
+                : "memory");
         }
-        long long t1 = clk();
+        mb_wait(mb[s], ph[s]); ph[s] ^= 1;
+    }
+    long long t1 = clk();
+
+    if (cta_rank == 0) {
         if (lane == 0) *out_cta0 = t1 - t0;
     } else {
-        for (int i = 0; i < WARMUP; i++) {
-            int s = i % PIPE;
-            if (lane == 0) mb_expect_tx(mb[s], XFER);
-            mb_wait(mb[s], ph[s]); ph[s] ^= 1;
-        }
-
-        long long t0 = clk();
-        for (int i = 0; i < REPS; i++) {
-            int s = i % PIPE;
-            if (lane == 0) mb_expect_tx(mb[s], XFER);
-            mb_wait(mb[s], ph[s]); ph[s] ^= 1;
-        }
-        long long t1 = clk();
         if (lane == 0) *out_cta1 = t1 - t0;
     }
     cluster_sync();
