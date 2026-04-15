@@ -257,6 +257,10 @@ calib-warp: bench/calib/gen_warp_scaling.cu
 
 calib-all: calib-tput calib-lat calib-conflict calib-warp
 
+# ── cp.async.bulk (1D) vs cp.async.bulk.tensor.2d ──
+bulk-vs-tensor: bench/bulk_vs_tensor.cu
+	$(NVCC) $(CFLAGS) $< -o $@ -lcuda
+
 # ── TMA microbenchmark (latency, throughput, SMEM contention) ──
 tma-bench: bench/tma_bench.cu
 	$(NVCC) $(CFLAGS) $< -o $@ -lcuda
