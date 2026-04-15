@@ -46,8 +46,13 @@ EXPERIMENTS=(
     "w3_zorder|make -B fc2-w3-zorder DFLAGS=-DNO_PREFILL|./fc2-w3-zorder"
     "w3_hilbert|make -B fc2-w3-hilbert DFLAGS=-DNO_PREFILL|./fc2-w3-hilbert"
     "w3_zigzag|make -B fc2-w3-zigzag DFLAGS=-DNO_PREFILL|./fc2-w3-zigzag"
-    "w3_colfirst|make -B fc2-w3-colfirst DFLAGS=-DNO_PREFILL|./fc2-w3-colfirst"
     "w3_gemm|make -B fc2-w3-gemm|./fc2-w3-gemm"
+    "w3_lean_gemm|make -B fc2-w3-lean DFLAGS=-DGEMM_ONLY|./fc2-w3-lean"
+    "w3_sched_gemm|make -B fc2-w3-sched DFLAGS=-DGEMM_ONLY|./fc2-w3-sched"
+    "w3_dgswizzle_gemm|make -B fc2-w3-dgswizzle DFLAGS='-DNO_PREFILL -DGEMM_ONLY'|./fc2-w3-dgswizzle"
+    "w3_zorder_gemm|make -B fc2-w3-zorder DFLAGS='-DNO_PREFILL -DGEMM_ONLY'|./fc2-w3-zorder"
+    "w3_hilbert_gemm|make -B fc2-w3-hilbert DFLAGS='-DNO_PREFILL -DGEMM_ONLY'|./fc2-w3-hilbert"
+    "w3_zigzag_gemm|make -B fc2-w3-zigzag DFLAGS='-DNO_PREFILL -DGEMM_ONLY'|./fc2-w3-zigzag"
     "w3_strip|make -B fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|./fc2-w3"
 )
 
@@ -114,21 +119,33 @@ if [ "$DRY_RUN" = "0" ] && [ -f "$OUTDIR/results.txt" ]; then
 
     log ""
 
-    # Extract decomposition
-    cutlass_fused=$(grep 'label=cutlass_fused' "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
-    cutlass_strip=$(grep 'label=cutlass_strip' "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
-    w3_fused=$(grep 'label=w3_fused' "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
-    w3_lean=$(grep 'label=w3_lean' "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
-    w3_strip=$(grep 'label=w3_strip' "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2)
+    # Extract decomposition: fused - gemm = epilogue overhead per dispatch method
+    get_ms() { grep -E "label=$1( |$)" "$OUTDIR/results.txt" | grep -o 'ms=[0-9.]*' | cut -d= -f2; }
+    cutlass_fused=$(get_ms cutlass_fused)
+    cutlass_strip=$(get_ms cutlass_strip)
 
-    if [ -n "$cutlass_fused" ] && [ -n "$cutlass_strip" ] && [ -n "$w3_lean" ] && [ -n "$w3_strip" ]; then
-        log "Decomposition:"
-        log "  CUTLASS:  fused=${cutlass_fused}ms  strip=${cutlass_strip}ms  epi_overhead=$(echo "$cutlass_fused - $cutlass_strip" | bc)ms"
-        log "  W3 lean:  fused=${w3_lean}ms  strip=${w3_strip}ms  epi_overhead=$(echo "$w3_lean - $w3_strip" | bc)ms"
-        [ -n "$w3_fused" ] && \
-        log "  W3 stride: fused=${w3_fused}ms  epi_overhead=$(echo "$w3_fused - $w3_strip" | bc)ms"
-        log "  Gap (lean vs CUTLASS): $(echo "$w3_lean - $cutlass_fused" | bc)ms"
+    log "Epilogue overhead (fused - gemm):"
+    printf "  %-16s %8s %8s %10s\n" "Variant" "fused" "gemm" "epi_cost" | tee -a "$OUTDIR/session.log"
+    printf "  %-16s %8s %8s %10s\n" "-------" "-----" "----" "--------" | tee -a "$OUTDIR/session.log"
+    for variant in fused lean sched dgswizzle zorder hilbert zigzag; do
+        fused_ms=$(get_ms "w3_${variant}")
+        gemm_ms=$(get_ms "w3_${variant}_gemm")
+        # w3_fused uses w3_gemm (default dispatch gemm)
+        [ "$variant" = "fused" ] && gemm_ms=$(get_ms "w3_gemm")
+        if [ -n "$fused_ms" ] && [ -n "$gemm_ms" ]; then
+            epi=$(echo "$fused_ms - $gemm_ms" | bc)
+            printf "  %-16s %7sms %7sms %9sms\n" "$variant" "$fused_ms" "$gemm_ms" "$epi" | tee -a "$OUTDIR/session.log"
+        fi
+    done
+    if [ -n "$cutlass_fused" ] && [ -n "$cutlass_strip" ]; then
+        epi=$(echo "$cutlass_fused - $cutlass_strip" | bc)
+        printf "  %-16s %7sms %7sms %9sms\n" "cutlass" "$cutlass_fused" "$cutlass_strip" "$epi" | tee -a "$OUTDIR/session.log"
     fi
+
+    log ""
+    w3_lean=$(get_ms w3_lean)
+    [ -n "$w3_lean" ] && [ -n "$cutlass_fused" ] && \
+        log "Gap (lean vs CUTLASS fused): $(echo "$w3_lean - $cutlass_fused" | bc)ms"
 
     log ""
     log "Results: $OUTDIR/results.txt"
