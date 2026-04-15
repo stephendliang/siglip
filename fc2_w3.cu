@@ -557,20 +557,6 @@ void mbar_wait(uint32_t addr, uint32_t phase) {
 }
 
 static __device__ __forceinline__
-void mbar_wait_cluster(uint32_t addr, uint32_t phase) {
-    uint32_t done;
-    do {
-        asm volatile(
-            "{\n\t"
-            ".reg .pred p;\n\t"
-            "mbarrier.try_wait.parity.acquire.cta.shared::cluster.b64 p, [%1], %2, 0x989680;\n\t"
-            "selp.b32 %0, 1, 0, p;\n\t"
-            "}"
-            : "=r"(done) : "r"(addr), "r"(phase));
-    } while (!done);
-}
-
-static __device__ __forceinline__
 void mbar_arrive_expect_tx(uint32_t addr, uint32_t tx_count) {
     asm volatile(
         "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
@@ -978,14 +964,8 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 #endif
 
 /* ── K-iteration macro (accumulating, ki >= 1) ── */
-#ifdef PRESWIZZLE
-#define _PRESWIZZLE_PEER_WAIT(S) mbar_wait_cluster(tma_mbar_peer[S], tma_phase[S]);
-#else
-#define _PRESWIZZLE_PEER_WAIT(S)
-#endif
 #define K_ITER_ACCUM(S) do { \
     mbar_wait(tma_mbar[S], tma_phase[S]); \
-    _PRESWIZZLE_PEER_WAIT(S) \
     tma_phase[S] ^= 1; \
     asm volatile("tcgen05.fence::after_thread_sync;"); \
     { \
@@ -1096,12 +1076,7 @@ fc2_w3_kernel(
     /* ── Mbarrier init ── */
     if (tid == 0) {
         for (int s = 0; s < N_STAGES; s++) {
-#ifdef PRESWIZZLE
-            /* Per-CTA mbar: only local W0 arrives (1D bulk copy can't cross-CTA signal) */
-            mbar_init(smem_to_uint(smem + OFF_TMA_MBAR + s * 8), 1);
-#else
             mbar_init(smem_to_uint(smem + OFF_TMA_MBAR + s * 8), 2);
-#endif
             mbar_init(smem_to_uint(smem + OFF_MMA_MBAR + s * 8), 1);
         }
         for (int i = 0; i < 2; i++) {
@@ -1174,17 +1149,11 @@ fc2_w3_kernel(
     /* ── Common state ── */
     uint32_t tma_mbar[N_STAGES], mma_mbar[N_STAGES];
     uint32_t smem_a[N_STAGES], smem_b[N_STAGES];
-#ifdef PRESWIZZLE
-    uint32_t tma_mbar_peer[N_STAGES];
-#endif
     for (int s = 0; s < N_STAGES; s++) {
         tma_mbar[s] = smem_to_uint(smem + OFF_TMA_MBAR + s * 8);
         mma_mbar[s] = smem_to_uint(smem + OFF_MMA_MBAR + s * 8);
         smem_a[s]   = smem_to_uint(smem + s * STAGE_BYTES);
         smem_b[s]   = smem_to_uint(smem + s * STAGE_BYTES + 16384);
-#ifdef PRESWIZZLE
-        tma_mbar_peer[s] = tma_mbar[s] ^ 0x01000000;  /* flip bit 24: peer CTA */
-#endif
     }
     const uint32_t mainloop_mbar_addr = smem_to_uint(smem + OFF_MAINLOOP_MBAR);
     const uint32_t epilogue_mbar_addr = smem_to_uint(smem + OFF_EPILOGUE_MBAR);
@@ -1770,12 +1739,7 @@ fc2_w3_kernel(
 #endif
 #endif
                 const uint32_t mma_mbar_s = smem_base + OFF_MMA_MBAR + s * 8;
-#ifdef PRESWIZZLE
-                /* Per-CTA mbar: each CTA signals own mbar (no cross-CTA routing) */
-                const uint32_t tma_mbar_s = smem_base + OFF_TMA_MBAR + s * 8;
-#else
                 const uint32_t tma_mbar_s = (smem_base + OFF_TMA_MBAR + s * 8) & 0xFEFFFFFF;
-#endif
 #if TILE_DISPATCH == 7
                 /* Issue atomicAdd for NEXT tile at ki=0. Result lands in _pf_next
                    after ~1000 cyc, well before we read it at ki=3. */
@@ -1930,9 +1894,6 @@ fc2_w3_kernel(
                 if (_ct) CT_READ(_ct_t);
 #endif
                 mbar_wait(tma_mbar[0], tma_phase[0]);
-#ifdef PRESWIZZLE
-                mbar_wait_cluster(tma_mbar_peer[0], tma_phase[0]);
-#endif
                 tma_phase[0] ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
 
