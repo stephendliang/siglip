@@ -1771,8 +1771,12 @@ fc2_w3_kernel(
                 if (lane == 0) {
                     const uint32_t a_dst = smem_base + s * STAGE_BYTES;
 #ifdef PRESWIZZLE
-                    /* 1D raw bulk copy: A/B data pre-swizzled in DRAM */
+                    /* 1D bulk copy: each CTA loads its own A/B, pre-swizzled in DRAM.
+                       .shared::cluster dest: bit 24 selects CTA (without cta_group::2,
+                       HW writes to the literal cluster address, not per-CTA).
+                       Both CTAs arrive at CTA0's tma_mbar (count=2). */
                     {
+                        const uint32_t my_dst = a_dst | ((uint32_t)cta_rank << 24);
                         const uint64_t a_addr = (uint64_t)raw_A
                             + (uint64_t)(a_m_tile * K_ITERS + ki) * (TM * TK);
                         const uint64_t b_addr = (uint64_t)raw_B
@@ -1785,9 +1789,9 @@ fc2_w3_kernel(
                             ".mbarrier::complete_tx::bytes"
                             " [%4], [%5], %6, [%3];\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%3], %7;"
-                            :: "r"(a_dst), "l"(a_addr), "r"(TM * TK),
+                            :: "r"(my_dst), "l"(a_addr), "r"(TM * TK),
                                "r"(tma_mbar_s),
-                               "r"(a_dst + 16384), "l"(b_addr), "r"((TN/2) * TK),
+                               "r"(my_dst + 16384), "l"(b_addr), "r"((TN/2) * TK),
                                "r"(TMA_BYTES)
                             : "memory");
                     }
