@@ -28,6 +28,8 @@ Compile-time flags:
   -DCUTLASS_LOOP=N      Loop structure: 1=nounroll si, 2=+nounroll chunk, 3=+C++ FP32 compute
   -DSTRIP_EPILOGUE      Skip epilogue (benchmark GEMM core only, valid=0)
   -DGEMM_ONLY           Write D=BF16(A×B), no residual/bias (apples-to-apples vs cutlass strip)
+  -DPACKED_TILES        Tile-contiguous DRAM layout. Each tile is a contiguous block.
+                        TMA loads/stores are sequential DRAM bursts (no page misses).
   -DSINGLE_WARP_STORE=1 Only ew==0 issues TMA stores (4 per sub-iter, 1 commit group)
   -DDELAY_TMA_STORE=1   Issue TMA store from sub-iter N at start of sub-iter N+1
   -DNUM_EPI_STAGES=N    Epilogue staging depth (default 2, try 3/4)
@@ -1687,8 +1689,17 @@ fc2_w3_kernel(
         int tn = tile_idx % TILES_N;
         M_SNAKE_REMAP(tm);
         if (SNAKE_ORDER && (tm & 1)) tn = TILES_N - 1 - tn;
+#ifdef PACKED_TILES
+        /* Packed tile layout: each tile is contiguous in DRAM.
+           A: (m_tile, k_tile) → linear row in packed tensor
+           B: (n_half, k_tile) → linear row in packed tensor */
+        const int a_m_tile = tm * 2 + cta_rank;
+        const int b_n_half = tn * 2 + cta_rank;
+        const int n_global = tn * TN;  /* for bias SMEM indexing */
+#else
         const int m_start = tm * TM * 2 + cta_rank * TM;
         const int n_start = tn * TN;
+#endif
 #if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4 || TILE_DISPATCH == 6 || TILE_DISPATCH == 7
         const bool has_prev = (_iter > 0);
 #elif TILE_DISPATCH == 0 || TILE_DISPATCH >= 8
@@ -1704,7 +1715,15 @@ fc2_w3_kernel(
 #endif
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
-                const int k_start = ki * TK;
+#ifdef PACKED_TILES
+                const int tma_c0    = 0;
+                const int tma_a_c1  = (a_m_tile * K_ITERS + ki) * TM;
+                const int tma_b_c1  = (b_n_half * K_ITERS + ki) * (TN/2);
+#else
+                const int tma_c0    = ki * TK;
+                const int tma_a_c1  = m_start;
+                const int tma_b_c1  = n_start + cta_rank * (TN/2);
+#endif
                 const uint32_t mma_mbar_s = smem_base + OFF_MMA_MBAR + s * 8;
                 const uint32_t tma_mbar_s = (smem_base + OFF_TMA_MBAR + s * 8) & 0xFEFFFFFF;
 #if TILE_DISPATCH == 7
@@ -1746,10 +1765,10 @@ fc2_w3_kernel(
                         ".mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
                         " [%6], [%7, {%2, %8}], [%4], %9;\n\t"
                         "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %10;"
-                        :: "r"(a_dst), "l"(&tma_a), "r"(k_start), "r"(m_start),
+                        :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(tma_a_c1),
                            "r"(tma_mbar_s), "l"(L2_A_HINT),
                            "r"(a_dst + 16384), "l"(&tma_b),
-                           "r"(n_start + cta_rank * (TN/2)), "l"(L2_B_HINT),
+                           "r"(tma_b_c1), "l"(L2_B_HINT),
                            "r"(TMA_BYTES)
 #else
                     asm volatile(
@@ -1760,9 +1779,9 @@ fc2_w3_kernel(
                         ".mbarrier::complete_tx::bytes.cta_group::2"
                         " [%5], [%6, {%2, %7}], [%4];\n\t"
                         "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %8;"
-                        :: "r"(a_dst), "l"(&tma_a), "r"(k_start), "r"(m_start),
+                        :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(tma_a_c1),
                            "r"(tma_mbar_s), "r"(a_dst + 16384), "l"(&tma_b),
-                           "r"(n_start + cta_rank * (TN/2)), "r"(TMA_BYTES)
+                           "r"(tma_b_c1), "r"(TMA_BYTES)
 #endif
                         : "memory");
                 }
@@ -1946,8 +1965,15 @@ fc2_w3_kernel(
                 int ptn = prev_idx % TILES_N;
                 M_SNAKE_REMAP(ptm);
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
+#ifdef PACKED_TILES
+                const int prev_m = ((ptm * 2 + cta_rank) * TILES_N + ptn) * TM;
+                const int prev_n = 0;
+                const int prev_n_bias = ptn * TN;
+#else
                 const int prev_m = ptm * TM * 2 + cta_rank * TM;
                 const int prev_n = ptn * TN;
+                const int prev_n_bias = prev_n;
+#endif
 
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                     const int stage = si % NUM_EPI_STAGES;
@@ -2035,8 +2061,15 @@ fc2_w3_kernel(
                 int ptn = prev_idx % TILES_N;
                 M_SNAKE_REMAP(ptm);
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
+#ifdef PACKED_TILES
+                const int prev_m = ((ptm * 2 + cta_rank) * TILES_N + ptn) * TM;
+                const int prev_n = 0;
+                const int prev_n_bias = ptn * TN;
+#else
                 const int prev_m = ptm * TM * 2 + cta_rank * TM;
                 const int prev_n = ptn * TN;
+                const int prev_n_bias = prev_n;
+#endif
 
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
@@ -2146,8 +2179,15 @@ fc2_w3_kernel(
                 int ptn = prev_idx % TILES_N;
                 M_SNAKE_REMAP(ptm);
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
+#ifdef PACKED_TILES
+                const int prev_m = ((ptm * 2 + cta_rank) * TILES_N + ptn) * TM;
+                const int prev_n = 0;
+                const int prev_n_bias = ptn * TN;
+#else
                 const int prev_m = ptm * TM * 2 + cta_rank * TM;
                 const int prev_n = ptn * TN;
+                const int prev_n_bias = prev_n;
+#endif
 
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
@@ -2278,7 +2318,7 @@ fc2_w3_kernel(
                                 + lane * 128;
 
                             /* C++ reads: bias from linear SMEM */
-                            const char* bp = smem + OFF_BIAS_SMEM + (prev_n + nc) * 2;
+                            const char* bp = smem + OFF_BIAS_SMEM + (prev_n_bias + nc) * 2;
                             uint4 bv0 = *(const uint4*)(bp);
                             uint4 bv1 = *(const uint4*)(bp + 16);
                             uint4 bv2 = *(const uint4*)(bp + 32);
@@ -2300,7 +2340,7 @@ fc2_w3_kernel(
                         }
 #else
                         /* LDS bias from SMEM (linear, not swizzled) */
-                        const uint32_t bs = bias_saddr + (prev_n + nc) * 2;
+                        const uint32_t bs = bias_saddr + (prev_n_bias + nc) * 2;
                         uint4 bv0, bv1, bv2, bv3;
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(bv0.x),"=r"(bv0.y),"=r"(bv0.z),"=r"(bv0.w) : "r"(bs));
@@ -2564,8 +2604,15 @@ _lean_done:
         int ltn = last_idx % TILES_N;
         M_SNAKE_REMAP(ltm);
         if (SNAKE_ORDER && (ltm & 1)) ltn = TILES_N - 1 - ltn;
+#ifdef PACKED_TILES
+        const int last_m = ((ltm * 2 + cta_rank) * TILES_N + ltn) * TM;
+        const int last_n = 0;
+        const int last_n_bias = ltn * TN;
+#else
         const int last_m = ltm * TM * 2 + cta_rank * TM;
         const int last_n = ltn * TN;
+        const int last_n_bias = last_n;
+#endif
 
         if (warp == 0) {
             /* W0: nothing to do for drain */
@@ -2845,7 +2892,7 @@ _lean_done:
                             + row_group * STAGING_REGION_BYTES
                             + lane * 128;
 
-                        const char* bp = smem + OFF_BIAS_SMEM + (last_n + nc) * 2;
+                        const char* bp = smem + OFF_BIAS_SMEM + (last_n_bias + nc) * 2;
                         uint4 bv0 = *(const uint4*)(bp);
                         uint4 bv1 = *(const uint4*)(bp + 16);
                         uint4 bv2 = *(const uint4*)(bp + 32);
@@ -2864,7 +2911,7 @@ _lean_done:
                         CPP_FP32_GROUP(a24,a25,a26,a27,a28,a29,a30,a31, bv3, rv3, sptr, rsw3);
                     }
 #else
-                    const uint32_t bs = bias_saddr + (last_n + nc) * 2;
+                    const uint32_t bs = bias_saddr + (last_n_bias + nc) * 2;
                     uint4 bv0, bv1, bv2, bv3;
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(bv0.x),"=r"(bv0.y),"=r"(bv0.z),"=r"(bv0.w) : "r"(bs));
@@ -3101,6 +3148,41 @@ __global__ void init_residual(__nv_bfloat16* __restrict__ res, int n_dim, long l
     }
 }
 
+#ifdef PACKED_TILES
+/*
+Packing kernels: rearrange row-major matrices into tile-contiguous layout.
+Each tile becomes a contiguous block in DRAM. TMA sees stride = tile_width
+instead of matrix_width → every load/store is a sequential DRAM burst.
+*/
+__global__ void pack_u8(uint8_t* __restrict__ dst, const uint8_t* __restrict__ src,
+                        int M, int K, int tile_m, int tile_k) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)M * K;
+    if (idx >= total) return;
+    int m = (int)(idx / K);
+    int k = (int)(idx % K);
+    int tiles_k = K / tile_k;
+    long long packed = (long long)(m / tile_m) * tiles_k * tile_m * tile_k
+                     + (long long)(k / tile_k) * tile_m * tile_k
+                     + (long long)(m % tile_m) * tile_k + (k % tile_k);
+    dst[packed] = src[idx];
+}
+
+__global__ void pack_bf16(__nv_bfloat16* __restrict__ dst, const __nv_bfloat16* __restrict__ src,
+                          int M, int N, int tile_m, int tile_n) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)M * N;
+    if (idx >= total) return;
+    int m = (int)(idx / N);
+    int n = (int)(idx % N);
+    int tiles_n = N / tile_n;
+    long long packed = (long long)(m / tile_m) * tiles_n * tile_m * tile_n
+                     + (long long)(n / tile_n) * tile_m * tile_n
+                     + (long long)(m % tile_m) * tile_n + (n % tile_n);
+    dst[packed] = src[idx];
+}
+#endif
+
 int main() {
     setbuf(stdout, NULL);
 #ifdef GEMM_ONLY
@@ -3159,10 +3241,119 @@ int main() {
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
     }
+#ifdef PACKED_TILES
+    /* Pack matrices into tile-contiguous layout */
+    {
+        printf("  Packing tiles...\n");
+        int tpb = 256;
+
+        /* Pack A: [M_TOTAL, K_DIM] FP8 → tiles of [TM, TK] */
+        {
+            uint8_t* d_tmp;
+            CUDA_CHECK(cudaMalloc(&d_tmp, (size_t)M_TOTAL * K_DIM));
+            long long n = (long long)M_TOTAL * K_DIM;
+            pack_u8<<<(int)((n+tpb-1)/tpb), tpb>>>(d_tmp, d_A, M_TOTAL, K_DIM, TM, TK);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(d_A, d_tmp, (size_t)M_TOTAL * K_DIM, cudaMemcpyDeviceToDevice));
+            cudaFree(d_tmp);
+        }
+        /* Pack B: [N_DIM, K_DIM] FP8 → tiles of [TN/2, TK] */
+        {
+            uint8_t* d_tmp;
+            CUDA_CHECK(cudaMalloc(&d_tmp, (size_t)N_DIM * K_DIM));
+            long long n = (long long)N_DIM * K_DIM;
+            pack_u8<<<(int)((n+tpb-1)/tpb), tpb>>>(d_tmp, d_B, N_DIM, K_DIM, TN/2, TK);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(d_B, d_tmp, (size_t)N_DIM * K_DIM, cudaMemcpyDeviceToDevice));
+            cudaFree(d_tmp);
+        }
+        /* Pack residual: [M_TOTAL, N_DIM] BF16 → tiles of [TM, TN] */
+        {
+            __nv_bfloat16* d_tmp;
+            CUDA_CHECK(cudaMalloc(&d_tmp, (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16)));
+            long long n = (long long)M_TOTAL * N_DIM;
+            pack_bf16<<<(int)((n+tpb-1)/tpb), tpb>>>(d_tmp, d_residual, M_TOTAL, N_DIM, TM, TN);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(d_residual, d_tmp, (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16),
+                                  cudaMemcpyDeviceToDevice));
+            cudaFree(d_tmp);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        printf("  Packing done\n");
+    }
+#endif
     printf("  Alloc + init done\n");
 
     /* TMA descriptors */
     CUtensorMap h_tma_a, h_tma_b;
+#ifdef PACKED_TILES
+    /* Packed: tiles are contiguous in DRAM. Tensor is "narrow and tall":
+       dim0 = tile_width, dim1 = total_tiles * tile_height. Stride = tile_width. */
+    {
+        uint64_t a_total_rows = (uint64_t)(M_TOTAL / TM) * K_ITERS * TM;
+        uint64_t dims[2]    = {(uint64_t)TK, a_total_rows};
+        uint64_t strides[1] = {(uint64_t)TK};
+        uint32_t box[2]     = {TK, TM};
+        uint32_t estrides[2]= {1, 1};
+        CU_CHECK(cuTensorMapEncodeTiled(&h_tma_a,
+            CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (void*)d_A,
+            dims, strides, box, estrides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    }
+    {
+        uint64_t b_total_rows = (uint64_t)(N_DIM / (TN/2)) * K_ITERS * (TN/2);
+        uint64_t dims[2]    = {(uint64_t)TK, b_total_rows};
+        uint64_t strides[1] = {(uint64_t)TK};
+        uint32_t box[2]     = {TK, TN/2};
+        uint32_t estrides[2]= {1, 1};
+        CU_CHECK(cuTensorMapEncodeTiled(&h_tma_b,
+            CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (void*)d_B,
+            dims, strides, box, estrides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    }
+
+    CUtensorMap h_tma_c;
+    {
+        uint64_t c_total_rows = (uint64_t)(M_TOTAL / TM) * TILES_N * TM;
+        uint64_t dims[2]    = {(uint64_t)TN, c_total_rows};
+        uint64_t strides[1] = {(uint64_t)TN * sizeof(__nv_bfloat16)};
+        uint32_t box[2]     = {64, 32};
+        uint32_t estrides[2]= {1, 1};
+        CU_CHECK(cuTensorMapEncodeTiled(&h_tma_c,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_C,
+            dims, strides, box, estrides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    }
+
+    CUtensorMap h_tma_res;
+    {
+        uint64_t r_total_rows = (uint64_t)(M_TOTAL / TM) * TILES_N * TM;
+        uint64_t dims[2]    = {(uint64_t)TN, r_total_rows};
+        uint64_t strides[1] = {(uint64_t)TN * sizeof(__nv_bfloat16)};
+#ifdef SELF_LOAD
+        uint32_t box[2]     = {64, 32};   /* Per-warp: 32 rows × 64 cols */
+#else
+        uint32_t box[2]     = {64, 128};  /* W2 loads full 128 rows × 64 cols per sub-iter */
+#endif
+        uint32_t estrides[2]= {1, 1};
+        CU_CHECK(cuTensorMapEncodeTiled(&h_tma_res,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_residual,
+            dims, strides, box, estrides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    }
+#else
     {
         uint64_t dims[2]    = {(uint64_t)K_DIM, (uint64_t)M_TOTAL};
         uint64_t strides[1] = {(uint64_t)K_DIM};
@@ -3223,6 +3414,7 @@ int main() {
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }
+#endif
 
     CUDA_CHECK(cudaFuncSetAttribute(fc2_w3_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
@@ -3324,7 +3516,14 @@ int main() {
         float after_bias = __bfloat162float(__float2bfloat16(acc_rounded + bias_bf16_f));
         __nv_bfloat16 expected = __float2bfloat16(after_bias + res_bf16_f);
 #endif
+#ifdef PACKED_TILES
+        /* Packed output: compute tile-major index */
+        long long packed_idx = (long long)((int)(row / TM) * TILES_N + col / TN) * TM * TN
+                             + (long long)((int)(row % TM)) * TN + (col % TN);
+        __nv_bfloat16 actual = h_C[packed_idx];
+#else
         __nv_bfloat16 actual = h_C[row * N_DIM + col];
+#endif
         float ef = __bfloat162float(expected);
         float af = __bfloat162float(actual);
         if (ef != af) {

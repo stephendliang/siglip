@@ -78,6 +78,12 @@ fc2-w3-strip: fc2_w3.cu
 fc2-w3-gemm: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY $< -o $@ $(LDFLAGS)
 
+fc2-w3-packed: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DPACKED_TILES $< -o $@ $(LDFLAGS)
+
+fc2-w3-packed-lean: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DPACKED_TILES -DTILE_DISPATCH=4 -DLEAN_DISPATCH $< -o $@ $(LDFLAGS)
+
 fc2-w3-drain: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DLDS_DRAIN $< -o $@ $(LDFLAGS)
 
