@@ -462,6 +462,21 @@ void mbar_wait(uint32_t addr, uint32_t phase) {
     } while (!done);
 }
 
+/* Wait on an mbar in any CTA within the cluster (shared::cluster addressing) */
+static __device__ __forceinline__
+void mbar_wait_cluster(uint32_t addr, uint32_t phase) {
+    uint32_t done;
+    do {
+        asm volatile(
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "mbarrier.try_wait.parity.acquire.cta.shared::cluster.b64 p, [%1], %2, 0x989680;\n\t"
+            "selp.b32 %0, 1, 0, p;\n\t"
+            "}"
+            : "=r"(done) : "r"(addr), "r"(phase));
+    } while (!done);
+}
+
 static __device__ __forceinline__
 void mbar_arrive_expect_tx(uint32_t addr, uint32_t tx_count) {
     asm volatile(

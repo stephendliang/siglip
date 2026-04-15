@@ -965,7 +965,7 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 
 /* ── K-iteration macro (accumulating, ki >= 1) ── */
 #ifdef PRESWIZZLE
-#define _PRESWIZZLE_PEER_WAIT(S) mbar_wait(tma_mbar_peer[S], tma_phase[S]);
+#define _PRESWIZZLE_PEER_WAIT(S) mbar_wait_cluster(tma_mbar_peer[S], tma_phase[S]);
 #else
 #define _PRESWIZZLE_PEER_WAIT(S)
 #endif
@@ -1917,7 +1917,7 @@ fc2_w3_kernel(
 #endif
                 mbar_wait(tma_mbar[0], tma_phase[0]);
 #ifdef PRESWIZZLE
-                mbar_wait(tma_mbar_peer[0], tma_phase[0]);
+                mbar_wait_cluster(tma_mbar_peer[0], tma_phase[0]);
 #endif
                 tma_phase[0] ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
