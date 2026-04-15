@@ -24,16 +24,20 @@ Build: make relay-mbar && ./relay-mbar
 
 #define WARMUP 128
 #define REPS   1024
+#ifndef XFER
 #define XFER   16384   /* 16KB = FC2 A-tile size */
+#endif
 
 #define CU_CHECK(x) do { CUresult _r = (x); if (_r) { const char *_s; cuGetErrorString(_r, &_s); fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, _s); exit(1); } } while(0)
 #define CUDA_CHECK(x) do { cudaError_t _e = (x); if (_e) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(_e)); exit(1); } } while(0)
 
 /* SMEM layout per CTA:
-   [0..47]       6 mbars × 8B
-   [512..512+6*XFER)  6 buffers
+   [0..N*8)           N mbars × 8B
+   [512..512+N*XFER)  N buffers
+   Auto-size MAX_PIPE to fit 228KB SMEM.
 */
-#define MAX_PIPE 6
+#define MAX_PIPE_RAW ((228*1024 - 512) / XFER)
+#define MAX_PIPE (MAX_PIPE_RAW > 4 ? 4 : MAX_PIPE_RAW)
 #define MBAR_OFF 0
 #define BUF_OFF  512
 #define SMEM_BYTES (BUF_OFF + MAX_PIPE * XFER)
@@ -258,8 +262,9 @@ void k_relay(const uint8_t *src, long long *out_cta0, long long *out_cta1) {
 
 /* ═══════ Kernel C: tensor.2d + cta_group::2 reference ═══════
    Both CTAs issue loads (cta_group::2 requires both to participate).
-   CTA0 loads tile A, CTA1 loads tile B — each deposited into both CTAs.
-   Uses unified mbar on CTA0 (bit 24 cleared), count=2 (both CTAs arrive). */
+   Each CTA uses its OWN mbar (count=1): expect_tx arrives at own mbar,
+   cta_group::2 HW complete_tx goes to each CTA's referenced mbar.
+   mb_wait is .shared::cta (CTA-local), so each CTA must satisfy its own. */
 
 template <int PIPE>
 __global__ __launch_bounds__(32, 1) __cluster_dims__(2, 1, 1)
@@ -277,30 +282,30 @@ void k_tensor_cg2(const __grid_constant__ CUtensorMap tm, long long *out_cta0, l
         mb[i] = sb + MBAR_OFF + i * 8;
         buf[i] = sb + BUF_OFF + i * XFER;
         ph[i] = 0;
-        if (lane == 0) mb_init(mb[i], 2);  /* count=2: both CTAs arrive */
+        if (lane == 0) mb_init(mb[i], 1);  /* count=1: own CTA's expect_tx only */
     }
     __syncwarp();
     cluster_sync();
 
-    /* Unified mbar on CTA0 — both CTAs use this for expect_tx + load */
-    uint32_t cta0_mb[MAX_PIPE];
+    /* Each CTA's mbar in shared::cluster space (bit 24 = cta_rank) */
+    uint32_t my_mb[MAX_PIPE];
     for (int i = 0; i < PIPE; i++)
-        cta0_mb[i] = mb[i] & 0xFEFFFFFFu;
+        my_mb[i] = mb[i] | (cta_rank << 24);
 
-    /* Both CTAs issue loads + expect_tx. cta_group::2 deposits into both CTAs'
-       SMEM and signals both CTAs' mbars at the same offset. */
+    /* Both CTAs issue loads + expect_tx to their OWN mbar.
+       cta_group::2 completes each CTA's referenced mbar independently. */
     for (int i = 0; i < WARMUP; i++) {
         int s = i % PIPE;
         if (lane == 0) {
             asm volatile(
                 "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
-                :: "r"(cta0_mb[s]), "r"(XFER) : "memory");
+                :: "r"(my_mb[s]), "r"(XFER) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
                 ".mbarrier::complete_tx::bytes.cta_group::2"
                 " [%0], [%1, {%2, %3}], [%4];"
                 :: "r"(buf[s]), "l"(&tm), "r"(0), "r"((i * rows) % GROWS),
-                   "r"(cta0_mb[s])
+                   "r"(my_mb[s])
                 : "memory");
         }
         mb_wait(mb[s], ph[s]); ph[s] ^= 1;
@@ -312,13 +317,13 @@ void k_tensor_cg2(const __grid_constant__ CUtensorMap tm, long long *out_cta0, l
         if (lane == 0) {
             asm volatile(
                 "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
-                :: "r"(cta0_mb[s]), "r"(XFER) : "memory");
+                :: "r"(my_mb[s]), "r"(XFER) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
                 ".mbarrier::complete_tx::bytes.cta_group::2"
                 " [%0], [%1, {%2, %3}], [%4];"
                 :: "r"(buf[s]), "l"(&tm), "r"(0), "r"((i * rows) % GROWS),
-                   "r"(cta0_mb[s])
+                   "r"(my_mb[s])
                 : "memory");
         }
         mb_wait(mb[s], ph[s]); ph[s] ^= 1;
@@ -335,19 +340,22 @@ void k_tensor_cg2(const __grid_constant__ CUtensorMap tm, long long *out_cta0, l
 
 /* ═══════ Host ═══════ */
 
-void make_tmap(CUtensorMap *tm, uint8_t *ptr) {
+/* Returns true if tensor map was created (SWIZZLE_128B needs power-of-2 rows) */
+bool make_tmap(CUtensorMap *tm, uint8_t *ptr) {
     int rows = XFER / GCOLS;
     uint64_t dims[2]    = {GCOLS, GROWS};
     uint64_t strides[1] = {GCOLS};
     uint32_t box[2]     = {(uint32_t)GCOLS, (uint32_t)rows};
     uint32_t estrides[2]= {1, 1};
-    CU_CHECK(cuTensorMapEncodeTiled(tm,
+    CUresult r = cuTensorMapEncodeTiled(tm,
         CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (void*)ptr,
         dims, strides, box, estrides,
         CU_TENSOR_MAP_INTERLEAVE_NONE,
         CU_TENSOR_MAP_SWIZZLE_128B,
         CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (r != CUDA_SUCCESS) return false;
+    return true;
 }
 
 int main() {
@@ -371,7 +379,9 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_t1, sizeof(long long)));
 
     CUtensorMap tm;
-    make_tmap(&tm, d_src);
+    bool have_tmap = make_tmap(&tm, d_src);
+    if (!have_tmap)
+        printf("  (tensor map failed for XFER=%dKB — cg2 tests skipped)\n\n", XFER/1024);
 
     int smem = SMEM_BYTES;
     auto set_smem = [&](const void *fn) {
@@ -428,13 +438,17 @@ int main() {
     };
 
     run_relay("1D relay pipe=1", 1, k_relay<1>);
-    run_ref  ("tensor cg2 pipe=1", 1, k_tensor_cg2<1>);
+    if (have_tmap) run_ref("tensor cg2 pipe=1", 1, k_tensor_cg2<1>);
+#if MAX_PIPE >= 2
     printf("\n");
     run_relay("1D relay pipe=2", 2, k_relay<2>);
-    run_ref  ("tensor cg2 pipe=2", 2, k_tensor_cg2<2>);
+    if (have_tmap) run_ref("tensor cg2 pipe=2", 2, k_tensor_cg2<2>);
+#endif
+#if MAX_PIPE >= 4
     printf("\n");
-    run_relay("1D relay pipe=6", 6, k_relay<6>);
-    run_ref  ("tensor cg2 pipe=6", 6, k_tensor_cg2<6>);
+    run_relay("1D relay pipe=4", 4, k_relay<4>);
+    if (have_tmap) run_ref("tensor cg2 pipe=4", 4, k_tensor_cg2<4>);
+#endif
 
     printf("\nRelay overhead = CTA1(relay) - CTA1(cg2) per iteration\n");
 

@@ -263,7 +263,7 @@ bulk-vs-tensor: bench/bulk_vs_tensor.cu
 
 # ── 1D multicast + manual mbarrier relay (approach 2) ──
 relay-mbar: bench/relay_mbar.cu
-	$(NVCC) $(CFLAGS) $< -o $@ -lcuda
+	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ -lcuda
 
 # ── TMA microbenchmark (latency, throughput, SMEM contention) ──
 tma-bench: bench/tma_bench.cu
