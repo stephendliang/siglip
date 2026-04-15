@@ -129,6 +129,18 @@ fc2-w3-inline7: fc2_w3.cu
 fc2-w3-dgswizzle: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 $< -o $@ $(LDFLAGS)
 
+fc2-w3-zorder: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=9 $< -o $@ $(LDFLAGS)
+
+fc2-w3-hilbert: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=10 $< -o $@ $(LDFLAGS)
+
+fc2-w3-zigzag: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=11 $< -o $@ $(LDFLAGS)
+
+fc2-w3-colfirst: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=12 $< -o $@ $(LDFLAGS)
+
 fc2-w3-inline7-clock: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=7 -DCLOCK_TIMING $< -o $@ $(LDFLAGS)
 

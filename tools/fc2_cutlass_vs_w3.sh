@@ -43,6 +43,10 @@ EXPERIMENTS=(
     "w3_lean|make -B fc2-w3-lean|./fc2-w3-lean"
     "w3_sched|make -B fc2-w3-sched|./fc2-w3-sched"
     "w3_dgswizzle|make -B fc2-w3-dgswizzle|./fc2-w3-dgswizzle"
+    "w3_zorder|make -B fc2-w3-zorder|./fc2-w3-zorder"
+    "w3_hilbert|make -B fc2-w3-hilbert|./fc2-w3-hilbert"
+    "w3_zigzag|make -B fc2-w3-zigzag|./fc2-w3-zigzag"
+    "w3_colfirst|make -B fc2-w3-colfirst|./fc2-w3-colfirst"
     "w3_gemm|make -B fc2-w3-gemm|./fc2-w3-gemm"
     "w3_strip|make -B fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|./fc2-w3"
 )

@@ -97,6 +97,140 @@ Compile-time flags:
 #define M_SNAKE_REMAP(tm) ((void)0)
 #endif
 
+/* ── Static tile swizzle for TD=8-12 ──
+   All static dispatch modes (TD=0, TD=8-12) stride through a linear index:
+     block_idx = _ti * num_clusters + cluster_id
+   The swizzle converts block_idx → tile_idx (= tm * TILES_N + tn). */
+#if TILE_DISPATCH >= 8
+
+#ifndef DG_GROUP_SIZE
+#define DG_GROUP_SIZE 8
+#endif
+
+static __device__ __forceinline__ int static_swizzle(int block_idx) {
+#if TILE_DISPATCH == 8
+    /* DeepGEMM 2D swizzle: group DG_GROUP_SIZE M-blocks, sweep all N within group.
+       Within group: cycle M-rows fast, advance N slowly.
+       (m0,n0)(m1,n0)...(m7,n0)(m0,n1)...(m7,n1)(m0,n2)...(m7,n2) */
+    const int group_tiles = TILES_N * DG_GROUP_SIZE;
+    const int group_idx = block_idx / group_tiles;
+    const int first_m = group_idx * DG_GROUP_SIZE;
+    const int in_group = block_idx % group_tiles;
+    const int num_in_group = min(DG_GROUP_SIZE, TILES_M - first_m);
+    return (first_m + in_group % num_in_group) * TILES_N + in_group / num_in_group;
+
+#elif TILE_DISPATCH == 9
+    /* Z-order (Morton) curve: bit-interleave M and N coordinates.
+       Since TILES_N is small (3), we pad to next power-of-2 (4) and skip OOB.
+       block_idx is pre-compacted (no gaps), so we walk a lookup-free Z-curve
+       in a padded grid and filter. For TILES_N<=4 this is just: split block_idx
+       into (tm, tn) via Z-order in the padded grid, skip if tn >= TILES_N.
+       But since we need a gapless sequence, use modular arithmetic on the
+       compacted index directly:
+         tm = block_idx / TILES_N
+         tn = block_idx % TILES_N
+       ...then apply Z-order reordering to tm within groups.
+       Group size = Z_ORDER_BITS^2 in M × padded N. We use 2-bit interleave
+       giving 4×4 blocks, but only 4×3 are valid. */
+    /* Practical Z-order for rectangular grids: tile the M-axis into blocks of 4,
+       within each 4×TILES_N block use bit-interleaved order, skip OOB. */
+    {
+        const int ZB = 4;  /* Z-order block size in M dimension */
+        const int ztiles = ZB * TILES_N;  /* tiles per Z-block (12 for TILES_N=3) */
+        const int zgroup = block_idx / ztiles;
+        const int zlocal = block_idx % ztiles;
+        /* Within the 4×3 block, Z-order visits: interleave bits of (row, col).
+           For 2-bit × 2-bit: z = (row_bit1 << 3) | (col_bit1 << 2) | (row_bit0 << 1) | col_bit0
+           But col only needs ~2 bits (max 3). Use a compact LUT for 4×4→gapless. */
+        /* Since TILES_N is tiny, just precompute the Z-order for 4×TILES_N.
+           Z-curve in 4×4 padded grid: (0,0)(0,1)(1,0)(1,1)(0,2)(0,3)(1,2)(1,3)(2,0)...
+           Filter to 4×TILES_N, compact. For TILES_N=3, 12 entries: */
+        /* Generic approach: walk Z-curve in 4×4, collect first ztiles valid entries. */
+        int tm_local = 0, tn_local = 0;
+        int count = 0;
+        for (int z = 0; z < ZB * 4; z++) {
+            int zr = ((z >> 1) & 1) | ((z >> 2) & 2);
+            int zc = (z & 1) | ((z >> 1) & 2);
+            if (zc >= TILES_N) continue;
+            if (count == zlocal) { tm_local = zr; tn_local = zc; break; }
+            count++;
+        }
+        int tm = zgroup * ZB + tm_local;
+        if (tm >= TILES_M) tm = TILES_M - 1;  /* clamp last group */
+        return tm * TILES_N + tn_local;
+    }
+
+#elif TILE_DISPATCH == 10
+    /* Hilbert curve: true space-filling curve with optimal locality.
+       For rectangular grids, we run Hilbert in a padded square and skip OOB.
+       Use iterative algorithm (rotation-based) for power-of-2 side. */
+    {
+        /* Pad to square power-of-2 encompassing both dims */
+        const int maxdim = TILES_M > TILES_N ? TILES_M : TILES_N;
+        int order = 1;
+        while ((1 << order) < maxdim) order++;
+        const int side = 1 << order;
+
+        /* Walk Hilbert curve, collect the block_idx-th valid tile */
+        /* Since block_idx can be up to ~147 per cluster (10878/74), and we iterate
+           up to side*side (4096*4096=16M for TILES_M=3626), a linear scan is too slow.
+           Instead: use d2xy conversion on a compacted index.
+           The trick: most of the Hilbert curve falls in-bounds (TILES_M >> TILES_N).
+           Map block_idx to Hilbert d, then d2xy, check bounds, retry if OOB.
+           For TILES_N=3 vs side=4096, ~25% of points are OOB — too many gaps.
+           Better: run Hilbert on the actual rectangle by scaling.
+           Simpler: run Hilbert on a small square (ceil to power-of-2 of TILES_N=3 → 4),
+           and tile that vertically. Groups of 4×4 blocks, Hilbert within each. */
+        const int HB = 4;  /* Hilbert block: 4×4, only 4×TILES_N valid */
+        const int htiles = HB * TILES_N;
+        const int hgroup = block_idx / htiles;
+        const int hlocal = block_idx % htiles;
+
+        /* Hilbert d2xy for 4×4 (order=2): 16 entries, precomputed */
+        /* d=0..15 → (x,y): (0,0)(1,0)(1,1)(0,1)(0,2)(0,3)(1,3)(1,2)
+                             (2,2)(2,3)(3,3)(3,2)(3,1)(2,1)(2,0)(3,0) */
+        const int h_x[16] = {0,1,1,0,0,0,1,1,2,2,3,3,3,2,2,3};
+        const int h_y[16] = {0,0,1,1,2,3,3,2,2,3,3,2,1,1,0,0};
+
+        /* Walk Hilbert, skip OOB (col >= TILES_N), pick hlocal-th valid */
+        int tm_local = 0, tn_local = 0;
+        int count = 0;
+        for (int d = 0; d < 16; d++) {
+            int hx = h_x[d], hy = h_y[d];
+            if (hy >= TILES_N) continue;
+            if (count == hlocal) { tm_local = hx; tn_local = hy; break; }
+            count++;
+        }
+        int tm = hgroup * HB + tm_local;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + tn_local;
+    }
+
+#elif TILE_DISPATCH == 11
+    /* Zigzag-N: row-major, but reverse N direction on odd M-rows.
+       Even rows: (m,0)(m,1)(m,2). Odd rows: (m,2)(m,1)(m,0).
+       Adjacent M-rows share an N-tile at the boundary → better L2. */
+    {
+        int tm = block_idx / TILES_N;
+        int tn = block_idx % TILES_N;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        if (tm & 1) tn = TILES_N - 1 - tn;
+        return tm * TILES_N + tn;
+    }
+
+#elif TILE_DISPATCH == 12
+    /* Column-first: all M-rows for n=0, then all for n=1, then n=2.
+       Maximizes B-tile reuse (one B-column active at a time). */
+    {
+        int tn = block_idx / TILES_M;
+        int tm = block_idx % TILES_M;
+        if (tn >= TILES_N) { tn = TILES_N - 1; tm = TILES_M - 1; }
+        return tm * TILES_N + tn;
+    }
+#endif
+}
+#endif /* TILE_DISPATCH >= 8 */
+
 /* ── Pipeline ── */
 #ifndef N_STAGES
 #define N_STAGES       6
@@ -253,7 +387,11 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
    3 = grid-based non-persistent (blockIdx.y = tile, zero dispatch cost)
    4 = dedicated W7 scheduler warp (atomicAdd, mbarrier pipe to W0)
    7 = inline atomic in K-loop, epoch-based broadcast (no W7, no dispatch mbarriers)
-   8 = DeepGEMM-style 2D swizzle (static, group DG_GROUP_SIZE M-blocks, sweep all N) */
+   8 = DeepGEMM-style 2D swizzle (static, group DG_GROUP_SIZE M-blocks, sweep all N)
+   9 = Z-order (Morton) curve (bit-interleave M/N coords, padded to power-of-2)
+   10 = Hilbert curve (true space-filling, padded to power-of-2)
+   11 = Zigzag-N (row-major, reverse N on odd M-rows)
+   12 = Column-first (all M-rows for each N-column before next) */
 #ifndef TILE_DISPATCH
 #ifdef ATOMIC_TILES
 #define TILE_DISPATCH 1
@@ -916,7 +1054,7 @@ fc2_w3_kernel(
     const int warp  = tid / 32;
     const int lane  = tid % 32;
 
-#if TILE_DISPATCH == 0 || TILE_DISPATCH == 8
+#if TILE_DISPATCH == 0 || TILE_DISPATCH >= 8
     const int cluster_id = sm_id / 2;
     const int num_clusters = SM_COUNT / 2;
 #endif
@@ -1047,18 +1185,13 @@ fc2_w3_kernel(
     const uint32_t td7_cta0_fifo   = td7_fifo_addr & 0xFEFFFFFFU;
     int td7_bcast_phase[2] = {0, 0};
 #endif
-#if TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
+#if TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
     int _iter = 0;
     int _prev_tile = -1;
 #else
-#if TILE_DISPATCH == 8
-    /* DeepGEMM swizzle: group DG_GROUP_SIZE M-blocks, sweep all N within each group.
-       Tile order within group: (m0,n0)...(m7,n0), (m0,n1)...(m7,n1), (m0,n2)...(m7,n2).
-       Designed to bound L2 working set: only DG_GROUP_SIZE M-rows + all N active. */
-#ifndef DG_GROUP_SIZE
-#define DG_GROUP_SIZE 8
-#endif
-    const int dg_group_tiles = TILES_N * DG_GROUP_SIZE;  /* 24 tiles per group */
+#if TILE_DISPATCH >= 8
+    /* Static swizzle (TD=8-12): each cluster strides through a linear index,
+       static_swizzle() remaps to (tm, tn). */
     const int tile_count = (TOTAL_TILES + num_clusters - 1) / num_clusters;
 #else
     const int tile_stride = num_clusters;  /* strided: cluster 0 gets 0,74,148,... */
@@ -1492,7 +1625,7 @@ fc2_w3_kernel(
         }
         if (tile_idx >= TOTAL_TILES) break;
         const int buf = _iter & 1;
-#elif TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
+#elif TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
     while (true) {
         int tile_idx;
 #if TILE_DISPATCH == 1
@@ -1535,16 +1668,10 @@ fc2_w3_kernel(
         const int buf = _iter & 1;
 #else
     for (int _ti = 0; _ti < tile_count; _ti++) {
-#if TILE_DISPATCH == 8
-        /* DeepGEMM 2D swizzle: stride through linear index, then swizzle to (tm, tn) */
+#if TILE_DISPATCH >= 8
         const int block_idx = _ti * num_clusters + cluster_id;
         if (block_idx >= TOTAL_TILES) break;
-        const int group_idx = block_idx / dg_group_tiles;
-        const int first_m = group_idx * DG_GROUP_SIZE;
-        const int in_group = block_idx % dg_group_tiles;
-        const int num_in_group = min(DG_GROUP_SIZE, TILES_M - first_m);
-        const int tile_idx = (first_m + in_group % num_in_group) * TILES_N
-                           + in_group / num_in_group;
+        const int tile_idx = static_swizzle(block_idx);
 #elif defined(BIDIR_SNAKE)
         const int fwd_tile = fwd_id + _ti * tile_stride;
         const int tile_idx = reverse ? (TOTAL_TILES - 1 - fwd_tile) : fwd_tile;
@@ -1564,7 +1691,7 @@ fc2_w3_kernel(
         const int n_start = tn * TN;
 #if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4 || TILE_DISPATCH == 6 || TILE_DISPATCH == 7
         const bool has_prev = (_iter > 0);
-#elif TILE_DISPATCH == 0 || TILE_DISPATCH == 8
+#elif TILE_DISPATCH == 0 || TILE_DISPATCH >= 8
         const bool has_prev = (_ti > 0);
 #endif
         /* TILE_DISPATCH==3: has_prev already set to false above */
@@ -1805,15 +1932,10 @@ fc2_w3_kernel(
             /* ── W2: EpilogueLoad — circular producer for PREVIOUS tile ──
                Stream four 64-col slices through a 2-stage shared pipe. */
             if (has_prev) {
-#if TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
+#if TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
                 const int prev_idx = _prev_tile;
-#elif TILE_DISPATCH == 8
-                const int _pb = (_ti - 1) * num_clusters + cluster_id;
-                const int _pg = _pb / dg_group_tiles;
-                const int _pfm = _pg * DG_GROUP_SIZE;
-                const int _pig = _pb % dg_group_tiles;
-                const int _pnig = min(DG_GROUP_SIZE, TILES_M - _pfm);
-                const int prev_idx = (_pfm + _pig % _pnig) * TILES_N + _pig / _pnig;
+#elif TILE_DISPATCH >= 8
+                const int prev_idx = static_swizzle((_ti - 1) * num_clusters + cluster_id);
 #elif defined(BIDIR_SNAKE)
                 const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
                 const int prev_idx = reverse ? (TOTAL_TILES - 1 - prev_fwd) : prev_fwd;
@@ -1899,15 +2021,10 @@ fc2_w3_kernel(
             const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
 
             if (has_prev) {
-#if TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
+#if TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
                 const int prev_idx = _prev_tile;
-#elif TILE_DISPATCH == 8
-                const int _pb = (_ti - 1) * num_clusters + cluster_id;
-                const int _pg = _pb / dg_group_tiles;
-                const int _pfm = _pg * DG_GROUP_SIZE;
-                const int _pig = _pb % dg_group_tiles;
-                const int _pnig = min(DG_GROUP_SIZE, TILES_M - _pfm);
-                const int prev_idx = (_pfm + _pig % _pnig) * TILES_N + _pig / _pnig;
+#elif TILE_DISPATCH >= 8
+                const int prev_idx = static_swizzle((_ti - 1) * num_clusters + cluster_id);
 #elif defined(BIDIR_SNAKE)
                 const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
                 const int prev_idx = reverse ? (TOTAL_TILES - 1 - prev_fwd) : prev_fwd;
@@ -2015,15 +2132,10 @@ fc2_w3_kernel(
             const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
 
             if (has_prev) {
-#if TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
+#if TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
                 const int prev_idx = _prev_tile;
-#elif TILE_DISPATCH == 8
-                const int _pb = (_ti - 1) * num_clusters + cluster_id;
-                const int _pg = _pb / dg_group_tiles;
-                const int _pfm = _pg * DG_GROUP_SIZE;
-                const int _pig = _pb % dg_group_tiles;
-                const int _pnig = min(DG_GROUP_SIZE, TILES_M - _pfm);
-                const int prev_idx = (_pfm + _pig % _pnig) * TILES_N + _pig / _pnig;
+#elif TILE_DISPATCH >= 8
+                const int prev_idx = static_swizzle((_ti - 1) * num_clusters + cluster_id);
 #elif defined(BIDIR_SNAKE)
                 const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
                 const int prev_idx = reverse ? (TOTAL_TILES - 1 - prev_fwd) : prev_fwd;
@@ -2415,7 +2527,7 @@ fc2_w3_kernel(
         }
         if (_ct) _ct_n++;
 #endif
-#if TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
+#if TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
         _prev_tile = tile_idx;
         _iter++;
 #ifdef LEAN_DISPATCH
@@ -2434,18 +2546,12 @@ _lean_done:
 #if TILE_DISPATCH == 3
         const int last_idx = (int)blockIdx.y;
         const int last_buf = 0;
-#elif TILE_DISPATCH >= 1 && TILE_DISPATCH != 8
+#elif TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
         const int last_idx = _prev_tile;
         const int last_buf = (_iter - 1) & 1;
 #else
-#if TILE_DISPATCH == 8
-        /* DeepGEMM swizzle: recompute last tile from last iteration */
-        const int _lb = (tile_count - 1) * num_clusters + cluster_id;
-        const int _lg = _lb / dg_group_tiles;
-        const int _lfm = _lg * DG_GROUP_SIZE;
-        const int _lig = _lb % dg_group_tiles;
-        const int _lnig = min(DG_GROUP_SIZE, TILES_M - _lfm);
-        const int last_idx = (_lfm + _lig % _lnig) * TILES_N + _lig / _lnig;
+#if TILE_DISPATCH >= 8
+        const int last_idx = static_swizzle((tile_count - 1) * num_clusters + cluster_id);
 #elif defined(BIDIR_SNAKE)
         const int last_fwd = fwd_id + (tile_count - 1) * tile_stride;
         const int last_idx = reverse ? (TOTAL_TILES - 1 - last_fwd) : last_fwd;
