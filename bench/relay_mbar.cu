@@ -338,6 +338,86 @@ void k_tensor_cg2(const __grid_constant__ CUtensorMap tm, long long *out_cta0, l
     cluster_sync();
 }
 
+/* ═══════ Kernel D: 1D bulk copy, per-CTA mbar (no cta_group, no multicast) ═══════
+   Apples-to-apples vs k_tensor_cg2: same per-CTA mbar protocol (count=1),
+   but plain cp.async.bulk.shared::cluster.global instead of tensor.2d cta_group::2.
+   Each CTA independently loads XFER bytes to its own SMEM. No cross-CTA coordination
+   in the load instruction — only the mbar tracks completion. */
+
+template <int PIPE>
+__global__ __launch_bounds__(32, 1) __cluster_dims__(2, 1, 1)
+void k_1d_percta(const uint8_t *src, long long *out_cta0, long long *out_cta1) {
+    extern __shared__ __align__(128) char smem[];
+    uint32_t sb = to_smem(smem);
+    uint32_t mb[MAX_PIPE], buf[MAX_PIPE];
+    int ph[MAX_PIPE];
+    int lane = threadIdx.x;
+    uint32_t cta_rank;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+
+    for (int i = 0; i < PIPE; i++) {
+        mb[i] = sb + MBAR_OFF + i * 8;
+        buf[i] = sb + BUF_OFF + i * XFER;
+        ph[i] = 0;
+        if (lane == 0) mb_init(mb[i], 1);
+    }
+    __syncwarp();
+    cluster_sync();
+
+    /* Per-CTA addresses in .shared::cluster space (bit 24 = cta_rank).
+       Without cta_group::2, HW writes to the literal cluster address. */
+    uint32_t my_mb[MAX_PIPE], my_buf[MAX_PIPE];
+    for (int i = 0; i < PIPE; i++) {
+        my_mb[i] = mb[i] | (cta_rank << 24);
+        my_buf[i] = buf[i] | (cta_rank << 24);
+    }
+
+    for (int i = 0; i < WARMUP; i++) {
+        int s = i % PIPE;
+        if (lane == 0) {
+            uint64_t gaddr = (uint64_t)src + (uint64_t)(i % 64) * XFER;
+            asm volatile(
+                "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                :: "r"(my_mb[s]), "r"(XFER) : "memory");
+            asm volatile(
+                "cp.async.bulk.shared::cluster.global"
+                ".mbarrier::complete_tx::bytes"
+                " [%0], [%1], %2, [%3];"
+                :: "r"(my_buf[s]), "l"(gaddr), "r"(XFER),
+                   "r"(my_mb[s])
+                : "memory");
+        }
+        mb_wait(mb[s], ph[s]); ph[s] ^= 1;
+    }
+
+    long long t0 = clk();
+    for (int i = 0; i < REPS; i++) {
+        int s = i % PIPE;
+        if (lane == 0) {
+            uint64_t gaddr = (uint64_t)src + (uint64_t)(i % 64) * XFER;
+            asm volatile(
+                "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                :: "r"(my_mb[s]), "r"(XFER) : "memory");
+            asm volatile(
+                "cp.async.bulk.shared::cluster.global"
+                ".mbarrier::complete_tx::bytes"
+                " [%0], [%1], %2, [%3];"
+                :: "r"(my_buf[s]), "l"(gaddr), "r"(XFER),
+                   "r"(my_mb[s])
+                : "memory");
+        }
+        mb_wait(mb[s], ph[s]); ph[s] ^= 1;
+    }
+    long long t1 = clk();
+
+    if (cta_rank == 0) {
+        if (lane == 0) *out_cta0 = t1 - t0;
+    } else {
+        if (lane == 0) *out_cta1 = t1 - t0;
+    }
+    cluster_sync();
+}
+
 /* ═══════ Host ═══════ */
 
 /* Returns true if tensor map was created (SWIZZLE_128B needs power-of-2 rows) */
@@ -412,12 +492,12 @@ int main() {
     if (!h_result) { printf("FAIL — aborting latency tests\n"); return 1; }
 
     /* ── Test B: Latency comparison ── */
-    printf("═══ Latency: 1D relay vs tensor cta_group::2 (XFER=%dKB, REPS=%d) ═══\n",
+    printf("═══ Latency: 1D per-CTA vs 1D relay vs tensor cg2 (XFER=%dKB, REPS=%d) ═══\n",
            XFER / 1024, REPS);
     printf("  %-24s %8s %8s %8s\n", "variant", "CTA0 cy", "CTA1 cy", "CTA1/iter");
     printf("  %-24s %8s %8s %8s\n", "-------", "-------", "-------", "---------");
 
-    auto run_relay = [&](const char *label, int pipe, auto fn) {
+    auto run_1d = [&](const char *label, int pipe, auto fn) {
         set_smem((const void*)fn);
         fn<<<2, 32, smem>>>(d_src, d_t0, d_t1);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -437,16 +517,19 @@ int main() {
         printf("  %-24s %8lld %8lld %8.1f\n", label, h0, h1, (double)h1 / REPS);
     };
 
-    run_relay("1D relay pipe=1", 1, k_relay<1>);
+    run_1d("1D per-CTA pipe=1", 1, k_1d_percta<1>);
+    run_1d("1D relay pipe=1", 1, k_relay<1>);
     if (have_tmap) run_ref("tensor cg2 pipe=1", 1, k_tensor_cg2<1>);
 #if MAX_PIPE >= 2
     printf("\n");
-    run_relay("1D relay pipe=2", 2, k_relay<2>);
+    run_1d("1D per-CTA pipe=2", 2, k_1d_percta<2>);
+    run_1d("1D relay pipe=2", 2, k_relay<2>);
     if (have_tmap) run_ref("tensor cg2 pipe=2", 2, k_tensor_cg2<2>);
 #endif
 #if MAX_PIPE >= 4
     printf("\n");
-    run_relay("1D relay pipe=4", 4, k_relay<4>);
+    run_1d("1D per-CTA pipe=4", 4, k_1d_percta<4>);
+    run_1d("1D relay pipe=4", 4, k_relay<4>);
     if (have_tmap) run_ref("tensor cg2 pipe=4", 4, k_tensor_cg2<4>);
 #endif
 
