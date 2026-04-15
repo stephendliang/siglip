@@ -10,12 +10,27 @@ Cross-compiled on CPU VPS, runs on B200 (148 SMs, 74 clusters). PE kernel is don
 
 | Variant | ms | TFLOPS | vs CUTLASS |
 |---|---|---|---|
-| **w3_lean (LEAN_DISPATCH)** | **1.074** | **4078** | **-12.4%** |
-| w3_fused (default striding) | 1.113 | 3936 | -9.2% |
-| w3_gemm (GEMM-only) | 1.100 | 3981 | — |
-| w3_sched (TD=4 work-stealing) | 1.147 | 3819 | -6.4% |
-| CUTLASS fused | 1.226 | 3573 | baseline |
-| CUTLASS strip | 1.152 | 3801 | — |
+| **w3_lean (LEAN_DISPATCH)** | **1.058** | **4140** | **-13.5%** |
+| w3_fused (default striding) | 1.109 | 3949 | -9.3% |
+| w3_gemm (GEMM-only) | 1.100 | 3982 | — |
+| w3_sched (TD=4 work-stealing) | 1.133 | 3866 | -7.4% |
+| CUTLASS fused | 1.223 | 3581 | baseline |
+| CUTLASS strip | 1.152 | 3802 | — |
+
+Three-level decomposition (B200, NO_PREFILL for TD=8-12):
+
+| Variant | fused | gemm | strip | fused-gemm | gemm-strip |
+|---|---|---|---|---|---|
+| **lean** | **1.058** | **1.033** | **0.991** | 25us | 42us |
+| fused (striding) | 1.109 | 1.100 | 1.043 | 9us | 57us |
+| sched (TD=4) | 1.133 | 1.107 | 0.992 | 26us | 115us |
+| dgswizzle (TD=8) | 1.118 | 1.090 | 0.989 | 28us | 101us |
+| zorder (TD=9) | 1.121 | 1.104 | 0.988 | 17us | 116us |
+| hilbert (TD=10) | 1.126 | 1.094 | 0.989 | 32us | 105us |
+| zigzag (TD=11) | 1.115 | 1.103 | 0.987 | 12us | 116us |
+| CUTLASS (CLC) | 1.223 | — | 1.152 | 71us | — |
+
+Strip floor: all work-stealing/static modes converge at ~0.99ms (= MMA compute floor). Default striding is 1.043ms due to 1.13x DRAM read amplification affecting A+B TMA loads. gemm-strip gap (TMA store cost): LEAN 42us vs sched/static 101-116us — LEAN's mbarrier-free dispatch lets epilogue warps start TMA stores earlier, spreading write traffic.
 
 ### FC1: [928256, 768] x [768, 3072]^T + bias + GELU
 
@@ -44,7 +59,7 @@ Fixed N-tile (tn) per cluster, stride through M-rows. All clusters sharing the s
 
 Why it's still fast at K=3072: NS6 (6-stage pipeline, 227KB of 228KB SMEM) hides the extra DRAM latency. The pipeline is deep enough relative to the K-loop (6/24 = 25% of iterations) to absorb L2 miss stalls. And striding has zero dispatch overhead — no mbarriers, no atomics, no dedicated warp.
 
-1.113ms FC2, 1.13x DRAM amplification.
+1.109ms FC2, 1.13x DRAM amplification.
 
 ### 3. Work-stealing (TD=4) — eliminates amplification, adds overhead
 
@@ -52,7 +67,7 @@ Dedicated W7 scheduler warp issues `atomicAdd` on a global tile counter. All clu
 
 The cost: W7 must broadcast each tile assignment to W0-W6 via `tile_ready_mbar`. This mbarrier is on W3's critical path and costs ~300 cyc/tile (clock-timing-measured). At K=3072, the 34us mbar overhead exceeds the DRAM savings from eliminating 0.13x amplification, so work-stealing is 34us slower than striding.
 
-1.147ms FC2 at K=3072, 4.28GB DRAM = 1.00x.
+1.133ms FC2 at K=3072, 4.28GB DRAM = 1.00x.
 
 **K crossover**: at large K, compute dominates and NS6's latency hiding shrinks (6/K_ITERS). At K=6144 (12.5%), striding's amplification penalty is fully exposed. Work-stealing wins by 7% at K=6144. Crossover at K~5120.
 
@@ -62,7 +77,7 @@ Same work-stealing as TD=4 (zero amplification), but W2-W6 skip `tile_ready_mbar
 
 Only W0 lane 0 arrives tile_ready_mbar (count=1), and only W1 waits it. The mbarrier broadcast to W2-W6 — the 300 cyc/tile bottleneck — is eliminated.
 
-1.074ms FC2, 4.28GB DRAM = 1.00x, 71us fused overhead (vs striding's 62us, work-stealing's 145us).
+1.058ms FC2, 4.28GB DRAM = 1.00x, 67us fused overhead (vs striding's 66us, work-stealing's 141us).
 
 ### Dispatch hierarchy summary
 
@@ -70,6 +85,7 @@ Only W0 lane 0 arrives tile_ready_mbar (count=1), and only W1 waits it. The mbar
 |---|---|---|---|
 | Contiguous | catastrophic | zero | nothing |
 | Striding | 1.13x (L2 capacity) | zero | K<=3072 (NS6 hides) |
+| Static curves (TD=8-11) | 1.13x | zero | nothing (same as striding) |
 | Work-stealing (TD=4) | 1.00x | 34us (mbar) | K>=5120 |
 | **LEAN (TD=4+LEAN)** | **1.00x** | **~9us** | **all K** |
 
@@ -81,6 +97,7 @@ Only W0 lane 0 arrives tile_ready_mbar (count=1), and only W1 waits it. The mbar
 - **TD=7 inline atomic in K-loop**: atomicAdd at ki=0. 1.257ms — disrupts W0's TMA pipeline (+41% tma_issue). Proves W0's K-loop is memory-pipeline-sensitive; ANY global memory op degrades TMA throughput.
 - **COL_LOCK**: Column-locked dispatch (fixed tn, dynamic M-row). 1.137ms — TMA penalty is inherent to the W7 mbarrier path, not tile ordering. Strip 62us slower than sched (load imbalance: 74 clusters / 3 cols = 25/25/24).
 - **Tile reordering (striding variants)**: N-batch (+12% regression), phase-offset N-batch (+6-11%), Group-3 (neutral). Static dispatch can't match work-stealing's L2 efficiency.
+- **Space-filling curves (TD=9-12)**: Z-order/Morton (1.121ms), Hilbert (1.126ms), zigzag-N (1.115ms), column-first (1.707ms DEAD). All static modes cluster at ~1.11-1.13ms fused with identical strip floor (~0.99ms). Tile ordering doesn't matter — 1.13x DRAM amplification is a capacity problem from 74 clusters, not traversal order. Column-first catastrophically bad: all clusters hit same N-column → TMA store contention + enormous A-tile L2 working set.
 - **L2 cache hints**: EVICT_FIRST/LAST/NORMAL on TMA loads. Zero effect — amplification is a capacity problem, not eviction policy.
 
 ## Pipeline depth: why NS6 matters
@@ -113,7 +130,7 @@ Tile: 256x256x128. K_ITERS=K_DIM/128. FC2: K=3072 (24 iters), FC1: K=768 (6 iter
 
 From bench/mma_bench.cu: MMA K-iteration 665 cyc raw, 525.6 cyc/iter pipelined. Per FC2 tile (24 iters): ~12,614 cyc. Theoretical strip floor at 1.813 GHz = ~1.048ms (matches observed).
 
-**Epilogue is 100% hidden in MMA shadow.** The fused-strip gap (26us for LEAN, 62us for striding) is entirely memory-side: DRAM amplification + TMA store contention. NOT compute, NOT instruction scheduling, NOT cross-warp STS clustering.
+**Epilogue is 100% hidden in MMA shadow.** The fused-strip gap (67us for LEAN, 66us for striding) is entirely memory-side: DRAM amplification + TMA store contention. NOT compute, NOT instruction scheduling, NOT cross-warp STS clustering.
 
 Our BF16 epilogue (HFMA2/HADD2) costs ~44us vs CUTLASS's FP32 (FFMA+F2FP) ~72us. Cross-warp STS clustering is real (barrier stalls +753% in ncu) but is a symptom, not a bottleneck — proven by STRIP_EPILOGUE isolating the gap to memory traffic.
 
