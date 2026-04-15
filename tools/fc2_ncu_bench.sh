@@ -113,7 +113,7 @@ BINARIES=(
     "w3_gemm|make -B fc2-w3-gemm|./fc2-w3-gemm|fc2_w3_kernel"
     "w3_fused|make -B fc2-w3|./fc2-w3|fc2_w3_kernel"
     "w3_lean|make -B fc2-w3-lean|./fc2-w3-lean|fc2_w3_kernel"
-    "w3_dgswizzle|make -B fc2-w3-dgswizzle|./fc2-w3-dgswizzle|fc2_w3_kernel"
+    "w3_dgswizzle|make -B fc2-w3-dgswizzle DFLAGS=-DNO_PREFILL|./fc2-w3-dgswizzle|fc2_w3_kernel"
     "cutlass_strip|make fc2-cutlass-strip|./fc2-cutlass-strip|regex:^(?!init)"
     "cutlass_fused|make fc2-cutlass|./fc2-cutlass|regex:^(?!init)"
 )
