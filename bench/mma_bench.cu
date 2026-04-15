@@ -838,6 +838,122 @@ void k_kloop(__grid_constant__ const CUtensorMap tma_a,
     bench_fini(s);
 }
 
+/* ═══════ T. K-loop pipeline — N_STAGES sweep ═══════ */
+/* Same as Section G but with variable pipeline depth (1..7 stages).
+   Self-contained: doesn't use Setup/bench_init (those are tied to N_STAGES=4).
+   NS8 needs 262KB, over 228KB SMEM limit. */
+
+#define NS_SMEM(nstg) (A_OFF + (nstg) * STAGE_SZ)
+
+template <int KITERS, int NSTG>
+__global__ __launch_bounds__(32, 1) __cluster_dims__(2, 1, 1)
+void k_kloop_ns(__grid_constant__ const CUtensorMap tma_a,
+                __grid_constant__ const CUtensorMap tma_b,
+                long long *out) {
+    extern __shared__ __align__(128) char smem[];
+    uint32_t sb = to_smem(smem);
+    int lane = threadIdx.x;
+    int cta_rank;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+
+    /* Mbar layout: [0..NSTG-1]=TMA, [NSTG..2*NSTG-1]=MMA, [2*NSTG]=DONE */
+    if (lane == 0)
+        for (int i = 0; i <= 2 * NSTG; i++)
+            mb_init(sb + i * 8, 1);
+    __syncwarp();
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
+
+    asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
+        :: "r"(sb + TMEM_OFF), "r"(TMEM_COLS));
+    uint32_t taddr;
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(taddr) : "r"(sb + TMEM_OFF));
+
+    uint64_t da[NSTG], db[NSTG];
+    for (int i = 0; i < NSTG; i++) {
+        da[i] = make_desc(sb + A_OFF + i * STAGE_SZ);
+        db[i] = make_desc(sb + A_OFF + A_SZ + i * STAGE_SZ);
+    }
+
+    /* TMA load initial stages (wrap K coord for stages beyond global data) */
+    int n_load = KITERS < NSTG ? KITERS : NSTG;
+    for (int st = 0; st < n_load; st++) {
+        if (lane == 0) {
+            uint32_t mb = sb + st * 8;
+            int coord_k = (st % (GA_K / BENCH_TK)) * BENCH_TK;
+            mb_expect_tx(mb, A_SZ + B_SZ);
+            tma_ld(sb + A_OFF + st * STAGE_SZ, &tma_a,
+                   coord_k, cta_rank * BENCH_TM, mb);
+            tma_ld(sb + A_OFF + A_SZ + st * STAGE_SZ, &tma_b,
+                   coord_k, cta_rank * (BENCH_TN / 2), mb);
+        }
+        mb_wait(sb + st * 8, 0);
+    }
+
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
+
+    if (cta_rank == 0) {
+        uint32_t mbar[NSTG];
+        for (int i = 0; i < NSTG; i++)
+            mbar[i] = sb + (NSTG + i) * 8;
+        int ph[NSTG];
+        for (int i = 0; i < NSTG; i++) ph[i] = 0;
+
+        /* Warmup */
+        for (int w = 0; w < 4; w++) {
+            for (int ki = 0; ki < KITERS; ki++) {
+                int st = ki % NSTG;
+                if (ki >= NSTG) { mb_wait(mbar[st], ph[st]); ph[st] ^= 1; }
+                if (lane == 0) {
+                    mma_fence();
+                    MMA_4SUB(0, da[st], db[st], ki > 0 || w > 0 ? 1 : 0);
+                    mma_commit(mbar[st]);
+                }
+            }
+            for (int i = 0; i < NSTG && i < KITERS; i++) {
+                int st = (KITERS - 1 - i) % NSTG;
+                mb_wait(mbar[st], ph[st]); ph[st] ^= 1;
+            }
+        }
+
+        /* Measure */
+        long long tot = 0;
+        for (int rep = 0; rep < REPS; rep++) {
+            long long t0 = clk();
+            for (int ki = 0; ki < KITERS; ki++) {
+                int st = ki % NSTG;
+                if (ki >= NSTG) { mb_wait(mbar[st], ph[st]); ph[st] ^= 1; }
+                if (lane == 0) {
+                    mma_fence();
+                    MMA_4SUB(0, da[st], db[st], 1);
+                    mma_commit(mbar[st]);
+                }
+            }
+            for (int i = 0; i < NSTG && i < KITERS; i++) {
+                int st = (KITERS - 1 - i) % NSTG;
+                mb_wait(mbar[st], ph[st]); ph[st] ^= 1;
+            }
+            long long t1 = clk();
+            if (lane == 0) tot += t1 - t0;
+        }
+
+        if (lane == 0) out[0] = tot;
+    }
+
+    /* Both CTAs: flush MMA pipeline + dealloc TMEM */
+    if (lane == 0 && cta_rank == 0) {
+        mma_commit(sb + 2 * NSTG * 8);
+        mb_wait(sb + 2 * NSTG * 8, 0);
+    }
+    __syncwarp();
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
+    asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
+        :: "r"(0), "r"(TMEM_COLS));
+}
+
 /* ═══════ H. TMEM double-buffer — read buf0 while MMA writes buf1 ═══════ */
 
 __global__ __launch_bounds__(32, 1) __cluster_dims__(2, 1, 1)
@@ -1925,6 +2041,21 @@ int main() {
     set_smem((const void*)k_mw_tma_store<4>);
     set_smem((const void*)k_multi_sm);
 
+    /* Section T: N_STAGES sweep (variable SMEM per stage count) */
+    {
+        auto set_ns = [](const void *fn, int nstg) {
+            CUDA_CHECK(cudaFuncSetAttribute(fn,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, NS_SMEM(nstg)));
+        };
+        set_ns((const void*)k_kloop_ns<24,1>, 1);
+        set_ns((const void*)k_kloop_ns<24,2>, 2);
+        set_ns((const void*)k_kloop_ns<24,3>, 3);
+        set_ns((const void*)k_kloop_ns<24,4>, 4);
+        set_ns((const void*)k_kloop_ns<24,5>, 5);
+        set_ns((const void*)k_kloop_ns<24,6>, 6);
+        set_ns((const void*)k_kloop_ns<24,7>, 7);
+    }
+
     long long *d_out, h[256];
     CUDA_CHECK(cudaMalloc(&d_out, sizeof(h)));
     auto reset = [&]() { CUDA_CHECK(cudaMemset(d_out, 0, sizeof(h))); };
@@ -2122,6 +2253,36 @@ int main() {
         double per_iter = total / k;
         printf("  K=%2d:  %7.1f cyc total  %6.1f cyc/iter  (4 sub-MMAs/iter)\n",
                k, total, per_iter);
+    }
+
+    /* ═══ T. K-LOOP N_STAGES SWEEP ═══ */
+    printf("\n═══ T. K-Loop Pipeline — N_STAGES Sweep (K=24, MMA-only, data pre-loaded) ═══\n\n");
+    {
+        double ns4_per_iter = 0;
+        auto run_ns = [&](int nstg, const char *tag, auto kernel_fn, int smem_sz) {
+            cur = tag;
+            reset();
+            kernel_fn<<<grid, block, smem_sz>>>(tma_a, tma_b, d_out);
+            sync();
+            double total = (double)h[0] / REPS;
+            double per_iter = total / 24;
+            /* FC2 floor: 10878 tiles / 74 clusters = 147 tiles/cluster */
+            double ms_1813 = total * 147.0 / 1.813e6;
+            double ms_1900 = total * 147.0 / 1.9e6;
+            printf("  NS=%d:  %7.0f cyc  %6.1f cyc/iter  "
+                   "FC2 floor: %.3fms @1813  %.3fms @1900",
+                   nstg, total, per_iter, ms_1813, ms_1900);
+            if (nstg == 4) { ns4_per_iter = per_iter; printf("  ← G ref"); }
+            else if (ns4_per_iter > 0) printf("  (%+.1f)", per_iter - ns4_per_iter);
+            printf("\n");
+        };
+        run_ns(1, "T.ns1", k_kloop_ns<24,1>, NS_SMEM(1));
+        run_ns(2, "T.ns2", k_kloop_ns<24,2>, NS_SMEM(2));
+        run_ns(3, "T.ns3", k_kloop_ns<24,3>, NS_SMEM(3));
+        run_ns(4, "T.ns4", k_kloop_ns<24,4>, NS_SMEM(4));
+        run_ns(5, "T.ns5", k_kloop_ns<24,5>, NS_SMEM(5));
+        run_ns(6, "T.ns6", k_kloop_ns<24,6>, NS_SMEM(6));
+        run_ns(7, "T.ns7", k_kloop_ns<24,7>, NS_SMEM(7));
     }
 
     /* ═══ H. TMEM DOUBLE-BUFFER ═══ */
