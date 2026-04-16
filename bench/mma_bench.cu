@@ -32,6 +32,7 @@ Build: make mma-bench && ./mma-bench
 
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <cuda.h>
 #include <cuda_bf16.h>
 
@@ -1778,16 +1779,20 @@ void k_mw_real_kloop(__grid_constant__ const CUtensorMap tma_a,
             #pragma unroll 1
             for (int ki = 0; ki < KLOOP_ITERS; ki++) {
                 int st = ki % N_STAGES;
-                if (ki >= N_STAGES) {
-                    mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
-                }
-                if (s.lane == 0) {
-                    int coord_k = (ki % (GA_K / BENCH_TK)) * BENCH_TK;
-                    mb_expect_tx(tma_mbar[st], A_SZ + B_SZ);
-                    tma_ld(s.sb + STAGE_A(st), &tma_a,
-                           coord_k, s.cta_rank * BENCH_TM, tma_mbar[st]);
-                    tma_ld(s.sb + STAGE_B(st), &tma_b,
-                           coord_k, s.cta_rank * (BENCH_TN / 2), tma_mbar[st]);
+                /* Skip first N_STAGES iters of rep 0: W1 uses mw_init data,
+                   loading here would race TMA writes against MMA reads. */
+                if (ki >= N_STAGES || rep > 0) {
+                    if (ki >= N_STAGES) {
+                        mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+                    }
+                    if (s.lane == 0) {
+                        int coord_k = (ki % (GA_K / BENCH_TK)) * BENCH_TK;
+                        mb_expect_tx(tma_mbar[st], A_SZ + B_SZ);
+                        tma_ld(s.sb + STAGE_A(st), &tma_a,
+                               coord_k, s.cta_rank * BENCH_TM, tma_mbar[st]);
+                        tma_ld(s.sb + STAGE_B(st), &tma_b,
+                               coord_k, s.cta_rank * (BENCH_TN / 2), tma_mbar[st]);
+                    }
                 }
             }
             for (int i = 0; i < N_STAGES && i < KLOOP_ITERS; i++) {
@@ -1874,9 +1879,9 @@ void k_r2c_tma_only(__grid_constant__ const CUtensorMap tma_a,
     mw_fini(s);
 }
 
-/* R2d: W0 TMA + W1 MMA, single pass of 4 iters (K=N_STAGES, no refill).
-   W1 uses mw_init data (skips tma_wait). W0 issues TMA in parallel.
-   Both drain mma_mbar at end. */
+/* R2d: W1 MMA on pre-loaded data, W0 idle, both drain mma_mbar.
+   Tests that both warps can coexist and drain correctly.
+   (W0 must NOT do TMA loads here — would race against W1's MMA reads.) */
 __global__ __launch_bounds__(MW_THREADS, 1) __cluster_dims__(2, 1, 1)
 void k_r2d_pipeline_4(__grid_constant__ const CUtensorMap tma_a,
                       __grid_constant__ const CUtensorMap tma_b,
@@ -1892,7 +1897,6 @@ void k_r2d_pipeline_4(__grid_constant__ const CUtensorMap tma_a,
     }
 
     if (s.warp == 1) {
-        /* 4 iters: no tma_wait (using mw_init data), no mma_wait (ki < N_STAGES) */
         #pragma unroll 1
         for (int ki = 0; ki < 4; ki++) {
             if (s.lane == 0) {
@@ -1901,34 +1905,12 @@ void k_r2d_pipeline_4(__grid_constant__ const CUtensorMap tma_a,
                 mma_commit(mma_mbar[ki]);
             }
         }
-        /* Drain */
         for (int i = 0; i < N_STAGES; i++) {
             mb_wait(mma_mbar[i], mma_ph[i]); mma_ph[i] ^= 1;
         }
         if (s.lane == 0) out[0] = 42;
-
-    } else if (s.warp == 0) {
-        uint32_t tma_mbar[N_STAGES];
-        for (int i = 0; i < N_STAGES; i++)
-            tma_mbar[i] = s.sb + MB_TMA(i);
-
-        /* 4 iters: TMA reload (no mma_wait since ki < N_STAGES) */
-        #pragma unroll 1
-        for (int ki = 0; ki < 4; ki++) {
-            if (s.lane == 0) {
-                mb_expect_tx(tma_mbar[ki], A_SZ + B_SZ);
-                tma_ld(s.sb + STAGE_A(ki), &tma_a,
-                       ki * BENCH_TK, s.cta_rank * BENCH_TM, tma_mbar[ki]);
-                tma_ld(s.sb + STAGE_B(ki), &tma_b,
-                       ki * BENCH_TK, s.cta_rank * (BENCH_TN / 2), tma_mbar[ki]);
-            }
-        }
-        /* Drain: wait for all 4 MMA completes */
-        for (int i = 0; i < N_STAGES; i++) {
-            mb_wait(mma_mbar[i], mma_ph[i]); mma_ph[i] ^= 1;
-        }
-        if (s.lane == 0) out[1] = 42;
     }
+    /* W0 idles — drain in mw_fini handles synchronization */
     mw_fini(s);
 }
 
@@ -1971,19 +1953,21 @@ void k_r2e_pipeline_8(__grid_constant__ const CUtensorMap tma_a,
         if (s.lane == 0) out[0] = 42;
 
     } else if (s.warp == 0) {
+        /* W0: skip first N_STAGES iters (W1 reads pre-loaded data).
+           Only load at ki >= N_STAGES where mma_mbar ensures W1 is done. */
         #pragma unroll 1
         for (int ki = 0; ki < 8; ki++) {
             int st = ki % N_STAGES;
             if (ki >= N_STAGES) {
                 mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
-            }
-            if (s.lane == 0) {
-                int coord_k = (ki % (GA_K / BENCH_TK)) * BENCH_TK;
-                mb_expect_tx(tma_mbar[st], A_SZ + B_SZ);
-                tma_ld(s.sb + STAGE_A(st), &tma_a,
-                       coord_k, s.cta_rank * BENCH_TM, tma_mbar[st]);
-                tma_ld(s.sb + STAGE_B(st), &tma_b,
-                       coord_k, s.cta_rank * (BENCH_TN / 2), tma_mbar[st]);
+                if (s.lane == 0) {
+                    int coord_k = (ki % (GA_K / BENCH_TK)) * BENCH_TK;
+                    mb_expect_tx(tma_mbar[st], A_SZ + B_SZ);
+                    tma_ld(s.sb + STAGE_A(st), &tma_a,
+                           coord_k, s.cta_rank * BENCH_TM, tma_mbar[st]);
+                    tma_ld(s.sb + STAGE_B(st), &tma_b,
+                           coord_k, s.cta_rank * (BENCH_TN / 2), tma_mbar[st]);
+                }
             }
         }
         for (int i = 0; i < N_STAGES; i++) {
@@ -2109,7 +2093,7 @@ void k_multi_sm(__grid_constant__ const CUtensorMap tma_a,
 
 /* ═══════ Host ═══════ */
 
-int main() {
+int main(int argc, char **argv) {
     CUDA_CHECK(cudaSetDevice(0));
 
     /* Global data */
@@ -2267,8 +2251,18 @@ int main() {
     /* Launch config: 2 blocks (1 cluster), 32 threads */
     dim3 grid(2), block(32);
 
+    /* Section filter: ./mma-bench R2  skips to R2 only */
+    const char *only = (argc > 1) ? argv[1] : nullptr;
+    auto sect = [&](const char *tag) -> bool {
+        return !only || !strncmp(tag, only, strlen(only));
+    };
+
     printf("MMA Microbenchmark — SM100a (tcgen05.mma.cta_group::2.kind::f8f6f4)\n");
     printf("REPS=%d, WARMUP=%d, IDESC=0x%08X, SMEM=%d bytes\n\n", REPS, WARMUP, IDESC, SMEM_TOT);
+
+    double t_kiter = 0.0; /* set in B, referenced in R — declared here for skip */
+
+    if (!only) { /* Sections A–Q: skip if a specific section filter is set */
 
     /* ═══ A. MMA ISSUE THROUGHPUT ═══ */
     printf("═══ A. MMA Issue Throughput (back-to-back, same descriptor, accumulating) ═══\n\n");
@@ -2302,7 +2296,7 @@ int main() {
 
     cur = "B.kiter_full";
     reset(); k_kiter_full<<<grid, block, SMEM_TOT>>>(tma_a, tma_b, d_out); sync();
-    double t_kiter = (double)h[0] / REPS;
+    t_kiter = (double)h[0] / REPS;
     printf("  fence+4×MMA+commit+wait: %6.1f cyc  (4 sub-MMAs = 1 K-iteration)\n", t_kiter);
 
     /* 4×MMA only from section A */
@@ -2648,7 +2642,9 @@ int main() {
         }
     }
 
-    /* ═══ R2. PROGRESSIVE ISOLATION ═══ */
+    } /* end if (!only) — sections A–Q */
+
+    if (sect("R2")) { /* ═══ R2. PROGRESSIVE ISOLATION ═══ */
     printf("\n═══ R2. Progressive Isolation (finding deadlock source) ═══\n\n");
     {
         dim3 grid_mw(2), block_mw(MW_THREADS);
@@ -2669,14 +2665,21 @@ int main() {
             CUDA_CHECK(cudaMemcpy(h, d_out, sizeof(h), cudaMemcpyDeviceToHost));
             printf("  %-4s %-44s OK  (out[0]=%lld out[1]=%lld)\n", tag, desc, h[0], h[1]);
         };
+        fflush(stdout);
         run_test("R2a", "mw_init(n_load=4) + mw_fini only",     k_r2a_init_only);
+        fflush(stdout);
         run_test("R2b", "W1 MMA×4 on pre-loaded data, W0 idle", k_r2b_mma_only);
+        fflush(stdout);
         run_test("R2c", "W0 TMA reload×4, W1 idle",             k_r2c_tma_only);
-        run_test("R2d", "W0 TMA + W1 MMA, 4 iters (no refill)", k_r2d_pipeline_4);
+        fflush(stdout);
+        run_test("R2d", "W1 MMA×4, W0 idle, both drain mma_mbar", k_r2d_pipeline_4);
+        fflush(stdout);
         run_test("R2e", "W0 TMA + W1 MMA, 8 iters (1 refill)",  k_r2e_pipeline_8);
+        fflush(stdout);
     }
+    } /* end sect("R2") */
 
-    /* ═══ R. PIPELINED K-LOOP WITH TMA ═══ */
+    if (sect("R.")) { /* ═══ R. PIPELINED K-LOOP WITH TMA ═══ */
     printf("\n═══ R. Pipelined K-Loop (W0=TMA, W1=MMA, %d iters, %d stages) ═══\n\n",
            KLOOP_ITERS, N_STAGES);
     cur = "R.kloop_tma";
@@ -2694,6 +2697,9 @@ int main() {
         printf("  TMA overhead:  %.1f cyc/iter (%.1f%%)\n",
                per_iter - 525.6, 100.0 * (per_iter / 525.6 - 1.0));
     }
+    } /* end sect("R.") */
+
+    if (!only) { /* Sections S, M: skip if filter set */
 
     /* ═══ S. TMA STORE DURING MMA ═══ */
     printf("\n═══ S. TMA Store During MMA (cp.async.bulk.tensor.2d contention) ═══\n\n");
@@ -2744,6 +2750,8 @@ int main() {
         /* Single cluster for comparison (from section B) */
         printf("  single cluster (B):  %6.1f cyc/iter\n", t_kiter);
     }
+
+    } /* end if (!only) — sections S, M */
 
     printf("\nDone.\n");
 
