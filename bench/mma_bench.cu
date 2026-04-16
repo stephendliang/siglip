@@ -1689,7 +1689,12 @@ void k_mw_fence(__grid_constant__ const CUtensorMap tma_a,
 /* W0 does TMA loads, W1 does MMA — the real FC2 K-loop pattern.
    Pipeline: W0 fills stage s+N_STAGES via TMA while W1 processes stage s via MMA.
    TMA mbars signal data ready (W0→W1), MMA mbars signal stage free (W1→W0).
-   Measures the true K-loop floor with realistic TMA interleaving. */
+   Measures the true K-loop floor with realistic TMA interleaving.
+
+   Protocol per stage s, steady state:
+     W0: wait mma_mbar[s] → mb_expect_tx(tma_mbar[s]) + TMA loads → tma_mbar[s] flips
+     W1: wait tma_mbar[s] → wait mma_mbar[s] → MMA + commit(mma_mbar[s]) → mma_mbar[s] flips
+   No circular dependency: both waits resolve via async HW ops (TMA/MMA). */
 
 #define KLOOP_ITERS 24  /* FC2: K=3072, TK=128 → 24 iterations */
 
@@ -1713,18 +1718,14 @@ void k_mw_real_kloop(__grid_constant__ const CUtensorMap tma_a,
         /* W1: MMA warp — process stages in pipeline order */
 
         /* Warmup (4 full K-loops) */
+        #pragma unroll 1
         for (int w = 0; w < 4; w++) {
+            #pragma unroll 1
             for (int ki = 0; ki < KLOOP_ITERS; ki++) {
                 int st = ki % N_STAGES;
-                /* Wait for TMA data (first pass of first warmup: already loaded) */
                 if (ki >= N_STAGES || w > 0) {
                     mb_wait(tma_mbar[st], tma_ph[st]); tma_ph[st] ^= 1;
                 }
-                /* Wait for previous MMA on this slot.
-                   Always skip for ki < N_STAGES — the drain (or initial fill)
-                   already confirmed these stages are free. Using w > 0 here
-                   would add an extra wait per stage per K-loop (drain + ki=0),
-                   consuming a phase flip that hasn't been produced yet. */
                 if (ki >= N_STAGES) {
                     mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
                 }
@@ -1743,8 +1744,10 @@ void k_mw_real_kloop(__grid_constant__ const CUtensorMap tma_a,
 
         /* Measure */
         long long tot = 0;
+        #pragma unroll 1
         for (int rep = 0; rep < REPS; rep++) {
             long long t0 = clk();
+            #pragma unroll 1
             for (int ki = 0; ki < KLOOP_ITERS; ki++) {
                 int st = ki % N_STAGES;
                 mb_wait(tma_mbar[st], tma_ph[st]); tma_ph[st] ^= 1;
@@ -1768,22 +1771,16 @@ void k_mw_real_kloop(__grid_constant__ const CUtensorMap tma_a,
 
     } else if (s.warp == 0) {
         /* W0: TMA warp — reload stages for W1's pipeline.
-           For each K-iter (beyond initial fill), wait for MMA to free the stage,
-           then issue TMA loads. Coordinates wrap around the small tensor.
-
-           W0 drains mma_mbar after each K-loop (matching W1). This:
-           1. Balances phase tracking (no buffer drift, no race with W1's
-              ki=0 commit that could annihilate a buffered flip).
-           2. Confirms the last N_STAGES MMAs completed, which implies their
-              TMA source data is no longer in flight — safe to mb_expect_tx
-              on the same tma_mbar without corrupting in-flight state. */
+           W0 drains mma_mbar after each K-loop (matching W1) to keep
+           phase tracking aligned and confirm stages are safe to reuse. */
+        #pragma unroll 1
         for (int rep = 0; rep < 4 + REPS; rep++) {
+            #pragma unroll 1
             for (int ki = 0; ki < KLOOP_ITERS; ki++) {
                 int st = ki % N_STAGES;
                 if (ki >= N_STAGES) {
                     mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
                 }
-                /* Issue TMA loads (only lane 0) */
                 if (s.lane == 0) {
                     int coord_k = (ki % (GA_K / BENCH_TK)) * BENCH_TK;
                     mb_expect_tx(tma_mbar[st], A_SZ + B_SZ);
@@ -1793,7 +1790,6 @@ void k_mw_real_kloop(__grid_constant__ const CUtensorMap tma_a,
                            coord_k, s.cta_rank * (BENCH_TN / 2), tma_mbar[st]);
                 }
             }
-            /* Drain: confirm last N_STAGES MMAs done (and their TMAs) */
             for (int i = 0; i < N_STAGES && i < KLOOP_ITERS; i++) {
                 int st = (KLOOP_ITERS - N_STAGES + i) % N_STAGES;
                 mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
@@ -1801,6 +1797,109 @@ void k_mw_real_kloop(__grid_constant__ const CUtensorMap tma_a,
         }
     }
     /* W2-W5 idle */
+    mw_fini(s);
+}
+
+/* ═══════ R2. Minimal W0+W1 pipeline (diagnostic) ═══════ */
+/* Same protocol as R but stripped to bare minimum:
+   - No warmup/measure split, just one timed set of passes
+   - Template KITERS so we can test 4 (no refill) vs 24 (full refill)
+   - Writes per-warp progress to out[] for deadlock diagnosis */
+
+template <int KITERS>
+__global__ __launch_bounds__(MW_THREADS, 1) __cluster_dims__(2, 1, 1)
+void k_mw_kloop_diag(__grid_constant__ const CUtensorMap tma_a,
+                     __grid_constant__ const CUtensorMap tma_b,
+                     long long *out) {
+    MWSetup s;
+    if (!mw_init(s, tma_a, tma_b, N_STAGES)) { mw_fini(s); return; }
+
+    uint32_t mma_mbar[N_STAGES], tma_mbar[N_STAGES];
+    int mma_ph[N_STAGES], tma_ph[N_STAGES];
+    for (int i = 0; i < N_STAGES; i++) {
+        mma_mbar[i] = s.sb + MB_MMA(i);
+        tma_mbar[i] = s.sb + MB_TMA(i);
+        mma_ph[i] = 0;
+        tma_ph[i] = 1;
+    }
+
+    if (s.warp == 1) {
+        /* W1: MMA.  First pass: skip tma wait for ki<N_STAGES (mw_init fill).
+           Subsequent passes: always wait. */
+        #pragma unroll 1
+        for (int pass = 0; pass < 8; pass++) {
+            #pragma unroll 1
+            for (int ki = 0; ki < KITERS; ki++) {
+                int st = ki % N_STAGES;
+                if (ki >= N_STAGES || pass > 0) {
+                    mb_wait(tma_mbar[st], tma_ph[st]); tma_ph[st] ^= 1;
+                }
+                if (ki >= N_STAGES) {
+                    mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+                }
+                if (s.lane == 0) {
+                    mma_fence();
+                    MMA_4SUB(0, s.da[st], s.db[st], ki > 0 || pass > 0 ? 1 : 0);
+                    mma_commit(mma_mbar[st]);
+                }
+            }
+            for (int i = 0; i < N_STAGES && i < KITERS; i++) {
+                int st = (KITERS - N_STAGES + i) % N_STAGES;
+                if (st < 0) st += N_STAGES;
+                mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+            }
+            /* Progress: write pass number so host can see how far we got */
+            if (s.lane == 0) out[1] = pass + 1;
+        }
+        /* Timing: measure one pass */
+        long long t0 = clk();
+        #pragma unroll 1
+        for (int ki = 0; ki < KITERS; ki++) {
+            int st = ki % N_STAGES;
+            mb_wait(tma_mbar[st], tma_ph[st]); tma_ph[st] ^= 1;
+            if (ki >= N_STAGES) {
+                mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+            }
+            if (s.lane == 0) {
+                mma_fence();
+                MMA_4SUB(0, s.da[st], s.db[st], 1);
+                mma_commit(mma_mbar[st]);
+            }
+        }
+        for (int i = 0; i < N_STAGES && i < KITERS; i++) {
+            int st = (KITERS - N_STAGES + i) % N_STAGES;
+            if (st < 0) st += N_STAGES;
+            mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+        }
+        long long t1 = clk();
+        if (s.lane == 0) out[0] = t1 - t0;
+
+    } else if (s.warp == 0) {
+        #pragma unroll 1
+        for (int pass = 0; pass < 9; pass++) {
+            #pragma unroll 1
+            for (int ki = 0; ki < KITERS; ki++) {
+                int st = ki % N_STAGES;
+                if (ki >= N_STAGES) {
+                    mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+                }
+                if (s.lane == 0) {
+                    int coord_k = (ki % (GA_K / BENCH_TK)) * BENCH_TK;
+                    mb_expect_tx(tma_mbar[st], A_SZ + B_SZ);
+                    tma_ld(s.sb + STAGE_A(st), &tma_a,
+                           coord_k, s.cta_rank * BENCH_TM, tma_mbar[st]);
+                    tma_ld(s.sb + STAGE_B(st), &tma_b,
+                           coord_k, s.cta_rank * (BENCH_TN / 2), tma_mbar[st]);
+                }
+            }
+            for (int i = 0; i < N_STAGES && i < KITERS; i++) {
+                int st = (KITERS - N_STAGES + i) % N_STAGES;
+                if (st < 0) st += N_STAGES;
+                mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+            }
+            if (s.lane == 0) out[2] = pass + 1;
+        }
+    }
     mw_fini(s);
 }
 
@@ -2035,6 +2134,9 @@ int main() {
     set_smem((const void*)k_mw_fence<8>);
     set_smem((const void*)k_mw_fence<16>);
     set_smem((const void*)k_mw_real_kloop);
+    set_smem((const void*)k_mw_kloop_diag<4>);
+    set_smem((const void*)k_mw_kloop_diag<8>);
+    set_smem((const void*)k_mw_kloop_diag<24>);
     set_smem((const void*)k_mw_tma_store<0>);
     set_smem((const void*)k_mw_tma_store<1>);
     set_smem((const void*)k_mw_tma_store<2>);
@@ -2450,6 +2552,34 @@ int main() {
             if (n == 0) printf("  (baseline)");
             printf("\n");
         }
+    }
+
+    /* ═══ R2. DIAGNOSTIC PIPELINE TEST ═══ */
+    printf("\n═══ R2. Diagnostic Pipeline (W0=TMA, W1=MMA, escalating K-iters) ═══\n\n");
+    {
+        dim3 grid_mw(2), block_mw(MW_THREADS);
+        auto run_diag = [&](const char *tag, auto kernel_fn, int kiters) {
+            cur = tag;
+            reset();
+            kernel_fn<<<grid_mw, block_mw, SMEM_TOT>>>(tma_a, tma_b, d_out);
+            cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) {
+                printf("  K=%2d: launch error: %s\n", kiters, cudaGetErrorString(e));
+                return;
+            }
+            e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) {
+                printf("  K=%2d: DEADLOCK/ERROR: %s\n", kiters, cudaGetErrorString(e));
+                return;
+            }
+            CUDA_CHECK(cudaMemcpy(h, d_out, sizeof(h), cudaMemcpyDeviceToHost));
+            double t = (double)h[0];
+            printf("  K=%2d: %8.1f cyc  (%5.1f cyc/iter)  W1 passes=%lld  W0 passes=%lld\n",
+                   kiters, t, t / kiters, h[1], h[2]);
+        };
+        run_diag("R2.k4",  k_mw_kloop_diag<4>,  4);
+        run_diag("R2.k8",  k_mw_kloop_diag<8>,  8);
+        run_diag("R2.k24", k_mw_kloop_diag<24>, 24);
     }
 
     /* ═══ R. PIPELINED K-LOOP WITH TMA ═══ */
