@@ -5,8 +5,17 @@ Design
   Cluster = 4 CTAs (37 clusters × 4 = 148 SMs).
   Pair P0 = {CTA0, CTA1} computes cluster tile (2*m_pair,     tn).
   Pair P1 = {CTA2, CTA3} computes cluster tile (2*m_pair + 1, tn).
-  Shared B via 4-CTA TMA multicast (mask 0xF).
-  A via pair multicast (mask 0x3 / 0xC).
+
+  A: per-CTA private TMA (shared::cta).  Each CTA loads its own 128-row
+     slice of the pair-tile.  No sharing — each CTA needs a different
+     M-row half for cta_group::2 MMA.
+
+  B: cross-pair multicast by B-half.  Both pairs compute the same N-tile
+     (tn), so B is identical across pairs.  Pair 0 issues B:
+       CTA0 (pair_lane=0): B_part0 → {CTA0,CTA2} via mask 0x5
+       CTA1 (pair_lane=1): B_part1 → {CTA1,CTA3} via mask 0xA
+     Halves the per-tile B DRAM traffic vs 4 independent loads.
+
   Scheduler = CTA0 W7 only.  atomicAdd g_pair_ctr, DSMEM-fanout pair_ready_mbar
   to all 4 CTAs, publish pair_idx to CTA0-hosted pair_bcast (read via DSMEM).
 
@@ -521,26 +530,36 @@ fc2_w3_c4_kernel(
 
                 if (lane == 0) {
                     /* Own local mbar: arrive.expect_tx in shared::cta scope so
-                       the arrival stays on THIS CTA (not routed to CTA0 by the
-                       cluster scope). */
+                       the arrival stays on THIS CTA. */
                     mbar_arrive_expect_tx_local(tma_mbar_s, TMA_BYTES);
 
-                    if (cta_rank == 0) {
+                    /* A: per-CTA private load.  multicast would REPLICATE the
+                       same M-rows to every target — wrong, each pair CTA
+                       needs a different M-row half.  shared::cta + no mask
+                       loads only to the issuing CTA's SMEM. */
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.tile"
+                        ".mbarrier::complete_tx::bytes"
+                        " [%0], [%1, {%2, %3}], [%4];"
+                        :: "r"(a_dst), "l"(&tma_a), "r"(k_tk), "r"(m_start),
+                           "r"(tma_mbar_s)
+                        : "memory");
+
+                    /* B: cross-pair multicast by B-half.  Pair 0 CTAs are the
+                       issuers — CTA0 (pair_lane=0, b_c1=n_start) mcast mask 0x5
+                       sends B_part0 to {CTA0,CTA2}; CTA1 (pair_lane=1,
+                       b_c1=n_start+TN/2) mcast mask 0xA sends B_part1 to
+                       {CTA1,CTA3}.  Inside a pair, each CTA holds a different
+                       B-half at smem_b — matches cta_group::2 MMA layout. */
+                    if (pair_id == 0) {
+                        const uint16_t b_mask = (pair_lane == 0)
+                            ? (uint16_t)0x0005 : (uint16_t)0x000A;
                         asm volatile(
                             "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
                             ".mbarrier::complete_tx::bytes.multicast::cluster"
                             " [%0], [%1, {%2, %3}], [%4], %5;"
                             :: "r"(b_dst), "l"(&tma_b), "r"(k_tk), "r"(b_c1),
-                               "r"(tma_mbar_s), "h"((uint16_t)0x000F)
-                            : "memory");
-                    }
-                    if (pair_lane == 0) {
-                        asm volatile(
-                            "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                            ".mbarrier::complete_tx::bytes.multicast::cluster"
-                            " [%0], [%1, {%2, %3}], [%4], %5;"
-                            :: "r"(a_dst), "l"(&tma_a), "r"(k_tk), "r"(m_start),
-                               "r"(tma_mbar_s), "h"(pair_mcast_mask)
+                               "r"(tma_mbar_s), "h"(b_mask)
                             : "memory");
                     }
                 }
