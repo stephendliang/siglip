@@ -23,6 +23,7 @@ Sections:
   P. W0 TMA dispatch during MMA — TMA load contention test
   Q. fence.proxy.async + mbar_arrive during MMA
   R. Pipelined K-loop with TMA — W0 TMA + W1 MMA (realistic FC2 pattern)
+  U. Pipelined K-loop — N_STAGES sweep with TMA (1..7 stages, W0+W1)
   S. TMA store during MMA — cp.async.bulk.tensor store contention
   M. Multi-SM scaling — all 74 clusters, per-cluster throughput variance
 
@@ -1979,6 +1980,171 @@ void k_r2e_pipeline_8(__grid_constant__ const CUtensorMap tma_a,
     mw_fini(s);
 }
 
+/* ═══════ U. Pipelined K-loop — N_STAGES sweep with TMA ═══════ */
+/* Like Section T (MMA-only stage sweep) but with W0=TMA + W1=MMA.
+   Self-contained: doesn't use MWSetup/mw_init (tied to N_STAGES=4).
+   Measures how pipeline depth hides TMA load latency. */
+
+template <int KITERS, int NSTG>
+__global__ __launch_bounds__(MW_THREADS, 1) __cluster_dims__(2, 1, 1)
+void k_kloop_tma_ns(__grid_constant__ const CUtensorMap tma_a,
+                    __grid_constant__ const CUtensorMap tma_b,
+                    long long *out) {
+    extern __shared__ __align__(128) char smem[];
+    uint32_t sb = to_smem(smem);
+    int lane = threadIdx.x % 32;
+    int warp = threadIdx.x / 32;
+    int cta_rank;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+
+    /* Mbar layout: [0..NSTG-1]=TMA, [NSTG..2*NSTG-1]=MMA, [2*NSTG]=DONE */
+    if (warp == 0 && lane == 0)
+        for (int i = 0; i <= 2 * NSTG; i++)
+            mb_init(sb + i * 8, 1);
+    __syncthreads();
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
+
+    if (warp == 1)
+        asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
+            :: "r"(sb + TMEM_OFF), "r"(TMEM_COLS));
+    __syncthreads();
+
+    uint64_t da[NSTG], db[NSTG];
+    for (int i = 0; i < NSTG; i++) {
+        da[i] = make_desc(sb + A_OFF + i * STAGE_SZ);
+        db[i] = make_desc(sb + A_OFF + A_SZ + i * STAGE_SZ);
+    }
+
+    /* W0 loads initial stages (both CTAs load into own SMEM) */
+    int n_load = KITERS < NSTG ? KITERS : NSTG;
+    for (int st = 0; st < n_load; st++) {
+        if (warp == 0 && lane == 0) {
+            uint32_t mb = sb + st * 8;
+            int coord_k = (st % (GA_K / BENCH_TK)) * BENCH_TK;
+            mb_expect_tx(mb, A_SZ + B_SZ);
+            tma_ld(sb + A_OFF + st * STAGE_SZ, &tma_a,
+                   coord_k, cta_rank * BENCH_TM, mb);
+            tma_ld(sb + A_OFF + A_SZ + st * STAGE_SZ, &tma_b,
+                   coord_k, cta_rank * (BENCH_TN / 2), mb);
+        }
+        __syncthreads();
+        if (warp == 0) mb_wait(sb + st * 8, 0);
+        __syncthreads();
+    }
+
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
+
+    if (cta_rank == 0) {
+        uint32_t mma_mbar[NSTG], tma_mbar[NSTG];
+        int mma_ph[NSTG], tma_ph[NSTG];
+        for (int i = 0; i < NSTG; i++) {
+            tma_mbar[i] = sb + i * 8;
+            mma_mbar[i] = sb + (NSTG + i) * 8;
+            mma_ph[i] = 0;
+            tma_ph[i] = 1; /* init consumed phase 0 */
+        }
+
+        if (warp == 1) {
+            /* W1: MMA consumer — warmup */
+            #pragma unroll 1
+            for (int w = 0; w < 4; w++) {
+                #pragma unroll 1
+                for (int ki = 0; ki < KITERS; ki++) {
+                    int st = ki % NSTG;
+                    if (ki >= NSTG || w > 0) {
+                        mb_wait(tma_mbar[st], tma_ph[st]); tma_ph[st] ^= 1;
+                    }
+                    if (ki >= NSTG) {
+                        mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+                    }
+                    if (lane == 0) {
+                        mma_fence();
+                        MMA_4SUB(0, da[st], db[st], ki > 0 || w > 0 ? 1 : 0);
+                        mma_commit(mma_mbar[st]);
+                    }
+                }
+                for (int i = 0; i < NSTG && i < KITERS; i++) {
+                    int st = (KITERS - NSTG + i) % NSTG;
+                    mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+                }
+            }
+
+            /* W1: MMA consumer — measure */
+            long long tot = 0;
+            #pragma unroll 1
+            for (int rep = 0; rep < REPS; rep++) {
+                long long t0 = clk();
+                #pragma unroll 1
+                for (int ki = 0; ki < KITERS; ki++) {
+                    int st = ki % NSTG;
+                    mb_wait(tma_mbar[st], tma_ph[st]); tma_ph[st] ^= 1;
+                    if (ki >= NSTG) {
+                        mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+                    }
+                    if (lane == 0) {
+                        mma_fence();
+                        MMA_4SUB(0, da[st], db[st], 1);
+                        mma_commit(mma_mbar[st]);
+                    }
+                }
+                for (int i = 0; i < NSTG && i < KITERS; i++) {
+                    int st = (KITERS - NSTG + i) % NSTG;
+                    mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+                }
+                long long t1 = clk();
+                if (lane == 0) tot += t1 - t0;
+            }
+            if (lane == 0) out[0] = tot;
+
+        } else if (warp == 0) {
+            /* W0: TMA producer — runs 4 warmup + REPS measure reps */
+            #pragma unroll 1
+            for (int rep = 0; rep < 4 + REPS; rep++) {
+                #pragma unroll 1
+                for (int ki = 0; ki < KITERS; ki++) {
+                    int st = ki % NSTG;
+                    /* Skip first NSTG iters of rep 0: W1 uses pre-loaded data.
+                       Loading here would race TMA writes against MMA reads. */
+                    if (ki >= NSTG || rep > 0) {
+                        if (ki >= NSTG) {
+                            mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+                        }
+                        if (lane == 0) {
+                            int coord_k = (ki % (GA_K / BENCH_TK)) * BENCH_TK;
+                            mb_expect_tx(tma_mbar[st], A_SZ + B_SZ);
+                            tma_ld(sb + A_OFF + st * STAGE_SZ, &tma_a,
+                                   coord_k, cta_rank * BENCH_TM, tma_mbar[st]);
+                            tma_ld(sb + A_OFF + A_SZ + st * STAGE_SZ, &tma_b,
+                                   coord_k, cta_rank * (BENCH_TN / 2), tma_mbar[st]);
+                        }
+                    }
+                }
+                for (int i = 0; i < NSTG && i < KITERS; i++) {
+                    int st = (KITERS - NSTG + i) % NSTG;
+                    mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
+                }
+            }
+        }
+        /* W2-W5 idle */
+    }
+
+    /* Both CTAs: flush MMA + dealloc TMEM */
+    __syncthreads();
+    if (warp == 1 && lane == 0 && cta_rank == 0) {
+        mma_commit(sb + 2 * NSTG * 8);
+        mb_wait(sb + 2 * NSTG * 8, 0);
+    }
+    __syncthreads();
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
+    if (warp == 1)
+        asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
+            :: "r"(0), "r"(TMEM_COLS));
+}
+
 /* ═══════ S. TMA store during MMA ═══════ */
 /* W2-W5 do TMA stores (cp.async.bulk.tensor.2d) while W1 does MMA.
    Tests whether TMA store contends with MMA compute.
@@ -2234,6 +2400,15 @@ int main(int argc, char **argv) {
         set_ns((const void*)k_kloop_ns<24,5>, 5);
         set_ns((const void*)k_kloop_ns<24,6>, 6);
         set_ns((const void*)k_kloop_ns<24,7>, 7);
+
+        /* Section U: pipelined TMA+MMA sweep (same SMEM per stage) */
+        set_ns((const void*)k_kloop_tma_ns<24,1>, 1);
+        set_ns((const void*)k_kloop_tma_ns<24,2>, 2);
+        set_ns((const void*)k_kloop_tma_ns<24,3>, 3);
+        set_ns((const void*)k_kloop_tma_ns<24,4>, 4);
+        set_ns((const void*)k_kloop_tma_ns<24,5>, 5);
+        set_ns((const void*)k_kloop_tma_ns<24,6>, 6);
+        set_ns((const void*)k_kloop_tma_ns<24,7>, 7);
     }
 
     long long *d_out, h[256];
@@ -2698,6 +2873,57 @@ int main(int argc, char **argv) {
                per_iter - 525.6, 100.0 * (per_iter / 525.6 - 1.0));
     }
     } /* end sect("R.") */
+
+    if (sect("U.")) { /* ═══ U. PIPELINED K-LOOP N_STAGES SWEEP ═══ */
+    printf("\n═══ U. Pipelined K-Loop — N_STAGES Sweep (W0=TMA + W1=MMA, K=%d) ═══\n\n",
+           KLOOP_ITERS);
+    {
+        dim3 grid_mw(2), block_mw(MW_THREADS);
+
+        /* Collect MMA-only baselines from Section T kernels */
+        double mma_only[8] = {};
+        auto run_base = [&](int nstg, auto kernel_fn, int smem_sz) {
+            cur = "U.base";
+            reset();
+            kernel_fn<<<grid, block, smem_sz>>>(tma_a, tma_b, d_out);
+            sync();
+            mma_only[nstg] = (double)h[0] / REPS;
+        };
+        run_base(1, k_kloop_ns<24,1>, NS_SMEM(1));
+        run_base(2, k_kloop_ns<24,2>, NS_SMEM(2));
+        run_base(3, k_kloop_ns<24,3>, NS_SMEM(3));
+        run_base(4, k_kloop_ns<24,4>, NS_SMEM(4));
+        run_base(5, k_kloop_ns<24,5>, NS_SMEM(5));
+        run_base(6, k_kloop_ns<24,6>, NS_SMEM(6));
+        run_base(7, k_kloop_ns<24,7>, NS_SMEM(7));
+
+        printf("  NS  pipelined   per-iter  MMA-only  TMA overhead         FC2 floor\n");
+        printf("  --  ---------   --------  --------  ----------------     ----------\n");
+
+        auto run_pipe = [&](int nstg, auto kernel_fn, int smem_sz) {
+            cur = "U.pipe";
+            reset();
+            fflush(stdout);
+            kernel_fn<<<grid_mw, block_mw, smem_sz>>>(tma_a, tma_b, d_out);
+            sync();
+            double total = (double)h[0] / REPS;
+            double per_iter = total / KLOOP_ITERS;
+            double mma_per = mma_only[nstg] / KLOOP_ITERS;
+            double overhead = per_iter - mma_per;
+            double ms_1813 = total * 147.0 / 1.813e6;
+            printf("  %d   %7.0f cyc  %6.1f     %5.1f     %+6.1f cyc (%+5.1f%%)   %.3fms @1813\n",
+                   nstg, total, per_iter, mma_per, overhead,
+                   100.0 * overhead / mma_per, ms_1813);
+        };
+        run_pipe(1, k_kloop_tma_ns<24,1>, NS_SMEM(1));
+        run_pipe(2, k_kloop_tma_ns<24,2>, NS_SMEM(2));
+        run_pipe(3, k_kloop_tma_ns<24,3>, NS_SMEM(3));
+        run_pipe(4, k_kloop_tma_ns<24,4>, NS_SMEM(4));
+        run_pipe(5, k_kloop_tma_ns<24,5>, NS_SMEM(5));
+        run_pipe(6, k_kloop_tma_ns<24,6>, NS_SMEM(6));
+        run_pipe(7, k_kloop_tma_ns<24,7>, NS_SMEM(7));
+    }
+    } /* end sect("U.") */
 
     if (!only) { /* Sections S, M: skip if filter set */
 
