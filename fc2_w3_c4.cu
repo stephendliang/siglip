@@ -29,8 +29,8 @@ Synchronization
     mask arrives both pair CTAs' local mbar — only leader waits.
   - mainloop_mbar[2] per-CTA, count=1.  Pair leader tcgen05.commit with pair
     mcast mask arrives both pair CTAs' local mbar — all W2-W6 wait.
-  - epilogue_mbar[2] pair-shared at pair leader, count = 2 * (NUM_EPI_WARPS+1) * 32.
-    Addressed by partner via `& 0xFEFFFFFF`.
+  - epilogue_mbar[2] pair-shared at pair leader (rank = pair_id*2), count =
+    2 * (NUM_EPI_WARPS+1) * 32.  Partner routes via mapa.shared::cluster.
 
 LEAN_DISPATCH
   W0, W1 read pair_bcast at loop top (via pair_ready_mbar).
@@ -132,17 +132,14 @@ uint32_t smem_to_uint(const void* p) {
     return (uint32_t)__cvta_generic_to_shared(p);
 }
 
-/* DSMEM: bits [25:24] select CTA rank in cluster-of-4. */
+/* Map a local SMEM address (rank bits = 0) to cluster SMEM at target CTA rank.
+   Uses HW mapa.shared::cluster — the portable way for any cluster size. */
 static __device__ __forceinline__
-uint32_t dsmem_addr(uint32_t local, int dst_rank) {
-    return (local & 0xFCFFFFFFU) | ((uint32_t)dst_rank << 24);
-}
-
-/* Pair-leader SMEM address: clear bit 24 to fall onto the even-ranked CTA in
-   the pair.  Bit 25 selects pair (0 = P0, 1 = P1). */
-static __device__ __forceinline__
-uint32_t pair_leader_addr(uint32_t local) {
-    return local & 0xFEFFFFFFU;
+uint32_t map_rank(uint32_t local, int dst_rank) {
+    uint32_t out;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+        : "=r"(out) : "r"(local), "r"(dst_rank));
+    return out;
 }
 
 static __device__ __forceinline__
@@ -172,14 +169,23 @@ static __device__ __forceinline__ void mbar_wait(uint32_t addr, uint32_t phase) 
     } while (!done);
 }
 
-static __device__ __forceinline__ void mbar_arrive(uint32_t addr) {
-    asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
+/* Local (shared::cta): arrives on the CURRENT CTA's mbar only. */
+static __device__ __forceinline__ void mbar_arrive_local(uint32_t addr) {
+    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
         :: "r"(addr) : "memory");
 }
 
-static __device__ __forceinline__ void mbar_arrive_expect_tx(uint32_t addr, uint32_t bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+static __device__ __forceinline__
+void mbar_arrive_expect_tx_local(uint32_t addr, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
         :: "r"(addr), "r"(bytes) : "memory");
+}
+
+/* Cluster (shared::cluster): address must carry target-CTA rank bits (use
+   map_rank to compute).  For cross-CTA arrives only. */
+static __device__ __forceinline__ void mbar_arrive_cluster(uint32_t addr) {
+    asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
+        :: "r"(addr) : "memory");
 }
 
 #if !defined(STRIP_EPILOGUE) && !defined(GEMM_ONLY)
@@ -374,10 +380,13 @@ fc2_w3_c4_kernel(
     }
     const uint32_t mainloop_mbar_addr = smem_to_uint(smem + OFF_MAINLOOP_MBAR);
     const uint32_t epilogue_mbar_addr = smem_to_uint(smem + OFF_EPILOGUE_MBAR);
-    const uint32_t epi_mbar_masked    = pair_leader_addr(epilogue_mbar_addr);
+    /* Pair-leader's epi_mbar (leader rank = pair_id*2).  For the leader itself
+       mapa returns the local address unchanged; for the partner it routes via
+       DSMEM.  Both use `mbar_arrive_cluster` below. */
+    const uint32_t epi_mbar_shared = map_rank(epilogue_mbar_addr, pair_id * 2);
 
-    /* CTA0-hosted pair_bcast — all CTAs read via DSMEM rank=0 */
-    const uint32_t pair_bcast_cta0 = dsmem_addr(
+    /* CTA0-hosted pair_bcast — all CTAs read via ld.shared::cluster */
+    const uint32_t pair_bcast_cta0 = map_rank(
         smem_to_uint(smem + OFF_PAIR_BCAST), 0);
 
     uint64_t desc_a_base[N_STAGES], desc_b_base[N_STAGES];
@@ -431,11 +440,12 @@ fc2_w3_c4_kernel(
                 asm volatile("st.shared.b32 [%0], %1;"
                     :: "r"(smem_to_uint(smem + OFF_PAIR_BCAST + _buf * 4)), "r"(pair_idx));
                 asm volatile("fence.acq_rel.cluster;");
-                /* Arrive each CTA's local pair_ready_mbar via DSMEM */
+                /* Arrive each CTA's local pair_ready_mbar via DSMEM (mapa) */
+                const uint32_t pr_local = smem_to_uint(smem + OFF_PAIR_READY_MBAR + _buf * 8);
+                mbar_arrive_local(pr_local);
                 #pragma unroll
-                for (int dst = 0; dst < CTAS_PER_CLUSTER; dst++) {
-                    mbar_arrive(dsmem_addr(
-                        smem_to_uint(smem + OFF_PAIR_READY_MBAR + _buf * 8), dst));
+                for (int dst = 1; dst < CTAS_PER_CLUSTER; dst++) {
+                    mbar_arrive_cluster(map_rank(pr_local, dst));
                 }
             }
             asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
@@ -473,13 +483,14 @@ fc2_w3_c4_kernel(
         }
 
         if (pair_idx >= TOTAL_PAIRS) {
-            /* W0, W1 break path.  W1 lane 0 arrives mainloop_mbar[iter] so
-               W2-W6 unblock with the deferred read seeing the TOTAL_PAIRS
-               sentinel in pair_bcast. */
+            /* W0, W1 break path.  Each CTA's W1 arrives its OWN local
+               mainloop_mbar (shared::cta scope) so this CTA's W2-W6 unblock
+               and see the TOTAL_PAIRS sentinel in pair_bcast via deferred
+               read.  During regular iters this arrive came from the pair
+               leader's tcgen05.commit.cta_group::2.multicast::cluster, which
+               fans out across the pair; here we replace that per-CTA. */
             if (warp == 1 && lane == 0) {
-                asm volatile(
-                    "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                    :: "r"(mainloop_mbar_addr + _buf * 8) : "memory");
+                mbar_arrive_local(mainloop_mbar_addr + _buf * 8);
             }
             break;
         }
@@ -509,7 +520,10 @@ fc2_w3_c4_kernel(
                 const uint32_t tma_mbar_s = smem_base + OFF_TMA_MBAR + s * 8;
 
                 if (lane == 0) {
-                    mbar_arrive_expect_tx(tma_mbar_s, TMA_BYTES);
+                    /* Own local mbar: arrive.expect_tx in shared::cta scope so
+                       the arrival stays on THIS CTA (not routed to CTA0 by the
+                       cluster scope). */
+                    mbar_arrive_expect_tx_local(tma_mbar_s, TMA_BYTES);
 
                     if (cta_rank == 0) {
                         asm volatile(
@@ -619,12 +633,12 @@ fc2_w3_c4_kernel(
             /* _prev_pair = prev_idx; (unused in current path) */
 
             if (prev_idx >= TOTAL_PAIRS) {
-                mbar_arrive(epi_mbar_masked + prev_buf * 8);
+                mbar_arrive_cluster(epi_mbar_shared + prev_buf * 8);
                 goto _lean_done;
             }
 
 #if defined(STRIP_EPILOGUE) || defined(GEMM_ONLY)
-            if (has_prev) mbar_arrive(epi_mbar_masked + prev_buf * 8);
+            if (has_prev) mbar_arrive_cluster(epi_mbar_shared + prev_buf * 8);
 #else
             if (has_prev) {
                 const int pm_pair = prev_idx % (TILES_M / 2);
@@ -642,13 +656,13 @@ fc2_w3_c4_kernel(
                     if (lane == 0) {
                         const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING
                             + stage * EPI_STAGE_BYTES);
-                        mbar_arrive_expect_tx(load_mbar[stage], EPI_STAGE_BYTES);
+                        mbar_arrive_expect_tx_local(load_mbar[stage], EPI_STAGE_BYTES);
                         tma_load_2d_cta(res_dst, &tma_res,
                                         prev_n + si * 64, prev_m, load_mbar[stage]);
                     }
                     load_issue_count++;
                 }
-                mbar_arrive(epi_mbar_masked + prev_buf * 8);
+                mbar_arrive_cluster(epi_mbar_shared + prev_buf * 8);
             }
 #endif
         }
@@ -670,12 +684,12 @@ fc2_w3_c4_kernel(
             /* _prev_pair = prev_idx; (unused in current path) */
 
             if (prev_idx >= TOTAL_PAIRS) {
-                mbar_arrive(epi_mbar_masked + prev_buf * 8);
+                mbar_arrive_cluster(epi_mbar_shared + prev_buf * 8);
                 goto _lean_done;
             }
 
 #ifdef STRIP_EPILOGUE
-            if (has_prev) mbar_arrive(epi_mbar_masked + prev_buf * 8);
+            if (has_prev) mbar_arrive_cluster(epi_mbar_shared + prev_buf * 8);
 #else
             if (has_prev) {
                 const int pm_pair = prev_idx % (TILES_M / 2);
@@ -732,7 +746,7 @@ fc2_w3_c4_kernel(
                     EPI_STORE(stage, nc_base, prev_n, prev_m);
                     EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
                 }
-                mbar_arrive(epi_mbar_masked + prev_buf * 8);
+                mbar_arrive_cluster(epi_mbar_shared + prev_buf * 8);
 #else
                 const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
@@ -812,11 +826,11 @@ fc2_w3_c4_kernel(
                     EPI_STORE(stage, nc_base, prev_n, prev_m);
                     EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
                     if (si > 0)
-                        mbar_arrive(consumed_mbar[(si - 1) % NUM_EPI_STAGES]);
+                        mbar_arrive_local(consumed_mbar[(si - 1) % NUM_EPI_STAGES]);
                     if (si == NUM_EPI_SUBITERS - 1)
-                        mbar_arrive(consumed_mbar[stage]);
+                        mbar_arrive_local(consumed_mbar[stage]);
                 }
-                mbar_arrive(epi_mbar_masked + prev_buf * 8);
+                mbar_arrive_cluster(epi_mbar_shared + prev_buf * 8);
 #endif /* GEMM_ONLY */
             }
 #endif /* STRIP_EPILOGUE */
