@@ -1981,21 +1981,25 @@ void k_r2e_pipeline_8(__grid_constant__ const CUtensorMap tma_a,
 }
 
 /* ═══════ U. Pipelined K-loop — N_STAGES sweep with TMA ═══════ */
-/* Like Section T (MMA-only stage sweep) but with W0=TMA + W1=MMA.
-   Self-contained: doesn't use MWSetup/mw_init (tied to N_STAGES=4).
-   Measures how pipeline depth hides TMA load latency. */
+/* Like Section T but with W0=TMA + W1=MMA on all 74 clusters.
+   Large A array (>L2) + M cycling per tile → realistic L2 miss rate.
+   ga_m = A tensor M dimension. Each rep = one virtual tile with new M offset. */
 
 template <int KITERS, int NSTG>
 __global__ __launch_bounds__(MW_THREADS, 1) __cluster_dims__(2, 1, 1)
 void k_kloop_tma_ns(__grid_constant__ const CUtensorMap tma_a,
                     __grid_constant__ const CUtensorMap tma_b,
-                    long long *out) {
+                    long long *out, int ga_m) {
     extern __shared__ __align__(128) char smem[];
     uint32_t sb = to_smem(smem);
     int lane = threadIdx.x % 32;
     int warp = threadIdx.x / 32;
     int cta_rank;
     asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+
+    int cluster_id = blockIdx.x / 2;
+    int n_clusters = gridDim.x / 2;
+    int n_m_tiles = ga_m / (BENCH_TM * 2); /* tiles covering M dim */
 
     /* Mbar layout: [0..NSTG-1]=TMA, [NSTG..2*NSTG-1]=MMA, [2*NSTG]=DONE */
     if (warp == 0 && lane == 0)
@@ -2017,17 +2021,20 @@ void k_kloop_tma_ns(__grid_constant__ const CUtensorMap tma_a,
         db[i] = make_desc(sb + A_OFF + A_SZ + i * STAGE_SZ);
     }
 
+    /* Initial M offset: each cluster gets a different tile */
+    int init_tile = cluster_id % n_m_tiles;
+    int init_m = (init_tile * 2 + cta_rank) * BENCH_TM;
+
     /* W0 loads initial stages (both CTAs load into own SMEM) */
     int n_load = KITERS < NSTG ? KITERS : NSTG;
     for (int st = 0; st < n_load; st++) {
         if (warp == 0 && lane == 0) {
             uint32_t mb = sb + st * 8;
-            int coord_k = (st % (GA_K / BENCH_TK)) * BENCH_TK;
             mb_expect_tx(mb, A_SZ + B_SZ);
             tma_ld(sb + A_OFF + st * STAGE_SZ, &tma_a,
-                   coord_k, cta_rank * BENCH_TM, mb);
+                   st * BENCH_TK, init_m, mb);
             tma_ld(sb + A_OFF + A_SZ + st * STAGE_SZ, &tma_b,
-                   coord_k, cta_rank * (BENCH_TN / 2), mb);
+                   st * BENCH_TK, cta_rank * (BENCH_TN / 2), mb);
         }
         __syncthreads();
         if (warp == 0) mb_wait(sb + st * 8, 0);
@@ -2097,28 +2104,28 @@ void k_kloop_tma_ns(__grid_constant__ const CUtensorMap tma_a,
                 long long t1 = clk();
                 if (lane == 0) tot += t1 - t0;
             }
-            if (lane == 0) out[0] = tot;
+            if (lane == 0) out[cluster_id] = tot;
 
         } else if (warp == 0) {
-            /* W0: TMA producer — runs 4 warmup + REPS measure reps */
+            /* W0: TMA producer — cycles M per tile (rep) */
+            int tile_idx = 0;
             #pragma unroll 1
             for (int rep = 0; rep < 4 + REPS; rep++) {
+                int tile_m = (cluster_id + tile_idx * n_clusters) % n_m_tiles;
+                int m_coord = (tile_m * 2 + cta_rank) * BENCH_TM;
                 #pragma unroll 1
                 for (int ki = 0; ki < KITERS; ki++) {
                     int st = ki % NSTG;
-                    /* Skip first NSTG iters of rep 0: W1 uses pre-loaded data.
-                       Loading here would race TMA writes against MMA reads. */
                     if (ki >= NSTG || rep > 0) {
                         if (ki >= NSTG) {
                             mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
                         }
                         if (lane == 0) {
-                            int coord_k = (ki % (GA_K / BENCH_TK)) * BENCH_TK;
                             mb_expect_tx(tma_mbar[st], A_SZ + B_SZ);
                             tma_ld(sb + A_OFF + st * STAGE_SZ, &tma_a,
-                                   coord_k, cta_rank * BENCH_TM, tma_mbar[st]);
+                                   ki * BENCH_TK, m_coord, tma_mbar[st]);
                             tma_ld(sb + A_OFF + A_SZ + st * STAGE_SZ, &tma_b,
-                                   coord_k, cta_rank * (BENCH_TN / 2), tma_mbar[st]);
+                                   ki * BENCH_TK, cta_rank * (BENCH_TN / 2), tma_mbar[st]);
                         }
                     }
                 }
@@ -2126,6 +2133,7 @@ void k_kloop_tma_ns(__grid_constant__ const CUtensorMap tma_a,
                     int st = (KITERS - NSTG + i) % NSTG;
                     mb_wait(mma_mbar[st], mma_ph[st]); mma_ph[st] ^= 1;
                 }
+                tile_idx++;
             }
         }
         /* W2-W5 idle */
@@ -2875,12 +2883,46 @@ int main(int argc, char **argv) {
     } /* end sect("R.") */
 
     if (sect("U.")) { /* ═══ U. PIPELINED K-LOOP N_STAGES SWEEP ═══ */
-    printf("\n═══ U. Pipelined K-Loop — N_STAGES Sweep (W0=TMA + W1=MMA, K=%d) ═══\n\n",
-           KLOOP_ITERS);
-    {
-        dim3 grid_mw(2), block_mw(MW_THREADS);
 
-        /* Collect MMA-only baselines from Section T kernels */
+    /* Large A/B arrays so TMA loads miss L2 under 74-cluster pressure.
+       A = 192MB (2x L2). B = 768KB (shared, always cached). */
+    const int ua_k = 3072, ua_m = 65536;   /* A = ua_k * ua_m = 192MB */
+    uint8_t *d_A_u, *d_B_u;
+    CUDA_CHECK(cudaMalloc(&d_A_u, (size_t)ua_k * ua_m));
+    CUDA_CHECK(cudaMalloc(&d_B_u, (size_t)ua_k * 256));
+    CUDA_CHECK(cudaMemset(d_A_u, 0x3C, (size_t)ua_k * ua_m));
+    CUDA_CHECK(cudaMemset(d_B_u, 0x3C, (size_t)ua_k * 256));
+
+    CUtensorMap tma_a_u, tma_b_u;
+    {
+        uint64_t dims[2]    = {(uint64_t)ua_k, (uint64_t)ua_m};
+        uint64_t strides[1] = {(uint64_t)ua_k};
+        uint32_t box[2]     = {BENCH_TK, BENCH_TM};
+        uint32_t estrides[2]= {1, 1};
+        CU_CHECK(cuTensorMapEncodeTiled(&tma_a_u,
+            CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (void*)d_A_u,
+            dims, strides, box, estrides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    }
+    {
+        uint64_t dims[2]    = {(uint64_t)ua_k, 256};
+        uint64_t strides[1] = {(uint64_t)ua_k};
+        uint32_t box[2]     = {BENCH_TK, BENCH_TN / 2};
+        uint32_t estrides[2]= {1, 1};
+        CU_CHECK(cuTensorMapEncodeTiled(&tma_b_u,
+            CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (void*)d_B_u,
+            dims, strides, box, estrides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    }
+
+    printf("\n═══ U. Pipelined K-Loop — N_STAGES Sweep (W0=TMA + W1=MMA, K=%d, %d clusters) ═══\n\n",
+           KLOOP_ITERS, MAX_CLUSTERS);
+    {
+        dim3 grid_all(MAX_CLUSTERS * 2), block_mw(MW_THREADS);
+
+        /* MMA-only baselines (1 cluster, compute-only — cluster count doesn't matter) */
         double mma_only[8] = {};
         auto run_base = [&](int nstg, auto kernel_fn, int smem_sz) {
             cur = "U.base";
@@ -2904,9 +2946,13 @@ int main(int argc, char **argv) {
             cur = "U.pipe";
             reset();
             fflush(stdout);
-            kernel_fn<<<grid_mw, block_mw, smem_sz>>>(tma_a, tma_b, d_out);
+            kernel_fn<<<grid_all, block_mw, smem_sz>>>(tma_a_u, tma_b_u, d_out, ua_m);
             sync();
-            double total = (double)h[0] / REPS;
+            /* Mean across all clusters */
+            double sum = 0;
+            for (int i = 0; i < MAX_CLUSTERS; i++)
+                sum += (double)h[i] / REPS;
+            double total = sum / MAX_CLUSTERS;
             double per_iter = total / KLOOP_ITERS;
             double mma_per = mma_only[nstg] / KLOOP_ITERS;
             double overhead = per_iter - mma_per;
@@ -2923,6 +2969,8 @@ int main(int argc, char **argv) {
         run_pipe(6, k_kloop_tma_ns<24,6>, NS_SMEM(6));
         run_pipe(7, k_kloop_tma_ns<24,7>, NS_SMEM(7));
     }
+    CUDA_CHECK(cudaFree(d_A_u));
+    CUDA_CHECK(cudaFree(d_B_u));
     } /* end sect("U.") */
 
     if (!only) { /* Sections S, M: skip if filter set */
