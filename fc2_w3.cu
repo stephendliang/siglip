@@ -1110,9 +1110,12 @@ fc2_w3_kernel(
             mbar_init(smem_to_uint(smem + OFF_TILE_READY_MBAR + i * 8), 32);   /* W0 warp arrives */
 #endif
         }
-        /* Clear epoch slots so CTA1 spin-wait works */
+        /* Clear epoch + bcast slots so CTA1 spin-wait works and
+           LEAN_DISPATCH doesn't read stale TOTAL_TILES from a prior launch */
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH)));
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH + 4)));
+        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_BCAST_TILE)));
+        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_BCAST_TILE + 4)));
 #elif TILE_DISPATCH == 6
         for (int i = 0; i < 2; i++)
             mbar_init(smem_to_uint(smem + OFF_TD6_BCAST_MBAR + i * 8), 32);   /* W0 arrives → W1-W6 wait */
