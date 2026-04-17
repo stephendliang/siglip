@@ -1,0 +1,37 @@
+FC2 W3 kernel — 7 warps (0 idle), shared-SMEM epilogue
+  GEMM: [928256,3072] x [768,3072]^T  6-stage pipeline  SMEM: 231424 bytes  EPI_REUSE=0
+  LOAD: PACKED=1  PRESWIZZLE=0
+  EPI: stages=2  SWS=0  DTS=0  FP32=0  CPP=0
+==PROF== Connected to process 2944 (/root/siglip/fc2-w3-strip)
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=231424 B)
+Launching warmup (2 iters)...
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+  Warmup done.
+Timing: 10 iterations...
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+FC2-W3 kernel: 692.151 ms  6.33 TFLOPS
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 12 passes
+  MISMATCH at (0,0): expected 6912.0 got 0.0 (gemm=6912.0 bias=1.0 res=0.0000)
+  MISMATCH at (29008,47): expected 4704.0 got 0.0 (gemm=4608.0 bias=48.0 res=25.8750)
+  MISMATCH at (58016,94): expected 7040.0 got 0.0 (gemm=6912.0 bias=95.0 res=19.7500)
+  MISMATCH at (87024,141): expected 4768.0 got 0.0 (gemm=4608.0 bias=142.0 res=45.5000)
+  MISMATCH at (116032,188): expected 7136.0 got 0.0 (gemm=6912.0 bias=189.0 res=39.5000)
+Validation: 0/32 spot checks passed — FAILED
+Checksum (1024 strided): 0.000000
+C[0,0..3] = 0.0 0.0 0.0 0.0
+@@RESULT ms=692.151 tflops=6.33 checksum=0.000000 valid=0 c0=0.0
+==PROF== Disconnected from process 2944
+==PROF== Report: /root/siglip/data/ncu_20260417_051819/w3_strip.ncu-rep
