@@ -4,46 +4,57 @@ Hand-tuned SM100a persistent GEMM kernels for FC1 and FC2 layers of `google/sigl
 FP8 (E4M3) inputs, BF16 output, tcgen05 MMA, TMA, `cta_group::2` with 2-CTA clusters.
 Cross-compiled on CPU VPS, runs on B200 (148 SMs, 74 clusters). PE kernel is done — see `CLAUDE.md.mothballed`.
 
-## Current status (B200, 2026-04-14)
+## Current status (B200, 2026-04-17, PACKED_TILES parity)
+
+All runs below use `-DPACKED_TILES` for static and dynamic variants alike. PREFILL no
+longer needs to be disabled for static swizzles (TD=8-16) — they work under the
+default pipeline settings. Numbers come from `./tools/bench.sh --comprehensive`.
 
 ### FC2: [928256, 3072] x [3072, 768]^T + bias + residual
 
-| Variant | ms | TFLOPS | vs CUTLASS |
-|---|---|---|---|
-| **w3_lean (LEAN_DISPATCH)** | **1.058** | **4140** | **-13.5%** |
-| w3_fused (default striding) | 1.109 | 3949 | -9.3% |
-| w3_gemm (GEMM-only) | 1.100 | 3982 | — |
-| w3_sched (TD=4 work-stealing) | 1.133 | 3866 | -7.4% |
-| CUTLASS fused | 1.223 | 3581 | baseline |
-| CUTLASS strip | 1.152 | 3802 | — |
-
-Three-level decomposition (B200, NO_PREFILL for TD=8-12):
-
-| Variant | fused | gemm | strip | fused-gemm | gemm-strip |
+| Variant | fused | gemm | strip | f-g | g-s |
 |---|---|---|---|---|---|
-| **lean** | **1.058** | **1.033** | **0.991** | 25us | 42us |
-| fused (striding) | 1.109 | 1.100 | 1.043 | 9us | 57us |
-| sched (TD=4) | 1.133 | 1.107 | 0.992 | 26us | 115us |
-| dgswizzle (TD=8) | 1.118 | 1.090 | 0.989 | 28us | 101us |
-| zorder (TD=9) | 1.121 | 1.104 | 0.988 | 17us | 116us |
-| hilbert (TD=10) | 1.126 | 1.094 | 0.989 | 32us | 105us |
-| zigzag (TD=11) | 1.115 | 1.103 | 0.987 | 12us | 116us |
-| CUTLASS (CLC) | 1.223 | — | 1.152 | 71us | — |
+| **default (stride)** | **1.071** | 1.073 | 1.026 | -0.002 | 0.047 |
+| rowmajor | 1.071 | 1.074 | 0.988 | -0.003 | 0.086 |
+| zigzag (TD=11) | 1.073 | 1.073 | 0.988 | 0.000 | 0.085 |
+| zorder (TD=9) | 1.082 | 1.071 | 0.988 | 0.011 | 0.083 |
+| dgswizzle (TD=8) | 1.065 | 1.053 | 0.989 | 0.012 | 0.064 |
+| hilbert (TD=10) | 1.089 | 1.067 | 0.989 | 0.022 | 0.078 |
+| sched (TD=4) | 1.101 | 1.083 | 0.994 | 0.018 | 0.089 |
+| tail | 1.102 | 1.086 | 0.993 | 0.016 | 0.093 |
+| tail-lean | 1.106 | 1.093 | 0.993 | 0.013 | 0.100 |
+| lean (LEAN_DISPATCH) | 1.107 | 1.093 | 0.994 | 0.014 | 0.099 |
+| ncycle / nsnake | 1.226 | 1.200 | 1.024 | 0.026 | 0.175 |
+| nflat | 1.205 | 1.168 | 1.021 | 0.037 | 0.147 |
+| rowsteal | 1.242 | 1.213 | 1.037 | 0.029 | 0.176 |
 
-Strip floor: all work-stealing/static modes converge at ~0.99ms (= MMA compute floor). Default striding is 1.043ms due to 1.13x DRAM read amplification affecting A+B TMA loads. gemm-strip gap (TMA store cost): LEAN 42us vs sched/static 101-116us — LEAN's mbarrier-free dispatch lets epilogue warps start TMA stores earlier, spreading write traffic.
+Static swizzles with PACKED_TILES (default/rowmajor/zigzag/zorder/dgswizzle) now
+beat LEAN by ~30us. Work-stealing (sched/lean/tail/tail-lean) all cluster around
+1.10ms. Strip floor for the fast group is 0.988ms; default's 1.026ms strip is an
+outlier worth investigating.
 
 ### FC1: [928256, 768] x [768, 3072]^T + bias + GELU
 
-| Variant | ms | vs sched |
-|---|---|---|
-| lean fused | 2.037 | -12us (-0.6%) |
-| lean gemm | 1.938 | -38us (-1.9%) |
-| lean strip | 1.410 | 0 |
-| sched fused | 2.049 | baseline |
-| sched gemm | 1.976 | — |
-| sched strip | 1.410 | — |
+| Variant | fused | gemm | strip | f-g | g-s |
+|---|---|---|---|---|---|
+| zigzag (TD=11) | 2.024 | 1.894 | 1.382 | 0.130 | 0.512 |
+| rowmajor | 2.027 | 1.894 | 1.383 | 0.133 | 0.511 |
+| nflat | 2.035 | 1.721 | 1.339 | 0.314 | 0.382 |
+| nsnake | 2.035 | 2.042 | 1.336 | -0.007 | 0.706 |
+| ncycle | 2.033 | 2.039 | 1.339 | -0.006 | 0.700 |
+| sched | 2.076 | 1.854 | 1.411 | 0.222 | 0.443 |
+| lean | 2.075 | 1.832 | 1.410 | 0.243 | 0.422 |
+| default | 2.094 | 1.875 | 1.380 | 0.219 | 0.495 |
+| dgswizzle | 2.093 | 1.659 | 1.378 | 0.434 | 0.281 |
+| zorder | 2.089 | 1.740 | 1.362 | 0.349 | 0.378 |
+| hilbert | 2.257 | 1.694 | 1.435 | 0.563 | 0.259 |
 
-FC1 bottleneck is write bandwidth: 528us gemm-strip gap = 5.7GB TMA stores at DRAM speed. K_ITERS=6 (K=768/128) forces NO_PREFILL (FORCE_PREFILL deadlocks). LEAN gains are modest because dispatch overhead is small relative to FC1's long epilogue.
+FC1 dispatch matters more than FC2: dgswizzle's gemm 1.659ms vs default 1.875ms is
+a 216us gap. zigzag/rowmajor have the fastest fused (2.024ms) despite mediocre gemm
+— they overlap mainloop and epilogue differently. ncycle/nsnake show f-g ≈ 0
+(fused == gemm), meaning those variants get no epilogue/mainloop overlap at all.
+Strip floor spread is 100us (1.336 nsnake → 1.435 hilbert), so tile order affects
+even the GEMM compute ceiling for FC1.
 
 ## Tile dispatch: why LEAN wins
 
