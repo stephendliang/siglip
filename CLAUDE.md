@@ -79,15 +79,36 @@ Only W0 lane 0 arrives tile_ready_mbar (count=1), and only W1 waits it. The mbar
 
 1.058ms FC2, 4.28GB DRAM = 1.00x, 67us fused overhead (vs striding's 66us, work-stealing's 141us).
 
-### Dispatch hierarchy summary
+### Dispatch hierarchy summary — UNDER REVISION (2026-04-17)
+
+Prior thesis claimed "LEAN wins by eliminating DRAM amplification." The 2026-04-17 ncu run with PACKED_TILES parity between static and dynamic variants undermines this:
+
+| Variant | ms | DRAM amp | long_scoreboard | barrier |
+|---|---|---|---|---|
+| w3_fused (stride) | 1.070 | 1.59× | 2.17M | 274K |
+| **w3_dgswizzle** | **1.074** | 1.32× | **2.04M** | 268K |
+| w3_sched (TD=4) | 1.101 | 1.00× | 2.67M | 45K |
+| w3_lean (LEAN) | 1.107 | 1.00× | 2.67M | 44K |
+| w3_tail | 1.101 | 1.21× | 2.72M | 45K |
+
+Dynamic (sched/lean/tail) have the lowest DRAM read bytes *and* the highest memory stalls. Static dgswizzle has 1.32× amplification but 630K fewer long_scoreboard stalls and beats LEAN by ~30us wall-clock. LEAN's mbarrier removal (barrier 44K vs 268K) is real but lands on a non-bottleneck.
+
+**Possible interpretations** (none confirmed — single run, within variance for some rows):
+- Predictable tile order (static swizzles) lets L2 prefetch / TMA pipeline stay ahead; counter-driven order produces unpredictable arrivals.
+- PACKED_TILES physical reordering makes "amplified" per-tile reads L2-hot anyway, so byte-count no longer predicts stall count.
+- Historical data (CLAUDE.md tables pre-2026-04-17) compared static *without* PACKED_TILES vs dynamic *with* implicit good-order atomics — not apples-to-apples.
+
+**Status:** need ≥3 reps of the full suite (fc2_cutlass_vs_w3.sh now includes hilbert/zorder/zigzag under PACKED_TILES) before overturning the LEAN thesis. Do not assume any ordering is stable until variance is characterized.
+
+Old hierarchy table (pre-PACKED_TILES parity):
 
 | Approach | DRAM amplification | Dispatch overhead | Best for |
 |---|---|---|---|
 | Contiguous | catastrophic | zero | nothing |
 | Striding | 1.13x (L2 capacity) | zero | K<=3072 (NS6 hides) |
-| Static curves (TD=8-11) | 1.13x | zero | nothing (same as striding) |
-| Work-stealing (TD=4) | 1.00x | 34us (mbar) | K>=5120 |
-| **LEAN (TD=4+LEAN)** | **1.00x** | **~9us** | **all K** |
+| Static curves (TD=8-11) | 1.13x | zero | previously claimed "same as striding" — disputed |
+| Work-stealing (TD=4) | 1.00x | 34us (mbar) | previously claimed "K>=5120" — K-crossover not re-tested under parity |
+| LEAN (TD=4+LEAN) | 1.00x | ~9us | previously claimed "all K" — disputed |
 
 ### Other dispatch variants tried (all dead)
 
@@ -97,7 +118,7 @@ Only W0 lane 0 arrives tile_ready_mbar (count=1), and only W1 waits it. The mbar
 - **TD=7 inline atomic in K-loop**: atomicAdd at ki=0. 1.257ms — disrupts W0's TMA pipeline (+41% tma_issue). Proves W0's K-loop is memory-pipeline-sensitive; ANY global memory op degrades TMA throughput.
 - **COL_LOCK**: Column-locked dispatch (fixed tn, dynamic M-row). 1.137ms — TMA penalty is inherent to the W7 mbarrier path, not tile ordering. Strip 62us slower than sched (load imbalance: 74 clusters / 3 cols = 25/25/24).
 - **Tile reordering (striding variants)**: N-batch (+12% regression), phase-offset N-batch (+6-11%), Group-3 (neutral). Static dispatch can't match work-stealing's L2 efficiency.
-- **Space-filling curves (TD=9-12)**: Z-order/Morton (1.121ms), Hilbert (1.126ms), zigzag-N (1.115ms), column-first (1.707ms DEAD). All static modes cluster at ~1.11-1.13ms fused with identical strip floor (~0.99ms). Tile ordering doesn't matter — 1.13x DRAM amplification is a capacity problem from 74 clusters, not traversal order. Column-first catastrophically bad: all clusters hit same N-column → TMA store contention + enormous A-tile L2 working set.
+- **Space-filling curves (TD=9-12)**: Z-order/Morton, Hilbert, zigzag-N, column-first (1.707ms DEAD, catastrophic: all clusters hit same N-column → TMA store contention + enormous A-tile L2 working set). Pre-2026-04-17 numbers (no PACKED_TILES) put these at 1.11-1.13ms. **Under PACKED_TILES parity (2026-04-17) dgswizzle landed at 1.074ms — tied with stride, ~30us under LEAN — so the "tile ordering doesn't matter" conclusion is under review.** hilbert/zorder/zigzag under PACKED_TILES not yet measured head-to-head.
 - **L2 cache hints**: EVICT_FIRST/LAST/NORMAL on TMA loads. Zero effect — amplification is a capacity problem, not eviction policy.
 
 ## Pipeline depth: why NS6 matters
@@ -177,7 +198,7 @@ At K=3072, NS6 pipeline depth = 25% of K-loop, hiding DRAM latency effectively. 
 |---|---|---|
 | N_STAGES | NS6 for N<=1536, NS5 for N>1536 | SMEM per stage grows with N |
 | PREFILL | On for K_ITERS>=20, off otherwise | Short K-loop deadlocks (parity wrap) |
-| Dispatch | LEAN everywhere | Zero amplification + minimal overhead |
+| Dispatch | **UNSETTLED (2026-04-17)** | LEAN previously claimed best; one PACKED_TILES ncu run had stride/dgswizzle ~30us ahead of LEAN. Needs reps. |
 
 ## Dead ends — do NOT retry
 
