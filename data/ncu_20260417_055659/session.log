@@ -1,0 +1,175 @@
+[05:56:59] ========================================
+[05:56:59]   FC2 NCU DIAGNOSIS v4  20260417_055659
+[05:56:59]   Output: data/ncu_20260417_055659
+[05:56:59] ========================================
+NVIDIA B200, 120 MHz
+[05:56:59] 
+[05:56:59] ── Phase 1: Building binaries ──
+[05:56:59]   [w3_strip] make -B fc2-w3 DFLAGS='-DPACKED_TILES -DSTRIP_EPILOGUE'
+[05:57:01]   [w3_strip] copied fc2-w3 -> fc2-w3-strip
+[05:57:01]   [w3_strip] built (regs=48, bars=1)
+[05:57:01]   [w3_gemm] make -B fc2-w3-gemm DFLAGS=-DPACKED_TILES
+[05:57:02]   [w3_gemm] built (regs=111, bars=2)
+[05:57:02]   [w3_fused] make -B fc2-w3-packed
+[05:57:04]   [w3_fused] built (regs=126, bars=2)
+[05:57:04]   [w3_lean] make -B fc2-w3-packed-lean
+[05:57:06]   [w3_lean] built (regs=164, bars=2)
+[05:57:06]   [w3_sched] make -B fc2-w3-sched DFLAGS=-DPACKED_TILES
+[05:57:08]   [w3_sched] built (regs=164, bars=2)
+[05:57:08]   [w3_rowsteal] make -B fc2-w3-rowsteal DFLAGS=-DPACKED_TILES
+[05:57:10]   [w3_rowsteal] built (regs=164, bars=2)
+[05:57:10]   [w3_tail] make -B fc2-w3-tail DFLAGS=-DPACKED_TILES
+[05:57:12]   [w3_tail] built (regs=165, bars=2)
+[05:57:12]   [w3_tail_lean] make -B fc2-w3-tail-lean DFLAGS=-DPACKED_TILES
+[05:57:14]   [w3_tail_lean] built (regs=164, bars=2)
+[05:57:14]   [w3_dgswizzle] make -B fc2-w3-dgswizzle DFLAGS='-DPACKED_TILES -DNO_PREFILL'
+[05:57:16]   [w3_dgswizzle] built (regs=117, bars=2)
+[05:57:16]   [w3_zorder] make -B fc2-w3-zorder DFLAGS='-DPACKED_TILES -DNO_PREFILL'
+[05:57:17]   [w3_zorder] built (regs=117, bars=2)
+[05:57:17]   [w3_hilbert] make -B fc2-w3-hilbert DFLAGS='-DPACKED_TILES -DNO_PREFILL'
+[05:57:19]   [w3_hilbert] built (regs=118, bars=2)
+[05:57:19]   [w3_zigzag] make -B fc2-w3-zigzag DFLAGS='-DPACKED_TILES -DNO_PREFILL'
+[05:57:21]   [w3_zigzag] built (regs=117, bars=2)
+[05:57:21]   [cutlass_strip] make fc2-cutlass-strip
+[05:57:52]   [cutlass_strip] built (regs=16, bars=0)
+[05:57:52]   [cutlass_fused] make fc2-cutlass
+[05:58:24]   [cutlass_fused] built (regs=16, bars=0)
+[05:58:24]   [cublas_gemm] make -B cublas-bench-fc2-ncu
+[05:58:26]   [cublas_gemm] built (regs=12, bars=0)
+[05:58:26] 
+[05:58:26] ── Phase 2: Wall time sanity checks ──
+[05:58:27]   [w3_strip] 1.028ms  4261.95 TFLOPS  valid=0
+[05:58:29]   [w3_gemm] 1.074ms  4079.74 TFLOPS  valid=1
+[05:58:30]   [w3_fused] 1.070ms  4092.34 TFLOPS  valid=1
+[05:58:32]   [w3_lean] 1.107ms  3955.44 TFLOPS  valid=1
+[05:58:33]   [w3_sched] 1.101ms  3978.66 TFLOPS  valid=1
+[05:58:35]   [w3_rowsteal] 1.244ms  3520.57 TFLOPS  valid=1
+[05:58:36]   [w3_tail] 1.100ms  3980.10 TFLOPS  valid=1
+[05:58:38]   [w3_tail_lean] 1.105ms  3962.78 TFLOPS  valid=1
+[05:58:39]   [w3_dgswizzle] 1.074ms  4076.75 TFLOPS  valid=1
+[05:58:41]   [w3_zorder] 1.085ms  4038.01 TFLOPS  valid=1
+[05:58:42]   [w3_hilbert] 1.097ms  3994.38 TFLOPS  valid=1
+[05:58:44]   [w3_zigzag] 1.076ms  4071.56 TFLOPS  valid=1
+[05:58:45]   [cutlass_strip] 1.151ms  3804.10 TFLOPS  valid=1
+[05:58:47]   [cutlass_fused] 1.224ms  3577.16 TFLOPS  valid=1
+[05:58:48]   [cublas_gemm] 1.102ms  3974.94 TFLOPS  valid=0
+[05:58:48] 
+[05:58:48] ── Phase 3: Targeted ncu metric collection ──
+[05:58:48]   [w3_strip] collecting ncu metrics...
+[05:59:00]   [w3_strip] ncu done (495 CSV lines)
+[05:59:00]   [w3_gemm] collecting ncu metrics...
+[05:59:12]   [w3_gemm] ncu done (495 CSV lines)
+[05:59:12]   [w3_fused] collecting ncu metrics...
+[05:59:24]   [w3_fused] ncu done (495 CSV lines)
+[05:59:24]   [w3_lean] collecting ncu metrics...
+[05:59:36]   [w3_lean] ncu done (495 CSV lines)
+[05:59:36]   [w3_sched] collecting ncu metrics...
+[05:59:48]   [w3_sched] ncu done (495 CSV lines)
+[05:59:48]   [w3_rowsteal] collecting ncu metrics...
+[06:00:00]   [w3_rowsteal] ncu done (495 CSV lines)
+[06:00:00]   [w3_tail] collecting ncu metrics...
+[06:00:12]   [w3_tail] ncu done (495 CSV lines)
+[06:00:12]   [w3_tail_lean] collecting ncu metrics...
+[06:00:24]   [w3_tail_lean] ncu done (495 CSV lines)
+[06:00:24]   [w3_dgswizzle] collecting ncu metrics...
+[06:00:37]   [w3_dgswizzle] ncu done (495 CSV lines)
+[06:00:37]   [w3_zorder] collecting ncu metrics...
+[06:00:49]   [w3_zorder] ncu done (495 CSV lines)
+[06:00:49]   [w3_hilbert] collecting ncu metrics...
+[06:01:01]   [w3_hilbert] ncu done (495 CSV lines)
+[06:01:01]   [w3_zigzag] collecting ncu metrics...
+[06:01:13]   [w3_zigzag] ncu done (495 CSV lines)
+[06:01:13]   [cutlass_strip] collecting ncu metrics...
+[06:01:25]   [cutlass_strip] ncu done (495 CSV lines)
+[06:01:25]   [cutlass_fused] collecting ncu metrics...
+[06:01:37]   [cutlass_fused] ncu done (495 CSV lines)
+[06:01:37]   [cublas_gemm] collecting ncu metrics...
+[06:01:40]   [cublas_gemm] ncu done (39 CSV lines)
+[06:01:40] 
+[06:01:40] ── Phase 4: Metric diffs ──
+[06:01:40]   diff_q1_w3: w3_gemm.csv vs w3_fused.csv
+[06:01:40]   diff_q1_cutlass: cutlass_strip.csv vs cutlass_fused.csv
+[06:01:40]   diff_q2_lean_vs_cutlass: w3_lean.csv vs cutlass_fused.csv
+[06:01:40]   diff_q3_gemm: w3_gemm.csv vs cutlass_strip.csv
+[06:01:40]   diff_q3_cublas: w3_gemm.csv vs cublas_gemm.csv
+[06:01:40]   diff_q5_lean_vs_fused: w3_lean.csv vs w3_fused.csv
+[06:01:40]   diff_q5_dgswizzle_vs_fused: w3_dgswizzle.csv vs w3_fused.csv
+[06:01:40]   diff_q5_dgswizzle_vs_lean: w3_dgswizzle.csv vs w3_lean.csv
+[06:01:41]   diff_q6_output_cost: w3_strip.csv vs w3_gemm.csv
+[06:01:41] 
+[06:01:41] ── Phase 5: Summary table ──
+metric                          w3_strip           w3_gemm          w3_fused           w3_lean          w3_sched       w3_rowsteal           w3_tail      w3_tail_lean      w3_dgswizzle         w3_zorder        w3_hilbert         w3_zigzag     cutlass_strip     cutlass_fused       cublas_gemm
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+long_scoreboard                    2.51M             2.42M             2.15M             2.67M             2.67M             2.76M             2.73M             2.71M             2.04M             2.04M             2.09M             2.14M             2.42M             2.72M             2.26M
+short_scoreboard                    1.4K             26.3K            164.4K            216.2K            202.6K            201.9K            201.4K            213.0K            186.3K            177.9K            176.2K            172.6K             30.4K            134.8K            205.7K
+wait                              263.6K            332.2K            384.5K            404.1K            400.6K            395.4K            399.7K            403.1K            401.3K            422.7K            419.0K            387.8K            141.0K            228.1K            188.3K
+barrier                           224.8K            281.2K            273.0K             44.8K             44.9K             45.2K             44.6K             44.8K            268.2K            268.0K            271.0K            272.7K             92.7K             31.2K             64.8K
+sleeping                           13.9K             24.2K             22.0K              3.8K              3.9K              5.0K              5.0K              4.9K             18.6K             17.8K             17.8K             20.8K              0.00              0.00            227.26
+not_selected                      632.97              4.2K              6.7K              7.2K              7.4K              7.4K              7.3K              7.1K              7.8K              7.5K              8.8K              7.2K             25.9K             21.9K              4.8K
+mio_throttle                       17.77             17.62             17.72             23.30             24.46             24.28             23.74             24.05             17.75             17.73             63.98             17.72              2.2K              3.7K              3.5K
+math_throttle                     237.02              2.4K              2.2K              2.3K              2.3K              2.4K              2.3K              2.3K              2.9K              2.7K              3.5K              2.7K            576.70              2.6K             28.0K
+dram_read_bytes                    5.23G             4.27G             6.74G             4.28G             4.28G             4.90G             5.07G             5.14G             5.53G             5.99G             5.85G             6.32G             2.85G             4.28G             2.94G
+dram_write_bytes                  12.07M             1.42G             1.43G             1.42G             1.43G             1.44G             1.44G             1.43G             1.42G             1.42G             1.45G             1.42G             1.40G             1.40G             1.40G
+dram_read_sectors                163.57M           133.33M           210.73M           133.78M           133.77M           153.23M           158.35M           160.52M           172.73M           187.32M           182.76M           197.42M            89.19M           133.75M            91.98M
+dram_write_sectors                377.1K            44.42M            44.57M            44.32M            44.61M            44.88M            45.03M            44.66M            44.38M            44.47M            45.44M            44.48M            43.73M            43.83M            43.79M
+dram_pct                           38.18             39.54             57.01             42.64             42.95             46.75             46.66             46.93             51.09             53.93             52.28             55.98             31.09             40.99             30.97
+lts_pct                            58.49             65.76             71.75             70.62             71.27             74.29             73.12             72.84             67.13             73.22             72.56             72.19             64.33             68.06             63.88
+lts_sectors                      552.38M           688.21M           748.08M           688.74M           682.26M           705.61M           745.04M           743.02M           675.55M           736.46M           775.03M           738.54M           619.75M           683.97M           650.76M
+lts_read_sectors                 551.39M           620.15M           679.90M           617.28M           610.15M           635.23M           672.78M           671.45M           607.42M           668.37M           681.53M           670.47M           552.67M           616.70M           583.26M
+lts_write_sectors                 666.6K            67.51M            67.51M            67.97M            68.61M            68.62M            68.63M            67.97M            67.55M            67.54M            92.97M            67.54M            66.83M            66.83M            66.84M
+lts_hit_rate                       48.06             56.81             45.85             56.66             56.02             57.38             54.51             53.97             48.82             49.96             52.05             47.44             64.05             56.42             62.67
+l1tex_pct                          46.70             44.43             48.77             52.34             52.68             51.53             50.06             50.01             51.30             50.69             49.98             50.32             52.25             54.15             51.98
+sm_pct                             93.40             89.73             90.92             97.31             97.80             96.06             93.29             93.21             94.98             94.16             93.14             93.70             95.36             94.63             93.40
+shared_pct                         93.39             88.87             90.04             96.61             97.24             95.13             92.40             92.31             94.71             93.58             92.28             92.90             94.05             93.06             91.68
+warps_active                        7.00              7.00              7.00              7.98              7.98              7.98              7.98              7.98              7.00              7.00              7.00              7.00              6.50              7.50              6.00
+cycles_active                      1.81M             1.90M             1.89M             1.86M             1.85M             1.87M             1.88M             1.88M             1.83M             1.86M             1.89M             1.87M             1.91M             1.93M             1.96M
+inst_executed                     44.05M            70.34M           101.91M           107.97M           108.59M           107.92M           108.44M           107.82M           106.15M           109.28M           113.21M           103.33M           141.73M           163.09M            89.72M
+warps_eligible                      0.04              0.07              0.10              0.10              0.10              0.10              0.10              0.10              0.10              0.10              0.11              0.10              0.14              0.15              0.08
+regs_per_thread                    48.00            111.00            126.00            164.00            164.00            164.00            165.00            164.00            117.00            117.00            118.00            117.00            186.00            252.00            255.00
+occupancy                            n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a
+smem_wavefronts                    88.3K            17.66M            47.67M            49.87M            50.03M            50.76M            50.23M            50.09M            49.78M            49.51M            48.74M            48.43M            19.91M            60.24M            18.07M
+smem_ld_wf                          2.0K              2.0K            26.90M            33.03M            32.82M            31.83M            32.01M            32.14M            29.42M            27.98M            25.76M            28.18M            429.3K            37.75M            450.9K
+smem_st_wf                          2.5K            16.45M            19.57M            14.87M            15.40M            17.08M            16.50M            16.17M            18.92M            19.82M            21.37M            18.81M            16.44M            19.01M            16.65M
+global_ld_wf                         n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a
+tma_read_reqs                        n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a
+tma_write_reqs                       n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a
+tma_read_bytes                       n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a
+tma_write_bytes                      n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a               n/a
+
+================================================================================
+DRAM AMPLIFICATION ANALYSIS
+================================================================================
+Theoretical minimum DRAM (FC2 928256x3072x768):
+  Read:  4.280 GB (A:FP8 + B:FP8 + residual:BF16 + bias:BF16)
+  Write: 1.426 GB (output:BF16)
+
+  w3_strip            : read=5.230GB (1.22x)  write=0.012GB (0.01x)
+  w3_gemm             : read=4.270GB (1.00x)  write=1.420GB (1.00x)
+  w3_fused            : read=6.740GB (1.57x)  write=1.430GB (1.00x)
+  w3_lean             : read=4.280GB (1.00x)  write=1.420GB (1.00x)
+  w3_sched            : read=4.280GB (1.00x)  write=1.430GB (1.00x)
+  w3_rowsteal         : read=4.900GB (1.14x)  write=1.440GB (1.01x)
+  w3_tail             : read=5.070GB (1.18x)  write=1.440GB (1.01x)
+  w3_tail_lean        : read=5.140GB (1.20x)  write=1.430GB (1.00x)
+  w3_dgswizzle        : read=5.530GB (1.29x)  write=1.420GB (1.00x)
+  w3_zorder           : read=5.990GB (1.40x)  write=1.420GB (1.00x)
+  w3_hilbert          : read=5.850GB (1.37x)  write=1.450GB (1.02x)
+  w3_zigzag           : read=6.320GB (1.48x)  write=1.420GB (1.00x)
+  cutlass_strip       : read=2.850GB (0.67x)  write=1.400GB (0.98x)
+  cutlass_fused       : read=4.280GB (1.00x)  write=1.400GB (0.98x)
+  cublas_gemm         : read=2.940GB (0.69x)  write=1.400GB (0.98x)
+[06:01:41] 
+[06:01:41] ════════════════════════════════════════
+[06:01:41]   DONE
+[06:01:41] ════════════════════════════════════════
+[06:01:41] 
+[06:01:41] Key outputs:
+[06:01:41]   data/ncu_20260417_055659/results.txt       — wall times
+[06:01:41]   data/ncu_20260417_055659/summary.txt       — all metrics side-by-side + DRAM amplification
+[06:01:41]   data/ncu_20260417_055659/diff_q1*.txt      — Q1: fusion cost (fused - gemm/strip)
+[06:01:41]   data/ncu_20260417_055659/diff_q2*.txt      — Q2: lean vs CUTLASS fused
+[06:01:41]   data/ncu_20260417_055659/diff_q3*.txt      — Q3: GEMM comparison (w3_gemm vs cutlass_strip, cuBLAS)
+[06:01:41]   data/ncu_20260417_055659/diff_q5*.txt      — Q5: dispatch comparison (lean vs striding vs dgswizzle)
+[06:01:41]   data/ncu_20260417_055659/diff_q6*.txt      — Q6: output write cost (w3_strip vs w3_gemm)
+[06:01:41] 
+[06:01:41] Analysis: python3 tools/ncu_anova.py data/ncu_20260417_055659

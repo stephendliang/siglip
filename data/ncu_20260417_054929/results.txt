@@ -1,0 +1,15 @@
+@@RESULT ms=1.028 tflops=4262.49 checksum=0.000000 valid=0 c0=0.0 label=w3_strip
+@@RESULT ms=1.073 tflops=4082.65 checksum=7077888.000000 valid=1 c0=6912.0 label=w3_gemm
+@@RESULT ms=1.071 tflops=4091.58 checksum=7461504.000000 valid=1 c0=6912.0 label=w3_fused
+@@RESULT ms=1.107 tflops=3955.32 checksum=7461504.000000 valid=1 c0=6912.0 label=w3_lean
+@@RESULT ms=1.101 tflops=3978.74 checksum=7461504.000000 valid=1 c0=6912.0 label=w3_sched
+@@RESULT ms=1.242 tflops=3527.06 checksum=7461504.000000 valid=1 c0=6912.0 label=w3_rowsteal
+@@RESULT ms=1.101 tflops=3979.77 checksum=7461504.000000 valid=1 c0=6912.0 label=w3_tail
+@@RESULT ms=1.105 tflops=3963.56 checksum=7461504.000000 valid=1 c0=6912.0 label=w3_tail_lean
+@@RESULT ms=1.074 tflops=4078.42 checksum=7461504.000000 valid=1 c0=6912.0 label=w3_dgswizzle
+@@RESULT ms=1.085 tflops=4037.79 checksum=7461504.000000 valid=1 c0=6912.0 label=w3_zorder
+@@RESULT ms=1.096 tflops=3995.48 checksum=7461504.000000 valid=1 c0=6912.0 label=w3_hilbert
+@@RESULT ms=1.075 tflops=4073.48 checksum=7461504.000000 valid=1 c0=6912.0 label=w3_zigzag
+@@RESULT ms=1.153 tflops=3799.99 checksum=7077888.000000 valid=1 c0=6912.0 label=cutlass_strip
+@@RESULT ms=1.225 tflops=3575.93 checksum=7316096.000000 valid=1 c0=6912.0 label=cutlass_fused
+@@RESULT ms=1.101 tflops=3978.52 checksum=0.000000 valid=0 c0=0.0 label=cublas_gemm
