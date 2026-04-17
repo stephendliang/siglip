@@ -1,49 +1,41 @@
 /*
-FC2 W3 Cluster-of-4 — simplified independent-pair baseline.
+FC2 W3 Cluster-of-4 — A-multicast super-tile scheduler.
 
-Design
+Geometry
   Cluster = 4 CTAs (37 clusters × 4 = 148 SMs).
   Pair 0 = {CTA0, CTA1}, pair 1 = {CTA2, CTA3}.
-  Each pair is a fully independent cluster-of-2 worker: no cross-pair
-  SMEM sharing, no shared-B multicast, no pair-stealing scheduler.
-  Same math and same data traffic as 74 clusters-of-2; this kernel only
-  proves the cluster-of-4 launch + intra-pair DSMEM/mbar wiring works.
-  Shared-B / pair-stealing can be layered on top later.
+  Pair MMA = cta_group::2, mask = 0x3 (pair0) / 0xC (pair1).
+  A-multicast mask = 0x5 (top half: CTA0,CTA2) / 0xA (bot half: CTA1,CTA3).
 
-Dispatch: striding.
-  pair_global_id = cluster_id * 2 + pair_id  ∈ [0, 74)
-  NUM_PAIR_WORKERS = 2 * (SM_COUNT / 4) = 74
-  tile_idx = pair_global_id + _ti * NUM_PAIR_WORKERS, loop until it exceeds
-  TOTAL_TILES.  No atomic counter, no scheduler warp.
-
-Warps (8 per CTA)
-  W0  TMA A/B loads (both pair CTAs run W0)
-  W1  MMA (pair leader only; partner's W1 idle)
-  W2  epilogue residual load (both pair CTAs)
-  W3-W6 epilogue compute + TMA stores (both pair CTAs)
-  W7  idle
+Super-tile scheduler
+  A super-tile = 2 consecutive tiles in linear (tm, tn) space.
+    pair 0 processes tile lo = super_tile_idx*2
+    pair 1 processes tile hi = super_tile_idx*2 + 1
+  SHARED iff tm(lo) == tm(hi) — both pairs work same M pair-row, different
+  N.  With TILES_N=3 the pattern over 3 super-tiles is {SHARED, SHARED,
+  SPLIT}, so 2/3 of A-loads are multicast-capable.
+  Striding across clusters: super_tile_idx = cluster_id + _sti * NUM_CLUSTERS.
 
 TMA
-  Each pair CTA issues cp.async.bulk.tensor.2d...cta_group::2 for
-  its own A M-row slice and B N-column slice into OWN SMEM.  mbar
-  target = pair leader's tma_mbar (address routed via mapa.shared::
-  cluster.u32 to pair_leader_rank).  Count = 2 — both pair CTAs
-  arrive.  Only pair leader's W1 waits.
+  SHARED: pair0 issues two cta_group::2 + multicast::cluster A loads.
+    CTA_0 top-A mask=0x5, CTA_1 bot-A mask=0xA.  Bytes → CTA_0+CTA_2 SMEM
+    (top) and CTA_1+CTA_3 SMEM (bot).  mbar (peer-bit cleared) routes tx
+    bytes to pair-leader mbar of each destination pair.  All 4 CTAs issue
+    own B via cta_group::2 for their pair's N-tile + pair_lane half.
+  SPLIT: all 4 CTAs issue own A + own B via cta_group::2 (no multicast).
 
-MMA
-  Pair leader's W1 issues tcgen05.mma.cta_group::2.kind::f8f6f4 using
-  own SMEM descriptors.  HW pulls partner's SMEM at same offset to
-  complete the pair-tile (128 M × 256 N per MMA).
+Warps (8 per CTA)
+  W0  TMA A/B loads (branches on SHARED vs SPLIT)
+  W1  MMA (pair leader only: pair_lane==0, i.e. CTA0 and CTA2)
+  W2  epilogue residual load (all CTAs; per-pair tile)
+  W3-W6 epilogue compute + TMA stores
+  W7  idle
 
-Commits
-  tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster
-  .multicast::cluster with pair_mcast_mask (0x3 for pair 0, 0xC for
-  pair 1) arrives BOTH pair CTAs' local mbars.
-
-Epilogue mbar (count = (NUM_EPI_WARPS+1)*2*32 = 320)
-  Hosted on pair leader.  5 warps × 2 pair CTAs × 32 threads arrive
-  via shared::cluster.  Pair leader's W1 waits each iter before the
-  next MMA (NO_PREFILL only — keeps termination simple).
+Mbar
+  tma_mbar[s]    count=2 on pair leader, 2*TMA_BYTES tx
+  mma_mbar[s]    count=1 per CTA, signaled by pair-mcast MMA commit
+  mainloop_mbar  count=1 per CTA, signaled by final pair-mcast commit
+  epilogue_mbar  count=320 on pair leader, arrived by 5 warps × 2 CTAs × 32
 
 Build
   make fc2-w3-c4                          # default: BF16 full fused
@@ -75,13 +67,13 @@ Build
 #define TILES_M  ((M_TOTAL + TM * 2 - 1) / (TM * 2))
 #define TILES_N  (N_DIM / TN)
 #define TOTAL_TILES (TILES_M * TILES_N)
+#define SUPER_TILES ((TOTAL_TILES + 1) / 2)
 #define K_ITERS  (K_DIM / TK)
 #define MMA_K    32
 #define MMA_PER_KI (TK / MMA_K)
 
 #define CTAS_PER_CLUSTER 4
 #define NUM_CLUSTERS (SM_COUNT / CTAS_PER_CLUSTER)
-#define NUM_PAIR_WORKERS (NUM_CLUSTERS * 2)
 
 #ifndef N_STAGES
 #define N_STAGES 6
@@ -115,6 +107,8 @@ Build
 #define IDESC     0x10400010U
 #define SBO       1024
 #define BAR_EPI_SYNC "bar.sync 1, 128;"
+
+#define SM100_PEER_BIT_MASK 0xFEFFFFFFu
 
 #define _UNROLL_STR2(x) #x
 #define _UNROLL_STR(x)  _UNROLL_STR2(unroll x)
@@ -319,19 +313,19 @@ fc2_w3_c4_kernel(
     const int pair_id    = cta_rank >> 1;
     const int pair_lane  = cta_rank & 1;
     const int pair_leader_rank = pair_id << 1;
-    const int pair_global_id   = cluster_id * 2 + pair_id;
     const int tid  = threadIdx.x;
     const int warp = tid / 32;
     const int lane = tid % 32;
     (void)C; (void)residual;
 
-    const uint16_t pair_mcast_mask = (pair_id == 0) ? (uint16_t)0x0003 : (uint16_t)0x000C;
+    const uint16_t pair_mmacast_mask = (pair_id == 0) ? (uint16_t)0x0003 : (uint16_t)0x000C;
+    const uint16_t a_mcast_mask      = (pair_lane == 0) ? (uint16_t)0x0005 : (uint16_t)0x000A;
 
     /*── Mbar init ──
-       All mbars init'd on every CTA.  For pair-shared mbars (tma, epi) only
-       pair leader's copy is actually used; partner's copy exists but is never
-       arrived/waited.  Local-per-CTA mbars (mma, mainloop, load/consumed) are
-       all used on every CTA.                                                 */
+       tma_mbar  count=2 on pair leader (A+B bytes from both pair CTAs)
+       mma_mbar  count=1 local (signaled by pair-mcast commit)
+       mainloop  count=1 local (signaled by final pair-mcast commit)
+       epilogue  count=(NUM_EPI_WARPS+1)*2*32 on pair leader                   */
     if (tid == 0) {
         for (int s = 0; s < N_STAGES; s++) {
             mbar_init(smem_to_uint(smem + OFF_TMA_MBAR + s * 8), 2);
@@ -352,8 +346,7 @@ fc2_w3_c4_kernel(
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
-    /*── TMEM alloc — warp 1 of each CTA.  cta_group::2 pairs allocations
-       within each pair; pair {0,1} and pair {2,3} alloc independently.     */
+    /*── TMEM alloc — warp 1 of each CTA, cta_group::2 pairs allocations.    */
     if (warp == 1) {
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
             :: "r"(smem_to_uint(smem + OFF_TMEM)), "r"(TMEM_COLS));
@@ -369,7 +362,9 @@ fc2_w3_c4_kernel(
         smem_b[s]         = smem_to_uint(smem + s * STAGE_BYTES + 16384);
     }
 
-    /*── Pair-leader-hosted mbar addresses, routed via mapa ──*/
+    /*── Pair-leader-hosted mbars (tma, epilogue).  For multicast A, the
+       peer-bit-clear mask makes HW route tx bytes to pair leader mbar of
+       each destination pair automatically.                                 */
     uint32_t tma_mbar_leader[N_STAGES];
     for (int s = 0; s < N_STAGES; s++)
         tma_mbar_leader[s] = map_rank(tma_mbar_local[s], pair_leader_rank);
@@ -411,60 +406,135 @@ fc2_w3_c4_kernel(
     }
     __syncthreads();
 
-    /*── Striding dispatch: each pair processes tiles in fixed stride ──*/
-    const int tile_stride = NUM_PAIR_WORKERS;
-    const int tile_count  = (TOTAL_TILES - pair_global_id + tile_stride - 1) / tile_stride;
+    /*── Super-tile striding dispatch ──
+       Each cluster processes super_tile_idx = cluster_id + _sti*NUM_CLUSTERS.
+       Within a super-tile: pair0 gets tile lo = super_tile_idx*2,
+       pair1 gets tile hi = super_tile_idx*2 + 1.  SHARED iff tm(lo)==tm(hi).
+       With TILES_N=3 the pattern is {SHARED, SHARED, SPLIT} × (TILES_M/2).  */
+    const int super_tile_stride = NUM_CLUSTERS;
+    const int super_tile_count  = (SUPER_TILES - cluster_id + super_tile_stride - 1)
+                                  / super_tile_stride;
 
     /*═══════════════════════════════════════
-      MAIN TILE LOOP
+      MAIN SUPER-TILE LOOP
       ═══════════════════════════════════════*/
-    for (int _ti = 0; _ti < tile_count; _ti++) {
-        const int tile_idx = pair_global_id + _ti * tile_stride;
-        const int _buf     = _ti & 1;
-        const int tm       = tile_idx / TILES_N;
-        const int tn       = tile_idx % TILES_N;
-        const bool has_prev = (_ti > 0);
+    for (int _sti = 0; _sti < super_tile_count; _sti++) {
+        const int super_tile_idx = cluster_id + _sti * super_tile_stride;
+        const int tile_lo = super_tile_idx * 2;
+        const int tile_hi = super_tile_idx * 2 + 1;
+        const int my_tile = (pair_id == 0) ? tile_lo : tile_hi;
 
-        const int m_start = tm * TM * 2 + pair_lane * TM;
-        const int n_start = tn * TN;
-        const int b_c1    = n_start + pair_lane * (TN / 2);
+        const int tm_lo = tile_lo / TILES_N;
+        const int tm_hi = (tile_hi < TOTAL_TILES) ? (tile_hi / TILES_N) : -1;
+        const bool is_shared = (tm_lo == tm_hi);
+        const bool hi_valid  = (tile_hi < TOTAL_TILES);
+        const bool my_valid  = (my_tile < TOTAL_TILES);
 
-        if (warp == 0) {
-            /*── W0: TMA A/B — both pair CTAs run this.  Each loads own
-               M-row half of A and own N-col half of B into own SMEM.
-               mbar target = pair leader's tma_mbar (routed via mapa).   */
-            PRAGMA_UNROLL(K_LOOP_UNROLL)
-            for (int ki = 0; ki < K_ITERS; ki++) {
-                const int s = ki % N_STAGES;
-                if (has_prev || ki >= N_STAGES) {
-                    mbar_wait(mma_mbar_local[s], mma_phase[s]);
-                    mma_phase[s] ^= 1;
+        const int _buf     = _sti & 1;
+        const bool has_prev = (_sti > 0);
+
+        const int tm       = my_tile / TILES_N;
+        const int tn       = my_tile % TILES_N;
+        const int m_start  = tm * TM * 2 + pair_lane * TM;
+        const int n_start  = tn * TN;
+        const int b_c1     = n_start + pair_lane * (TN / 2);
+
+        if (warp == 0 && my_valid) {
+            if (is_shared) {
+                /*── SHARED: pair0 issues two A-multicast loads.  CTA_0
+                   top-half (mask 0x5 → CTA0,CTA2), CTA_1 bot-half (mask
+                   0xA → CTA1,CTA3).  cta_group::2 + peer-bit-clear mbar
+                   routes tx bytes to pair-leader of each destination pair,
+                   so pair0_leader_mbar and pair1_leader_mbar each receive
+                   16KB from the top and 16KB from the bot.  CTAs 2,3 do
+                   not issue A.  All 4 CTAs issue own B cta_group::2.    */
+                PRAGMA_UNROLL(K_LOOP_UNROLL)
+                for (int ki = 0; ki < K_ITERS; ki++) {
+                    const int s = ki % N_STAGES;
+                    if (has_prev || ki >= N_STAGES) {
+                        mbar_wait(mma_mbar_local[s], mma_phase[s]);
+                        mma_phase[s] ^= 1;
+                    }
+                    const int tma_c0 = ki * TK;
+                    const uint32_t a_dst      = smem_a[s];
+                    const uint32_t b_dst      = smem_b[s];
+                    const uint32_t tma_mbar_s_peer_clear =
+                        tma_mbar_leader[s] & SM100_PEER_BIT_MASK;
+
+                    if (lane == 0) {
+                        /* A-multicast issued only by pair0 (CTA_0,CTA_1).
+                           m_start is relative to THIS CTA (pair_lane); the
+                           multicast A_top/A_bot split matches the pair
+                           layout exactly.                                  */
+                        if (pair_id == 0) {
+                            asm volatile(
+                                "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global.tile"
+                                ".mbarrier::complete_tx::bytes.multicast::cluster"
+                                " [%0], [%1, {%2, %3}], [%4], %5;"
+                                :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(m_start),
+                                   "r"(tma_mbar_s_peer_clear), "h"(a_mcast_mask)
+                                : "memory");
+                        }
+                        /* B per-CTA, cta_group::2 (peer bit clear so tx
+                           bytes credit pair leader mbar).                  */
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global.tile"
+                            ".mbarrier::complete_tx::bytes"
+                            " [%0], [%1, {%2, %3}], [%4];"
+                            :: "r"(b_dst), "l"(&tma_b), "r"(tma_c0), "r"(b_c1),
+                               "r"(tma_mbar_s_peer_clear)
+                            : "memory");
+                        /* Pair CTA's expect_tx arrive on pair leader (all
+                           4 CTAs contribute 32KB per pair; each pair leader
+                           mbar reaches count=2, tx=64KB).                  */
+                        asm volatile(
+                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64"
+                            " _, [%0], %1;"
+                            :: "r"(tma_mbar_leader[s]), "r"(TMA_BYTES)
+                            : "memory");
+                    }
                 }
-                const int tma_c0   = ki * TK;
-                const uint32_t a_dst      = smem_a[s];
-                const uint32_t b_dst      = smem_b[s];
-                const uint32_t tma_mbar_s = tma_mbar_leader[s];
+            } else {
+                /*── SPLIT: each CTA issues own A + own B (baseline pattern,
+                   no multicast).  pair0 on my_tile, pair1 on my_tile+1
+                   (different tm).  Pair leader mbar gets 2×32KB as in the
+                   c2 baseline.                                              */
+                PRAGMA_UNROLL(K_LOOP_UNROLL)
+                for (int ki = 0; ki < K_ITERS; ki++) {
+                    const int s = ki % N_STAGES;
+                    if (has_prev || ki >= N_STAGES) {
+                        mbar_wait(mma_mbar_local[s], mma_phase[s]);
+                        mma_phase[s] ^= 1;
+                    }
+                    const int tma_c0 = ki * TK;
+                    const uint32_t a_dst = smem_a[s];
+                    const uint32_t b_dst = smem_b[s];
+                    const uint32_t tma_mbar_s_peer_clear =
+                        tma_mbar_leader[s] & SM100_PEER_BIT_MASK;
 
-                if (lane == 0) {
-                    asm volatile(
-                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                        ".mbarrier::complete_tx::bytes.cta_group::2"
-                        " [%0], [%1, {%2, %3}], [%4];\n\t"
-                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                        ".mbarrier::complete_tx::bytes.cta_group::2"
-                        " [%5], [%6, {%2, %7}], [%4];\n\t"
-                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %8;"
-                        :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(m_start),
-                           "r"(tma_mbar_s),
-                           "r"(b_dst), "l"(&tma_b), "r"(b_c1),
-                           "r"(TMA_BYTES)
-                        : "memory");
+                    if (lane == 0) {
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global.tile"
+                            ".mbarrier::complete_tx::bytes"
+                            " [%0], [%1, {%2, %3}], [%4];\n\t"
+                            "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global.tile"
+                            ".mbarrier::complete_tx::bytes"
+                            " [%5], [%6, {%2, %7}], [%4];\n\t"
+                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64"
+                            " _, [%4], %8;"
+                            :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(m_start),
+                               "r"(tma_mbar_s_peer_clear),
+                               "r"(b_dst), "l"(&tma_b), "r"(b_c1),
+                               "r"(TMA_BYTES)
+                            : "memory");
+                    }
                 }
             }
         }
 
-        else if (warp == 1) {
-            /*── W1: MMA — pair leader only.  Partner's W1 idles. ──*/
+        else if (warp == 1 && my_valid) {
+            /*── W1: MMA — pair leader only (pair_lane==0).  Runs on BOTH
+               CTA_0 (pair0) and CTA_2 (pair1).  Partner's W1 is idle.    */
             if (pair_lane == 0 && lane == 0) {
                 mbar_wait(epilogue_mbar_local + _buf * 8, epi_phase[_buf]);
                 epi_phase[_buf] ^= 1;
@@ -473,7 +543,7 @@ fc2_w3_c4_kernel(
                 tma_phase[0] ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
 
-                /* ki=0: p=0 → zero-init accumulator at buf*TN */
+                /* ki=0: zero-init accumulator */
                 {
                     uint64_t da = desc_a_base[0], db = desc_b_base[0];
                     asm volatile(
@@ -500,7 +570,7 @@ fc2_w3_c4_kernel(
                                "r"(0),"r"(0),"r"(0),"r"(0));
                     }
                 }
-                tcgen05_commit_pair(mma_mbar_local[0], pair_mcast_mask);
+                tcgen05_commit_pair(mma_mbar_local[0], pair_mmacast_mask);
 
                 PRAGMA_UNROLL(K_LOOP_UNROLL)
                 for (int ki = 1; ki < K_ITERS; ki++) {
@@ -522,16 +592,16 @@ fc2_w3_c4_kernel(
                                "r"(0),"r"(0),"r"(0),"r"(0));
                         da += 2; db += 2;
                     }
-                    tcgen05_commit_pair(mma_mbar_local[s], pair_mcast_mask);
+                    tcgen05_commit_pair(mma_mbar_local[s], pair_mmacast_mask);
                 }
 
-                /* Arrives both pair CTAs' mainloop_mbar[_buf] via multicast */
-                tcgen05_commit_pair(mainloop_mbar_addr + _buf * 8, pair_mcast_mask);
+                /* Final commit arrives both pair CTAs' mainloop_mbar[_buf]. */
+                tcgen05_commit_pair(mainloop_mbar_addr + _buf * 8, pair_mmacast_mask);
             }
         }
 
-        else if (warp == 2) {
-            /*── W2: epilogue residual load — previous tile ──*/
+        else if (warp == 2 && my_valid) {
+            /*── W2: epilogue residual load — previous super-tile's pair tile ──*/
             const int prev_buf = _buf ^ 1;
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             ml_phase[prev_buf] ^= 1;
@@ -540,11 +610,13 @@ fc2_w3_c4_kernel(
             if (has_prev) mbar_arrive_cluster(epi_mbar_leader + prev_buf * 8);
 #else
             if (has_prev) {
-                const int prev_tile = pair_global_id + (_ti - 1) * tile_stride;
-                const int ptm       = prev_tile / TILES_N;
-                const int ptn       = prev_tile % TILES_N;
-                const int prev_m    = ptm * TM * 2 + pair_lane * TM;
-                const int prev_n    = ptn * TN;
+                const int prev_super = cluster_id + (_sti - 1) * super_tile_stride;
+                const int prev_my_tile = (pair_id == 0)
+                    ? prev_super * 2 : prev_super * 2 + 1;
+                const int ptm = prev_my_tile / TILES_N;
+                const int ptn = prev_my_tile % TILES_N;
+                const int prev_m = ptm * TM * 2 + pair_lane * TM;
+                const int prev_n = ptn * TN;
 
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                     const int stage = si % NUM_EPI_STAGES;
@@ -566,7 +638,7 @@ fc2_w3_c4_kernel(
 #endif
         }
 
-        else if (warp < 7) {
+        else if (warp < 7 && my_valid) {
             /*── W3-W6: epilogue compute ──*/
             const int ew = warp - 3;
             const int prev_buf = _buf ^ 1;
@@ -577,11 +649,13 @@ fc2_w3_c4_kernel(
             if (has_prev) mbar_arrive_cluster(epi_mbar_leader + prev_buf * 8);
 #else
             if (has_prev) {
-                const int prev_tile = pair_global_id + (_ti - 1) * tile_stride;
-                const int ptm       = prev_tile / TILES_N;
-                const int ptn       = prev_tile % TILES_N;
-                const int prev_m    = ptm * TM * 2 + pair_lane * TM;
-                const int prev_n    = ptn * TN;
+                const int prev_super = cluster_id + (_sti - 1) * super_tile_stride;
+                const int prev_my_tile = (pair_id == 0)
+                    ? prev_super * 2 : prev_super * 2 + 1;
+                const int ptm = prev_my_tile / TILES_N;
+                const int ptn = prev_my_tile % TILES_N;
+                const int prev_m = ptm * TM * 2 + pair_lane * TM;
+                const int prev_n = ptn * TN;
                 const int prev_n_bias = prev_n;
 
                 const uint32_t xor_val = (lane & 7) << 4;
@@ -721,188 +795,198 @@ fc2_w3_c4_kernel(
 #endif /* STRIP_EPILOGUE */
         }
         /* warp == 7: idle */
+
+        /* If this pair's tile is invalid (hi_valid==false on odd-tail
+           super-tile) but the cluster still runs, other CTAs' mainloop
+           / epilogue progression continues; this CTA skips.  With
+           TOTAL_TILES=10878 (even) this branch is unreachable, but keep
+           for generality.                                                */
+        (void)hi_valid;
     }
 
     /*═══════════════════════════════════════
-      DRAIN: last tile's epilogue
-      The main loop commits mainloop_mbar for tile (tile_count-1) on its
-      final iter, but the W2-W6 epilogue in the loop only processes the
-      PREVIOUS tile.  Process the final tile's epilogue here.
+      DRAIN: last super-tile's epilogue
       ═══════════════════════════════════════*/
-    if (tile_count > 0) {
-        const int last_tile = pair_global_id + (tile_count - 1) * tile_stride;
-        const int last_buf  = (tile_count - 1) & 1;
-        const int ltm = last_tile / TILES_N;
-        const int ltn = last_tile % TILES_N;
-        const int last_m = ltm * TM * 2 + pair_lane * TM;
-        const int last_n = ltn * TN;
-        const int last_n_bias = last_n;
+    if (super_tile_count > 0) {
+        const int last_super = cluster_id + (super_tile_count - 1) * super_tile_stride;
+        const int last_my_tile = (pair_id == 0)
+            ? last_super * 2 : last_super * 2 + 1;
+        const bool last_valid = (last_my_tile < TOTAL_TILES);
+        const int last_buf = (super_tile_count - 1) & 1;
 
-        if (warp == 2) {
+        if (last_valid) {
+            const int ltm = last_my_tile / TILES_N;
+            const int ltn = last_my_tile % TILES_N;
+            const int last_m = ltm * TM * 2 + pair_lane * TM;
+            const int last_n = ltn * TN;
+            const int last_n_bias = last_n;
+
+            if (warp == 2) {
 #if defined(STRIP_EPILOGUE) || defined(GEMM_ONLY)
-            mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
-            ml_phase[last_buf] ^= 1;
-            mbar_arrive_cluster(epi_mbar_leader + last_buf * 8);
+                mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
+                ml_phase[last_buf] ^= 1;
+                mbar_arrive_cluster(epi_mbar_leader + last_buf * 8);
 #else
-            mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
-            ml_phase[last_buf] ^= 1;
-            for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
-                const int stage = si % NUM_EPI_STAGES;
-                if (load_issue_count >= NUM_EPI_STAGES) {
-                    mbar_wait(consumed_mbar[stage], load_consumed_phase[stage]);
-                    load_consumed_phase[stage] ^= 1;
+                mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
+                ml_phase[last_buf] ^= 1;
+                for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
+                    const int stage = si % NUM_EPI_STAGES;
+                    if (load_issue_count >= NUM_EPI_STAGES) {
+                        mbar_wait(consumed_mbar[stage], load_consumed_phase[stage]);
+                        load_consumed_phase[stage] ^= 1;
+                    }
+                    if (lane == 0) {
+                        const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING + stage * EPI_STAGE_BYTES);
+                        mbar_arrive_expect_tx_local(load_mbar[stage], EPI_STAGE_BYTES);
+                        tma_load_2d_cta(res_dst, &tma_res,
+                                        last_n + si * 64, last_m, load_mbar[stage]);
+                    }
+                    load_issue_count++;
                 }
-                if (lane == 0) {
-                    const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING + stage * EPI_STAGE_BYTES);
-                    mbar_arrive_expect_tx_local(load_mbar[stage], EPI_STAGE_BYTES);
-                    tma_load_2d_cta(res_dst, &tma_res,
-                                    last_n + si * 64, last_m, load_mbar[stage]);
-                }
-                load_issue_count++;
-            }
-            mbar_arrive_cluster(epi_mbar_leader + last_buf * 8);
+                mbar_arrive_cluster(epi_mbar_leader + last_buf * 8);
 #endif
-        } else if (warp >= 3 && warp < 7) {
-            const int ew = warp - 3;
-            mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
-            ml_phase[last_buf] ^= 1;
+            } else if (warp >= 3 && warp < 7) {
+                const int ew = warp - 3;
+                mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
+                ml_phase[last_buf] ^= 1;
 
 #ifdef STRIP_EPILOGUE
-            mbar_arrive_cluster(epi_mbar_leader + last_buf * 8);
+                mbar_arrive_cluster(epi_mbar_leader + last_buf * 8);
 #else
-            const uint32_t xor_val = (lane & 7) << 4;
-            const uint32_t sw0 = 0 ^ xor_val, sw1 = 16 ^ xor_val;
-            const uint32_t sw2 = 32 ^ xor_val, sw3 = 48 ^ xor_val;
-            const uint32_t sw4 = 64 ^ xor_val, sw5 = 80 ^ xor_val;
-            const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
-            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+                const uint32_t xor_val = (lane & 7) << 4;
+                const uint32_t sw0 = 0 ^ xor_val, sw1 = 16 ^ xor_val;
+                const uint32_t sw2 = 32 ^ xor_val, sw3 = 48 ^ xor_val;
+                const uint32_t sw4 = 64 ^ xor_val, sw5 = 80 ^ xor_val;
+                const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
+                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
 #ifdef GEMM_ONLY
-            for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
-                const int stage = si % NUM_EPI_STAGES;
-                const int nc_base = si * 64;
-                const int row_group = ew;
+                for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
+                    const int stage = si % NUM_EPI_STAGES;
+                    const int nc_base = si * 64;
+                    const int row_group = ew;
 
-                const int taddr_base = last_buf * TN
-                    + ((pair_lane * 128 + row_group * 32) << 16);
-                float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
-                float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
+                    const int taddr_base = last_buf * TN
+                        + ((pair_lane * 128 + row_group * 32) << 16);
+                    float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
+                    float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
 
-                const uint32_t stage_base = smem_to_uint(smem + OFF_STAGING
-                    + stage * EPI_STAGE_BYTES
-                    + row_group * STAGING_REGION_BYTES
-                    + lane * 128);
+                    const uint32_t stage_base = smem_to_uint(smem + OFF_STAGING
+                        + stage * EPI_STAGE_BYTES
+                        + row_group * STAGING_REGION_BYTES
+                        + lane * 128);
 
-                for (int _ci = 0; _ci < 2; _ci++) {
-                    const int chunk = _ci;
-                    const int nc = nc_base + chunk * 32;
-                    TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,
-                                  a8,a9,a10,a11,a12,a13,a14,a15,
-                                  a16,a17,a18,a19,a20,a21,a22,a23,
-                                  a24,a25,a26,a27,a28,a29,a30,a31,
-                                  taddr_base + nc);
-                    const uint32_t rsw0 = chunk ? sw4 : sw0;
-                    const uint32_t rsw1 = chunk ? sw5 : sw1;
-                    const uint32_t rsw2 = chunk ? sw6 : sw2;
-                    const uint32_t rsw3 = chunk ? sw7 : sw3;
-                    TMEM_WAIT();
-                    GEMM_CVT_STS(a0,a1,a2,a3,a4,a5,a6,a7,   stage_base + rsw0);
-                    GEMM_CVT_STS(a8,a9,a10,a11,a12,a13,a14,a15,  stage_base + rsw1);
-                    GEMM_CVT_STS(a16,a17,a18,a19,a20,a21,a22,a23, stage_base + rsw2);
-                    GEMM_CVT_STS(a24,a25,a26,a27,a28,a29,a30,a31, stage_base + rsw3);
+                    for (int _ci = 0; _ci < 2; _ci++) {
+                        const int chunk = _ci;
+                        const int nc = nc_base + chunk * 32;
+                        TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,
+                                      a8,a9,a10,a11,a12,a13,a14,a15,
+                                      a16,a17,a18,a19,a20,a21,a22,a23,
+                                      a24,a25,a26,a27,a28,a29,a30,a31,
+                                      taddr_base + nc);
+                        const uint32_t rsw0 = chunk ? sw4 : sw0;
+                        const uint32_t rsw1 = chunk ? sw5 : sw1;
+                        const uint32_t rsw2 = chunk ? sw6 : sw2;
+                        const uint32_t rsw3 = chunk ? sw7 : sw3;
+                        TMEM_WAIT();
+                        GEMM_CVT_STS(a0,a1,a2,a3,a4,a5,a6,a7,   stage_base + rsw0);
+                        GEMM_CVT_STS(a8,a9,a10,a11,a12,a13,a14,a15,  stage_base + rsw1);
+                        GEMM_CVT_STS(a16,a17,a18,a19,a20,a21,a22,a23, stage_base + rsw2);
+                        GEMM_CVT_STS(a24,a25,a26,a27,a28,a29,a30,a31, stage_base + rsw3);
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile(BAR_EPI_SYNC ::: "memory");
+                    EPI_STORE(stage, nc_base, last_n, last_m);
+                    EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
                 }
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                asm volatile(BAR_EPI_SYNC ::: "memory");
-                EPI_STORE(stage, nc_base, last_n, last_m);
-                EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
-            }
-            mbar_arrive_cluster(epi_mbar_leader + last_buf * 8);
+                mbar_arrive_cluster(epi_mbar_leader + last_buf * 8);
 #else
-            const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
-            for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
-                const int stage = si % NUM_EPI_STAGES;
-                const int nc_base = si * 64;
-                const int row_group = ew;
+                const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
+                for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
+                    const int stage = si % NUM_EPI_STAGES;
+                    const int nc_base = si * 64;
+                    const int row_group = ew;
 
-                mbar_wait(load_mbar[stage], load_phase[stage]);
-                load_phase[stage] ^= 1;
+                    mbar_wait(load_mbar[stage], load_phase[stage]);
+                    load_phase[stage] ^= 1;
 
-                const int taddr_base = last_buf * TN
-                    + ((pair_lane * 128 + row_group * 32) << 16);
-                float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
-                float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
+                    const int taddr_base = last_buf * TN
+                        + ((pair_lane * 128 + row_group * 32) << 16);
+                    float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
+                    float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
 
-                const uint32_t stage_base = smem_to_uint(smem + OFF_STAGING
-                    + stage * EPI_STAGE_BYTES
-                    + row_group * STAGING_REGION_BYTES
-                    + lane * 128);
+                    const uint32_t stage_base = smem_to_uint(smem + OFF_STAGING
+                        + stage * EPI_STAGE_BYTES
+                        + row_group * STAGING_REGION_BYTES
+                        + lane * 128);
 
-                for (int _ci = 0; _ci < 2; _ci++) {
-                    const int chunk = _ci;
-                    const int nc = nc_base + chunk * 32;
-                    TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,
-                                  a8,a9,a10,a11,a12,a13,a14,a15,
-                                  a16,a17,a18,a19,a20,a21,a22,a23,
-                                  a24,a25,a26,a27,a28,a29,a30,a31,
-                                  taddr_base + nc);
+                    for (int _ci = 0; _ci < 2; _ci++) {
+                        const int chunk = _ci;
+                        const int nc = nc_base + chunk * 32;
+                        TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,
+                                      a8,a9,a10,a11,a12,a13,a14,a15,
+                                      a16,a17,a18,a19,a20,a21,a22,a23,
+                                      a24,a25,a26,a27,a28,a29,a30,a31,
+                                      taddr_base + nc);
 
-                    const uint32_t bs = bias_saddr + (last_n_bias + nc) * 2;
-                    uint4 bv0, bv1, bv2, bv3;
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(bv0.x),"=r"(bv0.y),"=r"(bv0.z),"=r"(bv0.w) : "r"(bs));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(bv1.x),"=r"(bv1.y),"=r"(bv1.z),"=r"(bv1.w) : "r"(bs + 16));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(bv2.x),"=r"(bv2.y),"=r"(bv2.z),"=r"(bv2.w) : "r"(bs + 32));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
+                        const uint32_t bs = bias_saddr + (last_n_bias + nc) * 2;
+                        uint4 bv0, bv1, bv2, bv3;
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(bv0.x),"=r"(bv0.y),"=r"(bv0.z),"=r"(bv0.w) : "r"(bs));
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(bv1.x),"=r"(bv1.y),"=r"(bv1.z),"=r"(bv1.w) : "r"(bs + 16));
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(bv2.x),"=r"(bv2.y),"=r"(bv2.z),"=r"(bv2.w) : "r"(bs + 32));
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
 
-                    const uint32_t rsw0 = chunk ? sw4 : sw0;
-                    const uint32_t rsw1 = chunk ? sw5 : sw1;
-                    const uint32_t rsw2 = chunk ? sw6 : sw2;
-                    const uint32_t rsw3 = chunk ? sw7 : sw3;
-                    uint4 rv0, rv1, rv2, rv3;
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w)
-                        : "r"(stage_base + rsw0));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(rv1.x),"=r"(rv1.y),"=r"(rv1.z),"=r"(rv1.w)
-                        : "r"(stage_base + rsw1));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w)
-                        : "r"(stage_base + rsw2));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w)
-                        : "r"(stage_base + rsw3));
+                        const uint32_t rsw0 = chunk ? sw4 : sw0;
+                        const uint32_t rsw1 = chunk ? sw5 : sw1;
+                        const uint32_t rsw2 = chunk ? sw6 : sw2;
+                        const uint32_t rsw3 = chunk ? sw7 : sw3;
+                        uint4 rv0, rv1, rv2, rv3;
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w)
+                            : "r"(stage_base + rsw0));
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(rv1.x),"=r"(rv1.y),"=r"(rv1.z),"=r"(rv1.w)
+                            : "r"(stage_base + rsw1));
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w)
+                            : "r"(stage_base + rsw2));
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w)
+                            : "r"(stage_base + rsw3));
 
-                    TMEM_WAIT();
+                        TMEM_WAIT();
 
-                    BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
-                        bv0.x,bv0.y,bv0.z,bv0.w,
-                        rv0.x,rv0.y,rv0.z,rv0.w, stage_base + rsw0);
-                    BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
-                        bv1.x,bv1.y,bv1.z,bv1.w,
-                        rv1.x,rv1.y,rv1.z,rv1.w, stage_base + rsw1);
-                    BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
-                        bv2.x,bv2.y,bv2.z,bv2.w,
-                        rv2.x,rv2.y,rv2.z,rv2.w, stage_base + rsw2);
-                    BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
-                        bv3.x,bv3.y,bv3.z,bv3.w,
-                        rv3.x,rv3.y,rv3.z,rv3.w, stage_base + rsw3);
+                        BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                            bv0.x,bv0.y,bv0.z,bv0.w,
+                            rv0.x,rv0.y,rv0.z,rv0.w, stage_base + rsw0);
+                        BIAS_RES_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                            bv1.x,bv1.y,bv1.z,bv1.w,
+                            rv1.x,rv1.y,rv1.z,rv1.w, stage_base + rsw1);
+                        BIAS_RES_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                            bv2.x,bv2.y,bv2.z,bv2.w,
+                            rv2.x,rv2.y,rv2.z,rv2.w, stage_base + rsw2);
+                        BIAS_RES_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                            bv3.x,bv3.y,bv3.z,bv3.w,
+                            rv3.x,rv3.y,rv3.z,rv3.w, stage_base + rsw3);
+                    }
+
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile(BAR_EPI_SYNC ::: "memory");
+                    EPI_STORE(stage, nc_base, last_n, last_m);
+                    EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
+                    if (si > 0)
+                        mbar_arrive_local(consumed_mbar[(si - 1) % NUM_EPI_STAGES]);
+                    if (si == NUM_EPI_SUBITERS - 1)
+                        mbar_arrive_local(consumed_mbar[stage]);
                 }
-
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                asm volatile(BAR_EPI_SYNC ::: "memory");
-                EPI_STORE(stage, nc_base, last_n, last_m);
-                EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
-                if (si > 0)
-                    mbar_arrive_local(consumed_mbar[(si - 1) % NUM_EPI_STAGES]);
-                if (si == NUM_EPI_SUBITERS - 1)
-                    mbar_arrive_local(consumed_mbar[stage]);
-            }
-            mbar_arrive_cluster(epi_mbar_leader + last_buf * 8);
+                mbar_arrive_cluster(epi_mbar_leader + last_buf * 8);
 #endif /* GEMM_ONLY drain */
 #endif /* STRIP_EPILOGUE drain */
+            }
         }
     }
 
@@ -930,10 +1014,10 @@ __global__ void init_residual(__nv_bfloat16* res, int n_dim, long long total) {
 
 int main() {
     setbuf(stdout, NULL);
-    printf("FC2 W3 c4 — independent-pair baseline (cluster=4)\n");
-    printf("  GEMM: [%d,%d] x [%d,%d]^T  NS=%d  SMEM=%d B  clusters=%d  pair_workers=%d\n",
+    printf("FC2 W3 c4 — A-multicast super-tile (cluster=4)\n");
+    printf("  GEMM: [%d,%d] x [%d,%d]^T  NS=%d  SMEM=%d B  clusters=%d  super_tiles=%d\n",
            M_TOTAL, K_DIM, N_DIM, K_DIM, N_STAGES, SMEM_BYTES,
-           NUM_CLUSTERS, NUM_PAIR_WORKERS);
+           NUM_CLUSTERS, SUPER_TILES);
 #ifdef STRIP_EPILOGUE
     printf("  Mode: STRIP_EPILOGUE (GEMM core only, validation disabled)\n");
 #elif defined(GEMM_ONLY)
