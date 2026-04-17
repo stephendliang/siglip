@@ -92,6 +92,8 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define SCHED_WARP (2 + NUM_EPI_WARPS)      /* scheduler warp index */
 #endif
 
+#include "tile_dispatch.cuh"
+
 #if defined(STRIP_EPILOGUE) && defined(GEMM_ONLY)
 #error "STRIP_EPILOGUE and GEMM_ONLY are mutually exclusive"
 #endif
@@ -432,7 +434,7 @@ fc1_w3_kernel(
     const int warp  = tid / 32;
     const int lane  = tid % 32;
 
-#if TILE_DISPATCH == 0
+#if TILE_DISPATCH == 0 || TILE_DISPATCH >= 8
     const int cluster_id = sm_id / 2;
     const int num_clusters = SM_COUNT / 2;
 #endif
@@ -518,6 +520,9 @@ fc1_w3_kernel(
 #if TILE_DISPATCH == 4
     int _iter = 0;
     int _prev_tile = -1;
+#elif TILE_DISPATCH >= 8
+    /* Static swizzle: each cluster strides a linear index, static_swizzle() remaps. */
+    const int tile_count = (TOTAL_TILES + num_clusters - 1) / num_clusters;
 #else
     /* Group-3: each cluster handles a fixed N-tile, strides through M-rows */
     const int tn_fixed = cluster_id % TILES_N;
@@ -757,9 +762,15 @@ fc1_w3_kernel(
         const int buf = _iter & 1;
 #else
     for (int _ti = 0; _ti < tile_count; _ti++) {
+#if TILE_DISPATCH >= 8
+        const int block_idx = _ti * num_clusters + cluster_id;
+        if (block_idx >= TOTAL_TILES) break;
+        const int tile_idx = static_swizzle(block_idx);
+#else
         const int _tm = m_rank + _ti * my_m_stride;
         if (_tm >= TILES_M) break;
         const int tile_idx = _tm * TILES_N + tn_fixed;
+#endif
         const int buf = _ti & 1;
 #endif
         int tm = tile_idx / TILES_N;
@@ -938,6 +949,8 @@ fc1_w3_kernel(
             if (has_prev) {
 #if TILE_DISPATCH == 4
                 const int prev_idx = _prev_tile;
+#elif TILE_DISPATCH >= 8
+                const int prev_idx = static_swizzle((_ti - 1) * num_clusters + cluster_id);
 #else
                 const int prev_idx = (m_rank + (_ti - 1) * my_m_stride) * TILES_N + tn_fixed;
 #endif
@@ -1037,6 +1050,8 @@ fc1_w3_kernel(
             if (has_prev) {
 #if TILE_DISPATCH == 4
                 const int prev_idx = _prev_tile;
+#elif TILE_DISPATCH >= 8
+                const int prev_idx = static_swizzle((_ti - 1) * num_clusters + cluster_id);
 #else
                 const int prev_idx = (m_rank + (_ti - 1) * my_m_stride) * TILES_N + tn_fixed;
 #endif
@@ -1217,6 +1232,9 @@ _lean_done:
 #if TILE_DISPATCH == 4
         const int last_idx = _prev_tile;
         const int last_buf = (_iter - 1) & 1;
+#elif TILE_DISPATCH >= 8
+        const int last_idx = static_swizzle((tile_count - 1) * num_clusters + cluster_id);
+        const int last_buf = (tile_count - 1) & 1;
 #else
         const int last_idx = (m_rank + (tile_count - 1) * my_m_stride) * TILES_N + tn_fixed;
         const int last_buf = (tile_count - 1) & 1;
