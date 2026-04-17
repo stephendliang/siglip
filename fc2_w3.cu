@@ -232,6 +232,34 @@ static __device__ __forceinline__ int static_swizzle(int block_idx) {
         if (tn >= TILES_N) { tn = TILES_N - 1; tm = TILES_M - 1; }
         return tm * TILES_N + tn;
     }
+
+#elif TILE_DISPATCH == 13
+    /* Pure row-major: bi → (bi/TILES_N, bi%TILES_N).
+       Baseline for isolating zigzag's N-boustrophedon contribution. */
+    {
+        int tm = block_idx / TILES_N;
+        int tn = block_idx % TILES_N;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + tn;
+    }
+
+#elif TILE_DISPATCH == 14
+    /* Cluster-N-cycle: within each cluster cycle N fastest on the same M-row,
+       then jump +num_clusters M. All 74 clusters synchronized on same sub-tick →
+       one B-column "live" at a time (74 clusters all on tn=s). Adjacent sub-ticks
+       reuse same A-tile per cluster (3× intra-cluster A reuse).
+       Super-tick T, cluster c, sub s: tile (T*NC + c, s).
+       block_idx = _ti*NC + c, _ti = T*TILES_N + s → T = _ti/TILES_N, s = _ti%TILES_N. */
+    {
+        const int NC = SM_COUNT / 2;
+        const int c = block_idx % NC;
+        const int _ti_local = block_idx / NC;
+        const int super = _ti_local / TILES_N;
+        const int tn = _ti_local % TILES_N;
+        int tm = super * NC + c;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + tn;
+    }
 #endif
 }
 #endif /* TILE_DISPATCH >= 8 */

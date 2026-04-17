@@ -168,6 +168,23 @@ fc2-w3-zigzag: fc2_w3.cu
 fc2-w3-colfirst: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=12 $< -o $@ $(LDFLAGS)
 
+fc2-w3-rowmajor: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=13 $< -o $@ $(LDFLAGS)
+
+fc2-w3-ncycle: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=14 $< -o $@ $(LDFLAGS)
+
+fc2-w3-dg4: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=4  $< -o $@ $(LDFLAGS)
+fc2-w3-dg6: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=6  $< -o $@ $(LDFLAGS)
+fc2-w3-dg12: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=12 $< -o $@ $(LDFLAGS)
+fc2-w3-dg16: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=16 $< -o $@ $(LDFLAGS)
+fc2-w3-dg24: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=24 $< -o $@ $(LDFLAGS)
+
 fc2-w3-inline7-clock: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=7 -DCLOCK_TIMING $< -o $@ $(LDFLAGS)
 

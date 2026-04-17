@@ -51,6 +51,13 @@ EXPERIMENTS=(
     "w3_zorder|make -B fc2-w3-zorder DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-zorder"
     "w3_hilbert|make -B fc2-w3-hilbert DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-hilbert"
     "w3_zigzag|make -B fc2-w3-zigzag DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-zigzag"
+    "w3_rowmajor|make -B fc2-w3-rowmajor DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-rowmajor"
+    "w3_ncycle|make -B fc2-w3-ncycle DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-ncycle"
+    "w3_dg4|make -B fc2-w3-dg4  DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-dg4"
+    "w3_dg6|make -B fc2-w3-dg6  DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-dg6"
+    "w3_dg12|make -B fc2-w3-dg12 DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-dg12"
+    "w3_dg16|make -B fc2-w3-dg16 DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-dg16"
+    "w3_dg24|make -B fc2-w3-dg24 DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-dg24"
     "w3_gemm|make -B fc2-w3-gemm DFLAGS=-DPACKED_TILES|./fc2-w3-gemm"
     "w3_lean_gemm|make -B fc2-w3-lean DFLAGS='-DPACKED_TILES -DGEMM_ONLY'|./fc2-w3-lean"
     "w3_sched_gemm|make -B fc2-w3-sched DFLAGS='-DPACKED_TILES -DGEMM_ONLY'|./fc2-w3-sched"
@@ -61,6 +68,8 @@ EXPERIMENTS=(
     "w3_zorder_gemm|make -B fc2-w3-zorder DFLAGS='-DPACKED_TILES -DNO_PREFILL -DGEMM_ONLY'|./fc2-w3-zorder"
     "w3_hilbert_gemm|make -B fc2-w3-hilbert DFLAGS='-DPACKED_TILES -DNO_PREFILL -DGEMM_ONLY'|./fc2-w3-hilbert"
     "w3_zigzag_gemm|make -B fc2-w3-zigzag DFLAGS='-DPACKED_TILES -DNO_PREFILL -DGEMM_ONLY'|./fc2-w3-zigzag"
+    "w3_rowmajor_gemm|make -B fc2-w3-rowmajor DFLAGS='-DPACKED_TILES -DNO_PREFILL -DGEMM_ONLY'|./fc2-w3-rowmajor"
+    "w3_ncycle_gemm|make -B fc2-w3-ncycle DFLAGS='-DPACKED_TILES -DNO_PREFILL -DGEMM_ONLY'|./fc2-w3-ncycle"
     "w3_strip|make -B fc2-w3 DFLAGS='-DPACKED_TILES -DSTRIP_EPILOGUE'|./fc2-w3"
     "w3_lean_strip|make -B fc2-w3-lean DFLAGS='-DPACKED_TILES -DSTRIP_EPILOGUE'|./fc2-w3-lean"
     "w3_sched_strip|make -B fc2-w3-sched DFLAGS='-DPACKED_TILES -DSTRIP_EPILOGUE'|./fc2-w3-sched"
@@ -71,6 +80,8 @@ EXPERIMENTS=(
     "w3_zorder_strip|make -B fc2-w3-zorder DFLAGS='-DPACKED_TILES -DNO_PREFILL -DSTRIP_EPILOGUE'|./fc2-w3-zorder"
     "w3_hilbert_strip|make -B fc2-w3-hilbert DFLAGS='-DPACKED_TILES -DNO_PREFILL -DSTRIP_EPILOGUE'|./fc2-w3-hilbert"
     "w3_zigzag_strip|make -B fc2-w3-zigzag DFLAGS='-DPACKED_TILES -DNO_PREFILL -DSTRIP_EPILOGUE'|./fc2-w3-zigzag"
+    "w3_rowmajor_strip|make -B fc2-w3-rowmajor DFLAGS='-DPACKED_TILES -DNO_PREFILL -DSTRIP_EPILOGUE'|./fc2-w3-rowmajor"
+    "w3_ncycle_strip|make -B fc2-w3-ncycle DFLAGS='-DPACKED_TILES -DNO_PREFILL -DSTRIP_EPILOGUE'|./fc2-w3-ncycle"
 )
 
 for exp in "${EXPERIMENTS[@]}"; do
@@ -144,7 +155,7 @@ if [ "$DRY_RUN" = "0" ] && [ -f "$OUTDIR/results.txt" ]; then
     log "Decomposition (fused / gemm / strip):"
     printf "  %-16s %8s %8s %8s %10s %10s\n" "Variant" "fused" "gemm" "strip" "fused-gemm" "gemm-strip" | tee -a "$OUTDIR/session.log"
     printf "  %-16s %8s %8s %8s %10s %10s\n" "-------" "-----" "----" "-----" "----------" "----------" | tee -a "$OUTDIR/session.log"
-    for variant in fused lean sched dgswizzle zorder hilbert zigzag; do
+    for variant in fused lean sched dgswizzle zorder hilbert zigzag rowmajor ncycle; do
         fused_ms=$(get_ms "w3_${variant}")
         gemm_ms=$(get_ms "w3_${variant}_gemm")
         strip_ms=$(get_ms "w3_${variant}_strip")
