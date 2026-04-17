@@ -1,0 +1,7 @@
+FC2 W3 c4 — A-multicast super-tile (cluster=4)
+  GEMM: [928256,3072] x [768,3072]^T  NS=6  SMEM=231424 B  clusters=37  super_tiles=5439
+  Mode: full (bias + residual)
+  Packing tiles...
+FC2-W3-c4 kernel: 2.052 ms  2134.16 TFLOPS
+Validation: 32/32 spot checks passed
+@@RESULT ms=2.052 tflops=2134.16 checksum=7461504.000000 valid=1 c0=6912.0

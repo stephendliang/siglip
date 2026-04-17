@@ -1,0 +1,64 @@
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static  -DSTRIP_EPILOGUE fc2_w3_c4.cu -o fc2-w3-c4-strip -lcurand_static -lculibos -lcuda
+fc2_w3_c4.cu(657): warning #177-D: variable "ew" was declared but never referenced
+              const int ew = warp - 3;
+                        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc2_w3_c4.cu(434): warning #177-D: variable "tm_lo" was declared but never referenced
+          const int tm_lo = tile_lo / (768 / 256);
+                    ^
+
+fc2_w3_c4.cu(435): warning #177-D: variable "tm_hi" was declared but never referenced
+          const int tm_hi = (tile_hi < (((928256 + 128 * 2 - 1) / (128 * 2)) * (768 / 256))) ? (tile_hi / (768 / 256)) : -1;
+                    ^
+
+fc2_w3_c4.cu(865): warning #177-D: variable "ew" was declared but never referenced
+                  const int ew = warp - 3;
+                            ^
+
+fc2_w3_c4.cu(836): warning #177-D: variable "last_m" was declared but never referenced
+              const int last_m = ((ltm * 2 + pair_lane) * (768 / 256) + ltn) * 128;
+                        ^
+
+fc2_w3_c4.cu(837): warning #177-D: variable "last_n" was declared but never referenced
+              const int last_n = 0;
+                        ^
+
+fc2_w3_c4.cu(838): warning #177-D: variable "last_n_bias" was declared but never referenced
+              const int last_n_bias = ltn * 256;
+                        ^
+
+fc2_w3_c4.cu(169): warning #177-D: function "mbar_arrive_local" was declared but never referenced
+  static __attribute__((device)) __inline__ __attribute__((always_inline)) void mbar_arrive_local(uint32_t addr) {
+                                                                                ^
+
+fc2_w3_c4.cu(175): warning #177-D: function "mbar_arrive_expect_tx_local" was declared but never referenced
+  void mbar_arrive_expect_tx_local(uint32_t addr, uint32_t bytes) {
+       ^
+
+fc2_w3_c4.cu(181): warning #177-D: function "mbar_arrive_expect_tx_cluster" was declared but never referenced
+  void mbar_arrive_expect_tx_cluster(uint32_t addr, uint32_t bytes) {
+       ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z9pack_bf16P13__nv_bfloat16PKS_iiii' for 'sm_100a'
+ptxas info    : Function properties for _Z9pack_bf16P13__nv_bfloat16PKS_iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 8.965 ms
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 8.266 ms
+ptxas info    : Compiling entry function '_Z13init_residualP13__nv_bfloat16ix' for 'sm_100a'
+ptxas info    : Function properties for _Z13init_residualP13__nv_bfloat16ix
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 0 barriers
+ptxas info    : Compile time = 5.185 ms
+ptxas info    : Compiling entry function '_Z16fc2_w3_c4_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_S2_S_' for 'sm_100a'
+ptxas info    : Function properties for _Z16fc2_w3_c4_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_S2_S_
+    16 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 43 registers, used 1 barriers, 16 bytes cumulative stack size
+ptxas info    : Compile time = 37.526 ms
