@@ -1889,16 +1889,17 @@ fc2_w3_kernel(
 #elif defined(C4_B_MULTICAST)
                     /* C4 dual-pair with B multicast:
                        Requires TD=14 (ncycle) so pair 0 and pair 1 share tn within
-                       a super-tick → pair 0's B tile == pair 1's B tile.
-                       Only pair 0 issues B TMA with .multicast::cluster so tx-byte
-                       arrivals land exactly once on each CTA's mbar (no overshoot).
-                       CTA 0's issue: mask=0x5, delivers B cols 0..128 to CTAs {0,2}.
-                       CTA 1's issue: mask=0xA, delivers B cols 128..256 to CTAs {1,3}.
-                       Pair 1 CTAs skip B TMA but still count B bytes in expect_tx.
-                       Qualifier order matches CUTLASS SM100_TMA_2SM_LOAD_MULTICAST_2D
-                       (.cta_group::2 right after .2d, no .tile). */
-                    if (pair_id == 0) {
-                        const uint16_t b_mcast = (cta_rank == 0) ? (uint16_t)0x5 : (uint16_t)0xA;
+                       a super-tick → pair 1 CTAs have SAME (cta_rank, c1) as pair 0.
+                       All 4 CTAs issue cta_group::2 + multicast::cluster mask=0xF.
+                       Hardware coalesces coordinated issues (same c1 across pairs
+                       for each cta_rank) into ONE DRAM fetch, split-delivers to
+                       all 4 CTAs per cta_rank. Each CTA's mbar receives tx-bytes
+                       once (from its pair's cta_group::2 split).
+                       Mask=0xF keeps both pairs complete so cta_group::2 pair
+                       invariant holds for both pairs.
+                       A remains pair-local (no multicast). */
+                    {
+                        const uint16_t b_mcast = (uint16_t)0xF;
                         asm volatile(
                             "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global"
                             ".mbarrier::complete_tx::bytes"
@@ -1910,15 +1911,6 @@ fc2_w3_kernel(
                             :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(tma_a_c1),
                                "r"(tma_mbar_s), "r"(a_dst + 16384), "l"(&tma_b),
                                "r"(tma_b_c1), "r"(TMA_BYTES), "h"(b_mcast)
-                            : "memory");
-                    } else {
-                        asm volatile(
-                            "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global"
-                            ".mbarrier::complete_tx::bytes"
-                            " [%0], [%1, {%2, %3}], [%4];\n\t"
-                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %5;"
-                            :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(tma_a_c1),
-                               "r"(tma_mbar_s), "r"(TMA_BYTES)
                             : "memory");
                     }
 #else
