@@ -426,6 +426,39 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+#ifdef NCU_MODE
+    /* Single-algo, 3 warmup + 1 timed, GEMM-only.  Designed for ncu: total 4
+       kernel launches of one cuBLAS gemm.  Filter with --launch-count 1
+       --launch-skip 3 to profile only the timed iteration.                    */
+    {
+        float alpha = 1.0f, beta0 = 0.0f;
+        cudaEvent_t t0, t1;
+        CUDA_CHECK(cudaEventCreate(&t0));
+        CUDA_CHECK(cudaEventCreate(&t1));
+        CUDA_CHECK(cudaMemset(d_D, 0, sz_d));
+        for (int i = 0; i < 3; i++) {
+            CUBLAS_CHECK(cublasLtMatmul(lt, desc_mxfp8, &alpha,
+                d_B, layoutA, d_A, layoutB, &beta0,
+                d_D, layoutC, d_D, layoutC,
+                &heur_mxfp8[0].algo, d_workspace, WORKSPACE_BYTES, 0));
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaEventRecord(t0));
+        CUBLAS_CHECK(cublasLtMatmul(lt, desc_mxfp8, &alpha,
+            d_B, layoutA, d_A, layoutB, &beta0,
+            d_D, layoutC, d_D, layoutC,
+            &heur_mxfp8[0].algo, d_workspace, WORKSPACE_BYTES, 0));
+        CUDA_CHECK(cudaEventRecord(t1));
+        CUDA_CHECK(cudaEventSynchronize(t1));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
+        printf("NCU_MODE: cuBLAS gemm (algo 0, 1 timed iter)\n");
+        printf("@@RESULT ms=%.3f tflops=%.2f checksum=0.000000 valid=0 c0=0.0\n",
+               ms, to_tflops(flops, ms));
+        return 0;
+    }
+#endif
+
     // Fused descs + heuristics
     cublasLtMatmulDesc_t desc_fused_mxfp8 = nullptr, desc_fused_plain = nullptr;
     cublasLtMatmulHeuristicResult_t heur_fused_mxfp8[MAX_ALGOS], heur_fused_plain[MAX_ALGOS];
@@ -577,6 +610,9 @@ int main(int argc, char** argv) {
         if (has_plain)
             oh("PerTensor", plain_gemm, plain_fused, plain_unfused);
     }
+
+    printf("\n@@RESULT ms=%.3f tflops=%.2f checksum=0.000000 valid=0 c0=0.0\n",
+           mxfp8_gemm.ms, to_tflops(flops, mxfp8_gemm.ms));
 
     // Cleanup
 

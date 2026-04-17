@@ -4,6 +4,10 @@
 # Profiles: w3 (strided), w3-lean (LEAN_DISPATCH), w3-dgswizzle (DeepGEMM 2D),
 #           CUTLASS fused/strip. Each in fused + gemm/strip variants.
 #
+# All w3 variants use PACKED_TILES (tile-contiguous DRAM layout) for the
+# faster tile-order path.  CUTLASS remains row-major (no packed wrapper);
+# CUTLASS numbers are still the correctness baseline, not apples-to-apples.
+#
 # Q1: Fusion cost — w3 fused vs w3 gemm, cutlass fused vs cutlass strip
 # Q2: Head-to-head fused — w3_lean vs cutlass_fused
 # Q3: GEMM comparison — w3 gemm vs cutlass strip
@@ -109,13 +113,14 @@ METRICS_ALL="${METRICS_STALL},${METRICS_MEM},${METRICS_PIPE},${METRICS_SCHED},${
 
 # ── Binary definitions: label|build_cmd|binary|kernel_filter ──
 BINARIES=(
-    "w3_strip|make -B fc2-w3 DFLAGS=-DSTRIP_EPILOGUE|COPY:fc2-w3:fc2-w3-strip|fc2_w3_kernel"
-    "w3_gemm|make -B fc2-w3-gemm|./fc2-w3-gemm|fc2_w3_kernel"
-    "w3_fused|make -B fc2-w3|./fc2-w3|fc2_w3_kernel"
-    "w3_lean|make -B fc2-w3-lean|./fc2-w3-lean|fc2_w3_kernel"
-    "w3_dgswizzle|make -B fc2-w3-dgswizzle DFLAGS=-DNO_PREFILL|./fc2-w3-dgswizzle|fc2_w3_kernel"
-    "cutlass_strip|make fc2-cutlass-strip|./fc2-cutlass-strip|regex:^(?!init)"
-    "cutlass_fused|make fc2-cutlass|./fc2-cutlass|regex:^(?!init)"
+    "w3_strip|make -B fc2-w3 DFLAGS='-DPACKED_TILES -DSTRIP_EPILOGUE'|COPY:fc2-w3:fc2-w3-strip|fc2_w3_kernel|"
+    "w3_gemm|make -B fc2-w3-gemm DFLAGS=-DPACKED_TILES|./fc2-w3-gemm|fc2_w3_kernel|"
+    "w3_fused|make -B fc2-w3-packed|./fc2-w3-packed|fc2_w3_kernel|"
+    "w3_lean|make -B fc2-w3-packed-lean|./fc2-w3-packed-lean|fc2_w3_kernel|"
+    "w3_dgswizzle|make -B fc2-w3-dgswizzle DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-dgswizzle|fc2_w3_kernel|"
+    "cutlass_strip|make fc2-cutlass-strip|./fc2-cutlass-strip|regex:^(?!init)|"
+    "cutlass_fused|make fc2-cutlass|./fc2-cutlass|regex:^(?!init)|"
+    "cublas_gemm|make -B cublas-bench-fc2-ncu|./cublas-bench-fc2-ncu|regex:.|--launch-count 1 --launch-skip 3"
 )
 
 
@@ -127,7 +132,7 @@ log ""
 log "── Phase 1: Building binaries ──"
 
 for entry in "${BINARIES[@]}"; do
-    IFS='|' read -r label build_cmd binary kfilter <<< "$entry"
+    IFS='|' read -r label build_cmd binary kfilter extra_ncu <<< "$entry"
     log "  [$label] $build_cmd"
 
     if [ "$DRY_RUN" = "1" ]; then
@@ -163,7 +168,7 @@ log ""
 log "── Phase 2: Wall time sanity checks ──"
 
 for entry in "${BINARIES[@]}"; do
-    IFS='|' read -r label build_cmd binary kfilter <<< "$entry"
+    IFS='|' read -r label build_cmd binary kfilter extra_ncu <<< "$entry"
 
     if [[ "$binary" == COPY:* ]]; then
         binary="./${binary##*:}"
@@ -204,7 +209,7 @@ log ""
 log "── Phase 3: Targeted ncu metric collection ──"
 
 for entry in "${BINARIES[@]}"; do
-    IFS='|' read -r label build_cmd binary kfilter <<< "$entry"
+    IFS='|' read -r label build_cmd binary kfilter extra_ncu <<< "$entry"
 
     if [[ "$binary" == COPY:* ]]; then
         binary="./${binary##*:}"
@@ -223,6 +228,7 @@ for entry in "${BINARIES[@]}"; do
     log "  [$label] collecting ncu metrics..."
     if ncu --metrics "$METRICS_ALL" \
            --kernel-name "$kfilter" \
+           $extra_ncu \
            -o "$OUTDIR/${label}" \
            "$binary" \
            > "$OUTDIR/${label}_ncu_stdout.txt" 2>"$OUTDIR/${label}_ncu_stderr.txt"; then
@@ -265,6 +271,7 @@ if [ "$DRY_RUN" = "0" ]; then
 
     # Q3: GEMM comparison (apples-to-apples: both write output, no residual/bias)
     run_diff "diff_q3_gemm"       "$OUTDIR/w3_gemm.csv"       "$OUTDIR/cutlass_strip.csv"
+    run_diff "diff_q3_cublas"     "$OUTDIR/w3_gemm.csv"       "$OUTDIR/cublas_gemm.csv"
 
     # Q5: Dispatch comparison — lean vs striding vs dgswizzle
     run_diff "diff_q5_lean_vs_fused"      "$OUTDIR/w3_lean.csv"      "$OUTDIR/w3_fused.csv"
@@ -492,7 +499,7 @@ log "  $OUTDIR/results.txt       — wall times"
 log "  $OUTDIR/summary.txt       — all metrics side-by-side + DRAM amplification"
 log "  $OUTDIR/diff_q1*.txt      — Q1: fusion cost (fused - gemm/strip)"
 log "  $OUTDIR/diff_q2*.txt      — Q2: lean vs CUTLASS fused"
-log "  $OUTDIR/diff_q3*.txt      — Q3: GEMM comparison (w3_gemm vs cutlass_strip)"
+log "  $OUTDIR/diff_q3*.txt      — Q3: GEMM comparison (w3_gemm vs cutlass_strip, cuBLAS)"
 log "  $OUTDIR/diff_q5*.txt      — Q5: dispatch comparison (lean vs striding vs dgswizzle)"
 log "  $OUTDIR/diff_q6*.txt      — Q6: output write cost (w3_strip vs w3_gemm)"
 if [ "$FULL" = "1" ]; then
