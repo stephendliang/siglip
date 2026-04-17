@@ -192,6 +192,12 @@ fc2-w3-rowmajor: fc2_w3.cu
 fc2-w3-ncycle: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=14 $< -o $@ $(LDFLAGS)
 
+fc2-w3-nflat: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=15 $< -o $@ $(LDFLAGS)
+
+fc2-w3-nsnake: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=16 $< -o $@ $(LDFLAGS)
+
 fc2-w3-dg4: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=4  $< -o $@ $(LDFLAGS)
 fc2-w3-dg6: fc2_w3.cu

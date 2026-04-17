@@ -125,6 +125,9 @@ BINARIES=(
     "w3_zorder|make -B fc2-w3-zorder DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-zorder|fc2_w3_kernel|"
     "w3_hilbert|make -B fc2-w3-hilbert DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-hilbert|fc2_w3_kernel|"
     "w3_zigzag|make -B fc2-w3-zigzag DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-zigzag|fc2_w3_kernel|"
+    "w3_ncycle|make -B fc2-w3-ncycle DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-ncycle|fc2_w3_kernel|"
+    "w3_nflat|make -B fc2-w3-nflat DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-nflat|fc2_w3_kernel|"
+    "w3_nsnake|make -B fc2-w3-nsnake DFLAGS='-DPACKED_TILES -DNO_PREFILL'|./fc2-w3-nsnake|fc2_w3_kernel|"
     "cutlass_strip|make fc2-cutlass-strip|./fc2-cutlass-strip|regex:^(?!init)|"
     "cutlass_fused|make fc2-cutlass|./fc2-cutlass|regex:^(?!init)|"
     "cublas_gemm|make -B cublas-bench-fc2-ncu|./cublas-bench-fc2-ncu|regex:.|--launch-count 1 --launch-skip 3"
@@ -233,7 +236,7 @@ for entry in "${BINARIES[@]}"; do
     fi
 
     log "  [$label] collecting ncu metrics..."
-    if ncu --metrics "$METRICS_ALL" \
+    if timeout 180 ncu --metrics "$METRICS_ALL" \
            --kernel-name "$kfilter" \
            $extra_ncu \
            -o "$OUTDIR/${label}" \
@@ -246,7 +249,12 @@ for entry in "${BINARIES[@]}"; do
         lines=$(wc -l < "$OUTDIR/${label}.csv")
         log "  [$label] ncu done ($lines CSV lines)"
     else
-        log "  [$label] NCU FAILED"
+        rc=$?
+        if [ $rc -eq 124 ]; then
+            log "  [$label] NCU TIMEOUT (likely deadlock — skipping)"
+        else
+            log "  [$label] NCU FAILED (rc=$rc)"
+        fi
         cat "$OUTDIR/${label}_ncu_stderr.txt" >> "$OUTDIR/session.log"
     fi
 done
@@ -473,7 +481,7 @@ if [ "$FULL" = "1" ]; then
         fi
 
         log "  [full/$label] collecting --set full..."
-        if ncu --set full \
+        if timeout 300 ncu --set full \
                --kernel-name "$kfilter" \
                -o "$OUTDIR/full_${label}" \
                "$binary" \
@@ -486,7 +494,12 @@ if [ "$FULL" = "1" ]; then
 
             log "  [full/$label] done"
         else
-            log "  [full/$label] FAILED"
+            rc=$?
+            if [ $rc -eq 124 ]; then
+                log "  [full/$label] TIMEOUT (likely deadlock — skipping)"
+            else
+                log "  [full/$label] FAILED (rc=$rc)"
+            fi
             cat "$OUTDIR/full_${label}_stderr.txt" >> "$OUTDIR/session.log"
         fi
     done

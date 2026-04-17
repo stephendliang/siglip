@@ -260,6 +260,57 @@ static __device__ __forceinline__ int static_swizzle(int block_idx) {
         if (tm >= TILES_M) tm = TILES_M - 1;
         return tm * TILES_N + tn;
     }
+
+#elif TILE_DISPATCH == 15
+    /*
+     * Banded N-flat: TD=14 inherits 74-way B-sharing per sub-tick but pays
+     * store contention on one tn at a time.  Split the 74 clusters into
+     * TILES_N bands of size ceil(NC/TILES_N); each band holds its own tn
+     * offset so all 3 tn values are active simultaneously across the
+     * cluster set.  Intra-cluster: 3 sub-ticks sweep all tn for the same
+     * tm (same A-tile reuse as TD=14).  Across clusters per sub-tick:
+     * 25-way B-sharing per tn (vs 74-way for TD=14) but 3 distinct B-tiles
+     * live concurrently (96KB, trivially L2-hot).  A working set and
+     * DRAM read bytes unchanged vs TD=14.  Goal: keep A floor, remove
+     * same-tn store pile-up.
+     */
+    {
+        const int NC = SM_COUNT / 2;
+        const int BAND_SIZE = (NC + TILES_N - 1) / TILES_N;
+        const int c = block_idx % NC;
+        const int _ti_local = block_idx / NC;
+        const int band = c / BAND_SIZE;
+        const int band_lane = c % BAND_SIZE;
+        const int super = _ti_local / TILES_N;
+        const int sub = _ti_local % TILES_N;
+        const int tn = (sub + band) % TILES_N;
+        int tm = super * NC + band * BAND_SIZE + band_lane;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + tn;
+    }
+
+#elif TILE_DISPATCH == 16
+    /*
+     * nsnake: TD=14 ncycle with alternating tn direction per super-tick.
+     * Even super s: sub 0,1,2 map to tn 0,1,2 (ascending).
+     * Odd super  s: sub 0,1,2 map to tn 2,1,0 (descending).
+     * At the super-boundary the last tn of super s equals the first tn of
+     * super s+1, so two consecutive sub-ticks hit the same N-col band
+     * across the 74-M wavefront jump — TMA store pages and residual read
+     * pages stay coherent across super transitions.  A reuse and wavefront
+     * width unchanged vs TD=14.
+     */
+    {
+        const int NC = SM_COUNT / 2;
+        const int c = block_idx % NC;
+        const int _ti_local = block_idx / NC;
+        const int super = _ti_local / TILES_N;
+        const int sub = _ti_local % TILES_N;
+        const int tn = (super & 1) ? (TILES_N - 1 - sub) : sub;
+        int tm = super * NC + c;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + tn;
+    }
 #endif
 }
 #endif /* TILE_DISPATCH >= 8 */
