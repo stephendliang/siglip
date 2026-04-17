@@ -1024,7 +1024,7 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
                   "r"(0),"r"(0),"r"(0),"r"(0)); \
         } \
     } \
-    tcgen05_commit_mcast(mma_mbar[S], 0x3); \
+    tcgen05_commit_mcast(mma_mbar[S], pair_mask); \
 } while(0)
 
 
@@ -1069,7 +1069,11 @@ __device__ ClockData g_clock;
    ════════════════════════════════════════════════════════════════ */
 
 __global__ void __launch_bounds__(THREADS, 1)
+#ifdef C4_DUAL_PAIR
+__cluster_dims__(4, 1, 1)
+#else
 __cluster_dims__(2, 1, 1)
+#endif
 fc2_w3_kernel(
 #ifdef PRESWIZZLE
     const uint8_t* __restrict__ raw_A,
@@ -1095,6 +1099,16 @@ fc2_w3_kernel(
     const int tid   = threadIdx.x;
     const int warp  = tid / 32;
     const int lane  = tid % 32;
+
+#ifdef C4_DUAL_PAIR
+    /* cluster_dims(4,1,1): two independent cta_group::2 pairs per cluster.
+       Pair 0 = CTAs {0,1}, Pair 1 = CTAs {2,3}. cta_rank (sm_id&1) is pair-local.
+       pair_mask selects the 2 CTAs of my pair for tcgen05 commit multicast. */
+    const int pair_id = (sm_id & 2) >> 1;
+    const uint16_t pair_mask = (uint16_t)(0x3U << (pair_id * 2));
+#else
+    const uint16_t pair_mask = 0x3U;
+#endif
 
 #if TILE_DISPATCH == 0 || TILE_DISPATCH >= 8
     const int cluster_id = sm_id / 2;
@@ -1987,7 +2001,7 @@ fc2_w3_kernel(
                               "r"(0),"r"(0),"r"(0),"r"(0));
                     }
                 }
-                tcgen05_commit_mcast(mma_mbar[0], 0x3);
+                tcgen05_commit_mcast(mma_mbar[0], pair_mask);
 
                 /* K-iterations 1..K_ITERS-1 */
                 PRAGMA_UNROLL(K_LOOP_UNROLL)
@@ -1996,7 +2010,7 @@ fc2_w3_kernel(
                 }
 
                 /* Signal epilogue: MMA done for this tile */
-                tcgen05_commit_mcast(mainloop_mbar_addr + buf * 8, 0x3);
+                tcgen05_commit_mcast(mainloop_mbar_addr + buf * 8, pair_mask);
 #ifdef CLOCK_TIMING
                 if (_ct) { int64_t _ct_e; CT_READ(_ct_e); _ct_a += _ct_e - _ct_t; }
 #endif

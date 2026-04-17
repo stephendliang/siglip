@@ -132,6 +132,15 @@ fc2-w3-inline: fc2_w3.cu
 fc2-w3-lean: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 -DLEAN_DISPATCH $< -o $@ $(LDFLAGS)
 
+fc2-w3-c4dual: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 -DLEAN_DISPATCH -DC4_DUAL_PAIR $< -o $@ $(LDFLAGS)
+
+fc2-w3-c4dual-strip: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 -DLEAN_DISPATCH -DC4_DUAL_PAIR -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
+
+fc2-w3-c4dual-gemm: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 -DLEAN_DISPATCH -DC4_DUAL_PAIR -DGEMM_ONLY $< -o $@ $(LDFLAGS)
+
 fc2-w3-tail: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 -DTAIL_STEAL $< -o $@ $(LDFLAGS)
 
