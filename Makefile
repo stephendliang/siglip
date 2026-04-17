@@ -9,7 +9,7 @@ CUTLASS_DIR = third_party/cutlass
 CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUTLASS_FLAGS = -std=c++17 --expt-relaxed-constexpr
 
-.PHONY: all clean timing fc1-gelu fc1-w3 fc1-w3-gemm fc1-w3-strip fc1-w3-sched fc2 fc2-timing fc2-w3 fc2-w3-c4 fc2-w3-c4-gemm fc2-w3-c4-strip fc2-w3-clock fc2-w3-sched-clock fc2-w3-collock fc2-w3-collock-clock fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-w3-self fc2-w3-atomic fc2-w3-spin fc2-w3-grid fc2-w3-inline fc2-w3-inline7 fc2-w3-inline7-clock fc2-w3-noprefill fc2-w3-ns7 fc2-w3-clc fc2-w3-rowsteal fc2-ldg fc2-ldg-strip fc2-ldg-gemm fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-warp calib-all tma-bench mma-bench stmatrix-bench
+.PHONY: all clean timing fc1-gelu fc1-w3 fc1-w3-gemm fc1-w3-strip fc1-w3-sched fc2 fc2-timing fc2-w3 fc2-w3-c4 fc2-w3-c4-gemm fc2-w3-c4-strip fc2-w3-clock fc2-w3-sched-clock fc2-w3-collock fc2-w3-collock-clock fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-w3-self fc2-w3-atomic fc2-w3-spin fc2-w3-grid fc2-w3-inline fc2-w3-inline7 fc2-w3-inline7-clock fc2-w3-noprefill fc2-w3-ns7 fc2-w3-clc fc2-w3-rowsteal fc2-w3-tail fc2-w3-tail-lean fc2-ldg fc2-ldg-strip fc2-ldg-gemm fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-warp calib-all tma-bench mma-bench stmatrix-bench
 
 all: $(TARGET)
 
@@ -131,6 +131,12 @@ fc2-w3-inline: fc2_w3.cu
 
 fc2-w3-lean: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 -DLEAN_DISPATCH $< -o $@ $(LDFLAGS)
+
+fc2-w3-tail: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 -DTAIL_STEAL $< -o $@ $(LDFLAGS)
+
+fc2-w3-tail-lean: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 -DTAIL_STEAL -DLEAN_DISPATCH $< -o $@ $(LDFLAGS)
 
 fc2-w3-c4: fc2_w3_c4.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
@@ -320,5 +326,5 @@ compare-fast:
 	python3 tools/compare_all.py --runs 5 --layer patch_embed --csv data/compare.csv
 
 clean:
-	rm -f $(TARGET) patch_embed_timing fc1-gelu fc1-w3 fc1-w3-gemm fc1-w3-strip fc1-w3-sched fc2 fc2-w3 fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-w3-reorder fc2-w3-self fc2-w3-atomic fc2-w3-spin fc2-w3-grid fc2-w3-inline fc2-w3-noprefill fc2-w3-ns7 fc2-w3-clc fc2-w3-rowsteal fc2-ldg fc2-ldg-strip fc2-ldg-gemm fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cublas-bench cublas-bench-fc1 cublas-bench-fc2 calibration calib-tput calib-lat calib-conflict calib-warp tma-bench mma-bench stmatrix-bench
+	rm -f $(TARGET) patch_embed_timing fc1-gelu fc1-w3 fc1-w3-gemm fc1-w3-strip fc1-w3-sched fc2 fc2-w3 fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-w3-reorder fc2-w3-self fc2-w3-atomic fc2-w3-spin fc2-w3-grid fc2-w3-inline fc2-w3-noprefill fc2-w3-ns7 fc2-w3-clc fc2-w3-rowsteal fc2-w3-tail fc2-w3-tail-lean fc2-ldg fc2-ldg-strip fc2-ldg-gemm fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cublas-bench cublas-bench-fc1 cublas-bench-fc2 calibration calib-tput calib-lat calib-conflict calib-warp tma-bench mma-bench stmatrix-bench
 	rm -rf sass/

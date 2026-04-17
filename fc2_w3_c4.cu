@@ -433,7 +433,7 @@ fc2_w3_c4_kernel(
 
         const int tm_lo = tile_lo / TILES_N;
         const int tm_hi = (tile_hi < TOTAL_TILES) ? (tile_hi / TILES_N) : -1;
-        const bool is_shared = (tm_lo == tm_hi);
+        const bool is_shared = false;  /* DEBUG: force SPLIT path to isolate mcast crash */
         const bool hi_valid  = (tile_hi < TOTAL_TILES);
         const bool my_valid  = (my_tile < TOTAL_TILES);
 

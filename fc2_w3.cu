@@ -1102,14 +1102,24 @@ fc2_w3_kernel(
 
 #if TILE_DISPATCH == 4
         for (int i = 0; i < 2; i++) {
-            mbar_init(smem_to_uint(smem + OFF_SCHED_PROD_MBAR + i * 8), 32);   /* W7 warp arrives */
-            mbar_init(smem_to_uint(smem + OFF_SCHED_CONS_MBAR + i * 8), 32);   /* W0 warp arrives */
 #ifdef LEAN_DISPATCH
             mbar_init(smem_to_uint(smem + OFF_TILE_READY_MBAR + i * 8), 1);    /* W0 lane 0 only */
 #else
             mbar_init(smem_to_uint(smem + OFF_TILE_READY_MBAR + i * 8), 32);   /* W0 warp arrives */
 #endif
         }
+        /*
+         * W7↔W0 handshake: use 4-byte monotonic epochs in place of prod/cons
+         * mbarriers. W7 st.release prod_epoch after writing fifo; W0 spins
+         * ld.acquire then st.release cons_epoch after consuming.
+         * Saves the 32-thread mbar arrive on each side → ~5-10 cyc/tile off
+         * W0's critical path. Layout: reuse OFF_SCHED_PROD_MBAR / OFF_SCHED_CONS_MBAR
+         * regions, first 4 bytes of each slot holds the epoch counter.
+         */
+        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_PROD_MBAR)));
+        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_PROD_MBAR + 8)));
+        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_CONS_MBAR)));
+        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_CONS_MBAR + 8)));
         /* Clear epoch + bcast slots so CTA1 spin-wait works and
            LEAN_DISPATCH doesn't read stale TOTAL_TILES from a prior launch */
         asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH)));
@@ -1170,16 +1180,14 @@ fc2_w3_kernel(
 #endif
 #if TILE_DISPATCH == 4
     /* Scheduler pipe addresses (CTA-local) */
-    const uint32_t sched_prod_mbar = smem_to_uint(smem + OFF_SCHED_PROD_MBAR);
-    const uint32_t sched_cons_mbar = smem_to_uint(smem + OFF_SCHED_CONS_MBAR);
+    const uint32_t prod_epoch_addr = smem_to_uint(smem + OFF_SCHED_PROD_MBAR);
+    const uint32_t cons_epoch_addr = smem_to_uint(smem + OFF_SCHED_CONS_MBAR);
     const uint32_t tile_ready_mbar = smem_to_uint(smem + OFF_TILE_READY_MBAR);
     const uint32_t bcast_addr      = smem_to_uint(smem + OFF_BCAST_TILE);
     const uint32_t fifo_addr       = smem_to_uint(smem + OFF_SCHED_FIFO);
     /* CTA0's epoch/fifo addresses for CTA1 to read via ld.shared::cluster */
     const uint32_t cta0_epoch = smem_to_uint(smem + OFF_SCHED_EPOCH) & 0xFEFFFFFFU;
     const uint32_t cta0_fifo  = smem_to_uint(smem + OFF_SCHED_FIFO) & 0xFEFFFFFFU;
-    int sched_prod_phase[2] = {0, 0};
-    int sched_cons_phase[2] = {0, 0};
     int tile_ready_phase[2] = {0, 0};
 #endif
 #if TILE_DISPATCH == 6
@@ -1335,10 +1343,17 @@ fc2_w3_kernel(
         int _rs_tn = TILES_N;   /* force row fetch on first iteration */
 #endif
         while (true) {
-            /* Wait for W0 to consume this slot (skip first 2 prefills) */
+            /*
+             * Wait for W0 to consume this slot (skip first 2 prefills).
+             * Monotonic epoch: cons_epoch[_s_buf] reaches _s_iter-1 once W0
+             * has consumed the production from W7's iter (_s_iter-2).
+             */
             if (_s_iter >= 2) {
-                mbar_wait(sched_cons_mbar + _s_buf * 8, sched_cons_phase[_s_buf]);
-                sched_cons_phase[_s_buf] ^= 1;
+                int _cons_e;
+                do {
+                    asm volatile("ld.acquire.cta.shared.b32 %0, [%1];"
+                        : "=r"(_cons_e) : "r"(cons_epoch_addr + _s_buf * 4));
+                } while (_cons_e < _s_iter - 1);
             }
 
             /* Dispatch: CTA0 atomicAdds, CTA1 reads via cluster SMEM */
@@ -1403,6 +1418,29 @@ fc2_w3_kernel(
                         : "=r"(_cl_tm) : "l"(&g_col_ctr[_cl_tn]));
                     tile_idx = (_cl_tm < TILES_M)
                         ? _cl_tm * TILES_N + _cl_tn : TOTAL_TILES;
+#elif defined(TAIL_STEAL)
+                    /*
+                     * Tail-steal: static linear-stride prefix + atomic tail.
+                     * Prefix: cluster cid processes tiles {cid + i*num_clusters}
+                     * for i in [0, STATIC_PER_CLUSTER). No atomic, no contention.
+                     * Tail: at most (TOTAL_TILES - STATIC_TOTAL) leftover tiles
+                     * raced by whichever cluster finishes static first. Drops
+                     * atomic count from 5439 → ~37 at K=3072.
+                     */
+                    {
+                        constexpr int NUM_CLUSTERS       = SM_COUNT / 2;
+                        constexpr int STATIC_PER_CLUSTER = TOTAL_TILES / NUM_CLUSTERS;
+                        constexpr int STATIC_TOTAL       = STATIC_PER_CLUSTER * NUM_CLUSTERS;
+                        if (_s_iter < STATIC_PER_CLUSTER) {
+                            tile_idx = (sm_id / 2) + _s_iter * NUM_CLUSTERS;
+                        } else {
+                            int _t;
+                            asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
+                                : "=r"(_t) : "l"(&g_tile_ctr));
+                            _t += STATIC_TOTAL;
+                            tile_idx = (_t < TOTAL_TILES) ? _t : TOTAL_TILES;
+                        }
+                    }
 #else
                     asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
                         : "=r"(tile_idx) : "l"(&g_tile_ctr));
@@ -1428,8 +1466,16 @@ fc2_w3_kernel(
             }
 #endif
 
-            /* Signal W0: tile ready in sched_fifo[buf] */
-            mbar_arrive(sched_prod_mbar + _s_buf * 8);
+            /*
+             * Signal W0: tile ready in sched_fifo[buf].
+             * st.release pairs with W0's ld.acquire on the same epoch word.
+             * Only lane 0 writes — one store, not 32 mbar arrives.
+             */
+            if (lane == 0) {
+                asm volatile("st.release.cta.shared.b32 [%0], %1;"
+                    :: "r"(prod_epoch_addr + _s_buf * 4), "r"(_s_iter + 1)
+                    : "memory");
+            }
 
             /* Broadcast tile_idx from lane 0 to check termination */
             asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
@@ -1466,11 +1512,22 @@ fc2_w3_kernel(
        At loop top W0 already has tile_idx in registers — zero stall. */
     int _pf_tile = TOTAL_TILES;
     int _pf_slot = 1;
+    /* Per-slot consumption count — all 32 W0 lanes track in lockstep so the
+       next spin uses the same target. Only lane 0 issues the release store. */
+    int _pf_cons[2] = {0, 0};
     if (warp == 0) {
-        mbar_wait(sched_prod_mbar, sched_prod_phase[0]);
-        sched_prod_phase[0] ^= 1;
+        /* First prefill: wait for W7 to produce slot 0, then read fifo[0]. */
+        int _prod_e;
+        do {
+            asm volatile("ld.acquire.cta.shared.b32 %0, [%1];"
+                : "=r"(_prod_e) : "r"(prod_epoch_addr));
+        } while (_prod_e < 1);
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_pf_tile) : "r"(fifo_addr));
-        mbar_arrive(sched_cons_mbar);
+        _pf_cons[0] = 1;
+        if (lane == 0) {
+            asm volatile("st.release.cta.shared.b32 [%0], %1;"
+                :: "r"(cons_epoch_addr), "r"(1) : "memory");
+        }
     }
     while (true) {
         int tile_idx;
@@ -1847,18 +1904,29 @@ fc2_w3_kernel(
 
 #if TILE_DISPATCH == 4
             /* Prefetch next tile from scheduler FIFO.
-               mbar_wait overlaps with W1's MMA / W2-W6's epilogue. */
+               Spin overlaps with W1's MMA / W2-W6's epilogue. */
 #ifdef CLOCK_TIMING
             int64_t _ct_pf; if (_ct) CT_READ(_ct_pf);
 #endif
-            mbar_wait(sched_prod_mbar + _pf_slot * 8, sched_prod_phase[_pf_slot]);
+            {
+                const int _pf_target = _pf_cons[_pf_slot] + 1;
+                int _prod_e;
+                do {
+                    asm volatile("ld.acquire.cta.shared.b32 %0, [%1];"
+                        : "=r"(_prod_e) : "r"(prod_epoch_addr + _pf_slot * 4));
+                } while (_prod_e < _pf_target);
+            }
 #ifdef CLOCK_TIMING
             if (_ct) { int64_t _ct_pe; CT_READ(_ct_pe); _ct_b += _ct_pe - _ct_pf; }
 #endif
-            sched_prod_phase[_pf_slot] ^= 1;
             asm volatile("ld.shared.b32 %0, [%1];"
                 : "=r"(_pf_tile) : "r"(fifo_addr + _pf_slot * 4));
-            mbar_arrive(sched_cons_mbar + _pf_slot * 8);
+            _pf_cons[_pf_slot]++;
+            if (lane == 0) {
+                asm volatile("st.release.cta.shared.b32 [%0], %1;"
+                    :: "r"(cons_epoch_addr + _pf_slot * 4), "r"(_pf_cons[_pf_slot])
+                    : "memory");
+            }
             _pf_slot ^= 1;
 #elif TILE_DISPATCH == 7
             /* CTA1 reads prefetched tile from CTA0's FIFO (written at ki=3).
