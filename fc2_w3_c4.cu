@@ -1,5 +1,12 @@
 /*
-FC2 W3 Cluster-of-4 — A-multicast super-tile scheduler.
+FC2 W3 Cluster-of-4 — A-multicast super-tile scheduler, PACKED_TILES only.
+
+Layout
+  All tensors (A, B, residual, output) are tile-contiguous in DRAM.  Each
+  tile is a single contiguous block, so every TMA load/store is a sequential
+  burst (no DRAM page misses from strided 2D walks).  Host packs row-major
+  input into tile-major before the timed launch.  There is no non-packed
+  code path.
 
 Geometry
   Cluster = 4 CTAs (37 clusters × 4 = 148 SMs).
@@ -435,9 +442,9 @@ fc2_w3_c4_kernel(
 
         const int tm       = my_tile / TILES_N;
         const int tn       = my_tile % TILES_N;
-        const int m_start  = tm * TM * 2 + pair_lane * TM;
-        const int n_start  = tn * TN;
-        const int b_c1     = n_start + pair_lane * (TN / 2);
+        /* Packed tile indices: each tile is a contiguous DRAM block. */
+        const int a_m_tile = tm * 2 + pair_lane;
+        const int b_n_half = tn * 2 + pair_lane;
 
         if (warp == 0 && my_valid) {
             if (is_shared) {
@@ -455,7 +462,10 @@ fc2_w3_c4_kernel(
                         mbar_wait(mma_mbar_local[s], mma_phase[s]);
                         mma_phase[s] ^= 1;
                     }
-                    const int tma_c0 = ki * TK;
+                    /* Packed coords: c0=0, c1 picks the tile's k-chunk row. */
+                    const int tma_c0    = 0;
+                    const int tma_a_c1  = (a_m_tile * K_ITERS + ki) * TM;
+                    const int tma_b_c1  = (b_n_half * K_ITERS + ki) * (TN / 2);
                     const uint32_t a_dst      = smem_a[s];
                     const uint32_t b_dst      = smem_b[s];
                     const uint32_t tma_mbar_s_peer_clear =
@@ -463,15 +473,15 @@ fc2_w3_c4_kernel(
 
                     if (lane == 0) {
                         /* A-multicast issued only by pair0 (CTA_0,CTA_1).
-                           m_start is relative to THIS CTA (pair_lane); the
-                           multicast A_top/A_bot split matches the pair
-                           layout exactly.                                  */
+                           The multicast A_top/A_bot split matches the pair
+                           layout exactly (same tm, so CTA_2 gets pair0's
+                           A_top and CTA_3 gets pair0's A_bot).              */
                         if (pair_id == 0) {
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global.tile"
                                 ".mbarrier::complete_tx::bytes.multicast::cluster"
                                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                                :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(m_start),
+                                :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(tma_a_c1),
                                    "r"(tma_mbar_s_peer_clear), "h"(a_mcast_mask)
                                 : "memory");
                         }
@@ -481,7 +491,7 @@ fc2_w3_c4_kernel(
                             "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global.tile"
                             ".mbarrier::complete_tx::bytes"
                             " [%0], [%1, {%2, %3}], [%4];"
-                            :: "r"(b_dst), "l"(&tma_b), "r"(tma_c0), "r"(b_c1),
+                            :: "r"(b_dst), "l"(&tma_b), "r"(tma_c0), "r"(tma_b_c1),
                                "r"(tma_mbar_s_peer_clear)
                             : "memory");
                         /* Pair CTA's expect_tx arrive on pair leader (all
@@ -506,7 +516,10 @@ fc2_w3_c4_kernel(
                         mbar_wait(mma_mbar_local[s], mma_phase[s]);
                         mma_phase[s] ^= 1;
                     }
-                    const int tma_c0 = ki * TK;
+                    /* Packed coords. */
+                    const int tma_c0    = 0;
+                    const int tma_a_c1  = (a_m_tile * K_ITERS + ki) * TM;
+                    const int tma_b_c1  = (b_n_half * K_ITERS + ki) * (TN / 2);
                     const uint32_t a_dst = smem_a[s];
                     const uint32_t b_dst = smem_b[s];
                     const uint32_t tma_mbar_s_peer_clear =
@@ -522,9 +535,9 @@ fc2_w3_c4_kernel(
                             " [%5], [%6, {%2, %7}], [%4];\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64"
                             " _, [%4], %8;"
-                            :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(m_start),
+                            :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(tma_a_c1),
                                "r"(tma_mbar_s_peer_clear),
-                               "r"(b_dst), "l"(&tma_b), "r"(b_c1),
+                               "r"(b_dst), "l"(&tma_b), "r"(tma_b_c1),
                                "r"(TMA_BYTES)
                             : "memory");
                     }
@@ -615,8 +628,9 @@ fc2_w3_c4_kernel(
                     ? prev_super * 2 : prev_super * 2 + 1;
                 const int ptm = prev_my_tile / TILES_N;
                 const int ptn = prev_my_tile % TILES_N;
-                const int prev_m = ptm * TM * 2 + pair_lane * TM;
-                const int prev_n = ptn * TN;
+                /* Packed: residual rows are tile-major.  prev_m = packed row. */
+                const int prev_m = ((ptm * 2 + pair_lane) * TILES_N + ptn) * TM;
+                const int prev_n = 0;
 
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                     const int stage = si % NUM_EPI_STAGES;
@@ -654,9 +668,10 @@ fc2_w3_c4_kernel(
                     ? prev_super * 2 : prev_super * 2 + 1;
                 const int ptm = prev_my_tile / TILES_N;
                 const int ptn = prev_my_tile % TILES_N;
-                const int prev_m = ptm * TM * 2 + pair_lane * TM;
-                const int prev_n = ptn * TN;
-                const int prev_n_bias = prev_n;
+                /* Packed: tile-major rows; bias still indexed by N. */
+                const int prev_m = ((ptm * 2 + pair_lane) * TILES_N + ptn) * TM;
+                const int prev_n = 0;
+                const int prev_n_bias = ptn * TN;
 
                 const uint32_t xor_val = (lane & 7) << 4;
                 const uint32_t sw0 = 0 ^ xor_val, sw1 = 16 ^ xor_val;
@@ -817,9 +832,10 @@ fc2_w3_c4_kernel(
         if (last_valid) {
             const int ltm = last_my_tile / TILES_N;
             const int ltn = last_my_tile % TILES_N;
-            const int last_m = ltm * TM * 2 + pair_lane * TM;
-            const int last_n = ltn * TN;
-            const int last_n_bias = last_n;
+            /* Packed coords for drain epilogue. */
+            const int last_m = ((ltm * 2 + pair_lane) * TILES_N + ltn) * TM;
+            const int last_n = 0;
+            const int last_n_bias = ltn * TN;
 
             if (warp == 2) {
 #if defined(STRIP_EPILOGUE) || defined(GEMM_ONLY)
@@ -1012,6 +1028,40 @@ __global__ void init_residual(__nv_bfloat16* res, int n_dim, long long total) {
     }
 }
 
+/*
+Packing kernels: rearrange row-major input into tile-contiguous layout.
+Each tile becomes a contiguous block in DRAM.  TMA sees stride = tile_width
+instead of matrix_width, so every load/store is a sequential DRAM burst.
+*/
+__global__ void pack_u8(uint8_t* __restrict__ dst, const uint8_t* __restrict__ src,
+                        int M, int K, int tile_m, int tile_k) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)M * K;
+    if (idx >= total) return;
+    int m = (int)(idx / K);
+    int k = (int)(idx % K);
+    int tiles_k = K / tile_k;
+    long long packed = (long long)(m / tile_m) * tiles_k * tile_m * tile_k
+                     + (long long)(k / tile_k) * tile_m * tile_k
+                     + (long long)(m % tile_m) * tile_k + (k % tile_k);
+    dst[packed] = src[idx];
+}
+
+__global__ void pack_bf16(__nv_bfloat16* __restrict__ dst,
+                          const __nv_bfloat16* __restrict__ src,
+                          int M, int N, int tile_m, int tile_n) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)M * N;
+    if (idx >= total) return;
+    int m = (int)(idx / N);
+    int n = (int)(idx % N);
+    int tiles_n = N / tile_n;
+    long long packed = (long long)(m / tile_m) * tiles_n * tile_m * tile_n
+                     + (long long)(n / tile_n) * tile_m * tile_n
+                     + (long long)(m % tile_m) * tile_n + (n % tile_n);
+    dst[packed] = src[idx];
+}
+
 int main() {
     setbuf(stdout, NULL);
     printf("FC2 W3 c4 — A-multicast super-tile (cluster=4)\n");
@@ -1054,10 +1104,55 @@ int main() {
         init_residual<<<(total + 255) / 256, 256>>>(d_residual, N_DIM, total);
     }
 
+    /* Pack row-major inputs into tile-contiguous DRAM layout. */
+    {
+        printf("  Packing tiles...\n");
+        const int tpb = 256;
+        {
+            uint8_t* d_tmp;
+            CUDA_CHECK(cudaMalloc(&d_tmp, (size_t)M_TOTAL * K_DIM));
+            long long n = (long long)M_TOTAL * K_DIM;
+            pack_u8<<<(int)((n + tpb - 1) / tpb), tpb>>>(
+                d_tmp, d_A, M_TOTAL, K_DIM, TM, TK);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(d_A, d_tmp, (size_t)M_TOTAL * K_DIM,
+                                  cudaMemcpyDeviceToDevice));
+            cudaFree(d_tmp);
+        }
+        {
+            uint8_t* d_tmp;
+            CUDA_CHECK(cudaMalloc(&d_tmp, (size_t)N_DIM * K_DIM));
+            long long n = (long long)N_DIM * K_DIM;
+            pack_u8<<<(int)((n + tpb - 1) / tpb), tpb>>>(
+                d_tmp, d_B, N_DIM, K_DIM, TN / 2, TK);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(d_B, d_tmp, (size_t)N_DIM * K_DIM,
+                                  cudaMemcpyDeviceToDevice));
+            cudaFree(d_tmp);
+        }
+        {
+            __nv_bfloat16* d_tmp;
+            CUDA_CHECK(cudaMalloc(&d_tmp,
+                (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16)));
+            long long n = (long long)M_TOTAL * N_DIM;
+            pack_bf16<<<(int)((n + tpb - 1) / tpb), tpb>>>(
+                d_tmp, d_residual, M_TOTAL, N_DIM, TM, TN);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(d_residual, d_tmp,
+                (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16),
+                cudaMemcpyDeviceToDevice));
+            cudaFree(d_tmp);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    /* Packed TMA descriptors: tensor is "narrow-tall" per input, with
+       dim0 = tile_width and dim1 = total_tiles * tile_height.           */
     CUtensorMap h_tma_a;
     {
-        uint64_t dims[2]    = {(uint64_t)K_DIM, (uint64_t)M_TOTAL};
-        uint64_t strides[1] = {(uint64_t)K_DIM};
+        uint64_t a_total_rows = (uint64_t)(M_TOTAL / TM) * K_ITERS * TM;
+        uint64_t dims[2]    = {(uint64_t)TK, a_total_rows};
+        uint64_t strides[1] = {(uint64_t)TK};
         uint32_t box[2]     = {TK, TM};
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_a,
@@ -1070,8 +1165,9 @@ int main() {
     }
     CUtensorMap h_tma_b;
     {
-        uint64_t dims[2]    = {(uint64_t)K_DIM, (uint64_t)N_DIM};
-        uint64_t strides[1] = {(uint64_t)K_DIM};
+        uint64_t b_total_rows = (uint64_t)(N_DIM / (TN / 2)) * K_ITERS * (TN / 2);
+        uint64_t dims[2]    = {(uint64_t)TK, b_total_rows};
+        uint64_t strides[1] = {(uint64_t)TK};
         uint32_t box[2]     = {TK, TN / 2};
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_b,
@@ -1084,8 +1180,9 @@ int main() {
     }
     CUtensorMap h_tma_c;
     {
-        uint64_t dims[2]    = {(uint64_t)N_DIM, (uint64_t)M_TOTAL};
-        uint64_t strides[1] = {(uint64_t)N_DIM * sizeof(__nv_bfloat16)};
+        uint64_t c_total_rows = (uint64_t)(M_TOTAL / TM) * TILES_N * TM;
+        uint64_t dims[2]    = {(uint64_t)TN, c_total_rows};
+        uint64_t strides[1] = {(uint64_t)TN * sizeof(__nv_bfloat16)};
         uint32_t box[2]     = {64, 32};
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_c,
@@ -1098,8 +1195,9 @@ int main() {
     }
     CUtensorMap h_tma_res;
     {
-        uint64_t dims[2]    = {(uint64_t)N_DIM, (uint64_t)M_TOTAL};
-        uint64_t strides[1] = {(uint64_t)N_DIM * sizeof(__nv_bfloat16)};
+        uint64_t r_total_rows = (uint64_t)(M_TOTAL / TM) * TILES_N * TM;
+        uint64_t dims[2]    = {(uint64_t)TN, r_total_rows};
+        uint64_t strides[1] = {(uint64_t)TN * sizeof(__nv_bfloat16)};
         uint32_t box[2]     = {64, 128};
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_res,
@@ -1171,7 +1269,11 @@ int main() {
         float after_bias = __bfloat162float(__float2bfloat16(acc_rounded + bias_bf16_f));
         __nv_bfloat16 expected = __float2bfloat16(after_bias + res_bf16_f);
 #endif
-        __nv_bfloat16 actual = h_C[row * N_DIM + col];
+        /* Output is packed tile-major. */
+        long long packed_idx =
+            (long long)((int)(row / TM) * TILES_N + col / TN) * TM * TN
+            + (long long)((int)(row % TM)) * TN + (col % TN);
+        __nv_bfloat16 actual = h_C[packed_idx];
         float ef = __bfloat162float(expected);
         float af = __bfloat162float(actual);
         if (ef != af) {
