@@ -1156,18 +1156,21 @@ fc2_w3_kernel(
     }
 #endif
 
-    /* ── Load bias into SMEM once ── */
+    /* ── Load bias into SMEM once ──
+       Skipped in STRIP_EPILOGUE / GEMM_ONLY — epilogue never reads bias in
+       those modes, and the global LDG + syncthreads would just thrash L2
+       and delay W0's TMA setup. */
+#if !defined(STRIP_EPILOGUE) && !defined(GEMM_ONLY)
     {
         const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
-        /* 256 BF16 = 128 uint32_t. Spread across all threads (224 threads, each loads ~0-1). */
         for (int i = tid; i < N_DIM / 2; i += THREADS) {
-            /* Load 2 BF16 as uint32_t, store to SMEM */
             uint32_t val;
             asm volatile("ld.global.b32 %0, [%1];" : "=r"(val) : "l"(bias + i * 2));
             asm volatile("st.shared.b32 [%0], %1;" :: "r"(bias_saddr + i * 4), "r"(val));
         }
     }
     __syncthreads();
+#endif
 
 #ifdef CLOCK_TIMING
 #if TILE_DISPATCH == 3

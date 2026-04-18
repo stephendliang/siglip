@@ -8,19 +8,21 @@
 #               ncycle, nflat, nsnake    (* = fc2-only)
 #   packed    : yes (DPACKED_TILES) | no
 #   mode      : fused | gemm (DGEMM_ONLY) | strip (DSTRIP_EPILOGUE)
+#   epi-warps : 4 (default) | 2 | 1  — rebuilds with -DNUM_EPI_WARPS=N
 #
-# Each enabled (layer, dispatch, packed, mode) tuple becomes one config.
+# Each enabled (layer, dispatch, packed, mode, epi_warps) tuple is one config.
 # Configs are built to unique binaries via COPY so they don't clobber each
 # other when re-running.  --ncu collects metrics on top of wall-time.
 #
 # Usage:
-#   ./tools/bench.sh                                # default smoke (both layers, core dispatches, both packings, fused only)
-#   ./tools/bench.sh --comprehensive                # packed-only, all dispatches, fused/gemm/strip, baselines — full subtracts
+#   ./tools/bench.sh                                # default smoke (both layers, core dispatches, both packings, fused, 4 epi-warps)
+#   ./tools/bench.sh --comprehensive                # packed-only, all dispatches, f/g/s, baselines, epi-warps={4,2}
 #   ./tools/bench.sh --comprehensive --ncu          # same + ncu metrics on every config
 #   ./tools/bench.sh --dispatch=all --decomp=all    # full combinatorial (packed+unpacked both)
 #   ./tools/bench.sh --fc2 --ncu                    # FC2 wall-time + ncu
 #   ./tools/bench.sh --baselines --ncu              # include cutlass/cublas
 #   ./tools/bench.sh --dispatch=lean,dgswizzle --packed=yes --ncu --full
+#   ./tools/bench.sh --epi-warps=2,4                # add 2-warp epilogue sweep
 #   ./tools/bench.sh --dry-run                      # print configs, build nothing
 #
 # Output: data/bench_YYYYMMDD_HHMMSS/
@@ -34,6 +36,7 @@ LAYERS="fc1 fc2"
 DISPATCH_SPEC="core"
 PACKED_SPEC="both"
 DECOMP_SPEC="fused"
+EPI_WARPS_SPEC="4"
 BASELINES=0
 DO_NCU=0
 DO_FULL=0
@@ -49,6 +52,7 @@ for arg in "$@"; do
         --dispatch=*)       DISPATCH_SPEC="${arg#*=}" ;;
         --packed=*)         PACKED_SPEC="${arg#*=}" ;;
         --decomp=*)         DECOMP_SPEC="${arg#*=}" ;;
+        --epi-warps=*)      EPI_WARPS_SPEC="${arg#*=}" ;;
         --baselines)        BASELINES=1 ;;
         --ncu)              DO_NCU=1 ;;
         --full)             DO_NCU=1; DO_FULL=1 ;;
@@ -56,11 +60,12 @@ for arg in "$@"; do
         --reps=*)           REPS="${arg#*=}" ;;
         --out=*)            OUT_OVERRIDE="${arg#*=}" ;;
         --comprehensive)
-            # force-packed + every dispatch + fused/gemm/strip + baselines.
+            # force-packed + every dispatch + fused/gemm/strip + baselines + epi-warp sweep.
             # Decomposition subtracts (f-g, g-s) populate automatically.
             DISPATCH_SPEC="all"
             PACKED_SPEC="yes"
             DECOMP_SPEC="all"
+            EPI_WARPS_SPEC="4,2"
             BASELINES=1
             ;;
         -h|--help)          sed -n '2,30p' "$0"; exit 0 ;;
@@ -100,6 +105,18 @@ resolve_modes() {
     esac
 }
 
+# Epi-warp sweep. Valid values: 1, 2, 4 (kernel_common.cuh enforces 4 % N == 0).
+resolve_epi_warps() {
+    local ews="${EPI_WARPS_SPEC//,/ }"
+    for n in $ews; do
+        case "$n" in
+            1|2|4) ;;
+            *) echo "Bad --epi-warps value: $n (valid: 1, 2, 4)" >&2; exit 1 ;;
+        esac
+    done
+    echo "$ews"
+}
+
 # Build the make-target suffix for a dispatch; also returns required flags.
 # Echoes "<suffix>|<extra_flags>".  Empty suffix means base target.
 dispatch_spec() {
@@ -123,10 +140,12 @@ dispatch_spec() {
     echo "${suffix}|${extra}"
 }
 
-# Emit a label + build_cmd + binary for one (layer,disp,packed,mode) tuple.
+# Emit a label + build_cmd + binary for one (layer,disp,packed,mode,epi_warps) tuple.
 # Format: "label|build_cmd|binary|kfilter"
+# epi_warps=4 (default) keeps legacy labels unchanged.  For 1/2 an "-eN" suffix
+# is injected into the disp slot so parse_label() still splits into 4 fields.
 make_cfg() {
-    local layer="$1" disp="$2" packed="$3" mode="$4"
+    local layer="$1" disp="$2" packed="$3" mode="$4" epi_warps="$5"
     local spec suffix extra
     spec=$(dispatch_spec "$layer" "$disp") || return 1
     suffix="${spec%|*}"
@@ -137,11 +156,14 @@ make_cfg() {
     [ "$packed" = "yes" ]  && flags="$flags -DPACKED_TILES"
     [ "$mode"   = "gemm"  ] && flags="$flags -DGEMM_ONLY"
     [ "$mode"   = "strip" ] && flags="$flags -DSTRIP_EPILOGUE"
+    [ "$epi_warps" != "4" ] && flags="$flags -DNUM_EPI_WARPS=${epi_warps}"
     flags="$(echo "$flags" | xargs)"  # collapse whitespace
 
     local pktag="np"; [ "$packed" = "yes" ] && pktag="p"
-    local label="${layer}_${disp//-/_}_${pktag}_${mode}"
-    local out_bin="bench-${layer}-${disp}-${pktag}-${mode}"
+    local disp_tag="$disp"
+    [ "$epi_warps" != "4" ] && disp_tag="${disp}-e${epi_warps}"
+    local label="${layer}_${disp_tag//-/_}_${pktag}_${mode}"
+    local out_bin="bench-${layer}-${disp_tag}-${pktag}-${mode}"
 
     local build_cmd
     if [ -z "$flags" ]; then
@@ -162,8 +184,10 @@ for layer in $LAYERS; do
     for disp in $(resolve_dispatches "$layer" "$DISPATCH_SPEC"); do
         for packed in $(resolve_packings); do
             for mode in $(resolve_modes); do
-                cfg=$(make_cfg "$layer" "$disp" "$packed" "$mode") || exit 1
-                CFGS+=("$cfg")
+                for ew in $(resolve_epi_warps); do
+                    cfg=$(make_cfg "$layer" "$disp" "$packed" "$mode" "$ew") || exit 1
+                    CFGS+=("$cfg")
+                done
             done
         done
     done
@@ -195,7 +219,7 @@ log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUTDIR/session.log"; }
 
 log "========================================"
 log "  unified bench  $TIMESTAMP"
-log "  layers=$LAYERS dispatch=$DISPATCH_SPEC packed=$PACKED_SPEC decomp=$DECOMP_SPEC"
+log "  layers=$LAYERS dispatch=$DISPATCH_SPEC packed=$PACKED_SPEC decomp=$DECOMP_SPEC epi-warps=$EPI_WARPS_SPEC"
 log "  baselines=$BASELINES ncu=$DO_NCU full=$DO_FULL reps=$REPS"
 log "  configs: ${#CFGS[@]}  out=$OUTDIR"
 log "========================================"

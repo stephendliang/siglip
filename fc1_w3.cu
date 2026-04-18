@@ -545,7 +545,11 @@ fc1_w3_kernel(
 #endif
     int ml_phase[2]  = {0, 1};
 
-    /* ── Load bias into SMEM ── */
+    /* ── Load bias into SMEM ──
+       Skipped in STRIP_EPILOGUE / GEMM_ONLY — epilogue never reads bias in
+       those modes, and the global LDG + syncthreads would thrash L2 and
+       delay W0's TMA setup. */
+#if !defined(STRIP_EPILOGUE) && !defined(GEMM_ONLY)
 #ifdef LDG_BIAS
     /* LDG_BIAS: no SMEM bias — direct LDG from L1-cached global in epilogue */
 #elif defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
@@ -592,6 +596,7 @@ fc1_w3_kernel(
     }
 #endif
     __syncthreads();
+#endif /* !STRIP_EPILOGUE && !GEMM_ONLY */
 
 #if TILE_DISPATCH == 4
     /* ════════════════════════════════════════════
