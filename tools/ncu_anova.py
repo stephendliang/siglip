@@ -1,46 +1,85 @@
 #!/usr/bin/env python3
 """
 ANOVA-style analysis of ncu CSV data across kernel variants.
-Reads all CSVs from a session directory, pivots into a metric×variant table,
-and highlights the biggest differences between strip/fused and w3/cutlass.
+
+Consumes the label schema produced by tools/bench.sh:
+    {layer}_{dispatch}_{pk}_{mode}.csv    (pk in {p, np}, mode in {fused, gemm, strip})
+    cutlass_fc2_fused.csv, cutlass_fc2_strip.csv, cublas_fc{1,2}_gemm.csv
+
+Produces:
+  1. Full metric × variant table.
+  2. Per (layer, pk, mode) cross-dispatch comparison vs default.
+  3. Per (layer, dispatch, pk) fused-vs-gemm and gemm-vs-strip delta (what
+     the epilogue / residual add).
+  4. Stall breakdown per variant (sorted, percent of total).
+  5. Fused - strip stall delta, per (layer, dispatch, pk).
 """
-import csv, sys, os, glob
+import csv, sys, os, glob, re
 from collections import defaultdict
 
+UNIT_SCALE = {
+    "Gbyte": 1e9, "Mbyte": 1e6, "Kbyte": 1e3, "byte": 1,
+    "Gsector": 1e9, "Msector": 1e6, "Ksector": 1e3, "sector": 1,
+}
+
 def load_csv(path):
-    """Returns {metric_name: (value_str, unit)}"""
     metrics = {}
     with open(path) as f:
         for row in csv.DictReader(f):
-            name = row["Metric Name"]
-            val = row["Metric Value"]
-            unit = row["Metric Unit"]
+            name = row.get("Metric Name", "")
+            val  = row.get("Metric Value", "")
+            unit = row.get("Metric Unit", "")
+            if not name: continue
             metrics[name] = (val, unit)
     return metrics
 
-def parse_val(s):
-    """Parse ncu metric value string to float, or None."""
-    if s in ("n/a", "", "N/A"):
+def parse_val(s, unit=""):
+    if s in ("n/a", "", "N/A"): return None
+    try: v = float(s.replace(",", ""))
+    except ValueError: return None
+    return v * UNIT_SCALE.get(unit, 1.0)
+
+def parse_label(lbl):
+    """Return (layer, dispatch, pk, mode) or None for baselines/bad."""
+    if lbl.startswith(("cutlass_", "cublas_")):
         return None
-    s = s.replace(",", "")
-    try:
-        return float(s)
-    except ValueError:
-        return None
+    parts = lbl.split("_")
+    if len(parts) < 4: return None
+    layer = parts[0]
+    if layer not in ("fc1", "fc2"): return None
+    mode = parts[-1]
+    pk   = parts[-2]
+    disp = "_".join(parts[1:-2])
+    return layer, disp, pk, mode
+
+def fmt_num(v):
+    if v is None: return "n/a"
+    av = abs(v)
+    if av >= 1e9: return f"{v/1e9:>11.2f}G"
+    if av >= 1e6: return f"{v/1e6:>11.2f}M"
+    if av >= 1e3: return f"{v/1e3:>11.1f}K"
+    return f"{v:>12.2f}"
+
+def fmt_pct(v):
+    if v is None: return "n/a"
+    if abs(v) >= 1e6: return ">>>"
+    return f"{v:>+7.1f}%"
 
 def main():
     if len(sys.argv) < 2:
-        datadir = max(glob.glob("data/ncu_*"), key=os.path.getmtime)
-        print(f"Auto-selected: {datadir}")
+        cands = glob.glob("data/bench_*") + glob.glob("data/ncu_*")
+        if not cands:
+            print("usage: ncu_anova.py <bench_or_ncu_dir>"); sys.exit(1)
+        datadir = max(cands, key=os.path.getmtime)
+        print(f"Auto-selected: {datadir}\n")
     else:
         datadir = sys.argv[1]
 
     csvfiles = sorted(glob.glob(os.path.join(datadir, "*.csv")))
+    csvfiles = [p for p in csvfiles if not os.path.basename(p).startswith("full_")]
     if not csvfiles:
-        print(f"No CSVs in {datadir}")
-        sys.exit(1)
+        print(f"No CSVs in {datadir}"); sys.exit(1)
 
-    # Load all variants
     variants = {}
     for path in csvfiles:
         name = os.path.basename(path).replace(".csv", "")
@@ -49,20 +88,20 @@ def main():
     vnames = sorted(variants.keys())
     all_metrics = sorted(set(m for v in variants.values() for m in v))
 
-    # === Table 1: Full metric table ===
-    print("=" * 120)
-    print("FULL METRIC TABLE")
-    print("=" * 120)
+    def get(vn, metric):
+        v, u = variants[vn].get(metric, ("", ""))
+        return parse_val(v, u)
 
-    # Header
+    # ── Table 1: full metric × variant ──
+    print("=" * 120)
+    print("FULL METRIC TABLE  (directory: %s)" % datadir)
+    print("=" * 120)
     hdr = f"{'Metric':<62} {'Unit':<8}"
-    for vn in vnames:
-        hdr += f" {vn:>12}"
-    print(hdr)
-    print("-" * len(hdr))
+    col_w = max(10, min(16, 180 // max(1, len(vnames))))
+    for vn in vnames: hdr += f" {vn[:col_w]:>{col_w}}"
+    print(hdr); print("-" * min(len(hdr), 180))
 
-    rows_for_analysis = []  # (metric, unit, {variant: float_val})
-
+    rows_for_analysis = []
     for metric in all_metrics:
         unit = ""
         vals = {}
@@ -70,142 +109,131 @@ def main():
             if metric in variants[vn]:
                 val_str, u = variants[vn][metric]
                 unit = u
-                vals[vn] = parse_val(val_str)
+                vals[vn] = parse_val(val_str, u)
             else:
                 vals[vn] = None
-
         row = f"{metric:<62} {unit:<8}"
         for vn in vnames:
             v = vals[vn]
-            if v is None:
-                row += f" {'n/a':>12}"
-            elif v >= 1e6:
-                row += f" {v:>12,.0f}"
-            elif v >= 100:
-                row += f" {v:>12,.1f}"
-            else:
-                row += f" {v:>12.2f}"
+            s = "n/a" if v is None else (f"{v:,.0f}" if abs(v) >= 1e6 else (f"{v:,.1f}" if abs(v) >= 100 else f"{v:.2f}"))
+            row += f" {s:>{col_w}}"
         print(row)
         rows_for_analysis.append((metric, unit, vals))
 
-    # === Comparison analyses ===
+    # ── Group variants by parsed label ──
+    parsed = {}   # vn -> (layer, disp, pk, mode)
+    baselines = []
+    for vn in vnames:
+        p = parse_label(vn)
+        if p is None: baselines.append(vn)
+        else: parsed[vn] = p
 
-    comparisons = [
-        ("Q1: w3 fusion cost (fused - gemm)", "w3_fused", "w3_gemm"),
-        ("Q1b: CUTLASS fusion cost (fused - strip)", "cutlass_fused", "cutlass_strip"),
-        ("Q2: w3 vs CUTLASS fused (18us gap)", "w3_fused", "cutlass_fused"),
-        ("Q3: w3 vs CUTLASS GEMM (46us gap)", "w3_gemm", "cutlass_strip"),
-        ("Q5: epi1 vs epi4 fused (warp count)", "epi1_fused", "w3_fused"),
-        ("Q6: w3 output cost (gemm - strip)", "w3_gemm", "w3_strip"),
-        ("Q8: inline vs sched (TD=6 vs TD=4)", "w3_inline", "w3_sched"),
-        ("Q9: inline vs cutlass fused", "w3_inline", "cutlass_fused"),
-        ("Q10: prefill vs baseline fused", "w3_prefill", "w3_fused"),
-        ("Q11: inline+prefill vs cutlass fused", "w3_inline_prefill", "cutlass_fused"),
-        ("Q12: NS7 vs NS6 fused", "w3_ns7", "w3_fused"),
-        ("Q13: NS7 vs cutlass fused", "w3_ns7", "cutlass_fused"),
-        ("Q14: LDG fused vs w3 fused", "ldg_fused", "w3_fused"),
-        ("Q15: LDG fused vs cutlass fused", "ldg_fused", "cutlass_fused"),
-        ("Q16: LDG gemm vs w3 gemm", "ldg_gemm", "w3_gemm"),
-    ]
+    by_group = defaultdict(dict)  # (layer, pk, mode) -> {disp: vn}
+    by_triple = defaultdict(dict) # (layer, disp, pk)  -> {mode: vn}
+    for vn, (layer, disp, pk, mode) in parsed.items():
+        by_group[(layer, pk, mode)][disp] = vn
+        by_triple[(layer, disp, pk)][mode] = vn
 
-    for title, a, b in comparisons:
-        if a not in variants or b not in variants:
-            continue
-        print()
+    # ── Cross-dispatch comparison (per layer, pk, mode) ──
+    def pairwise_block(title, a, b, metrics_filter=None):
+        print(); print("=" * 120); print(title)
+        print(f"  A = {a},  B = {b}   (positive delta% = A higher than B)")
         print("=" * 120)
-        print(f"{title}")
-        print(f"  A = {a},  B = {b}")
-        print(f"  Positive delta% = A is HIGHER than B")
-        print("=" * 120)
-
         diffs = []
         for metric, unit, vals in rows_for_analysis:
+            if metrics_filter and metric not in metrics_filter: continue
             va, vb = vals.get(a), vals.get(b)
-            if va is None or vb is None:
-                continue
-            if vb == 0 and va == 0:
-                continue
-
-            abs_diff = va - vb
-            if vb != 0:
-                pct = (va - vb) / abs(vb) * 100
-            else:
-                pct = float('inf') if va > 0 else float('-inf')
-
-            diffs.append((abs(pct), pct, abs_diff, va, vb, metric, unit))
-
+            if va is None or vb is None: continue
+            if vb == 0 and va == 0: continue
+            abs_d = va - vb
+            pct = (va - vb) / abs(vb) * 100 if vb != 0 else (float('inf') if va > 0 else float('-inf'))
+            diffs.append((abs(pct), pct, abs_d, va, vb, metric, unit))
         diffs.sort(reverse=True)
+        hdr2 = f"{'Metric':<58} {'Unit':<8} {'A':>13} {'B':>13} {'Diff':>13} {'Diff%':>9}"
+        print(hdr2); print("-" * len(hdr2))
+        for _, pct, abs_d, va, vb, metric, unit in diffs[:25]:
+            diff_str = f"{abs_d:>+13,.1f}" if abs(abs_d) >= 1 else f"{abs_d:>+13.3f}"
+            va_str = f"{va:,.0f}" if abs(va) >= 1e6 else (f"{va:,.1f}" if abs(va) >= 100 else f"{va:.2f}")
+            vb_str = f"{vb:,.0f}" if abs(vb) >= 1e6 else (f"{vb:,.1f}" if abs(vb) >= 100 else f"{vb:.2f}")
+            print(f"{metric:<58} {unit:<8} {va_str:>13} {vb_str:>13} {diff_str} {fmt_pct(pct):>9}")
 
-        hdr2 = f"{'Metric':<58} {'Unit':<8} {'A':>12} {'B':>12} {'Diff':>12} {'Diff%':>8}"
-        print(hdr2)
-        print("-" * len(hdr2))
+    print("\n" + "#" * 120)
+    print("# CROSS-DISPATCH COMPARISONS (within same layer + pk + mode; baseline = default, else alphabetically first)")
+    print("#" * 120)
+    for (layer, pk, mode), disps in sorted(by_group.items()):
+        if len(disps) < 2: continue
+        base = disps.get("default") or sorted(disps.values())[0]
+        base_disp = next(d for d,v in disps.items() if v == base)
+        for disp, vn in sorted(disps.items()):
+            if vn == base: continue
+            pairwise_block(
+                f"{layer} pk={pk} mode={mode}: {disp} vs {base_disp}",
+                vn, base,
+            )
 
-        for _, pct, abs_diff, va, vb, metric, unit in diffs[:30]:
-            def fmt(v):
-                if v >= 1e6:
-                    return f"{v:>12,.0f}"
-                elif v >= 100:
-                    return f"{v:>12,.1f}"
-                else:
-                    return f"{v:>12.2f}"
+    # ── Decomposition per (layer, disp, pk): fused-vs-gemm, gemm-vs-strip ──
+    print("\n" + "#" * 120)
+    print("# MODE DECOMPOSITION (per layer+dispatch+pk: fused−gemm, gemm−strip)")
+    print("#" * 120)
+    for (layer, disp, pk), modes in sorted(by_triple.items()):
+        f, g, s = modes.get("fused"), modes.get("gemm"), modes.get("strip")
+        if f and g:
+            pairwise_block(f"{layer} {disp} pk={pk}: fused - gemm  (residual load + bias mul cost)", f, g)
+        if g and s:
+            pairwise_block(f"{layer} {disp} pk={pk}: gemm - strip  (output store cost)", g, s)
 
-            pct_str = f"{pct:>+7.1f}%" if abs(pct) < 1e6 else f"{'>>':>8}"
-            diff_str = f"{abs_diff:>+12,.1f}" if abs(abs_diff) >= 1 else f"{abs_diff:>+12.2f}"
-            print(f"{metric:<58} {unit:<8} {fmt(va)} {fmt(vb)} {diff_str} {pct_str}")
+    # ── CUTLASS / cuBLAS cross-compare against best w3 variant, if present ──
+    print("\n" + "#" * 120)
+    print("# BASELINE COMPARISONS (cutlass / cublas vs best w3 per layer+mode)")
+    print("#" * 120)
+    for bl in baselines:
+        m = re.match(r"(cutlass|cublas)_(fc\d)_(\w+)", bl)
+        if not m: continue
+        _src, layer, mode = m.groups()
+        cands = by_group.get((layer, "p", mode), {})
+        if not cands: cands = by_group.get((layer, "np", mode), {})
+        if not cands: continue
+        peer = cands.get("default") or cands.get("lean") or sorted(cands.values())[0]
+        pairwise_block(f"{bl} vs {peer}", peer, bl)
 
-    # === Key stall breakdown ===
-    print()
-    print("=" * 120)
-    print("STALL BREAKDOWN (warps_issue_stalled_*)")
-    print("=" * 120)
-
+    # ── Stall breakdown per variant ──
+    print("\n" + "=" * 120); print("STALL BREAKDOWN (per variant, sorted)"); print("=" * 120)
     stall_metrics = [m for m in all_metrics if "warps_issue_stalled" in m]
-
     for vn in vnames:
-        print(f"\n  {vn}:")
         stalls = []
         for m in stall_metrics:
-            if m in variants[vn]:
-                v = parse_val(variants[vn][m][0])
-                if v is not None:
-                    stalls.append((v, m))
+            v = get(vn, m)
+            if v is not None: stalls.append((v, m))
+        if not stalls: continue
         stalls.sort(reverse=True)
-        total = sum(v for v, _ in stalls)
+        total = sum(v for v, _ in stalls) or 1.0
+        print(f"\n  {vn}:")
         for v, m in stalls:
-            short = m.replace("smsp__warps_issue_stalled_", "")
-            pct = v / total * 100 if total > 0 else 0
+            short = m.replace("smsp__warps_issue_stalled_", "").replace(".avg", "")
+            pct = v / total * 100
             bar = "█" * int(pct / 2)
-            print(f"    {short:<30} {v:>12,.1f}  ({pct:>5.1f}%) {bar}")
-        print(f"    {'TOTAL':<30} {total:>12,.1f}")
+            print(f"    {short:<28} {v:>12,.1f}  ({pct:>5.1f}%) {bar}")
+        print(f"    {'TOTAL':<28} {total:>12,.1f}")
 
-    # === Fused-Strip delta for stalls ===
-    print()
-    print("=" * 120)
-    print("STALL DELTA: fused - strip (what epilogue adds)")
-    print("=" * 120)
-
-    pairs = [("w3", "w3_fused", "w3_strip"), ("cutlass", "cutlass_fused", "cutlass_strip"),
-             ("epi1", "epi1_fused", "w3_strip")]
-
-    hdr3 = f"{'Stall type':<30}"
-    for label, _, _ in pairs:
-        hdr3 += f" {label+' Δ':>12} {label+' Δ%':>8}"
-    print(hdr3)
-    print("-" * len(hdr3))
-
-    for m in stall_metrics:
-        short = m.replace("smsp__warps_issue_stalled_", "")
-        row = f"{short:<30}"
-        for label, fused, strip in pairs:
-            vf = parse_val(variants.get(fused, {}).get(m, ("n/a",))[0]) if fused in variants else None
-            vs = parse_val(variants.get(strip, {}).get(m, ("n/a",))[0]) if strip in variants else None
-            if vf is not None and vs is not None:
+    # ── Stall delta fused-strip per (layer, disp, pk) ──
+    print("\n" + "=" * 120); print("FUSED − STRIP STALL DELTA  (what the epilogue adds, per triple)"); print("=" * 120)
+    triples = [(l, d, p) for (l, d, p), modes in by_triple.items() if "fused" in modes and "strip" in modes]
+    if not triples:
+        print("  (no triples have both fused and strip)")
+    else:
+        hdr3 = f"{'stall':<28}"
+        for l, d, p in sorted(triples): hdr3 += f" {(d+'/'+l+'/'+p)[:14]:>14}"
+        print(hdr3); print("-" * min(len(hdr3), 180))
+        for m in stall_metrics:
+            short = m.replace("smsp__warps_issue_stalled_", "").replace(".avg", "")
+            row = f"{short:<28}"
+            for l, d, p in sorted(triples):
+                vf = get(by_triple[(l,d,p)]["fused"], m)
+                vs = get(by_triple[(l,d,p)]["strip"], m)
+                if vf is None or vs is None: row += f" {'n/a':>14}"; continue
                 delta = vf - vs
-                dpct = (vf - vs) / abs(vs) * 100 if vs != 0 else float('inf')
-                row += f" {delta:>+12,.1f} {dpct:>+7.1f}%"
-            else:
-                row += f" {'n/a':>12} {'n/a':>8}"
-        print(row)
+                row += f" {delta:>+14,.0f}"
+            print(row)
 
 if __name__ == "__main__":
     main()

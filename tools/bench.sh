@@ -324,10 +324,77 @@ if [ "$DO_NCU" = "1" ]; then
     done
 fi
 
-# ─── Phase 4: summary ──────────────────────────────────────────────────
+# ─── Phase 4: pairwise diffs (when ncu csvs exist) ─────────────────────
+
+if [ "$DO_NCU" = "1" ]; then
+    log ""
+    log "── Phase 4: pairwise diffs ──"
+    mkdir -p "$OUTDIR/diffs"
+
+    # Collect the set of (layer, disp, pk) triples that successfully emitted
+    # a CSV for at least one mode.  Avoid bash's lack of set datatypes by
+    # accumulating into a uniq'd list.
+    triples=$(ls "$OUTDIR"/*.csv 2>/dev/null \
+        | sed -E 's#.*/([^/]+)\.csv$#\1#' \
+        | awk -F'_' 'NF>=4 && ($1=="fc1"||$1=="fc2"){
+              pk=$(NF-1); mode=$NF; disp=$2;
+              for(i=3;i<=NF-2;i++) disp=disp"_"$(i);
+              print $1"_"disp"_"pk
+          }' | sort -u)
+
+    # Per (layer, disp, pk): fused-vs-gemm, gemm-vs-strip.
+    while read -r t; do
+        [ -z "$t" ] && continue
+        for pair in fused_vs_gemm:fused:gemm gemm_vs_strip:gemm:strip fused_vs_strip:fused:strip; do
+            IFS=':' read -r pname ma mb <<< "$pair"
+            a="$OUTDIR/${t}_${ma}.csv"; b="$OUTDIR/${t}_${mb}.csv"
+            [ -f "$a" ] && [ -f "$b" ] && \
+                python3 tools/ncu_diff.py "$b" "$a" > "$OUTDIR/diffs/${t}_${pname}.txt" 2>&1 || true
+        done
+    done <<< "$triples"
+
+    # Per (layer, pk, mode): each dispatch vs default (baseline = default).
+    # Needs default to be present; otherwise pick first sorted dispatch as base.
+    modes=$(echo "$triples" | awk -F'_' '{print $1}' | sort -u)
+    for layer in $modes; do
+        for pk in p np; do
+            for mode in fused gemm strip; do
+                base="$OUTDIR/${layer}_default_${pk}_${mode}.csv"
+                if [ ! -f "$base" ]; then
+                    base=$(ls "$OUTDIR/${layer}_"*"_${pk}_${mode}.csv" 2>/dev/null | head -1)
+                fi
+                [ -z "$base" ] || [ ! -f "$base" ] && continue
+                bname=$(basename "$base" .csv)
+                for peer in "$OUTDIR/${layer}_"*"_${pk}_${mode}.csv"; do
+                    [ -f "$peer" ] || continue
+                    pname=$(basename "$peer" .csv)
+                    [ "$pname" = "$bname" ] && continue
+                    python3 tools/ncu_diff.py "$base" "$peer" \
+                        > "$OUTDIR/diffs/${pname}_vs_$(echo "$bname" | sed -E "s/${layer}_//; s/_${pk}_${mode}//").txt" 2>&1 || true
+                done
+            done
+        done
+    done
+
+    # CUTLASS vs best w3 (if both exist) for FC2.
+    for mode in fused strip; do
+        cl="$OUTDIR/cutlass_fc2_${mode}.csv"
+        [ -f "$cl" ] || continue
+        for w3 in "$OUTDIR/fc2_"*"_p_${mode}.csv"; do
+            [ -f "$w3" ] || continue
+            wname=$(basename "$w3" .csv)
+            python3 tools/ncu_diff.py "$cl" "$w3" \
+                > "$OUTDIR/diffs/${wname}_vs_cutlass_${mode}.txt" 2>&1 || true
+        done
+    done
+
+    log "  wrote $(ls "$OUTDIR/diffs" 2>/dev/null | wc -l) diff files to $OUTDIR/diffs/"
+fi
+
+# ─── Phase 5: summary ──────────────────────────────────────────────────
 
 log ""
-log "── Phase 4: summary ──"
+log "── Phase 5: summary ──"
 
 # Per-layer/per-packing decomposition table from results.txt.
 python3 - "$OUTDIR" <<'PYEOF' 2>&1 | tee "$OUTDIR/summary.txt" | tee -a "$OUTDIR/session.log"
@@ -448,37 +515,106 @@ if ncu_rows:
               f"{f(dw_v/1e9 if dw_v is not None else None,'%.3f'):>9}  "
               f"{f(wa,'%.2fx'):>9}")
 
-# ── Key stall metrics side-by-side (if any) ──
+# ── Full 35-metric side-by-side, grouped by (layer, pk, mode) ──
 if ncu_rows:
-    KEY = [
-        ("long_sb",   "smsp__warps_issue_stalled_long_scoreboard.avg"),
-        ("short_sb",  "smsp__warps_issue_stalled_short_scoreboard.avg"),
-        ("barrier",   "smsp__warps_issue_stalled_barrier.avg"),
-        ("mio_thr",   "smsp__warps_issue_stalled_mio_throttle.avg"),
-        ("math_thr",  "smsp__warps_issue_stalled_math_pipe_throttle.avg"),
-        ("dram_pct",  "dram__throughput.avg.pct_of_peak_sustained_elapsed"),
-        ("lts_hit",   "lts__t_sector_hit_rate.pct"),
-        ("sm_pct",    "sm__throughput.avg.pct_of_peak_sustained_elapsed"),
+    FULL_METRICS = [
+        # Stall reasons
+        ("long_sb",           "smsp__warps_issue_stalled_long_scoreboard.avg"),
+        ("short_sb",          "smsp__warps_issue_stalled_short_scoreboard.avg"),
+        ("wait",              "smsp__warps_issue_stalled_wait.avg"),
+        ("barrier",           "smsp__warps_issue_stalled_barrier.avg"),
+        ("sleeping",          "smsp__warps_issue_stalled_sleeping.avg"),
+        ("not_selected",      "smsp__warps_issue_stalled_not_selected.avg"),
+        ("mio_thr",           "smsp__warps_issue_stalled_mio_throttle.avg"),
+        ("math_thr",          "smsp__warps_issue_stalled_math_pipe_throttle.avg"),
+        # DRAM
+        ("dram_rd_B",         "dram__bytes_read.sum"),
+        ("dram_wr_B",         "dram__bytes_write.sum"),
+        ("dram_rd_sec",       "dram__sectors_read.sum"),
+        ("dram_wr_sec",       "dram__sectors_write.sum"),
+        ("dram_pct",          "dram__throughput.avg.pct_of_peak_sustained_elapsed"),
+        # L2
+        ("lts_pct",           "lts__throughput.avg.pct_of_peak_sustained_elapsed"),
+        ("lts_sec",           "lts__t_sectors.sum"),
+        ("lts_rd_sec",        "lts__t_sectors_op_read.sum"),
+        ("lts_wr_sec",        "lts__t_sectors_op_write.sum"),
+        ("lts_hit",           "lts__t_sector_hit_rate.pct"),
+        ("l1tex_pct",         "l1tex__throughput.avg.pct_of_peak_sustained_elapsed"),
+        # Pipe util
+        ("sm_pct",            "sm__throughput.avg.pct_of_peak_sustained_elapsed"),
+        ("shared_pct",        "sm__pipe_shared_cycles_active.avg.pct_of_peak_sustained_elapsed"),
+        ("lsu_pct",           "sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_elapsed"),
+        ("miorq_rd_pct",      "sm__mio_pq_read_cycles_active.avg.pct_of_peak_sustained_elapsed"),
+        ("miorq_wr_pct",      "sm__mio_pq_write_cycles_active.avg.pct_of_peak_sustained_elapsed"),
+        ("warps_act",         "sm__warps_active.avg.per_cycle_active"),
+        ("cyc_act",           "smsp__cycles_active.avg"),
+        ("inst_exec",         "smsp__inst_executed.sum"),
+        # Scheduler
+        ("warps_elig",        "smsp__warps_eligible.avg.per_cycle_active"),
+        ("regs",              "launch__registers_per_thread"),
+        ("occ",               "launch__occupancy"),
+        # SMEM wavefronts
+        ("smem_wf",           "l1tex__data_pipe_lsu_wavefronts_mem_shared.sum"),
+        ("smem_ld_wf",        "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum"),
+        ("smem_st_wf",        "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum"),
+        ("gbl_ld_wf",         "l1tex__data_pipe_lsu_wavefronts_mem_global_op_ld.sum"),
+        # TMA
+        ("tma_rd_reqs",       "l1tex__t_requests_pipe_tma_opc_read.sum"),
+        ("tma_wr_reqs",       "l1tex__t_requests_pipe_tma_opc_write.sum"),
+        ("tma_rd_B",          "l1tex__t_bytes_pipe_tma_opc_read.sum"),
+        ("tma_wr_B",          "l1tex__t_bytes_pipe_tma_opc_write.sum"),
     ]
-    print("\n=== KEY METRICS ===")
-    hdr = f"{'label':<42}" + "".join(f"  {short:>10}" for short,_ in KEY)
-    print(hdr); print("-" * len(hdr))
+
     def fmt_metric(vu):
         v, u = vu if vu else ("","")
         bv = to_base(v, u)
-        if bv is None: return v[:10] if v else "—"
+        if bv is None: return v[:12] if v else "—"
         if abs(bv) >= 1e9: return f"{bv/1e9:.2f}G"
         if abs(bv) >= 1e6: return f"{bv/1e6:.2f}M"
         if abs(bv) >= 1e3: return f"{bv/1e3:.1f}K"
         return f"{bv:.2f}"
+
+    # Group rows by (layer, pk, mode) so each table is apples-to-apples.
+    groups = {}
+    baselines = []
     for lbl, _dr, _dw, m in ncu_rows:
-        row = f"{lbl:<42}"
-        for short, full in KEY:
-            row += f"  {fmt_metric(m.get(full)):>10}"
-        print(row)
+        parsed = parse_label(lbl)
+        if parsed is None:
+            baselines.append((lbl, m))
+            continue
+        layer, disp, pk, mode = parsed
+        groups.setdefault((layer, pk, mode), []).append((disp, lbl, m))
+
+    for (layer, pk, mode), entries in sorted(groups.items()):
+        print(f"\n=== FULL METRICS: {layer} pk={pk} mode={mode} ===")
+        labels = sorted(entries, key=lambda x: x[0])
+        col_w = 14
+        hdr = f"{'metric':<16}"
+        for disp, _lbl, _m in labels:
+            hdr += f"  {disp[:col_w]:>{col_w}}"
+        print(hdr); print("-" * len(hdr))
+        for short, full in FULL_METRICS:
+            row = f"{short:<16}"
+            for _disp, _lbl, m in labels:
+                row += f"  {fmt_metric(m.get(full)):>{col_w}}"
+            print(row)
+
+    if baselines:
+        print("\n=== FULL METRICS: baselines (cutlass / cublas) ===")
+        col_w = 16
+        hdr = f"{'metric':<16}"
+        for lbl, _m in baselines:
+            hdr += f"  {lbl[:col_w]:>{col_w}}"
+        print(hdr); print("-" * len(hdr))
+        for short, full in FULL_METRICS:
+            row = f"{short:<16}"
+            for _lbl, m in baselines:
+                row += f"  {fmt_metric(m.get(full)):>{col_w}}"
+            print(row)
 
 PYEOF
 
 log ""
-log "Outputs: $OUTDIR/{results.txt,summary.txt,*_build.log,*.csv,*.ncu-rep}"
+log "Outputs: $OUTDIR/{results.txt,summary.txt,*_build.log,*.csv,*.ncu-rep,diffs/}"
+log "Analysis: python3 tools/ncu_anova.py $OUTDIR"
 log "Done."
