@@ -8,7 +8,7 @@
 #               ncycle, nflat, nsnake    (* = fc2-only)
 #   packed    : yes (DPACKED_TILES) | no
 #   mode      : fused | gemm (DGEMM_ONLY) | strip (DSTRIP_EPILOGUE)
-#   epi-warps : 4 (default) | 2 | 1  — rebuilds with -DNUM_EPI_WARPS=N
+#   epi-warps : 4 (default) | 2 | 1  — rebuilds with -DNUM_EPI_WARPS=N (e2 is dead: FC1 regresses 1.6x, FC2 often deadlocks/mismatches; flag kept for explicit one-offs)
 #
 # Each enabled (layer, dispatch, packed, mode, epi_warps) tuple is one config.
 # Configs are built to unique binaries via COPY so they don't clobber each
@@ -60,12 +60,13 @@ for arg in "$@"; do
         --reps=*)           REPS="${arg#*=}" ;;
         --out=*)            OUT_OVERRIDE="${arg#*=}" ;;
         --comprehensive)
-            # force-packed + every dispatch + fused/gemm/strip + baselines + epi-warp sweep.
+            # force-packed + every dispatch + fused/gemm/strip + baselines.
             # Decomposition subtracts (f-g, g-s) populate automatically.
+            # e2 axis intentionally excluded: FC1 regresses 1.6x, FC2 often deadlocks/mismatches.
             DISPATCH_SPEC="all"
             PACKED_SPEC="yes"
             DECOMP_SPEC="all"
-            EPI_WARPS_SPEC="4,2"
+            EPI_WARPS_SPEC="4"
             BASELINES=1
             ;;
         -h|--help)          sed -n '2,30p' "$0"; exit 0 ;;
@@ -76,8 +77,8 @@ done
 # ─── Dispatch sets ─────────────────────────────────────────────────────
 
 DISP_CORE="default dgswizzle zigzag"
-DISP_FC1_ALL="default dgswizzle zorder hilbert zigzag rowmajor ncycle nflat nsnake nlock checkered dgsnake kstagger dg4 dg6 dg10 dg12 dg16 dg24 dg32"
-DISP_FC2_ALL="default dgswizzle zorder hilbert zigzag rowmajor ncycle nflat nsnake nlock checkered dgsnake kstagger kstagger2 kstagger3 dg2 dg3 dg4 dg6 dg10 dg12 dg14 dg16 dg20 dg24 dg32"
+DISP_FC1_ALL="default dgswizzle zorder hilbert zigzag rowmajor ncycle nflat nsnake nlock checkered dgsnake kstagger dg4 dg6 dg10 dg12 dg16 dg24 dg32 ck2 ck3 ck4 ck5 ck6 ck7 ck8 ck11"
+DISP_FC2_ALL="default dgswizzle zorder hilbert zigzag rowmajor ncycle nflat nsnake nlock checkered dgsnake kstagger kstagger2 kstagger3 dg2 dg3 dg4 dg6 dg10 dg12 dg16 dg20 dg24 dg32 ck2"
 
 resolve_dispatches() {
     local layer="$1" spec="$2"
@@ -132,7 +133,8 @@ dispatch_spec() {
         dgswizzle|zorder|hilbert|zigzag|rowmajor|ncycle|nflat|nsnake| \
         nlock|checkered|dgsnake| \
         kstagger|kstagger2|kstagger3| \
-        dg2|dg3|dg4|dg6|dg10|dg12|dg14|dg16|dg20|dg24|dg32)
+        dg2|dg3|dg4|dg6|dg10|dg12|dg16|dg20|dg24|dg32| \
+        ck2|ck3|ck4|ck5|ck6|ck7|ck8|ck11)
             suffix="-${disp}"
             ;;
         *) echo "Bad dispatch: $disp" >&2; return 1 ;;
@@ -205,7 +207,11 @@ if [ "$BASELINES" = "1" ]; then
         fi
     fi
     if [[ "$LAYERS" == *fc1* ]]; then
-        CFGS+=("cublas_fc1_gemm|make -B cublas-bench-fc1 && cp cublas-bench-fc1 bench-cublas-fc1|./bench-cublas-fc1|regex:.")
+        if [ "$DO_NCU" = "1" ]; then
+            CFGS+=("cublas_fc1_gemm|make -B cublas-bench-fc1-ncu && cp cublas-bench-fc1-ncu bench-cublas-fc1|./bench-cublas-fc1|regex:.")
+        else
+            CFGS+=("cublas_fc1_gemm|make -B cublas-bench-fc1 && cp cublas-bench-fc1 bench-cublas-fc1|./bench-cublas-fc1|regex:.")
+        fi
     fi
 fi
 
@@ -320,7 +326,7 @@ if [ "$DO_NCU" = "1" ]; then
 
         log "  [$label] ncu ..."
         extra_ncu=""
-        [[ "$label" == cublas_* ]] && extra_ncu="--launch-count 1 --launch-skip 3"
+        [[ "$label" == cublas_* ]] && extra_ncu="--profile-from-start off --launch-count 1 --launch-skip 3"
         if timeout 240 ncu --metrics "$METRICS_ALL" \
                --kernel-name "$kfilter" $extra_ncu \
                -o "$OUTDIR/${label}" "$binary" \

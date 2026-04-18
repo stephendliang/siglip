@@ -28,48 +28,98 @@ static __device__ __forceinline__ int static_swizzle(int block_idx) {
     return (first_m + in_group % num_in_group) * TILES_N + in_group / num_in_group;
 
 #elif TILE_DISPATCH == 9
-    /* Z-order (Morton) on 4xTILES_N blocks. */
+    /* Z-order (Morton): 4x4 super-blocks tiled over (TILES_M, TILES_N) in
+       raster, traversed internally in Morton order.  TD=8-style tail
+       handling keeps the map bijective for arbitrary TILES_M, TILES_N. */
     {
         const int ZB = 4;
-        const int ztiles = ZB * TILES_N;
-        const int zgroup = block_idx / ztiles;
-        const int zlocal = block_idx % ztiles;
-        int tm_local = 0, tn_local = 0;
-        int count = 0;
-        for (int z = 0; z < ZB * 4; z++) {
-            int zr = ((z >> 1) & 1) | ((z >> 2) & 2);
-            int zc = (z & 1) | ((z >> 1) & 2);
-            if (zc >= TILES_N) continue;
-            if (count == zlocal) { tm_local = zr; tn_local = zc; break; }
+        const int num_bn = (TILES_N + ZB - 1) / ZB;
+        const int num_m_full = TILES_M / ZB;
+        const int tail_m = TILES_M - num_m_full * ZB;
+        const int last_bn_n = TILES_N - (num_bn - 1) * ZB;
+        const int full_mgroup_tiles = ZB * TILES_N;
+        const int full_m_total = num_m_full * full_mgroup_tiles;
+
+        int bm, within_mg;
+        if (block_idx < full_m_total) {
+            bm = block_idx / full_mgroup_tiles;
+            within_mg = block_idx % full_mgroup_tiles;
+        } else {
+            bm = num_m_full;
+            within_mg = block_idx - full_m_total;
+        }
+        const int num_m = (bm < num_m_full) ? ZB : tail_m;
+
+        int bn = 0;
+        for (int b = 0; b < num_bn; b++) {
+            int n_in_b = (b == num_bn - 1) ? last_bn_n : ZB;
+            int tiles_in_b = num_m * n_in_b;
+            if (within_mg < tiles_in_b) { bn = b; break; }
+            within_mg -= tiles_in_b;
+        }
+        const int num_n = (bn == num_bn - 1) ? last_bn_n : ZB;
+
+        int zr = 0, zc = 0, count = 0;
+        for (int z = 0; z < 16; z++) {
+            int r = ((z >> 1) & 1) | ((z >> 2) & 2);
+            int col = (z & 1) | ((z >> 1) & 2);
+            if (r >= num_m || col >= num_n) continue;
+            if (count == within_mg) { zr = r; zc = col; break; }
             count++;
         }
-        int tm = zgroup * ZB + tm_local;
+        int tm = bm * ZB + zr;
+        int tn = bn * ZB + zc;
         if (tm >= TILES_M) tm = TILES_M - 1;
-        return tm * TILES_N + tn_local;
+        if (tn >= TILES_N) tn = TILES_N - 1;
+        return tm * TILES_N + tn;
     }
 
 #elif TILE_DISPATCH == 10
-    /* Hilbert curve on 4x4 blocks, filtered to 4xTILES_N. */
+    /* Hilbert: 4x4 super-blocks tiled over (TILES_M, TILES_N) in raster,
+       traversed internally along a 4x4 Hilbert curve.  Same TD=8-style
+       tail handling as TD=9 to stay bijective for arbitrary dims. */
     {
         const int HB = 4;
-        const int htiles = HB * TILES_N;
-        const int hgroup = block_idx / htiles;
-        const int hlocal = block_idx % htiles;
-
+        const int num_bn = (TILES_N + HB - 1) / HB;
+        const int num_m_full = TILES_M / HB;
+        const int tail_m = TILES_M - num_m_full * HB;
+        const int last_bn_n = TILES_N - (num_bn - 1) * HB;
+        const int full_mgroup_tiles = HB * TILES_N;
+        const int full_m_total = num_m_full * full_mgroup_tiles;
         const int h_x[16] = {0,1,1,0,0,0,1,1,2,2,3,3,3,2,2,3};
         const int h_y[16] = {0,0,1,1,2,3,3,2,2,3,3,2,1,1,0,0};
 
-        int tm_local = 0, tn_local = 0;
-        int count = 0;
+        int bm, within_mg;
+        if (block_idx < full_m_total) {
+            bm = block_idx / full_mgroup_tiles;
+            within_mg = block_idx % full_mgroup_tiles;
+        } else {
+            bm = num_m_full;
+            within_mg = block_idx - full_m_total;
+        }
+        const int num_m = (bm < num_m_full) ? HB : tail_m;
+
+        int bn = 0;
+        for (int b = 0; b < num_bn; b++) {
+            int n_in_b = (b == num_bn - 1) ? last_bn_n : HB;
+            int tiles_in_b = num_m * n_in_b;
+            if (within_mg < tiles_in_b) { bn = b; break; }
+            within_mg -= tiles_in_b;
+        }
+        const int num_n = (bn == num_bn - 1) ? last_bn_n : HB;
+
+        int hr = 0, hc = 0, count = 0;
         for (int d = 0; d < 16; d++) {
-            int hx = h_x[d], hy = h_y[d];
-            if (hy >= TILES_N) continue;
-            if (count == hlocal) { tm_local = hx; tn_local = hy; break; }
+            int r = h_x[d], col = h_y[d];
+            if (r >= num_m || col >= num_n) continue;
+            if (count == within_mg) { hr = r; hc = col; break; }
             count++;
         }
-        int tm = hgroup * HB + tm_local;
+        int tm = bm * HB + hr;
+        int tn = bn * HB + hc;
         if (tm >= TILES_M) tm = TILES_M - 1;
-        return tm * TILES_N + tn_local;
+        if (tn >= TILES_N) tn = TILES_N - 1;
+        return tm * TILES_N + tn;
     }
 
 #elif TILE_DISPATCH == 11
@@ -149,59 +199,119 @@ static __device__ __forceinline__ int static_swizzle(int block_idx) {
 
 #elif TILE_DISPATCH == 17
     /*
-    nlock (static-N cluster bind): each cluster is permanently bound to one
-    N-column and sweeps M.  Tests the pure "B-column persistence" hypothesis
-    (dgswizzle holds B for ~4 ticks; nlock holds B for the full run).
-    Trade-off: slight load imbalance when NC % TILES_N != 0 (FC2 NC=74, N=3
-    → 25/25/24 clusters per band).  Each cluster only ever touches one B-tile
-    stream → maximal L2 B-hit, worst A-locality (A changes every tick).
+    nlock (static-N cluster bind): each cluster is mostly-permanently bound
+    to one N-column and sweeps M.  Bands are balanced: the first `extra`
+    bands have ceil(NC/N) clusters, the rest have floor(NC/N).  When
+    NC % N != 0, big bands' spill iterations cover the short (small) bands'
+    tails so the map stays bijective.  Assumes tile_count * NC ==
+    TILES_M * TILES_N.
     */
     {
         const int NC = SM_COUNT / 2;
         const int c = block_idx % NC;
-        const int _ti_local = block_idx / NC;
-        const int cpb = (NC + TILES_N - 1) / TILES_N;  /* ceil(NC/N) */
-        int tn = c / cpb;
-        if (tn >= TILES_N) tn = TILES_N - 1;
-        const int idx_in_band = c - tn * cpb;
-        /* Last band may be smaller; use full cpb for stride to keep coverage. */
-        int tm = _ti_local * cpb + idx_in_band;
+        const int _ti = block_idx / NC;
+        const int TC = (TILES_M * TILES_N) / NC;
+
+        const int fcpb = NC / TILES_N;
+        const int ex = NC - fcpb * TILES_N;
+        const int bb = fcpb + 1;
+        const int bcap = bb * ex;
+
+        int tn_p, idx, bs;
+        if (c < bcap) {
+            tn_p = c / bb;
+            idx = c - tn_p * bb;
+            bs = bb;
+        } else {
+            tn_p = ex + (c - bcap) / fcpb;
+            idx = (c - bcap) - (tn_p - ex) * fcpb;
+            bs = fcpb;
+        }
+
+        const int pa_ideal = TILES_M / bs;
+        const int pr = pa_ideal < TC ? pa_ideal : TC;
+        const int own_uncov = TILES_M - pr * bs;
+
+        int tm, tn;
+        if (_ti < pr) {
+            tm = _ti * bs + idx;
+            tn = tn_p;
+        } else {
+            const int spill = (_ti - pr) * bs + idx;
+            if (spill < own_uncov) {
+                tm = pr * bs + spill;
+                tn = tn_p;
+            } else {
+                const int help_local = spill - own_uncov;
+                const int big_sto = (TC - pr) * bs - own_uncov;
+                const int gh = tn_p * big_sto + help_local;
+                const int spi = TILES_M / fcpb;
+                const int spr = spi < TC ? spi : TC;
+                const int su = TILES_M - spr * fcpb;
+                const int so = gh / su;
+                const int within = gh - so * su;
+                tn = ex + so;
+                tm = spr * fcpb + within;
+            }
+        }
         if (tm >= TILES_M) tm = TILES_M - 1;
+        if (tn >= TILES_N) tn = TILES_N - 1;
         return tm * TILES_N + tn;
     }
 
 #elif TILE_DISPATCH == 18
     /*
-    checkered (2D M×N group): generalization of dgswizzle to a G_M × G_N
-    block of tiles per group.  Within group, traverse column-first so a
-    cluster stays on one N-tile for G_M ticks, then advances N.
-    CK_GROUP_M × CK_GROUP_N defines the tile; CK_GROUP_N must divide TILES_N
-    evenly (or the remainder is handled via min()).
+    checkered (2D M × N group): generalization of dgswizzle to a G_M × G_N
+    block of tiles per group.  Within a row_group of G_M M-rows, tiles are
+    laid out stripe-by-stripe where each stripe is a range of G_N N-columns
+    (last stripe may be narrower when G_N does not divide TILES_N).  Within
+    a stripe, traverse column-first so a cluster stays on one N-tile for
+    G_M ticks, then advances N.
+
+    Bijection across the full block_idx range requires:
+      - row_tiles = G_M * TILES_N  (constant per row_group stride)
+      - stripe stride scales with the current row_group's num_m so the
+        M-tail row_group (num_m < G_M) still packs real tiles densely
+        at the start of its slot range
+      - last stripe width = TILES_N - (spr-1)*G_N when G_N does not divide
     */
     {
 #ifndef CK_GROUP_M
 #define CK_GROUP_M 8
 #endif
 #ifndef CK_GROUP_N
-#if TILES_N >= 4
-#define CK_GROUP_N 4
+/* Default picks a G_N that does NOT divide typical TILES_N (3, 12). For
+   TILES_N >= 5 use G_N=5 (stripes 5,5,2,... on TILES_N=12). For small
+   TILES_N use G_N=2 (stripes 2,1 on TILES_N=3). Override with -DCK_GROUP_N=N
+   to sweep. */
+#if TILES_N > 4
+#define CK_GROUP_N 5
 #else
-#define CK_GROUP_N TILES_N
+#define CK_GROUP_N 2
 #endif
 #endif
         const int G_M = CK_GROUP_M;
         const int G_N = CK_GROUP_N;
         const int stripes_per_row = (TILES_N + G_N - 1) / G_N;
-        const int group_tiles = G_M * G_N;
-        const int row_tiles = stripes_per_row * group_tiles;
+        const int row_tiles = G_M * TILES_N;
         const int row_group = block_idx / row_tiles;
-        const int row_off = block_idx % row_tiles;
-        const int stripe = row_off / group_tiles;
-        const int in_group = row_off % group_tiles;
-        /* Column-first within group: fill G_M M-rows for each G_N column. */
-        const int local_m = in_group % G_M;
-        const int local_n = in_group / G_M;
-        int tm = row_group * G_M + local_m;
+        const int in_row = block_idx % row_tiles;
+        const int first_m = row_group * G_M;
+        const int num_m = min(G_M, TILES_M - first_m);
+        const int denom_m = num_m > 0 ? num_m : 1;
+        const int full_ss = denom_m * G_N;
+        const int interior_total = (stripes_per_row - 1) * full_ss;
+        int stripe, in_stripe;
+        if (stripes_per_row == 1 || in_row < interior_total) {
+            stripe = (stripes_per_row == 1) ? 0 : (in_row / full_ss);
+            in_stripe = in_row - stripe * full_ss;
+        } else {
+            stripe = stripes_per_row - 1;
+            in_stripe = in_row - interior_total;
+        }
+        const int local_m = in_stripe % denom_m;
+        const int local_n = in_stripe / denom_m;
+        int tm = first_m + local_m;
         int tn = stripe * G_N + local_n;
         if (tm >= TILES_M) tm = TILES_M - 1;
         if (tn >= TILES_N) tn = TILES_N - 1;

@@ -23,6 +23,7 @@ Examples:
 #include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <cublasLt.h>
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
@@ -427,32 +428,74 @@ int main(int argc, char** argv) {
     }
 
 #ifdef NCU_MODE
-    /* Single-algo, 3 warmup + 1 timed, GEMM-only.  Designed for ncu: total 4
-       kernel launches of one cuBLAS gemm.  Filter with --launch-count 1
-       --launch-skip 3 to profile only the timed iteration.                    */
+    /* Sweep per-tensor FP8 (and MXFP8 as fallback) heuristics to find the
+       fastest, then profile just that one.  Per-tensor usually beats MXFP8
+       since it skips the VEC32 scale apply.  Launch ncu with
+       --profile-from-start off: the sweep runs with profiling disabled;
+       cudaProfilerStart() gates in the 3 warmups + 1 timed launch of the
+       optimal algo, so --launch-count 1 --launch-skip 3 picks the timed run
+       of the best algo.                                                    */
     {
         float alpha = 1.0f, beta0 = 0.0f;
         cudaEvent_t t0, t1;
         CUDA_CHECK(cudaEventCreate(&t0));
         CUDA_CHECK(cudaEventCreate(&t1));
-        CUDA_CHECK(cudaMemset(d_D, 0, sz_d));
-        for (int i = 0; i < 3; i++) {
-            CUBLAS_CHECK(cublasLtMatmul(lt, desc_mxfp8, &alpha,
+
+        CUDA_CHECK(cudaProfilerStop());
+
+        BenchResult best_plain = {-1.0f, -1};
+        if (has_plain) {
+            best_plain = bench_best_algo(
+                lt, desc_plain, &alpha,
                 d_B, layoutA, d_A, layoutB, &beta0,
                 d_D, layoutC, d_D, layoutC,
-                &heur_mxfp8[0].algo, d_workspace, WORKSPACE_BYTES, 0));
+                heur_plain, n_plain, d_workspace, WORKSPACE_BYTES, sz_d, t0, t1);
+        }
+        BenchResult best_mxfp8 = bench_best_algo(
+            lt, desc_mxfp8, &alpha,
+            d_B, layoutA, d_A, layoutB, &beta0,
+            d_D, layoutC, d_D, layoutC,
+            heur_mxfp8, n_mxfp8, d_workspace, WORKSPACE_BYTES, sz_d, t0, t1);
+
+        /* Prefer per-tensor when it wins (typical); fall back to mxfp8 otherwise. */
+        bool use_plain = (best_plain.algo_idx >= 0) &&
+                         (best_mxfp8.algo_idx < 0 || best_plain.ms <= best_mxfp8.ms);
+        const BenchResult& best = use_plain ? best_plain : best_mxfp8;
+        cublasLtMatmulDesc_t desc_best = use_plain ? desc_plain : desc_mxfp8;
+        const cublasLtMatmulHeuristicResult_t* heur_best =
+            use_plain ? heur_plain : heur_mxfp8;
+        const char* mode_name = use_plain ? "per-tensor" : "mxfp8";
+
+        if (best.algo_idx < 0) {
+            fprintf(stderr, "NCU_MODE: no working cuBLAS algo\n");
+            return 1;
+        }
+
+        CUDA_CHECK(cudaMemset(d_D, 0, sz_d));
+        CUDA_CHECK(cudaProfilerStart());
+        for (int i = 0; i < 3; i++) {
+            CUBLAS_CHECK(cublasLtMatmul(lt, desc_best, &alpha,
+                d_B, layoutA, d_A, layoutB, &beta0,
+                d_D, layoutC, d_D, layoutC,
+                &heur_best[best.algo_idx].algo, d_workspace, WORKSPACE_BYTES, 0));
         }
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaEventRecord(t0));
-        CUBLAS_CHECK(cublasLtMatmul(lt, desc_mxfp8, &alpha,
+        CUBLAS_CHECK(cublasLtMatmul(lt, desc_best, &alpha,
             d_B, layoutA, d_A, layoutB, &beta0,
             d_D, layoutC, d_D, layoutC,
-            &heur_mxfp8[0].algo, d_workspace, WORKSPACE_BYTES, 0));
+            &heur_best[best.algo_idx].algo, d_workspace, WORKSPACE_BYTES, 0));
         CUDA_CHECK(cudaEventRecord(t1));
         CUDA_CHECK(cudaEventSynchronize(t1));
+        CUDA_CHECK(cudaProfilerStop());
+
         float ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
-        printf("NCU_MODE: cuBLAS gemm (algo 0, 1 timed iter)\n");
+        printf("NCU_MODE: cuBLAS gemm (mode=%s algo #%d, sweep_best=%.3fms; "
+               "mxfp8_best=%.3fms plain_best=%.3fms)\n",
+               mode_name, best.algo_idx, best.ms,
+               best_mxfp8.algo_idx >= 0 ? best_mxfp8.ms : -1.0f,
+               best_plain.algo_idx >= 0 ? best_plain.ms : -1.0f);
         printf("@@RESULT ms=%.3f tflops=%.2f checksum=0.000000 valid=0 c0=0.0\n",
                ms, to_tflops(flops, ms));
         return 0;
