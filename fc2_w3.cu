@@ -1645,15 +1645,23 @@ fc2_w3_kernel(
 #ifdef CLOCK_TIMING
             int64_t _ct_kl; if (_ct) CT_READ(_ct_kl);
 #endif
+#ifdef K_STAGGER
+            const int k_shift_b = (cluster_id * K_STAGGER) % K_ITERS;
+#endif
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
+#ifdef K_STAGGER
+                const int k_block = (ki + k_shift_b) % K_ITERS;
+#else
+                const int k_block = ki;
+#endif
 #ifndef PRESWIZZLE
 #ifdef PACKED_TILES
                 const int tma_c0    = 0;
-                const int tma_a_c1  = (a_m_tile * K_ITERS + ki) * TM;
-                const int tma_b_c1  = (b_n_half * K_ITERS + ki) * (TN/2);
+                const int tma_a_c1  = (a_m_tile * K_ITERS + k_block) * TM;
+                const int tma_b_c1  = (b_n_half * K_ITERS + k_block) * (TN/2);
 #else
-                const int tma_c0    = ki * TK;
+                const int tma_c0    = k_block * TK;
                 const int tma_a_c1  = m_start;
                 const int tma_b_c1  = n_start + cta_rank * (TN/2);
 #endif
@@ -1698,9 +1706,9 @@ fc2_w3_kernel(
                     {
                         const uint32_t my_dst = a_dst | ((uint32_t)cta_rank << 24);
                         const uint64_t a_addr = (uint64_t)raw_A
-                            + (uint64_t)(a_m_tile * K_ITERS + ki) * (TM * TK);
+                            + (uint64_t)(a_m_tile * K_ITERS + k_block) * (TM * TK);
                         const uint64_t b_addr = (uint64_t)raw_B
-                            + (uint64_t)(b_n_half * K_ITERS + ki) * ((TN/2) * TK);
+                            + (uint64_t)(b_n_half * K_ITERS + k_block) * ((TN/2) * TK);
                         asm volatile(
                             "cp.async.bulk.shared::cluster.global"
                             ".mbarrier::complete_tx::bytes"

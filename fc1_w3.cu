@@ -792,14 +792,22 @@ fc1_w3_kernel(
         if (warp == 0) {
             /* ── W0: TMA A/B loads ── */
             const uint32_t smem_base = warp_uniform(smem_to_uint(smem));
+#ifdef K_STAGGER
+            const int k_shift_b = (cluster_id * K_STAGGER) % K_ITERS;
+#endif
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
+#ifdef K_STAGGER
+                const int k_block = (ki + k_shift_b) % K_ITERS;
+#else
+                const int k_block = ki;
+#endif
 #ifdef PACKED_TILES
                 const int tma_c0   = 0;
-                const int tma_a_c1 = (a_m_tile * K_ITERS + ki) * TM;
-                const int tma_b_c1 = (b_n_half * K_ITERS + ki) * (TN/2);
+                const int tma_a_c1 = (a_m_tile * K_ITERS + k_block) * TM;
+                const int tma_b_c1 = (b_n_half * K_ITERS + k_block) * (TN/2);
 #else
-                const int tma_c0   = ki * TK;
+                const int tma_c0   = k_block * TK;
                 const int tma_a_c1 = m_start;
                 const int tma_b_c1 = n_start + cta_rank * (TN/2);
 #endif

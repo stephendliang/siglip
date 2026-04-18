@@ -9,7 +9,7 @@ CUTLASS_DIR = third_party/cutlass
 CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUTLASS_FLAGS = -std=c++17 --expt-relaxed-constexpr
 
-.PHONY: all clean timing fc1-gelu fc1-w3 fc1-w3-gemm fc1-w3-strip fc1-w3-sched fc1-w3-lean fc1-w3-dgswizzle fc1-w3-zorder fc1-w3-hilbert fc1-w3-zigzag fc1-w3-rowmajor fc1-w3-ncycle fc1-w3-nflat fc1-w3-nsnake fc1-w3-packed fc1-w3-packed-sched fc1-w3-packed-lean fc1-w3-packed-dgswizzle fc1-w3-packed-zorder fc1-w3-packed-hilbert fc1-w3-packed-zigzag fc1-w3-packed-rowmajor fc1-w3-packed-ncycle fc1-w3-packed-nflat fc1-w3-packed-nsnake fc2 fc2-timing fc2-w3 fc2-w3-c4 fc2-w3-c4-gemm fc2-w3-c4-strip fc2-w3-clock fc2-w3-sched-clock fc2-w3-collock fc2-w3-collock-clock fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-w3-self fc2-w3-atomic fc2-w3-spin fc2-w3-grid fc2-w3-inline fc2-w3-inline7 fc2-w3-inline7-clock fc2-w3-noprefill fc2-w3-ns7 fc2-w3-clc fc2-w3-rowsteal fc2-w3-tail fc2-w3-tail-lean fc2-ldg fc2-ldg-strip fc2-ldg-gemm fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-warp calib-all tma-bench mma-bench stmatrix-bench
+.PHONY: all clean timing fc1-gelu fc1-w3 fc1-w3-gemm fc1-w3-strip fc1-w3-sched fc1-w3-lean fc1-w3-dgswizzle fc1-w3-zorder fc1-w3-hilbert fc1-w3-zigzag fc1-w3-rowmajor fc1-w3-ncycle fc1-w3-nflat fc1-w3-nsnake fc1-w3-packed fc1-w3-packed-sched fc1-w3-packed-lean fc1-w3-packed-dgswizzle fc1-w3-packed-zorder fc1-w3-packed-hilbert fc1-w3-packed-zigzag fc1-w3-packed-rowmajor fc1-w3-packed-ncycle fc1-w3-packed-nflat fc1-w3-packed-nsnake fc1-w3-nlock fc1-w3-checkered fc1-w3-dgsnake fc1-w3-kstagger fc1-w3-dg4 fc1-w3-dg6 fc1-w3-dg10 fc1-w3-dg12 fc1-w3-dg16 fc1-w3-dg24 fc1-w3-dg32 fc2 fc2-timing fc2-w3 fc2-w3-c4 fc2-w3-c4-gemm fc2-w3-c4-strip fc2-w3-clock fc2-w3-sched-clock fc2-w3-collock fc2-w3-collock-clock fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-w3-self fc2-w3-atomic fc2-w3-spin fc2-w3-grid fc2-w3-inline fc2-w3-inline7 fc2-w3-inline7-clock fc2-w3-noprefill fc2-w3-ns7 fc2-w3-clc fc2-w3-rowsteal fc2-w3-tail fc2-w3-tail-lean fc2-w3-nlock fc2-w3-checkered fc2-w3-dgsnake fc2-w3-kstagger fc2-w3-kstagger2 fc2-w3-kstagger3 fc2-w3-dg2 fc2-w3-dg3 fc2-w3-dg10 fc2-w3-dg14 fc2-w3-dg20 fc2-w3-dg32 fc2-ldg fc2-ldg-strip fc2-ldg-gemm fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-warp calib-all tma-bench mma-bench stmatrix-bench
 
 all: $(TARGET)
 
@@ -265,6 +265,65 @@ fc2-w3-dg16: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=16 $< -o $@ $(LDFLAGS)
 fc2-w3-dg24: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=24 $< -o $@ $(LDFLAGS)
+
+# ── Tile-dispatch experiments (2026-04-18) ──
+# TD=17 nlock: each cluster bound to one N-column for the whole run.
+# TD=18 checkered: G_M × G_N 2D block per group (column-first within).
+# TD=19 dg-snake: dgswizzle M-band + zigzag N within band.
+# K_STAGGER: shift W0's K-block index by cluster_id*STAGGER (mod K_ITERS).
+# All add -DPACKED_TILES via DFLAGS when invoked through bench.sh --packed=yes.
+fc2-w3-nlock: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=17 $< -o $@ $(LDFLAGS)
+fc2-w3-checkered: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=18 $< -o $@ $(LDFLAGS)
+fc2-w3-dgsnake: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=19 $< -o $@ $(LDFLAGS)
+fc2-w3-kstagger: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DK_STAGGER=1 $< -o $@ $(LDFLAGS)
+fc2-w3-kstagger2: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DK_STAGGER=2 $< -o $@ $(LDFLAGS)
+fc2-w3-kstagger3: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DK_STAGGER=3 $< -o $@ $(LDFLAGS)
+
+# ── Extended DG_GROUP_SIZE sweep (TD=8 dgswizzle) ──
+fc2-w3-dg2:  fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=2  $< -o $@ $(LDFLAGS)
+fc2-w3-dg3:  fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=3  $< -o $@ $(LDFLAGS)
+fc2-w3-dg10: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=10 $< -o $@ $(LDFLAGS)
+fc2-w3-dg14: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=14 $< -o $@ $(LDFLAGS)
+fc2-w3-dg20: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=20 $< -o $@ $(LDFLAGS)
+fc2-w3-dg32: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=32 $< -o $@ $(LDFLAGS)
+
+# ── FC1 tile-dispatch experiments ──
+fc1-w3-nlock: fc1_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=17 $< -o $@ $(LDFLAGS)
+fc1-w3-checkered: fc1_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=18 $< -o $@ $(LDFLAGS)
+fc1-w3-dgsnake: fc1_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=19 $< -o $@ $(LDFLAGS)
+fc1-w3-kstagger: fc1_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DK_STAGGER=1 $< -o $@ $(LDFLAGS)
+
+# ── FC1 DG_GROUP_SIZE sweep ──
+fc1-w3-dg4:  fc1_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=4  $< -o $@ $(LDFLAGS)
+fc1-w3-dg6:  fc1_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=6  $< -o $@ $(LDFLAGS)
+fc1-w3-dg10: fc1_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=10 $< -o $@ $(LDFLAGS)
+fc1-w3-dg12: fc1_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=12 $< -o $@ $(LDFLAGS)
+fc1-w3-dg16: fc1_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=16 $< -o $@ $(LDFLAGS)
+fc1-w3-dg24: fc1_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=24 $< -o $@ $(LDFLAGS)
+fc1-w3-dg32: fc1_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 -DDG_GROUP_SIZE=32 $< -o $@ $(LDFLAGS)
 
 fc2-w3-inline7-clock: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=7 -DCLOCK_TIMING $< -o $@ $(LDFLAGS)

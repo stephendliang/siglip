@@ -146,6 +146,93 @@ static __device__ __forceinline__ int static_swizzle(int block_idx) {
         if (tm >= TILES_M) tm = TILES_M - 1;
         return tm * TILES_N + tn;
     }
+
+#elif TILE_DISPATCH == 17
+    /*
+    nlock (static-N cluster bind): each cluster is permanently bound to one
+    N-column and sweeps M.  Tests the pure "B-column persistence" hypothesis
+    (dgswizzle holds B for ~4 ticks; nlock holds B for the full run).
+    Trade-off: slight load imbalance when NC % TILES_N != 0 (FC2 NC=74, N=3
+    → 25/25/24 clusters per band).  Each cluster only ever touches one B-tile
+    stream → maximal L2 B-hit, worst A-locality (A changes every tick).
+    */
+    {
+        const int NC = SM_COUNT / 2;
+        const int c = block_idx % NC;
+        const int _ti_local = block_idx / NC;
+        const int cpb = (NC + TILES_N - 1) / TILES_N;  /* ceil(NC/N) */
+        int tn = c / cpb;
+        if (tn >= TILES_N) tn = TILES_N - 1;
+        const int idx_in_band = c - tn * cpb;
+        /* Last band may be smaller; use full cpb for stride to keep coverage. */
+        int tm = _ti_local * cpb + idx_in_band;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + tn;
+    }
+
+#elif TILE_DISPATCH == 18
+    /*
+    checkered (2D M×N group): generalization of dgswizzle to a G_M × G_N
+    block of tiles per group.  Within group, traverse column-first so a
+    cluster stays on one N-tile for G_M ticks, then advances N.
+    CK_GROUP_M × CK_GROUP_N defines the tile; CK_GROUP_N must divide TILES_N
+    evenly (or the remainder is handled via min()).
+    */
+    {
+#ifndef CK_GROUP_M
+#define CK_GROUP_M 8
+#endif
+#ifndef CK_GROUP_N
+#if TILES_N >= 4
+#define CK_GROUP_N 4
+#else
+#define CK_GROUP_N TILES_N
+#endif
+#endif
+        const int G_M = CK_GROUP_M;
+        const int G_N = CK_GROUP_N;
+        const int stripes_per_row = (TILES_N + G_N - 1) / G_N;
+        const int group_tiles = G_M * G_N;
+        const int row_tiles = stripes_per_row * group_tiles;
+        const int row_group = block_idx / row_tiles;
+        const int row_off = block_idx % row_tiles;
+        const int stripe = row_off / group_tiles;
+        const int in_group = row_off % group_tiles;
+        /* Column-first within group: fill G_M M-rows for each G_N column. */
+        const int local_m = in_group % G_M;
+        const int local_n = in_group / G_M;
+        int tm = row_group * G_M + local_m;
+        int tn = stripe * G_N + local_n;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        if (tn >= TILES_N) tn = TILES_N - 1;
+        return tm * TILES_N + tn;
+    }
+
+#elif TILE_DISPATCH == 19
+    /*
+    dg-snake (zigzag-within-dgswizzle-band): dgswizzle M-band layout, but
+    traverse N in zigzag within each M-row of the band.  At M-row boundary
+    N stays put → A changes but B persists across the boundary.  Gives
+    dgswizzle's B-column reuse AND zigzag's row-transition continuity.
+    */
+    {
+#ifndef DG_GROUP_SIZE
+#define DG_GROUP_SIZE 8
+#endif
+        const int G = DG_GROUP_SIZE;
+        const int group_tiles = TILES_N * G;
+        const int group_idx = block_idx / group_tiles;
+        const int first_m = group_idx * G;
+        const int in_group = block_idx % group_tiles;
+        const int num_in_group = min(G, TILES_M - first_m);
+        const int local_m = in_group % num_in_group;
+        int local_n = in_group / num_in_group;
+        /* zigzag N within group: reverse N direction on odd local_m */
+        if (local_m & 1) local_n = TILES_N - 1 - local_n;
+        int tm = first_m + local_m;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + local_n;
+    }
 #endif
 }
 

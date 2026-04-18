@@ -70,9 +70,9 @@ done
 
 # ─── Dispatch sets ─────────────────────────────────────────────────────
 
-DISP_CORE="default sched lean"
-DISP_FC1_ALL="default sched lean dgswizzle zorder hilbert zigzag rowmajor ncycle nflat nsnake"
-DISP_FC2_ALL="default sched lean tail tail-lean rowsteal dgswizzle zorder hilbert zigzag rowmajor ncycle nflat nsnake"
+DISP_CORE="default dgswizzle zigzag"
+DISP_FC1_ALL="default dgswizzle zorder hilbert zigzag rowmajor ncycle nflat nsnake nlock checkered dgsnake kstagger dg4 dg6 dg10 dg12 dg16 dg24 dg32"
+DISP_FC2_ALL="default dgswizzle zorder hilbert zigzag rowmajor ncycle nflat nsnake nlock checkered dgsnake kstagger kstagger2 kstagger3 dg2 dg3 dg4 dg6 dg10 dg12 dg14 dg16 dg20 dg24 dg32"
 
 resolve_dispatches() {
     local layer="$1" spec="$2"
@@ -112,7 +112,10 @@ dispatch_spec() {
         tail)       suffix="-tail" ;;
         tail-lean)  suffix="-tail-lean" ;;
         rowsteal)   suffix="-rowsteal" ;;
-        dgswizzle|zorder|hilbert|zigzag|rowmajor|ncycle|nflat|nsnake)
+        dgswizzle|zorder|hilbert|zigzag|rowmajor|ncycle|nflat|nsnake| \
+        nlock|checkered|dgsnake| \
+        kstagger|kstagger2|kstagger3| \
+        dg2|dg3|dg4|dg6|dg10|dg12|dg14|dg16|dg20|dg24|dg32)
             suffix="-${disp}"
             ;;
         *) echo "Bad dispatch: $disp" >&2; return 1 ;;
