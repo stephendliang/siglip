@@ -1,0 +1,20 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+smsp__warps_issue_stalled_sleeping.avg                                 |          0.00 |       9,612.1 |      inf% | warp
+smsp__warps_issue_stalled_barrier.avg                                  |      91,827.4 |     219,555.4 |    139.1% | warp
+smsp__warps_issue_stalled_wait.avg                                     |     140,959.1 |     299,310.3 |    112.3% | warp
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |    16,497,156 |         593.0 |   -100.0% | 
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |     440,199.0 |       2,010.0 |    -99.5% | 
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |    19,912,706 |      95,899.0 |    -99.5% | 
+dram__sectors_write.sum                                                |    43,756,560 |     253,632.0 |    -99.4% | sector
+lts__t_sectors_op_write.sum                                            |    66,829,404 |     664,352.0 |    -99.0% | sector
+smsp__warps_issue_stalled_not_selected.avg                             |      25,707.0 |       2,144.8 |    -91.7% | warp
+smsp__warps_issue_stalled_mio_throttle.avg                             |       2,178.3 |         258.8 |    -88.1% | warp
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |         588.2 |       1,037.1 |     76.3% | warp
+smsp__inst_executed.sum                                                |   141,729,533 |    54,171,090 |    -61.8% | inst
+smsp__warps_issue_stalled_short_scoreboard.avg                         |      30,322.3 |      12,730.0 |    -58.0% | warp
+launch__registers_per_thread                                           |         186.0 |         96.00 |    -48.4% | register/thread
+dram__sectors_read.sum                                                 |    89,204,288 |   122,872,624 |     37.7% | sector
+lts__t_sectors.sum                                                     |   632,713,222 |   491,148,320 |    -22.4% | sector
+lts__t_sectors_op_read.sum                                             |   565,628,740 |   490,165,634 |    -13.3% | sector
+smsp__cycles_active.avg                                                |     1,913,299 |     1,811,591 |     -5.3% | cycle

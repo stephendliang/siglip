@@ -1,0 +1,17 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+smsp__warps_issue_stalled_sleeping.avg                                 |          0.00 |      19,568.3 |      inf% | warp
+smsp__warps_issue_stalled_barrier.avg                                  |      30,977.1 |     268,973.4 |    768.3% | warp
+smsp__warps_issue_stalled_mio_throttle.avg                             |       3,745.3 |         17.83 |    -99.5% | warp
+smsp__warps_issue_stalled_wait.avg                                     |     228,134.7 |     406,971.0 |     78.4% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |      21,823.7 |       8,155.2 |    -62.6% | warp
+launch__registers_per_thread                                           |         252.0 |         117.0 |    -53.6% | register/thread
+smsp__warps_issue_stalled_short_scoreboard.avg                         |     136,275.6 |     183,766.1 |     34.8% | warp
+smsp__inst_executed.sum                                                |   163,088,846 |   107,509,695 |    -34.1% | inst
+dram__sectors_read.sum                                                 |   133,772,704 |   178,562,424 |     33.5% | sector
+dram__throughput.avg.pct_of_peak_sustained_elapsed                     |         41.67 |         53.26 |     27.8% | %
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |       2,572.9 |       3,260.2 |     26.7% | warp
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |    37,900,481 |    27,835,237 |    -26.6% | 
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     2,725,690 |     2,039,355 |    -25.2% | warp
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |    60,408,148 |    49,336,833 |    -18.3% | 
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |    19,022,607 |    20,072,464 |      5.5% | 

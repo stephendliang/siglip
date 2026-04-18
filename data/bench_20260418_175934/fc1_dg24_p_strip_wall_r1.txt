@@ -1,0 +1,20 @@
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 203776 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=203776 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 1.369 ms  3199.11 TFLOPS
+  MISMATCH at (0,0): expected 1728.0 got 0.0 (gemm=1728.0 bias=1.0)
+  MISMATCH at (29008,47): expected 1200.0 got 0.0 (gemm=1152.0 bias=48.0)
+  MISMATCH at (58016,94): expected 1824.0 got 0.0 (gemm=1728.0 bias=95.0)
+  MISMATCH at (87024,141): expected 1296.0 got 0.0 (gemm=1152.0 bias=142.0)
+  MISMATCH at (116032,188): expected 1920.0 got 0.0 (gemm=1728.0 bias=189.0)
+Validation: 0/32 spot checks passed — FAILED
+Checksum (1024 strided): 0.000000
+C[0,0..3] = 0.0 0.0 0.0 0.0
+@@RESULT ms=1.369 tflops=3199.11 checksum=0.000000 valid=0 c0=0.0

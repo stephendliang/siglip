@@ -1,0 +1,19 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+dram__bytes_read.sum                                                   |          1.82 |         715.4 |  39208.2% | Gbyte
+smsp__warps_issue_stalled_not_selected.avg                             |      10,108.8 |      18,732.8 |     85.3% | warp
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |       5,436.6 |       9,833.6 |     80.9% | warp
+smsp__warps_issue_stalled_sleeping.avg                                 |     134,301.0 |      48,320.3 |    -64.0% | warp
+dram__sectors_read.sum                                                 |    56,766,424 |    22,356,528 |    -60.6% | sector
+smsp__warps_issue_stalled_wait.avg                                     |     626,359.9 |     914,212.6 |     46.0% | warp
+smsp__warps_issue_stalled_short_scoreboard.avg                         |     101,518.0 |     146,328.7 |     44.1% | warp
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     2,999,167 |     1,835,336 |    -38.8% | warp
+smsp__inst_executed.sum                                                |   161,534,997 |   217,624,514 |     34.7% | inst
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |    45,241,298 |    60,692,857 |     34.2% | 
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |    49,885,700 |    65,206,662 |     30.7% | 
+lts__throughput.avg.pct_of_peak_sustained_elapsed                      |         44.77 |         57.47 |     28.4% | %
+sm__pipe_shared_cycles_active.avg.pct_of_peak_sustained_elapsed        |         53.15 |         66.88 |     25.8% | %
+l1tex__throughput.avg.pct_of_peak_sustained_elapsed                    |         49.98 |         62.54 |     25.1% | %
+smsp__warps_issue_stalled_barrier.avg                                  |     493,354.5 |     370,358.0 |    -24.9% | warp
+sm__throughput.avg.pct_of_peak_sustained_elapsed                       |         57.11 |         69.09 |     21.0% | %
+smsp__cycles_active.avg                                                |     3,228,937 |     2,693,323 |    -16.6% | cycle

@@ -1,0 +1,7 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+smsp__warps_issue_stalled_mio_throttle.avg                             |         439.1 |         347.5 |    -20.9% | warp
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |      39,156.8 |      34,447.1 |    -12.0% | warp
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |    45,272,479 |    50,334,009 |     11.2% | 
+smsp__warps_issue_stalled_wait.avg                                     |     1,126,122 |     1,044,961 |     -7.2% | warp
+smsp__warps_issue_stalled_sleeping.avg                                 |     144,844.0 |     135,964.5 |     -6.1% | warp

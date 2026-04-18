@@ -1,0 +1,26 @@
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DPACKED_TILES -DGEMM_ONLY -DK_STAGGER=1 fc1_w3.cu -o fc1-w3-kstagger -lcurand_static -lculibos -lcuda
+fc1_w3.cu(1286): warning #177-D: variable "last_n_bias" was declared but never referenced
+          const int last_n_bias = ltn * 256;
+                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc1_w3.cu(303): warning #177-D: function "gelu_approx" was declared but never referenced
+  static __attribute__((device)) __inline__ __attribute__((always_inline)) float gelu_approx(float acc, float bias_f32) {
+                                                                                 ^
+
+fc1_w3.cu(312): warning #177-D: function "gelu_fwd" was declared but never referenced
+  static __attribute__((host)) __inline__ __attribute__((always_inline)) float gelu_fwd(float x) {
+                                                                               ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 9.106 ms
+ptxas info    : Compiling entry function '_Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_
+    8 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 158 registers, used 2 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 65.571 ms
