@@ -1,0 +1,18 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |       1,857.0 |    29,539,327 | 1590601.5% | 
+smsp__warps_issue_stalled_mio_throttle.avg                             |         11.00 |         433.1 |   3836.9% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |      10,232.5 |     133,022.8 |   1200.0% | warp
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |       4,433.0 |      34,644.8 |    681.5% | warp
+smsp__inst_executed.sum                                                |   167,608,584 |   979,828,586 |    484.6% | inst
+smsp__warps_issue_stalled_short_scoreboard.avg                         |     106,586.8 |     386,606.7 |    262.7% | warp
+smsp__warps_issue_stalled_wait.avg                                     |     626,882.4 |     1,122,682 |     79.1% | warp
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     3,042,875 |     1,157,493 |    -62.0% | warp
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |    49,933,461 |    79,821,139 |     59.9% | 
+lts__t_sectors_op_read.sum                                             |   382,732,797 |   461,335,489 |     20.5% | sector
+sm__throughput.avg.pct_of_peak_sustained_elapsed                       |         59.26 |         49.20 |    -17.0% | %
+smsp__warps_issue_stalled_barrier.avg                                  |     480,001.5 |     543,096.4 |     13.1% | warp
+smsp__cycles_active.avg                                                |     3,270,989 |     3,672,648 |     12.3% | cycle
+lts__t_sectors.sum                                                     |   655,543,699 |   731,649,308 |     11.6% | sector
+dram__bytes_read.sum                                                   |         826.9 |         742.0 |    -10.3% | Mbyte
+dram__sectors_read.sum                                                 |    25,840,184 |    23,189,184 |    -10.3% | sector

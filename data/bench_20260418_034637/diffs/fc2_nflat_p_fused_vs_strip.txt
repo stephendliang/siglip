@@ -1,0 +1,22 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |       2,005.0 |    29,969,782 | 1494652.2% | 
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |       2,476.0 |    18,785,876 | 758618.7% | 
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |      85,684.0 |    50,262,596 |  58560.4% | 
+dram__sectors_write.sum                                                |     233,656.0 |    44,260,416 |  18842.6% | sector
+lts__t_sectors_op_write.sum                                            |     680,181.0 |    67,516,170 |   9826.2% | sector
+smsp__warps_issue_stalled_short_scoreboard.avg                         |       3,281.0 |     180,778.4 |   5409.9% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |       1,538.1 |       7,483.0 |    386.5% | warp
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |         967.5 |       2,851.9 |    194.8% | warp
+dram__throughput.avg.pct_of_peak_sustained_elapsed                     |         21.82 |         50.05 |    129.4% | %
+smsp__warps_issue_stalled_sleeping.avg                                 |       9,396.0 |      20,198.0 |    115.0% | warp
+launch__registers_per_thread                                           |         56.00 |         117.0 |    108.9% | register/thread
+smsp__inst_executed.sum                                                |    50,694,328 |   105,085,926 |    107.3% | inst
+dram__sectors_read.sum                                                 |    92,093,224 |   172,138,488 |     86.9% | sector
+smsp__warps_issue_stalled_wait.avg                                     |     277,607.9 |     391,565.6 |     41.0% | warp
+lts__t_sectors.sum                                                     |   535,892,420 |   721,950,155 |     34.7% | sector
+lts__t_sector_hit_rate.pct                                             |         71.86 |         54.35 |    -24.4% | %
+lts__t_sectors_op_read.sum                                             |   534,772,079 |   653,664,734 |     22.2% | sector
+smsp__warps_issue_stalled_barrier.avg                                  |     223,143.6 |     269,641.5 |     20.8% | warp
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     2,487,222 |     2,071,100 |    -16.7% | warp
+lts__throughput.avg.pct_of_peak_sustained_elapsed                      |         63.12 |         73.56 |     16.5% | %

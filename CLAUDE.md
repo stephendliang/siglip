@@ -56,70 +56,109 @@ a 216us gap. zigzag/rowmajor have the fastest fused (2.024ms) despite mediocre g
 Strip floor spread is 100us (1.336 nsnake → 1.435 hilbert), so tile order affects
 even the GEMM compute ceiling for FC1.
 
-## Tile dispatch: why LEAN wins
+## Tile dispatch: static swizzles win (updated 2026-04-18)
 
-There are three fundamental approaches to assigning tiles to persistent CTAs. Each trades off L2 cache efficiency against dispatch overhead. Understanding this hierarchy is the central insight of this project.
+**The old thesis was wrong.** For a year we believed LEAN won by eliminating
+DRAM read amplification from 1.13× to 1.00×. The 2026-04-18 ncu run under
+PACKED_TILES parity (76 configs, full 35-metric capture, see
+`data/bench_20260418_034637/anova.txt`) inverts this. Static swizzles lead FC2
+fused by ~30us despite reading 20-59% *more* DRAM bytes — because those extra
+bytes don't translate into MMA stalls, while work-stealing's tight wavefront
+does.
 
-### 1. Contiguous [begin:end] — traditional, worst
+### The new metric: `long_scoreboard`, not DRAM amplification
 
-Each CTA processes a fixed contiguous range of tiles. Adjacent CTAs touch disjoint M-row ranges, so B-tile reads have zero cross-CTA L2 reuse. At 74 clusters each reading its own B-tile column independently, DRAM amplification is catastrophic. Never implemented because the inferiority is obvious.
+| FC2 fused (p) | ms | long_sb | barrier | DRAM rd | amp |
+|---|---|---|---|---|---|
+| default (stride) | 1.071 | 2.12M | 272K | 6.79 GB | 1.59× |
+| **zigzag** (TD=11) | **1.073** | 2.12M | 271K | 6.04 GB | 1.41× |
+| dgswizzle (TD=8) | 1.065 | 2.02M | 267K | 5.44 GB | 1.27× |
+| sched (TD=4) | 1.101 | 2.66M | 45K | 4.28 GB | 1.00× |
+| **lean** (LEAN_DISPATCH) | 1.107 | 2.66M | 44K | 4.28 GB | 1.00× |
+| rowsteal | 1.242 | 2.76M | 45K | 4.28 GB | 1.00× |
 
-### 2. Striding (default Group-3) — good at small K
+LEAN trades **540K more long_scoreboard stalls for 230K fewer barrier stalls**.
+Net: slower. The mbarrier-removal trick was real and measurable (barrier 44K
+vs 272K), but the barrier wasn't the bottleneck — DRAM-load serialization
+was, and work-stealing made it *worse*.
 
-Fixed N-tile (tn) per cluster, stride through M-rows. All clusters sharing the same tn hit L2 for the same B-tile, giving good reuse. But the stride pattern means clusters cycle through N-tiles at different rates, and with 74 clusters the L2 working set (A-tiles from many M-rows + multiple B-tile columns) exceeds B200's 96MB L2. Result: 1.13x DRAM read amplification from L2 capacity misses.
+### Why static beats work-stealing
 
-Why it's still fast at K=3072: NS6 (6-stage pipeline, 227KB of 228KB SMEM) hides the extra DRAM latency. The pipeline is deep enough relative to the K-loop (6/24 = 25% of iterations) to absorb L2 miss stalls. And striding has zero dispatch overhead — no mbarriers, no atomics, no dedicated warp.
+- **Static TMA streaming is pipeline-friendly.** With striding or zigzag, 74
+  clusters hit B-columns at *offset* K-phases. Even if the L2 working set
+  exceeds 96MB and forces DRAM refills, those refills overlap each other and
+  the TMA load pipeline stays full. The "amplification" is bandwidth the HBM
+  already has spare.
+- **Work-stealing creates a synchronous wavefront.** All clusters march
+  through tiles in the same global order. Each tile's A+B must arrive
+  *just-in-time* from a hot L2, and when it doesn't, every cluster stalls
+  on the same `long_scoreboard` at once. Zero amplification, but every
+  miss is on the MMA critical path.
+- **PACKED_TILES changed the game.** Pre-2026-04-17 data compared static
+  swizzles without PACKED_TILES against dynamic variants with implicit
+  good-order atomics. Not apples-to-apples. Under parity, static wins.
 
-1.109ms FC2, 1.13x DRAM amplification.
+### Within the static family: zigzag gets +4.2 points L2 hit rate free
 
-### 3. Work-stealing (TD=4) — eliminates amplification, adds overhead
+Zigzag (TD=11) matches default's stall profile *exactly* (long_sb 2.12M,
+barrier 271K, wait 387K) but reads 750MB less DRAM and has 50.1% L2 hit rate
+vs default's 45.9% — +4.2 points. Same fused ms, better cache efficiency, so
+it's the new recommended default for FC2. dgswizzle has the lowest long_sb
+(2.02M) and lowest DRAM amp of the static group (1.27×), leading fused at
+1.065ms — but at the cost of a register-count bump that matters on FC1.
 
-Dedicated W7 scheduler warp issues `atomicAdd` on a global tile counter. All clusters process tiles in the same global order, so L2 sees sequential access. DRAM amplification drops to 1.00x (matches CUTLASS's CLC hardware dispatch).
+### FC1 is a different story
 
-The cost: W7 must broadcast each tile assignment to W0-W6 via `tile_ready_mbar`. This mbarrier is on W3's critical path and costs ~300 cyc/tile (clock-timing-measured). At K=3072, the 34us mbar overhead exceeds the DRAM savings from eliminating 0.13x amplification, so work-stealing is 34us slower than striding.
+FC1's f-g gap is a bigger lever than FC2's dispatch choice:
 
-1.133ms FC2 at K=3072, 4.28GB DRAM = 1.00x.
+- dgswizzle gemm 1.659ms (best) → fused 2.093ms. 434us f-g gap.
+- zigzag gemm 1.894ms → fused 2.024ms. 130us f-g gap — best fused.
+- ncycle/nsnake: f-g ≈ 0 — zero epilogue/mainloop overlap, pathological.
 
-**K crossover**: at large K, compute dominates and NS6's latency hiding shrinks (6/K_ITERS). At K=6144 (12.5%), striding's amplification penalty is fully exposed. Work-stealing wins by 7% at K=6144. Crossover at K~5120.
+FC1 wants a dispatch that preserves dgswizzle's mainloop locality *without*
+its epilogue overlap penalty. Phase-offset DG (static N band, dynamic M-row)
+is the open experiment.
 
-### 4. LEAN (TD=4 + LEAN_DISPATCH) — best of both worlds
+### Why LEAN's barrier reduction still matters (and doesn't)
 
-Same work-stealing as TD=4 (zero amplification), but W2-W6 skip `tile_ready_mbar` entirely and piggyback on `mainloop_mbar`. After W1 completes the K-loop and releases mainloop_mbar, the release-acquire ordering guarantees that W0's prior `bcast[]` SMEM write is visible. W2-W6 read `bcast[prev_buf]` after mainloop_mbar to get the previous tile index.
+LEAN_DISPATCH does eliminate the ~300 cyc/tile `tile_ready_mbar` broadcast
+from W3's critical path — that's real, measurable, and shows up as a 227K
+drop in barrier stalls. It just lands on a non-bottleneck under PACKED_TILES
+parity. Keep LEAN in the tree for large-K regimes where DRAM amplification
+dominates (K≥5120 data pre-parity suggested work-stealing wins), but at
+K=3072 it's outclassed.
 
-Only W0 lane 0 arrives tile_ready_mbar (count=1), and only W1 waits it. The mbarrier broadcast to W2-W6 — the 300 cyc/tile bottleneck — is eliminated.
+### Old variants (all dead)
 
-1.058ms FC2, 4.28GB DRAM = 1.00x, 67us fused overhead (vs striding's 66us, work-stealing's 141us).
+- **Contiguous [begin:end]**: never implemented. Adjacent CTAs touch disjoint
+  M-row ranges, catastrophic DRAM amplification.
+- **TD=1 atomic**: every warp does atomicAdd. 1.370ms — overhead swamps any
+  amplification savings.
+- **TD=5 CLC**: hardware dispatch via `clusterlaunchcontrol`. Deadlocks —
+  CLC's one-block-per-tile model is incompatible with persistent loops.
+- **TD=6 inline atomic (W0 at tile boundary)**: 1.370ms — blocks W0, delays
+  TMA loads.
+- **TD=7 inline atomic in K-loop**: 1.257ms — +41% TMA issue overhead. W0's
+  K-loop is memory-pipeline-sensitive; ANY global memory op degrades TMA.
+- **COL_LOCK**: 1.137ms. TMA penalty inherent to W7 mbarrier path, not tile
+  order. Strip 62us slower due to load imbalance (74 clusters / 3 cols).
+- **N-batch striding**: +12% regression. Static dispatch can't match LEAN's
+  L2 efficiency at the N-batch wavefront width.
+- **ncycle / nsnake / nflat**: column-first. Under PACKED_TILES still slow
+  (1.20-1.23ms) because 74 clusters hammer the same N-column → TMA store
+  contention.
+- **rowsteal**: 1.242ms. Work-stealing variant that tried to add N-column
+  locality. Worst of both worlds.
+- **L2 cache hints (EVICT_FIRST/LAST/NORMAL)**: zero effect. long_scoreboard
+  stalls are an arrival-pattern problem, not an eviction problem.
 
-### Dispatch hierarchy summary — UNDER REVISION (2026-04-17)
+### K-crossover (needs re-verification under parity)
 
-Prior thesis claimed "LEAN wins by eliminating DRAM amplification." The 2026-04-17 ncu run with PACKED_TILES parity between static and dynamic variants undermines this:
-
-| Variant | ms | DRAM amp | long_scoreboard | barrier |
-|---|---|---|---|---|
-| w3_fused (stride) | 1.070 | 1.59× | 2.17M | 274K |
-| **w3_dgswizzle** | **1.074** | 1.32× | **2.04M** | 268K |
-| w3_sched (TD=4) | 1.101 | 1.00× | 2.67M | 45K |
-| w3_lean (LEAN) | 1.107 | 1.00× | 2.67M | 44K |
-| w3_tail | 1.101 | 1.21× | 2.72M | 45K |
-
-Dynamic (sched/lean/tail) have the lowest DRAM read bytes *and* the highest memory stalls. Static dgswizzle has 1.32× amplification but 630K fewer long_scoreboard stalls and beats LEAN by ~30us wall-clock. LEAN's mbarrier removal (barrier 44K vs 268K) is real but lands on a non-bottleneck.
-
-**Possible interpretations** (none confirmed — single run, within variance for some rows):
-- Predictable tile order (static swizzles) lets L2 prefetch / TMA pipeline stay ahead; counter-driven order produces unpredictable arrivals.
-- PACKED_TILES physical reordering makes "amplified" per-tile reads L2-hot anyway, so byte-count no longer predicts stall count.
-- Historical data (CLAUDE.md tables pre-2026-04-17) compared static *without* PACKED_TILES vs dynamic *with* implicit good-order atomics — not apples-to-apples.
-
-**Status:** need ≥3 reps of the full suite (fc2_cutlass_vs_w3.sh now includes hilbert/zorder/zigzag under PACKED_TILES) before overturning the LEAN thesis. Do not assume any ordering is stable until variance is characterized.
-
-Old hierarchy table (pre-PACKED_TILES parity):
-
-| Approach | DRAM amplification | Dispatch overhead | Best for |
-|---|---|---|---|
-| Contiguous | catastrophic | zero | nothing |
-| Striding | 1.13x (L2 capacity) | zero | K<=3072 (NS6 hides) |
-| Static curves (TD=8-11) | 1.13x | zero | previously claimed "same as striding" — disputed |
-| Work-stealing (TD=4) | 1.00x | 34us (mbar) | previously claimed "K>=5120" — K-crossover not re-tested under parity |
-| LEAN (TD=4+LEAN) | 1.00x | ~9us | previously claimed "all K" — disputed |
+Pre-2026-04-17 data (without PACKED_TILES parity) showed work-stealing winning
+at K=6144 by 7%. Whether this reverses under the new thesis is an open
+question — if long_scoreboard stalls dominate regardless of K, static may lead
+at all K. Re-run `./tools/bench.sh --comprehensive --ncu` with `-DK_DIM=6144`
+and `K_DIM=4096` to confirm.
 
 ### Other dispatch variants tried (all dead)
 
@@ -162,20 +201,32 @@ Tile: 256x256x128. K_ITERS=K_DIM/128. FC2: K=3072 (24 iters), FC1: K=768 (6 iter
 
 From bench/mma_bench.cu: MMA K-iteration 665 cyc raw, 525.6 cyc/iter pipelined. Per FC2 tile (24 iters): ~12,614 cyc. Theoretical strip floor at 1.813 GHz = ~1.048ms (matches observed).
 
-**Epilogue is 100% hidden in MMA shadow.** The fused-strip gap (67us for LEAN, 66us for striding) is entirely memory-side: DRAM amplification + TMA store contention. NOT compute, NOT instruction scheduling, NOT cross-warp STS clustering.
+**Epilogue is 100% hidden in MMA shadow.** The fused-strip gap (~45us across
+all variants under PACKED_TILES) is entirely memory-side: `long_scoreboard`
+bubbles on A+B arrival + TMA store contention. NOT compute, NOT instruction
+scheduling, NOT cross-warp STS clustering. Note: older text in git history
+attributed this gap to "DRAM amplification" — 2026-04-18 data shows
+amplification is a red herring; what matters is the *pattern* of arrivals,
+not the byte count.
 
 Our BF16 epilogue (HFMA2/HADD2) costs ~44us vs CUTLASS's FP32 (FFMA+F2FP) ~72us. Cross-warp STS clustering is real (barrier stalls +753% in ncu) but is a symptom, not a bottleneck — proven by STRIP_EPILOGUE isolating the gap to memory traffic.
 
-## DRAM read amplification
+## DRAM read amplification (historical note — NOT the bottleneck)
 
 Theoretical minimum: fused = A+B+residual+bias = 4.28GB, strip = A+B = 2.85GB.
 
-| Variant | DRAM read | vs theoretical |
-|---|---|---|
-| w3_fused (striding) | 4.85GB | 1.13x |
-| w3_sched (work-stealing) | 4.28GB | 1.00x |
-| w3_lean (LEAN) | 4.28GB | 1.00x |
-| cutlass_fused (CLC) | 4.28GB | 1.00x |
+| Variant (FC2 fused, PACKED_TILES) | DRAM read | vs theoretical | ms |
+|---|---|---|---|
+| default (striding) | 6.79 GB | 1.59× | 1.071 |
+| zigzag (TD=11) | 6.04 GB | 1.41× | 1.073 |
+| dgswizzle (TD=8) | 5.44 GB | 1.27× | 1.065 |
+| sched (work-stealing) | 4.28 GB | 1.00× | 1.101 |
+| lean (LEAN_DISPATCH) | 4.28 GB | 1.00× | 1.107 |
+| cutlass_fused (CLC) | 4.28 GB | 1.00× | 1.226 |
+
+Work-stealing achieves 1.00× amplification and is *slower* than 1.59× striding.
+Amplification is not the bottleneck — MMA stalls from synchronous A+B arrivals
+are. See tile dispatch section above.
 
 Root cause of striding's 1.13x: 74 clusters striding through M-rows with different N-tile phases creates a working set that exceeds L2 capacity. Work-stealing processes tiles in global order, keeping the wavefront narrow.
 

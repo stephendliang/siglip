@@ -1,0 +1,17 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |       1,857.0 |     1,355,335 |  72885.2% | 
+dram__bytes_read.sum                                                   |          1.31 |         715.6 |  54522.9% | Gbyte
+smsp__warps_issue_stalled_barrier.avg                                  |     495,043.3 |     118,571.3 |    -76.0% | warp
+smsp__warps_issue_stalled_sleeping.avg                                 |     134,048.1 |      64,796.9 |    -51.7% | warp
+dram__sectors_read.sum                                                 |    40,957,048 |    22,361,136 |    -45.4% | sector
+launch__registers_per_thread                                           |         108.0 |         152.0 |     40.7% | register/thread
+smsp__warps_issue_stalled_short_scoreboard.avg                         |     101,783.1 |     132,349.6 |     30.0% | warp
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     2,980,197 |     3,769,420 |     26.5% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |      10,062.0 |      12,142.5 |     20.7% | warp
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |       5,254.1 |       6,215.6 |     18.3% | warp
+smsp__inst_executed.sum                                                |   160,649,578 |   180,724,432 |     12.5% | inst
+smsp__warps_issue_stalled_wait.avg                                     |     620,788.9 |     690,742.5 |     11.3% | warp
+lts__t_sectors_op_read.sum                                             |   508,644,057 |   453,534,505 |    -10.8% | sector
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |    49,934,137 |    54,434,198 |      9.0% | 
+lts__t_sectors.sum                                                     |   778,772,607 |   739,356,196 |     -5.1% | sector

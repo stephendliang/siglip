@@ -1,0 +1,489 @@
+
+=== WALL TIME ===
+label                                             ms    tflops  valid  regs  bars
+----------------------------------------------------------------------------------
+cublas_fc1_gemm                                1.423   3078.28      0    12     0
+cublas_fc2_gemm                                1.102   3974.13      0    12     0
+cutlass_fc2_fused                              1.224   3578.58      1    16     0
+cutlass_fc2_strip                              1.152   3801.89      1    16     0
+fc1_default_p_fused                            2.087   2098.52      1   105     2
+fc1_default_p_gemm                             1.882   2327.68      1   108     2
+fc1_default_p_strip                            1.380   3174.94      0    34     1
+fc1_dgswizzle_p_fused                          2.089   2096.24      1   110     2
+fc1_dgswizzle_p_gemm                           1.658   2641.16      1   112     2
+fc1_dgswizzle_p_strip                          1.381   3171.23      0    40     1
+fc1_hilbert_p_fused                            2.249   1947.48      0   112     2
+fc1_hilbert_p_gemm                             1.693   2587.72      0   112     2
+fc1_hilbert_p_strip                            1.436   3049.48      0    52     1
+fc1_lean_p_fused                               2.067   2118.94      1   151     2
+fc1_lean_p_gemm                                1.828   2396.00      1   151     2
+fc1_lean_p_strip                               1.407   3112.16      0    80     1
+fc1_ncycle_p_fused                             2.029   2158.51      1   110     2
+fc1_ncycle_p_gemm                              2.034   2153.17      1   114     2
+fc1_ncycle_p_strip                             1.336   3278.09      0    39     1
+fc1_nflat_p_fused                              2.031   2156.57      1   110     2
+fc1_nflat_p_gemm                               1.718   2548.79      1   113     2
+fc1_nflat_p_strip                              1.332   3288.14      0    39     1
+fc1_nsnake_p_fused                             2.029   2158.48      1   110     2
+fc1_nsnake_p_gemm                              2.034   2153.25      1   112     2
+fc1_nsnake_p_strip                             1.333   3284.82      0    39     1
+fc1_rowmajor_p_fused                           2.023   2164.68      1   110     2
+fc1_rowmajor_p_gemm                            1.905   2299.31      1   112     2
+fc1_rowmajor_p_strip                           1.388   3155.08      0    39     1
+fc1_sched_p_fused                              2.072   2114.16      1   151     2
+fc1_sched_p_gemm                               1.851   2366.29      1   152     2
+fc1_sched_p_strip                              1.410   3106.93      0    76     1
+fc1_zigzag_p_fused                             2.021   2167.31      1   110     2
+fc1_zigzag_p_gemm                              1.906   2298.08      1   112     2
+fc1_zigzag_p_strip                             1.389   3152.62      0    39     1
+fc1_zorder_p_fused                             2.087   2098.97      0   112     2
+fc1_zorder_p_gemm                              1.754   2497.28      0   116     2
+fc1_zorder_p_strip                             1.366   3206.37      0    40     1
+fc2_default_p_fused                            1.074   4077.26      1   126     2
+fc2_default_p_gemm                             1.075   4075.15      1   111     2
+fc2_default_p_strip                            1.025   4274.00      0    48     1
+fc2_dgswizzle_p_fused                          1.065   4113.54      0   117     2
+fc2_dgswizzle_p_gemm                           1.052   4161.95      1   119     2
+fc2_dgswizzle_p_strip                          0.985   4447.30      0    56     1
+fc2_hilbert_p_fused                            1.090   4018.66      1   117     2
+fc2_hilbert_p_gemm                             1.067   4104.39      1   116     2
+fc2_hilbert_p_strip                            0.985   4447.09      0    56     1
+fc2_lean_p_fused                               1.107   3958.10      1   164     2
+fc2_lean_p_gemm                                1.091   4013.01      1   163     2
+fc2_lean_p_strip                               0.990   4424.08      0   100     1
+fc2_ncycle_p_fused                             1.225   3574.44      1   117     2
+fc2_ncycle_p_gemm                              1.196   3661.54      1   118     2
+fc2_ncycle_p_strip                             1.029   4257.25      0    56     1
+fc2_nflat_p_fused                              1.201   3645.53      1   117     2
+fc2_nflat_p_gemm                               1.166   3757.39      1   117     2
+fc2_nflat_p_strip                              1.028   4260.99      0    56     1
+fc2_nsnake_p_fused                             1.223   3580.50      1   117     2
+fc2_nsnake_p_gemm                              1.196   3661.37      1   116     2
+fc2_nsnake_p_strip                             1.029   4254.81      0    56     1
+fc2_rowmajor_p_fused                           1.073   4081.55      1   117     2
+fc2_rowmajor_p_gemm                            1.076   4071.37      1   116     2
+fc2_rowmajor_p_strip                           0.984   4452.96      0    56     1
+fc2_rowsteal_p_fused                           1.243   3524.08      1   164     2
+fc2_rowsteal_p_gemm                            1.211   3617.50      1   164     2
+fc2_rowsteal_p_strip                           1.043   4197.55      0    98     1
+fc2_sched_p_fused                              1.101   3977.86      1   164     2
+fc2_sched_p_gemm                               1.083   4043.54      1   164     2
+fc2_sched_p_strip                              0.990   4422.47      0    98     1
+fc2_tail_lean_p_fused                          1.107   3956.29      1   164     2
+fc2_tail_lean_p_gemm                           1.096   3997.69      1   163     2
+fc2_tail_lean_p_strip                          0.989   4427.31      0   100     1
+fc2_tail_p_fused                               1.103   3970.20      1   165     2
+fc2_tail_p_gemm                                1.087   4027.85      1   165     2
+fc2_tail_p_strip                               0.990   4426.36      0    99     1
+fc2_zigzag_p_fused                             1.074   4078.91      1   117     2
+fc2_zigzag_p_gemm                              1.076   4072.47      1   116     2
+fc2_zigzag_p_strip                             0.985   4447.39      0    56     1
+fc2_zorder_p_fused                             1.082   4049.98      1   117     2
+fc2_zorder_p_gemm                              1.072   4085.45      1   116     2
+fc2_zorder_p_strip                             0.984   4449.30      0    56     1
+
+=== DECOMPOSITION (ms) ===
+layer  dispatch      pk     fused      gemm     strip       f-g       g-s
+-------------------------------------------------------------------------
+fc1   default       p      2.087     1.882     1.380     0.205     0.502
+fc1   dgswizzle     p      2.089     1.658     1.381     0.431     0.277
+fc1   hilbert       p      2.249     1.693     1.436     0.556     0.257
+fc1   lean          p      2.067     1.828     1.407     0.239     0.421
+fc1   ncycle        p      2.029     2.034     1.336    -0.005     0.698
+fc1   nflat         p      2.031     1.718     1.332     0.313     0.386
+fc1   nsnake        p      2.029     2.034     1.333    -0.005     0.701
+fc1   rowmajor      p      2.023     1.905     1.388     0.118     0.517
+fc1   sched         p      2.072     1.851     1.410     0.221     0.441
+fc1   zigzag        p      2.021     1.906     1.389     0.115     0.517
+fc1   zorder        p      2.087     1.754     1.366     0.333     0.388
+fc2   default       p      1.074     1.075     1.025    -0.001     0.050
+fc2   dgswizzle     p      1.065     1.052     0.985     0.013     0.067
+fc2   hilbert       p      1.090     1.067     0.985     0.023     0.082
+fc2   lean          p      1.107     1.091     0.990     0.016     0.101
+fc2   ncycle        p      1.225     1.196     1.029     0.029     0.167
+fc2   nflat         p      1.201     1.166     1.028     0.035     0.138
+fc2   nsnake        p      1.223     1.196     1.029     0.027     0.167
+fc2   rowmajor      p      1.073     1.076     0.984    -0.003     0.092
+fc2   rowsteal      p      1.243     1.211     1.043     0.032     0.168
+fc2   sched         p      1.101     1.083     0.990     0.018     0.093
+fc2   tail          p      1.103     1.087     0.990     0.016     0.097
+fc2   tail_lean     p      1.107     1.096     0.989     0.011     0.107
+fc2   zigzag        p      1.074     1.076     0.985    -0.002     0.091
+fc2   zorder        p      1.082     1.072     0.984     0.010     0.088
+
+=== DRAM AMPLIFICATION ===
+label                                         read_GB   read_amp   write_GB  write_amp
+--------------------------------------------------------------------------------------
+fc1_default_p_fused                             1.510      2.11x      5.650      0.99x
+fc1_default_p_gemm                              1.310      1.83x      5.640      0.99x
+fc1_default_p_strip                             0.921      1.29x      0.004          ?
+fc1_sched_p_fused                               0.716      1.00x      5.640      0.99x
+fc1_sched_p_gemm                                0.716      1.00x      5.640      0.99x
+fc1_sched_p_strip                               0.715      1.00x      0.004          ?
+fc1_lean_p_fused                                0.716      1.00x      5.640      0.99x
+fc1_lean_p_gemm                                 0.715      1.00x      5.640      0.99x
+fc1_lean_p_strip                                0.715      1.00x      0.004          ?
+fc1_dgswizzle_p_fused                           1.020      1.43x      5.650      0.99x
+fc1_dgswizzle_p_gemm                            0.716      1.00x      5.640      0.99x
+fc1_dgswizzle_p_strip                           0.716      1.00x      0.004          ?
+fc1_zorder_p_fused                              0.747      1.04x      1.860      0.33x
+fc1_zorder_p_gemm                               0.715      1.00x      1.850      0.32x
+fc1_zorder_p_strip                              0.715      1.00x      0.003          ?
+fc1_hilbert_p_fused                             0.718      1.00x      1.850      0.32x
+fc1_hilbert_p_gemm                              0.715      1.00x      1.850      0.32x
+fc1_hilbert_p_strip                             0.715      1.00x      0.004          ?
+fc1_zigzag_p_fused                              0.750      1.05x      5.650      0.99x
+fc1_zigzag_p_gemm                               0.715      1.00x      5.640      0.99x
+fc1_zigzag_p_strip                              0.715      1.00x      0.004          ?
+fc1_rowmajor_p_fused                            0.752      1.05x      5.650      0.99x
+fc1_rowmajor_p_gemm                             0.715      1.00x      5.640      0.99x
+fc1_rowmajor_p_strip                            0.715      1.00x      0.004          ?
+fc1_ncycle_p_fused                              0.736      1.03x      5.650      0.99x
+fc1_ncycle_p_gemm                               0.827      1.16x      5.640      0.99x
+fc1_ncycle_p_strip                              0.715      1.00x      0.004          ?
+fc1_nflat_p_fused                               0.718      1.00x      5.650      0.99x
+fc1_nflat_p_gemm                                0.718      1.00x      5.650      0.99x
+fc1_nflat_p_strip                               0.715      1.00x      0.003          ?
+fc1_nsnake_p_fused                              0.742      1.04x      5.650      0.99x
+fc1_nsnake_p_gemm                               0.827      1.16x      5.640      0.99x
+fc1_nsnake_p_strip                              0.715      1.00x      0.003          ?
+fc2_default_p_fused                             6.790      1.59x      1.430      1.00x
+fc2_default_p_gemm                              4.160      0.97x      1.420      1.00x
+fc2_default_p_strip                             5.090      1.78x      0.012          ?
+fc2_sched_p_fused                               4.280      1.00x      1.430      1.00x
+fc2_sched_p_gemm                                2.850      0.67x      1.410      0.99x
+fc2_sched_p_strip                               2.860      1.00x      0.004          ?
+fc2_lean_p_fused                                4.280      1.00x      1.420      1.00x
+fc2_lean_p_gemm                                 2.850      0.67x      1.400      0.98x
+fc2_lean_p_strip                                2.850      1.00x      0.004          ?
+fc2_tail_p_fused                                5.610      1.31x      1.440      1.01x
+fc2_tail_p_gemm                                 2.860      0.67x      1.410      0.99x
+fc2_tail_p_strip                                3.830      1.34x      0.020          ?
+fc2_tail_lean_p_fused                           5.510      1.29x      1.430      1.00x
+fc2_tail_lean_p_gemm                            2.850      0.67x      1.410      0.99x
+fc2_tail_lean_p_strip                           3.880      1.36x      0.013          ?
+fc2_rowsteal_p_fused                            4.870      1.14x      1.440      1.01x
+fc2_rowsteal_p_gemm                             2.970      0.69x      1.420      1.00x
+fc2_rowsteal_p_strip                            2.870      1.01x      0.012          ?
+fc2_dgswizzle_p_fused                           5.440      1.27x      1.420      1.00x
+fc2_dgswizzle_p_gemm                            3.030      0.71x      1.400      0.98x
+fc2_dgswizzle_p_strip                           3.360      1.18x      0.006          ?
+fc2_zorder_p_fused                              5.950      1.39x      1.420      1.00x
+fc2_zorder_p_gemm                               3.080      0.72x      1.410      0.99x
+fc2_zorder_p_strip                              4.090      1.43x      0.010          ?
+fc2_hilbert_p_fused                             5.810      1.36x      1.450      1.02x
+fc2_hilbert_p_gemm                              2.960      0.69x      1.410      0.99x
+fc2_hilbert_p_strip                             4.050      1.42x      0.021          ?
+fc2_zigzag_p_fused                              6.040      1.41x      1.420      1.00x
+fc2_zigzag_p_gemm                               2.870      0.67x      1.400      0.98x
+fc2_zigzag_p_strip                              3.920      1.37x      0.009          ?
+fc2_rowmajor_p_fused                            6.060      1.42x      1.420      1.00x
+fc2_rowmajor_p_gemm                             2.860      0.67x      1.400      0.98x
+fc2_rowmajor_p_strip                            3.990      1.40x      0.010          ?
+fc2_ncycle_p_fused                              5.530      1.29x      1.420      1.00x
+fc2_ncycle_p_gemm                               3.280      0.77x      1.410      0.99x
+fc2_ncycle_p_strip                              2.930      1.03x      0.008          ?
+fc2_nflat_p_fused                               5.510      1.29x      1.420      1.00x
+fc2_nflat_p_gemm                                3.290      0.77x      1.410      0.99x
+fc2_nflat_p_strip                               2.950      1.03x      0.007          ?
+fc2_nsnake_p_fused                              5.510      1.29x      1.420      1.00x
+fc2_nsnake_p_gemm                               3.270      0.76x      1.410      0.99x
+fc2_nsnake_p_strip                              2.940      1.03x      0.007          ?
+cutlass_fc2_fused                               4.280          —      1.400          —
+cutlass_fc2_strip                               2.850          —      1.400          —
+cublas_fc2_gemm                                 2.940          —      1.400          —
+cublas_fc1_gemm                                 0.739          —      5.640          —
+
+=== FULL METRICS: fc1 pk=p mode=fused ===
+metric                   default       dgswizzle         hilbert            lean          ncycle           nflat          nsnake        rowmajor           sched          zigzag          zorder
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+long_sb                    1.17M           1.16M           1.39M           2.43M           1.17M           1.16M           1.16M           1.18M           2.50M           1.17M           1.15M
+short_sb                  393.6K          408.5K          379.5K          433.3K          383.0K          381.0K          386.6K          390.9K          403.2K          384.1K          349.8K
+wait                       1.13M           1.19M           1.29M           1.20M           1.13M           1.15M           1.12M           1.14M           1.20M           1.12M           1.20M
+barrier                   556.1K          556.5K          604.2K          113.9K          544.9K          549.1K          543.1K          549.7K          120.1K          546.6K          545.2K
+sleeping                  140.5K          141.6K          160.2K          105.5K          136.3K          134.1K          132.4K          139.5K          103.7K          139.9K          130.7K
+not_selected              124.1K          127.8K          128.6K          142.2K          120.8K          132.7K          133.0K          115.9K          139.7K          116.5K          122.3K
+mio_thr                   443.03            1.2K          542.71            1.3K          474.53          484.47          433.06          476.72            1.3K          548.50          989.16
+math_thr                   39.1K           30.8K           36.5K           46.7K           41.5K           19.2K           34.6K           26.6K           48.6K           42.2K           36.9K
+dram_rd_B                  1.51G           1.02G         717.81M         715.50M         736.29M         718.32M         742.05M         752.45M         715.57M         749.87M         747.18M
+dram_wr_B                  5.65G           5.65G           1.85G           5.64G           5.65G           5.65G           5.65G           5.65G           5.64G           5.65G           1.86G
+dram_rd_sec               47.14M          31.96M          22.43M          22.36M          23.01M          22.45M          23.19M          23.51M          22.36M          23.43M          23.35M
+dram_wr_sec              176.48M         176.54M          57.94M         176.36M         176.42M         176.41M         176.42M         176.46M         176.36M         176.46M          58.14M
+dram_pct                   26.00           24.34            8.68           23.36           23.94           23.75           23.97           23.94           23.27           23.96            9.50
+lts_pct                    39.71           39.81           43.42           39.89           39.78           40.57           38.81           40.48           40.00           40.26           38.68
+lts_sec                  839.09M         822.48M         887.66M         780.77M         778.74M         806.31M         731.65M         809.81M         784.37M         804.87M         782.11M
+lts_rd_sec               568.91M         552.42M         527.13M         497.06M         508.44M         535.98M         461.34M         539.77M         498.54M         534.84M         509.31M
+lts_wr_sec               269.54M         269.55M         355.35M         271.23M         269.54M         269.56M         269.55M         269.53M         273.38M         269.51M         269.56M
+lts_hit                    57.28           59.95           83.40           58.49           60.27           62.75           59.81           60.88           58.79           60.38           81.30
+l1tex_pct                  43.53           43.76           49.66           44.42           44.96           44.82           45.07           45.04           44.58           44.97           43.61
+sm_pct                     47.48           47.73           44.20           48.08           49.09           48.93           49.20           49.15           47.99           49.07           47.60
+shared_pct                 46.55           46.80           43.16           47.13           48.13           47.97           48.24           48.20           47.03           48.11           46.68
+lsu_pct                     4.76            4.79            5.05            5.27            4.92            4.91            4.93            4.93            5.40            4.92            4.77
+miorq_rd_pct                8.92            9.01           10.60            9.81            9.23            9.19            9.25            9.24            9.93            9.23            8.95
+miorq_wr_pct                8.92            9.01           10.60            9.79            9.23            9.19            9.25            9.24            9.91            9.22            8.95
+warps_act                   6.00            6.00            6.00            6.99            6.00            6.00            6.00            6.00            6.99            6.00            6.00
+cyc_act                    3.68M           3.75M           4.10M           3.83M           3.67M           3.68M           3.67M           3.67M           3.84M           3.67M           3.70M
+inst_exec                972.90M         986.38M           1.01G         990.36M         978.90M         982.70M         979.83M         974.18M         992.49M         976.35M         995.59M
+warps_elig                  0.48            0.48            0.45            0.47            0.48            0.49            0.49            0.48            0.47            0.48            0.49
+regs                      105.00          110.00          112.00          151.00          110.00          110.00          110.00          110.00          151.00          110.00          112.00
+occ                          n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+smem_wf                   78.89M          80.06M          88.95M          84.70M          79.53M          79.62M          79.82M          79.83M          84.99M          79.36M          79.76M
+smem_ld_wf                28.30M          29.40M          28.90M          29.44M          29.26M          29.40M          29.54M          29.39M          29.38M          28.91M          29.09M
+smem_st_wf                45.34M          45.39M          54.37M          48.64M          44.97M          45.07M          45.00M          45.12M          49.03M          45.04M          45.34M
+gbl_ld_wf                    n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_rd_reqs                  n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_wr_reqs                  n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_rd_B                     n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_wr_B                     n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+
+=== FULL METRICS: fc1 pk=p mode=gemm ===
+metric                   default       dgswizzle         hilbert            lean          ncycle           nflat          nsnake        rowmajor           sched          zigzag          zorder
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+long_sb                    2.98M           2.40M           2.34M           3.73M           3.03M           2.71M           3.04M           2.75M           3.77M           2.77M           2.61M
+short_sb                  101.8K          117.9K          104.6K          149.0K          106.9K           99.2K          106.6K          111.1K          132.3K          106.1K          107.6K
+wait                      620.8K          676.7K          773.3K          695.6K          626.8K          636.2K          626.9K          617.0K          690.7K          627.3K          664.0K
+barrier                   495.0K          517.0K          488.2K           86.4K          500.5K          474.9K          480.0K          482.3K          118.6K          450.8K          470.8K
+sleeping                  134.0K           97.2K           96.0K           59.0K          136.2K          102.6K          135.9K          113.4K           64.8K          113.1K          103.2K
+not_selected               10.1K           12.7K           14.6K           11.3K           11.5K           11.2K           10.2K           11.9K           12.1K           11.9K           12.4K
+mio_thr                    11.00           11.00            2.7K           17.54           11.00           11.00           11.00           11.00           17.57           11.00           11.00
+math_thr                    5.3K            7.8K            6.9K            4.8K            4.3K            4.2K            4.4K            4.3K            6.2K            4.6K            6.8K
+dram_rd_B                  1.31G         715.82M         714.55M         715.46M         826.57M         717.59M         826.89M         715.39M         715.56M         715.46M         714.72M
+dram_wr_B                  5.64G           5.64G           1.85G           5.64G           5.64G           5.65G           5.64G           5.64G           5.64G           5.64G           1.85G
+dram_rd_sec               40.96M          22.37M          22.33M          22.36M          25.83M          22.42M          25.84M          22.36M          22.36M          22.36M          22.34M
+dram_wr_sec              176.37M         176.37M          57.88M         176.37M         176.38M         176.42M         176.38M         176.34M         176.37M         176.34M          57.85M
+dram_pct                   29.59           30.60           11.97           28.77           27.66           29.18           27.66           29.22           28.44           29.17           11.91
+lts_pct                    43.72           50.09           57.29           46.95           39.94           49.71           39.90           47.55           46.62           47.44           47.71
+lts_sec                  778.77M         771.11M         852.83M         740.51M         656.03M         812.34M         655.54M         763.98M         739.36M         763.32M         744.72M
+lts_rd_sec               508.64M         501.19M         492.21M         457.05M         383.11M         542.17M         382.73M         494.09M         453.53M         493.43M         469.57M
+lts_wr_sec               269.48M         269.46M         354.81M         271.17M         269.47M         269.44M         269.45M         269.45M         273.26M         269.45M         269.44M
+lts_hit                    56.19           59.35           82.34           56.35           52.50           62.90           52.48           59.35           56.78           59.43           81.96
+l1tex_pct                  51.22           57.94           69.69           54.90           51.73           55.14           51.73           55.34           54.56           55.31           55.66
+sm_pct                     58.65           66.89           64.20           62.63           59.25           63.95           59.26           63.67           61.92           63.64           64.53
+shared_pct                 54.46           61.97           60.15           58.14           55.05           59.05           55.04           59.02           57.47           58.99           59.58
+lsu_pct                     3.28            3.74            4.51            4.07            3.32            3.56            3.32            3.56            4.21            3.56            3.59
+miorq_rd_pct               10.41           11.85           14.59           12.06           10.54           11.32           10.54           11.27           12.08           11.26           11.34
+miorq_wr_pct               10.41           11.85           14.59           12.05           10.54           11.32           10.54           11.27           12.07           11.27           11.34
+warps_act                   6.00            6.00            6.00            7.00            6.00            6.00            6.00            6.00            7.00            6.00            6.00
+cyc_act                    3.22M           2.90M           2.97M           3.09M           3.28M           3.03M           3.27M           3.05M           3.13M           3.05M           3.00M
+inst_exec                160.65M         174.30M         199.19M         178.05M         166.65M         170.51M         167.61M         161.86M         180.72M         164.06M         183.12M
+warps_elig                  0.09            0.11            0.12            0.10            0.09            0.10            0.09            0.09            0.10            0.10            0.11
+regs                      108.00          112.00          112.00          151.00          114.00          113.00          112.00          112.00          152.00          112.00          116.00
+occ                          n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+smem_wf                   49.93M          49.78M          59.61M          53.22M          49.94M          49.96M          49.93M          49.92M          54.43M          49.91M          49.68M
+smem_ld_wf                  1.9K            1.9K            1.9K          671.4K            1.9K            1.9K            1.9K            1.9K           1.36M            1.9K            1.9K
+smem_st_wf                45.28M          45.19M          55.28M          46.51M          45.28M          45.31M          45.33M          45.25M          46.94M          45.29M          45.15M
+gbl_ld_wf                    n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_rd_reqs                  n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_wr_reqs                  n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_rd_B                     n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_wr_B                     n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+
+=== FULL METRICS: fc1 pk=p mode=strip ===
+metric                   default       dgswizzle         hilbert            lean          ncycle           nflat          nsnake        rowmajor           sched          zigzag          zorder
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+long_sb                    2.82M           2.64M           2.78M           3.54M           2.68M           2.64M           2.67M           2.78M           3.53M           2.76M           2.70M
+short_sb                  744.15           37.3K          728.18           40.8K          745.78          727.93          873.88          723.84           23.3K          727.88          713.73
+wait                      341.0K          427.2K          443.1K          425.6K          366.6K          389.1K          368.5K          346.4K          419.8K          367.8K          393.0K
+barrier                   303.7K          286.4K          300.3K            2.0K          290.0K          286.4K          289.1K          300.4K            1.6K          298.2K          292.7K
+sleeping                   93.8K           66.5K           77.9K           43.4K           79.2K           73.5K           78.3K           90.2K           43.9K           86.4K           79.5K
+not_selected                1.4K            2.1K            3.3K            2.0K            1.7K            2.6K            1.9K            1.3K            2.2K            1.4K            2.0K
+mio_thr                    11.00           26.72           11.00           17.86           11.00           11.00           11.00           11.00           17.81           11.00           11.00
+math_thr                  244.71          608.59            1.1K          329.01          526.12          668.20          392.52          234.55          671.87          280.17          499.47
+dram_rd_B                920.76M         716.39M         714.92M         715.47M         715.38M         715.44M         715.40M         715.42M         715.33M         715.45M         714.52M
+dram_wr_B                  3.55M           3.56M           3.60M           3.97M           3.58M           3.29M           3.22M           3.60M           4.00M           3.54M           3.46M
+dram_rd_sec               28.77M          22.39M          22.34M          22.36M          22.36M          22.36M          22.36M          22.36M          22.35M          22.36M          22.33M
+dram_wr_sec               111.0K          111.3K          112.6K          124.0K          111.8K          102.9K          100.6K          112.6K          125.2K          110.6K          108.0K
+dram_pct                    5.03            4.00            3.82            3.92            4.06            4.06            4.07            4.02            3.96            4.01            4.04
+lts_pct                    49.26           47.40           48.02           42.42           53.30           54.18           52.70           49.80           44.41           49.75           51.11
+lts_sec                  529.56M         495.70M         574.78M         460.26M         539.41M         545.81M         528.63M         518.26M         480.98M         518.81M         527.78M
+lts_rd_sec               527.34M         493.51M         520.92M         444.83M         537.24M         543.64M         526.40M         516.01M         463.40M         516.59M         525.56M
+lts_wr_sec                 2.12M           2.09M          53.76M           3.81M           2.11M           2.11M           2.16M           2.14M           5.96M           2.11M           2.12M
+lts_hit                    89.67           91.09           92.44           88.42           92.98           93.77           94.45           91.43           88.24           91.34           91.46
+l1tex_pct                  35.19           35.95           34.36           35.22           36.54           36.55           36.63           36.15           35.65           36.09           36.40
+sm_pct                     71.81           73.35           70.16           71.81           74.53           74.56           74.72           73.76           72.69           73.63           74.25
+shared_pct                 70.37           71.89           68.72           70.39           73.07           73.09           73.26           72.30           71.25           72.17           72.79
+lsu_pct                     0.21            0.22            0.83            0.89            0.22            0.22            0.22            0.22            1.11            0.22            0.22
+miorq_rd_pct                1.43            1.73            3.66            2.61            1.47            1.47            1.47            1.47            2.83            1.46            1.46
+miorq_wr_pct                1.43            1.73            3.66            2.59            1.47            1.47            1.47            1.47            2.81            1.46            1.46
+warps_act                   6.00            6.00            6.00            7.00            6.00            6.00            6.00            6.00            7.00            6.00            6.00
+cyc_act                    2.51M           2.50M           2.61M           2.56M           2.44M           2.43M           2.43M           2.49M           2.53M           2.49M           2.47M
+inst_exec                 54.04M          77.21M          80.92M          74.61M          66.78M          74.59M          67.89M          53.40M          75.11M          60.67M          69.01M
+warps_elig                  0.04            0.05            0.05            0.05            0.05            0.05            0.05            0.04            0.05            0.04            0.05
+regs                       34.00           40.00           52.00           80.00           39.00           39.00           39.00           39.00           76.00           39.00           40.00
+occ                          n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+smem_wf                   318.9K          318.8K          471.3K           2.69M          319.0K          318.7K          318.8K          318.7K           2.71M          318.6K          318.9K
+smem_ld_wf                  1.9K            1.9K            1.9K          633.7K            1.9K            1.9K            1.9K            1.9K          634.0K            1.9K            1.9K
+smem_st_wf                  8.2K            8.2K            8.3K          228.8K            8.3K            8.2K            8.1K            8.1K          232.6K            8.1K            8.2K
+gbl_ld_wf                    n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_rd_reqs                  n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_wr_reqs                  n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_rd_B                     n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_wr_B                     n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+
+=== FULL METRICS: fc2 pk=p mode=fused ===
+metric                   default       dgswizzle         hilbert            lean          ncycle           nflat          nsnake        rowmajor        rowsteal           sched            tail       tail_lean          zigzag          zorder
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+long_sb                    2.12M           2.02M           2.05M           2.66M           2.08M           2.07M           2.08M           2.12M           2.76M           2.66M           2.74M           2.71M           2.12M           2.02M
+short_sb                  168.7K          188.0K          179.1K          216.9K          181.0K          180.8K          181.3K          173.8K          200.8K          203.2K          201.1K          213.3K          177.4K          178.3K
+wait                      384.3K          401.0K          418.7K          404.0K          386.6K          391.6K          387.9K          382.7K          395.3K          400.5K          399.6K          403.0K          387.4K          422.4K
+barrier                   271.7K          267.3K          268.7K           43.8K          269.2K          269.6K          269.1K          270.7K           45.0K           44.5K           43.9K           44.2K          271.0K          266.5K
+sleeping                   21.0K           18.7K           17.1K            3.6K           20.4K           20.2K           20.1K           20.4K            4.9K            3.7K            4.9K            4.8K           20.2K           17.6K
+not_selected                6.7K            7.8K            9.0K            7.2K            7.2K            7.5K            7.3K            7.2K            7.4K            7.4K            7.3K            7.2K            7.1K            7.5K
+mio_thr                    17.61           17.80           67.34           23.46           17.74           17.83           17.73           17.75           24.23           24.39           24.86           23.18           17.70           17.71
+math_thr                    2.2K            2.9K            3.7K            2.3K            2.6K            2.9K            2.7K            2.6K            2.4K            2.4K            2.3K            2.3K            2.6K            2.7K
+dram_rd_B                  6.79G           5.44G           5.81G           4.28G           5.53G           5.51G           5.51G           6.06G           4.87G           4.28G           5.61G           5.51G           6.04G           5.95G
+dram_wr_B                  1.43G           1.42G           1.45G           1.42G           1.42G           1.42G           1.42G           1.42G           1.44G           1.43G           1.44G           1.43G           1.42G           1.42G
+dram_rd_sec              212.17M         170.12M         181.62M         133.75M         172.90M         172.14M         172.11M         189.38M         152.33M         133.75M         175.40M         172.26M         188.60M         186.01M
+dram_wr_sec               44.59M          44.34M          45.40M          44.33M          44.25M          44.26M          44.26M          44.45M          44.89M          44.61M          45.09M          44.75M          44.44M          44.43M
+dram_pct                   57.47           50.09           51.89           41.74           50.31           50.05           50.10           54.30           45.55           41.93           49.91           49.15           53.89           53.33
+lts_pct                    70.73           66.60           72.75           69.32           71.44           73.56           71.57           72.64           72.56           68.51           72.56           72.93           72.46           72.85
+lts_sec                  741.58M         666.64M         777.22M         690.50M         706.99M         721.95M         707.13M         735.45M         707.39M         677.07M         741.77M         742.40M         735.15M         744.34M
+lts_rd_sec               673.40M         598.53M         683.52M         619.02M         638.69M         653.66M         638.85M         667.38M         637.02M         604.91M         669.50M         670.80M         667.07M         676.30M
+lts_wr_sec                67.51M          67.51M          93.13M          67.98M          67.51M          67.52M          67.50M          67.52M          68.64M          68.63M          68.64M          67.98M          67.51M          67.51M
+lts_hit                    45.85           50.57           52.38           56.38           52.72           54.35           52.92           50.72           57.13           56.08           52.78           53.17           50.09           50.27
+l1tex_pct                  49.69           52.30           51.40           52.48           51.87           51.71           51.85           51.43           51.58           52.79           50.54           50.53           51.80           51.50
+sm_pct                     92.34           96.72           95.56           97.51           96.13           95.90           96.11           95.48           96.08           97.96           94.27           94.26           96.09           95.49
+shared_pct                 91.74           96.55           94.88           96.87           95.76           95.47           95.72           94.95           95.22           97.43           93.28           93.27           95.63           95.07
+lsu_pct                     3.31            3.49            3.91            3.76            3.46            3.45            3.46            3.43            3.73            3.87            3.69            3.60            3.45            3.43
+miorq_rd_pct                5.75            6.03            7.55            6.70            5.98            5.96            5.98            5.95            6.58            6.81            6.52            6.44            5.99            5.96
+miorq_wr_pct                5.75            6.03            7.54            6.69            5.98            5.97            5.98            5.95            6.57            6.81            6.52            6.42            5.98            5.96
+warps_act                   7.00            7.00            7.00            7.98            7.00            7.00            7.00            7.00            7.98            7.98            7.98            7.98            7.00            7.00
+cyc_act                    1.85M           1.83M           1.86M           1.85M           1.84M           1.84M           1.84M           1.84M           1.87M           1.84M           1.88M           1.88M           1.84M           1.84M
+inst_exec                101.84M         106.06M         113.09M         107.94M         103.83M         105.09M         104.12M         102.57M         107.91M         108.57M         108.41M         107.80M         103.19M         109.15M
+warps_elig                  0.10            0.10            0.11            0.10            0.10            0.10            0.10            0.10            0.10            0.10            0.10            0.10            0.10            0.10
+regs                      126.00          117.00          117.00          164.00          117.00          117.00          117.00          117.00          164.00          164.00          165.00          164.00          117.00          117.00
+occ                          n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+smem_wf                   48.47M          50.00M          49.49M          49.69M          50.28M          50.26M          50.27M          48.71M          50.26M          49.85M          49.85M          49.82M          49.33M          49.56M
+smem_ld_wf                27.94M          30.17M          25.86M          33.24M          30.51M          29.97M          30.63M          29.30M          32.11M          33.21M          32.46M          32.53M          29.62M          28.61M
+smem_st_wf                19.17M          18.32M          21.76M          14.51M          18.31M          18.79M          18.23M          18.13M          16.35M          14.79M          15.31M          15.09M          18.21M          19.75M
+gbl_ld_wf                    n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_rd_reqs                  n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_wr_reqs                  n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_rd_B                     n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_wr_B                     n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+
+=== FULL METRICS: fc2 pk=p mode=gemm ===
+metric                   default       dgswizzle         hilbert            lean          ncycle           nflat          nsnake        rowmajor        rowsteal           sched            tail       tail_lean          zigzag          zorder
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+long_sb                    2.42M           2.36M           2.35M           2.98M           2.39M           2.39M           2.39M           2.39M           3.06M           3.01M           3.03M           2.99M           2.38M           2.31M
+short_sb                   26.4K           31.2K           33.1K           55.6K           28.2K           27.3K           27.4K           28.9K           42.2K           46.0K           41.1K           51.7K           27.9K           30.7K
+wait                      332.1K          344.4K          365.7K          357.7K          334.1K          334.7K          334.0K          331.7K          346.5K          352.0K          350.4K          356.4K          334.2K          368.3K
+barrier                   280.9K          278.4K          257.4K           44.8K          277.9K          277.3K          277.9K          278.1K           36.9K           43.4K           41.1K           44.7K          277.6K          266.4K
+sleeping                   24.2K           21.6K           20.3K            5.7K           22.9K           23.3K           23.4K           22.0K            7.6K            7.0K            7.3K            6.0K           21.9K           18.4K
+not_selected                4.2K            4.2K            4.9K            4.2K            4.7K            4.8K            5.2K            4.5K            5.4K            5.7K            5.4K            4.0K            4.7K            4.6K
+mio_thr                    17.62           17.61           21.20           24.51           17.59           17.68           17.62           17.56           23.16           23.02           23.56           23.60           17.62           17.62
+math_thr                    2.4K            2.1K            2.5K            2.2K            2.5K            2.6K            2.8K            2.3K            3.2K            3.3K            3.2K            2.1K            2.3K            2.5K
+dram_rd_B                  4.16G           3.03G           2.96G           2.85G           3.28G           3.29G           3.27G           2.86G           2.97G           2.85G           2.86G           2.85G           2.87G           3.08G
+dram_wr_B                  1.42G           1.40G           1.41G           1.40G           1.41G           1.41G           1.41G           1.40G           1.42G           1.41G           1.41G           1.41G           1.40G           1.41G
+dram_rd_sec              129.86M          94.61M          92.48M          89.19M         102.60M         102.89M         102.28M          89.23M          92.73M          89.19M          89.33M          89.21M          89.78M          96.35M
+dram_wr_sec               44.45M          43.81M          44.13M          43.88M          43.98M          43.98M          43.98M          43.85M          44.42M          43.94M          44.07M          43.91M          43.87M          44.05M
+dram_pct                   38.39           31.56           31.47           30.87           33.53           33.52           33.42           30.91           31.48           30.79           30.85           30.86           31.14           32.43
+lts_pct                    65.27           61.12           67.77           65.03           66.46           68.22           66.25           69.29           66.74           62.61           69.00           69.29           69.08           68.24
+lts_sec                  683.03M         609.22M         698.75M         636.07M         638.02M         650.09M         637.78M         661.00M         631.46M         624.09M         666.35M         667.33M         658.88M         674.52M
+lts_rd_sec               615.04M         541.29M         607.35M         564.60M         569.93M         581.98M         569.66M         593.06M         561.16M         551.96M         594.28M         595.92M         590.94M         606.60M
+lts_wr_sec                67.52M          67.51M          90.96M          67.97M          67.52M          67.50M          67.52M          67.51M          68.62M          68.64M          68.63M          67.98M          67.51M          67.51M
+lts_hit                    58.20           62.45           64.79           63.69           65.02           65.64           64.58           66.19           67.24           63.51           65.73           65.70           66.23           63.79
+l1tex_pct                  45.19           46.80           46.74           47.76           47.01           47.06           46.92           47.88           47.28           47.63           47.60           47.77           47.90           47.44
+sm_pct                     91.24           94.33           94.52           96.46           94.81           94.89           94.62           96.57           95.36           96.09           96.07           96.49           96.60           95.54
+shared_pct                 90.38           93.59           93.49           95.50           94.03           94.12           93.84           95.77           94.56           95.24           95.19           95.53           95.79           94.88
+lsu_pct                     1.38            1.43            1.86            1.72            1.44            1.44            1.43            1.46            1.73            1.80            1.77            1.69            1.46            1.45
+miorq_rd_pct                5.31            5.49            6.88            6.22            5.50            5.50            5.49            5.60            6.07            6.22            6.18            6.18            5.60            5.53
+miorq_wr_pct                5.31            5.49            6.87            6.21            5.50            5.50            5.49            5.60            6.07            6.22            6.17            6.18            5.60            5.52
+warps_act                   7.00            7.00            7.00            7.98            7.00            7.00            7.00            7.00            7.98            7.98            7.98            7.98            7.00            7.00
+cyc_act                    1.89M           1.87M           1.88M           1.88M           1.88M           1.88M           1.88M           1.87M           1.88M           1.88M           1.88M           1.88M           1.87M           1.86M
+inst_exec                 70.33M          73.93M          80.50M          76.38M          71.96M          73.01M          72.20M          70.86M          75.91M          76.64M          76.35M          76.14M          71.41M          76.84M
+warps_elig                  0.07            0.07            0.08            0.07            0.07            0.07            0.07            0.07            0.07            0.07            0.07            0.07            0.07            0.07
+regs                      111.00          119.00          116.00          163.00          118.00          117.00          116.00          116.00          164.00          164.00          165.00          163.00          116.00          116.00
+occ                          n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+smem_wf                   17.44M          16.86M          16.80M          18.25M          15.78M          15.70M          15.81M          16.43M          18.01M          18.72M          18.71M          18.55M          16.43M          18.68M
+smem_ld_wf                  2.0K            2.0K            2.0K          237.1K            2.0K            2.1K            2.1K            2.0K          236.6K          237.2K          236.3K          230.2K            2.1K            2.0K
+smem_st_wf                16.23M          15.59M          15.49M          16.37M          14.48M          14.45M          14.65M          15.26M          16.27M          16.81M          17.00M          16.73M          15.17M          17.49M
+gbl_ld_wf                    n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_rd_reqs                  n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_wr_reqs                  n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_rd_B                     n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_wr_B                     n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+
+=== FULL METRICS: fc2 pk=p mode=strip ===
+metric                   default       dgswizzle         hilbert            lean          ncycle           nflat          nsnake        rowmajor        rowsteal           sched            tail       tail_lean          zigzag          zorder
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+long_sb                    2.51M           2.46M           2.47M           3.07M           2.50M           2.49M           2.50M           2.51M           3.13M           3.08M           3.09M           3.08M           2.50M           2.46M
+short_sb                    2.3K           15.0K            1.5K           30.0K            3.8K            3.3K            4.0K            2.6K           15.7K           16.5K           15.2K           27.4K            2.9K            8.1K
+wait                      263.6K          286.7K          288.8K          290.9K          273.3K          277.6K          274.1K          265.6K          284.1K          289.5K          288.2K          289.5K          271.8K          290.1K
+barrier                   224.6K          220.9K          221.2K            2.7K          223.9K          223.1K          223.8K          224.7K            2.5K            2.4K            2.3K            2.8K          224.0K          220.9K
+sleeping                   12.9K           10.4K           12.0K            1.0K            9.7K            9.4K            9.5K           11.1K          749.39            1.0K          877.92          816.91           10.5K            9.9K
+not_selected              629.49            1.5K            2.2K          821.96            1.3K            1.5K            1.3K          598.38          966.10          934.84          995.07          793.09          830.12            1.1K
+mio_thr                    17.67           42.48           17.65           24.09           17.67           17.73           17.60           17.68           23.07           23.64           23.53           23.94           17.63           17.61
+math_thr                  236.05          494.46          782.42          219.43          719.42          967.48          725.81          190.11          316.27          310.03          295.39          212.73          281.38          408.13
+dram_rd_B                  5.09G           3.36G           4.05G           2.85G           2.93G           2.95G           2.94G           3.99G           2.87G           2.86G           3.83G           3.88G           3.92G           4.09G
+dram_wr_B                 11.65M           6.07M          20.56M           4.07M           7.78M           7.48M           7.25M           9.62M          12.25M           3.93M          19.54M          13.38M           9.18M          10.49M
+dram_rd_sec              159.18M         104.85M         126.60M          89.19M          91.71M          92.09M          91.73M         124.55M          89.61M          89.22M         119.70M         121.35M         122.38M         127.79M
+dram_wr_sec               364.1K          189.8K          642.5K          127.0K          243.0K          233.7K          226.6K          300.8K          383.0K          122.8K          610.8K          418.0K          286.8K          327.8K
+dram_pct                   36.64           24.92           30.15           21.43           21.81           21.82           21.78           29.64           21.42           21.47           28.54           28.84           29.13           30.35
+lts_pct                    57.37           54.65           61.35           49.51           57.53           63.12           59.20           61.14           66.88           45.59           62.72           62.64           60.29           62.25
+lts_sec                  538.87M         464.51M         574.85M         408.38M         499.07M         535.89M         490.23M         531.59M         540.97M         399.08M         558.07M         541.52M         550.85M         546.79M
+lts_rd_sec               537.89M         463.52M         558.88M         403.92M         497.98M         534.77M         489.16M         530.62M         537.66M         394.04M         552.96M         537.04M         549.89M         545.87M
+lts_wr_sec                679.8K          681.8K          15.70M           1.14M          680.3K          680.2K          670.1K          673.8K           1.80M           1.80M           1.79M           1.14M          669.7K          667.2K
+lts_hit                    54.81           61.10           61.30           64.80           70.65           71.86           73.57           63.28           73.15           65.33           63.13           65.42           61.57           60.26
+l1tex_pct                  47.17           48.85           48.86           49.55           48.83           48.89           48.84           48.90           49.11           49.48           48.87           48.76           48.94           48.76
+sm_pct                     94.34           97.71           97.73           99.08           97.68           97.79           97.69           97.80           98.25           98.96           97.75           97.51           97.89           97.52
+shared_pct                 94.33           97.70           97.72           99.07           97.67           97.79           97.68           97.80           98.22           98.95           97.72           97.50           97.88           97.51
+lsu_pct                     0.09            0.09            0.39            0.37            0.09            0.09            0.09            0.09            0.39            0.45            0.42            0.33            0.09            0.09
+miorq_rd_pct                1.61            1.73            2.55            2.32            1.65            1.64            1.65            1.67            2.27            2.40            2.33            2.24            1.66            1.76
+miorq_wr_pct                1.61            1.73            2.55            2.31            1.65            1.64            1.65            1.67            2.26            2.39            2.32            2.23            1.66            1.76
+warps_act                   7.00            7.00            7.00            7.98            7.00            7.00            7.00            7.00            7.99            7.99            7.99            7.99            7.00            7.00
+cyc_act                    1.81M           1.81M           1.81M           1.82M           1.81M           1.81M           1.81M           1.81M           1.82M           1.82M           1.81M           1.81M           1.81M           1.81M
+inst_exec                 44.06M          51.03M          51.48M          50.12M          48.07M          50.69M          48.23M          44.07M          50.34M          51.06M          50.83M          49.88M          46.14M          48.97M
+warps_elig                  0.04            0.05            0.05            0.05            0.05            0.05            0.05            0.04            0.05            0.05            0.05            0.05            0.04            0.05
+regs                       48.00           56.00           56.00          100.00           56.00           56.00           56.00           56.00           98.00           98.00           99.00          100.00           56.00           56.00
+occ                          n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+smem_wf                    87.9K          108.7K          177.2K           1.03M           85.9K           85.7K           85.8K           87.8K           1.09M          928.9K           1.05M           1.07M           87.0K          106.2K
+smem_ld_wf                  2.0K            2.0K            2.0K          231.1K            2.0K            2.0K            2.0K            2.0K          209.9K          225.7K          218.4K          218.8K            2.1K            2.1K
+smem_st_wf                  2.4K            2.5K            2.5K          253.3K            2.5K            2.5K            2.5K            2.5K          467.7K          148.5K          360.4K          373.5K            2.5K            2.5K
+gbl_ld_wf                    n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_rd_reqs                  n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_wr_reqs                  n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_rd_B                     n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+tma_wr_B                     n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a             n/a
+
+=== FULL METRICS: baselines (cutlass / cublas) ===
+metric            cutlass_fc2_fuse  cutlass_fc2_stri   cublas_fc2_gemm   cublas_fc1_gemm
+----------------------------------------------------------------------------------------
+long_sb                      2.70M             2.41M             2.26M             1.94M
+short_sb                    133.6K             30.3K            205.7K            608.7K
+wait                        228.2K            141.0K            188.3K            436.7K
+barrier                      31.7K             93.2K             64.5K            257.0K
+sleeping                      0.00              0.00            228.76            240.95
+not_selected                 21.9K             26.0K              4.8K             21.3K
+mio_thr                       3.8K              2.2K              3.6K             18.9K
+math_thr                      2.6K            556.73             28.0K             61.2K
+dram_rd_B                    4.28G             2.85G             2.94G           739.15M
+dram_wr_B                    1.40G             1.40G             1.40G             5.64G
+dram_rd_sec                133.75M            89.21M            92.02M            23.10M
+dram_wr_sec                 43.86M            43.74M            43.75M           176.35M
+dram_pct                     40.11             30.43             30.27             34.60
+lts_pct                      67.81             63.39             62.93             59.43
+lts_sec                    684.42M           636.14M           650.24M           821.01M
+lts_rd_sec                 617.15M           569.05M           582.72M           552.64M
+lts_wr_sec                  66.84M            66.85M            66.85M           267.34M
+lts_hit                      57.65             63.33             61.25             61.71
+l1tex_pct                    54.29             52.39             52.02             68.45
+sm_pct                       94.83             95.59             93.48             75.83
+shared_pct                   93.31             94.33             91.78             70.43
+lsu_pct                       5.17              2.08              1.28              3.92
+miorq_rd_pct                  5.12              4.69              4.60             12.45
+miorq_wr_pct                  5.11              4.68              4.59             12.43
+warps_act                     7.50              6.50              6.00              6.00
+cyc_act                      1.92M             1.90M             1.96M             2.56M
+inst_exec                  163.09M           141.73M            89.72M           255.62M
+warps_elig                    0.15              0.14              0.08              0.18
+regs                        252.00            186.00            255.00            255.00
+occ                            n/a               n/a               n/a               n/a
+smem_wf                     60.20M            20.14M            17.96M            87.99M
+smem_ld_wf                  37.57M            423.5K            443.6K             1.75M
+smem_st_wf                  19.12M            16.64M            16.60M            82.43M
+gbl_ld_wf                      n/a               n/a               n/a               n/a
+tma_rd_reqs                    n/a               n/a               n/a               n/a
+tma_wr_reqs                    n/a               n/a               n/a               n/a
+tma_rd_B                       n/a               n/a               n/a               n/a
+tma_wr_B                       n/a               n/a               n/a               n/a

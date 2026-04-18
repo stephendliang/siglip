@@ -1,0 +1,31 @@
+FC1 W3 kernel — 6 warps, GEMM_ONLY (D=BF16(A*B), no bias/GELU)
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 203776 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+==PROF== Connected to process 16642 (/root/siglip/bench-fc1-ncycle-p-gemm)
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=203776 B)
+Launching warmup (2 iters)...
+==PROF== Profiling "fc1_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc1_w3_kernel": 0%....50%....100% - 12 passes
+  Warmup done.
+Timing: 10 iterations...
+==PROF== Profiling "fc1_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc1_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc1_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc1_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc1_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc1_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc1_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc1_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc1_w3_kernel": 0%....50%....100% - 12 passes
+==PROF== Profiling "fc1_w3_kernel": 0%....50%....100% - 12 passes
+FC1-W3 kernel: 708.937 ms  6.18 TFLOPS
+==PROF== Profiling "fc1_w3_kernel": 0%....50%....100% - 12 passes
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 1769472.000000
+C[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=708.937 tflops=6.18 checksum=1769472.000000 valid=1 c0=1728.0
+==PROF== Disconnected from process 16642
+==PROF== Report: /root/siglip/data/bench_20260418_034637/fc1_ncycle_p_gemm.ncu-rep

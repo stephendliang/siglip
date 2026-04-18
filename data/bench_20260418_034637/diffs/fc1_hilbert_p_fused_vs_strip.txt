@@ -1,0 +1,22 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |       1,857.0 |    28,902,152 | 1556289.4% | 
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |       8,259.0 |    54,365,332 | 658155.6% | 
+smsp__warps_issue_stalled_short_scoreboard.avg                         |         728.2 |     379,452.4 |  52009.7% | warp
+dram__sectors_write.sum                                                |     112,624.0 |    57,941,776 |  51347.1% | sector
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |     471,345.0 |    88,949,538 |  18771.4% | 
+smsp__warps_issue_stalled_mio_throttle.avg                             |         11.00 |         542.7 |   4833.7% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |       3,280.4 |     128,642.6 |   3821.5% | warp
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |       1,096.8 |      36,538.2 |   3231.4% | warp
+smsp__inst_executed.sum                                                |    80,918,213 | 1,011,978,722 |   1150.6% | inst
+lts__t_sectors_op_write.sum                                            |    53,756,278 |   355,354,073 |    561.0% | sector
+smsp__warps_issue_stalled_wait.avg                                     |     443,098.6 |     1,294,722 |    192.2% | warp
+launch__registers_per_thread                                           |         52.00 |         112.0 |    115.4% | register/thread
+smsp__warps_issue_stalled_sleeping.avg                                 |      77,923.2 |     160,239.0 |    105.6% | warp
+smsp__warps_issue_stalled_barrier.avg                                  |     300,326.8 |     604,242.8 |    101.2% | warp
+smsp__cycles_active.avg                                                |     2,610,843 |     4,096,721 |     56.9% | cycle
+lts__t_sectors.sum                                                     |   574,781,240 |   887,656,816 |     54.4% | sector
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     2,781,926 |     1,387,473 |    -50.1% | warp
+l1tex__throughput.avg.pct_of_peak_sustained_elapsed                    |         34.36 |         49.66 |     44.5% | %
+sm__pipe_shared_cycles_active.avg.pct_of_peak_sustained_elapsed        |         68.72 |         43.16 |    -37.2% | %
+sm__throughput.avg.pct_of_peak_sustained_elapsed                       |         70.16 |         44.20 |    -37.0% | %

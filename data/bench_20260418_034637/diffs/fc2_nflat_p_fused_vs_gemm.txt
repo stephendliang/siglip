@@ -1,0 +1,17 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |       2,065.0 |    29,969,782 | 1451221.2% | 
+smsp__warps_issue_stalled_short_scoreboard.avg                         |      27,317.9 |     180,778.4 |    561.8% | warp
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |    15,704,537 |    50,262,596 |    220.1% | 
+dram__sectors_read.sum                                                 |   102,892,696 |   172,138,488 |     67.3% | sector
+smsp__warps_issue_stalled_not_selected.avg                             |       4,789.2 |       7,483.0 |     56.2% | warp
+dram__throughput.avg.pct_of_peak_sustained_elapsed                     |         33.52 |         50.05 |     49.3% | %
+smsp__inst_executed.sum                                                |    73,007,450 |   105,085,926 |     43.9% | inst
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |    14,447,407 |    18,785,876 |     30.0% | 
+lts__t_sector_hit_rate.pct                                             |         65.64 |         54.35 |    -17.2% | %
+smsp__warps_issue_stalled_wait.avg                                     |     334,664.4 |     391,565.6 |     17.0% | warp
+smsp__warps_issue_stalled_sleeping.avg                                 |      23,302.5 |      20,198.0 |    -13.3% | warp
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     2,386,266 |     2,071,100 |    -13.2% | warp
+lts__t_sectors_op_read.sum                                             |   581,978,569 |   653,664,734 |     12.3% | sector
+lts__t_sectors.sum                                                     |   650,091,266 |   721,950,155 |     11.1% | sector
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |       2,622.3 |       2,851.9 |      8.8% | warp
