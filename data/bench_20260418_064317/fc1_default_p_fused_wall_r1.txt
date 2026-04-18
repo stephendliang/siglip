@@ -1,0 +1,15 @@
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 203776 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=203776 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 2.097 ms  2088.75 TFLOPS
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 3207168.000000
+C[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=2.097 tflops=2088.75 checksum=3207168.000000 valid=1 c0=1728.0

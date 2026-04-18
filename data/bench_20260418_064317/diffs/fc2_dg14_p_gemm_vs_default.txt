@@ -1,0 +1,7 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+dram__sectors_read.sum                                                 |   129,563,024 |   102,484,208 |    -20.9% | sector
+lts__t_sectors_op_read.sum                                             |   618,178,581 |   554,388,648 |    -10.3% | sector
+lts__t_sectors.sum                                                     |   686,231,162 |   622,338,059 |     -9.3% | sector
+smsp__warps_issue_stalled_sleeping.avg                                 |      21,231.8 |      19,892.1 |     -6.3% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |       4,331.9 |       4,571.0 |      5.5% | warp

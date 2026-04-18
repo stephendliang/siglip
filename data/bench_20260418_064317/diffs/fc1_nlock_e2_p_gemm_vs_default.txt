@@ -1,0 +1,18 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+dram__bytes_read.sum                                                   |          1.31 |         715.4 |  54508.4% | Gbyte
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |       5,476.8 |          0.00 |   -100.0% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |      10,148.6 |          0.00 |   -100.0% | warp
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     2,965,326 |     1,467,021 |    -50.5% | warp
+dram__sectors_read.sum                                                 |    40,825,840 |    22,355,232 |    -45.2% | sector
+smsp__warps_issue_stalled_barrier.avg                                  |     492,199.9 |     383,994.1 |    -22.0% | warp
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |       1,857.0 |       1,554.0 |    -16.3% | 
+smsp__warps_issue_stalled_wait.avg                                     |     626,354.2 |     531,853.4 |    -15.1% | warp
+dram__sectors_write.sum                                                |   176,391,176 |   155,264,480 |    -12.0% | sector
+lts__t_sectors_op_read.sum                                             |   515,200,992 |   461,404,773 |    -10.4% | sector
+smsp__warps_issue_stalled_short_scoreboard.avg                         |     101,481.2 |      90,924.6 |    -10.4% | warp
+smsp__inst_executed.sum                                                |   161,505,556 |   146,298,296 |     -9.4% | inst
+smsp__cycles_active.avg                                                |     3,209,261 |     2,988,111 |     -6.9% | cycle
+lts__t_sectors.sum                                                     |   785,294,171 |   731,433,820 |     -6.9% | sector
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |    45,242,230 |    48,042,637 |      6.2% | 
+smsp__warps_issue_stalled_sleeping.avg                                 |     129,827.1 |     123,012.8 |     -5.2% | warp

@@ -1,0 +1,26 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |         593.0 |    45,060,496 | 7598634.6% | 
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |       1,856.0 |    29,377,656 | 1582747.8% | 
+dram__sectors_write.sum                                                |     105,088.0 |   176,619,944 | 167968.6% | sector
+smsp__warps_issue_stalled_short_scoreboard.avg                         |         469.0 |     390,125.4 |  83075.3% | warp
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |     311,036.0 |    79,767,078 |  25545.6% | 
+lts__t_sectors_op_write.sum                                            |     2,065,658 |   269,506,239 |  12947.0% | sector
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |         249.8 |      26,674.5 |  10577.1% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |       1,242.3 |     115,858.5 |   9226.4% | warp
+smsp__warps_issue_stalled_mio_throttle.avg                             |         11.00 |         475.4 |   4222.2% | warp
+smsp__inst_executed.sum                                                |    55,382,232 |   974,093,136 |   1658.9% | inst
+dram__throughput.avg.pct_of_peak_sustained_elapsed                     |          4.12 |         26.39 |    540.5% | %
+smsp__warps_issue_stalled_wait.avg                                     |     349,480.8 |     1,140,475 |    226.3% | warp
+dram__bytes_read.sum                                                   |         715.9 |          1.42 |    -99.8% | Mbyte
+dram__sectors_read.sum                                                 |    22,370,744 |    44,321,496 |     98.1% | sector
+smsp__warps_issue_stalled_barrier.avg                                  |     301,719.2 |     549,900.7 |     82.3% | warp
+smsp__warps_issue_stalled_sleeping.avg                                 |      85,590.7 |     143,401.2 |     67.5% | warp
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     2,790,510 |     1,176,172 |    -57.9% | warp
+lts__t_sectors.sum                                                     |   511,726,110 |   793,841,549 |     55.1% | sector
+smsp__cycles_active.avg                                                |     2,499,499 |     3,673,844 |     47.0% | cycle
+launch__registers_per_thread                                           |         75.00 |         110.0 |     46.7% | register/thread
+lts__t_sector_hit_rate.pct                                             |         90.99 |         57.88 |    -36.4% | %
+sm__throughput.avg.pct_of_peak_sustained_elapsed                       |         73.39 |         47.65 |    -35.1% | %
+sm__pipe_shared_cycles_active.avg.pct_of_peak_sustained_elapsed        |         71.91 |         46.71 |    -35.0% | %
+lts__throughput.avg.pct_of_peak_sustained_elapsed                      |         50.39 |         39.84 |    -20.9% | %

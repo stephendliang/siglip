@@ -1,0 +1,17 @@
+FC2 W3 kernel — 7 warps (0 idle), shared-SMEM epilogue
+  GEMM: [928256,3072] x [768,3072]^T  6-stage pipeline  SMEM: 231424 bytes  EPI_REUSE=0
+  LOAD: PACKED=1  PRESWIZZLE=0
+  EPI: stages=2  SWS=0  DTS=0  FP32=0  CPP=0
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=231424 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC2-W3 kernel: 1.058 ms  4140.06 TFLOPS
+  MISMATCH at (145040,235): expected 4864.0 got 318.0 (gemm=4608.0 bias=236.0 res=33.5000)
+Validation: 31/32 spot checks passed — FAILED
+Checksum (1024 strided): 7461504.000000
+C[0,0..3] = 6912.0 4608.0 6912.0 4608.0
+@@RESULT ms=1.058 tflops=4140.06 checksum=7461504.000000 valid=0 c0=6912.0

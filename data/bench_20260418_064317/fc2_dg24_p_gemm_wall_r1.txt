@@ -1,0 +1,16 @@
+FC2 W3 kernel — 7 warps (0 idle), GEMM_ONLY (D=BF16(A*B), no residual/bias)
+  GEMM: [928256,3072] x [768,3072]^T  6-stage pipeline  SMEM: 231424 bytes  EPI_REUSE=0
+  LOAD: PACKED=1  PRESWIZZLE=0
+  EPI: stages=2  SWS=0  DTS=0  FP32=0  CPP=0
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=231424 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC2-W3 kernel: 1.053 ms  4161.37 TFLOPS
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 7077888.000000
+C[0,0..3] = 6912.0 4608.0 6912.0 4608.0
+@@RESULT ms=1.053 tflops=4161.37 checksum=7077888.000000 valid=1 c0=6912.0

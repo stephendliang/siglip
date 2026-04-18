@@ -1,0 +1,5 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |       2,199.4 |       2,961.7 |     34.7% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |       6,677.7 |       7,944.6 |     19.0% | warp
+smsp__warps_issue_stalled_short_scoreboard.avg                         |     163,108.8 |     181,325.7 |     11.2% | warp

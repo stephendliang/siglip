@@ -1,0 +1,18 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |       1,858.0 |    29,342,639 | 1579159.4% | 
+smsp__warps_issue_stalled_mio_throttle.avg                             |         11.00 |         487.5 |   4331.8% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |      11,974.7 |     132,797.2 |   1009.0% | warp
+smsp__inst_executed.sum                                                |   172,507,483 |   982,699,032 |    469.7% | inst
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |       4,779.7 |      19,235.8 |    302.4% | warp
+smsp__warps_issue_stalled_short_scoreboard.avg                         |      98,850.2 |     381,900.5 |    286.3% | warp
+smsp__warps_issue_stalled_wait.avg                                     |     639,738.7 |     1,145,270 |     79.0% | warp
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |    49,938,175 |    79,694,268 |     59.6% | 
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     2,706,183 |     1,157,833 |    -57.2% | warp
+smsp__warps_issue_stalled_sleeping.avg                                 |      95,143.1 |     135,660.6 |     42.6% | warp
+launch__registers_per_thread                                           |         150.0 |         110.0 |    -26.7% | register/thread
+sm__throughput.avg.pct_of_peak_sustained_elapsed                       |         62.36 |         47.62 |    -23.6% | %
+smsp__cycles_active.avg                                                |     3,028,518 |     3,684,696 |     21.7% | cycle
+sm__pipe_shared_cycles_active.avg.pct_of_peak_sustained_elapsed        |         57.56 |         46.69 |    -18.9% | %
+l1tex__throughput.avg.pct_of_peak_sustained_elapsed                    |         53.75 |         43.63 |    -18.8% | %
+smsp__warps_issue_stalled_barrier.avg                                  |     470,704.0 |     549,000.3 |     16.6% | warp

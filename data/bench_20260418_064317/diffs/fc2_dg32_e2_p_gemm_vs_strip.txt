@@ -1,0 +1,18 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |         599.0 |    16,083,369 | 2684936.6% | 
+dram__sectors_write.sum                                                |     256,352.0 |    44,117,776 |  17109.8% | sector
+lts__t_sectors_op_write.sum                                            |     407,477.0 |    67,241,897 |  16402.0% | sector
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |     104,173.0 |    16,855,725 |  16080.5% | 
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |         79.10 |       1,381.6 |   1646.7% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |         445.6 |       3,041.9 |    582.7% | warp
+smsp__warps_issue_stalled_short_scoreboard.avg                         |      10,094.5 |      27,080.1 |    168.3% | warp
+smsp__warps_issue_stalled_sleeping.avg                                 |       9,357.2 |      20,239.1 |    116.3% | warp
+launch__registers_per_thread                                           |         96.00 |         163.0 |     69.8% | register/thread
+smsp__inst_executed.sum                                                |    47,725,283 |    68,068,036 |     42.6% | inst
+lts__t_sectors.sum                                                     |   557,786,379 |   669,886,806 |     20.1% | sector
+smsp__warps_issue_stalled_wait.avg                                     |     273,762.2 |     315,215.2 |     15.1% | warp
+dram__sectors_read.sum                                                 |   135,525,936 |   115,239,224 |    -15.0% | sector
+smsp__warps_issue_stalled_barrier.avg                                  |     220,289.9 |     244,120.4 |     10.8% | warp
+lts__t_sectors_op_read.sum                                             |   557,115,030 |   602,188,732 |      8.1% | sector
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |       1,836.0 |       1,702.0 |     -7.3% | 

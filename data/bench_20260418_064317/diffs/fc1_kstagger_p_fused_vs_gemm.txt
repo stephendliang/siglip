@@ -1,0 +1,17 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |       1,859.0 |    27,420,057 | 1474889.6% | 
+smsp__warps_issue_stalled_mio_throttle.avg                             |         11.00 |         336.2 |   2956.5% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |      10,828.3 |     128,612.2 |   1087.7% | warp
+smsp__inst_executed.sum                                                |   162,054,244 |   973,602,513 |    500.8% | inst
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |       6,021.5 |      34,317.4 |    469.9% | warp
+smsp__warps_issue_stalled_short_scoreboard.avg                         |     101,459.3 |     387,751.5 |    282.2% | warp
+smsp__warps_issue_stalled_wait.avg                                     |     622,636.6 |     1,045,109 |     67.9% | warp
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |    49,749,093 |    82,553,378 |     65.9% | 
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     2,671,523 |     1,212,677 |    -54.6% | warp
+launch__registers_per_thread                                           |         158.0 |         111.0 |    -29.7% | register/thread
+dram__sectors_read.sum                                                 |    61,247,096 |    75,247,936 |     22.9% | sector
+smsp__cycles_active.avg                                                |     3,001,536 |     3,635,847 |     21.1% | cycle
+smsp__warps_issue_stalled_sleeping.avg                                 |     115,775.8 |     134,184.7 |     15.9% | warp
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |    45,110,949 |    50,114,617 |     11.1% | 
+smsp__warps_issue_stalled_barrier.avg                                  |     489,386.1 |     541,726.0 |     10.7% | warp

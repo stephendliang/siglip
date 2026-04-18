@@ -1,0 +1,8 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+dram__sectors_read.sum                                                 |    77,578,608 |    39,493,688 |    -49.1% | sector
+dram__sectors_write.sum                                                |   176,660,464 |   155,497,848 |    -12.0% | sector
+lts__t_sectors_op_read.sum                                             |   567,277,954 |   504,572,320 |    -11.1% | sector
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |      39,129.6 |      35,737.2 |     -8.7% | warp
+lts__t_sectors.sum                                                     |   837,341,553 |   775,452,695 |     -7.4% | sector
+smsp__warps_issue_stalled_not_selected.avg                             |     124,124.5 |     116,157.3 |     -6.4% | warp

@@ -1,0 +1,8 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |         222.6 |         385.4 |     73.2% | warp
+launch__registers_per_thread                                           |         99.00 |         128.0 |     29.3% | register/thread
+smsp__warps_issue_stalled_not_selected.avg                             |         557.7 |         663.1 |     18.9% | warp
+lts__t_sectors_op_read.sum                                             |   567,736,371 |   607,983,731 |      7.1% | sector
+lts__t_sectors.sum                                                     |   568,755,714 |   609,004,441 |      7.1% | sector
+smsp__warps_issue_stalled_short_scoreboard.avg                         |         974.3 |         920.9 |     -5.5% | warp
