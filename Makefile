@@ -213,13 +213,19 @@ fc2-w3-tail: fc2_w3.cu
 fc2-w3-tail-lean: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 -DTAIL_STEAL -DLEAN_DISPATCH $< -o $@ $(LDFLAGS)
 
-fc2-w3-c4: fc2_w3.cu
+fc2-w3-c4: fc2_w3_c4.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
+
+fc2-w3-c4-gemm: fc2_w3_c4.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY $< -o $@ $(LDFLAGS)
+
+fc2-w3-c4-strip: fc2_w3_c4.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
+
+fc2-w3-c4dual2: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DPACKED_TILES -DTILE_DISPATCH=4 -DLEAN_DISPATCH -DC4_DUAL_PAIR $< -o $@ $(LDFLAGS)
 
-fc2-w3-c4-gemm: fc2_w3.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DPACKED_TILES -DTILE_DISPATCH=4 -DLEAN_DISPATCH -DC4_DUAL_PAIR -DGEMM_ONLY $< -o $@ $(LDFLAGS)
-
-fc2-w3-c4-strip: fc2_w3.cu
+fc2-w3-c4dual2-strip: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DPACKED_TILES -DTILE_DISPATCH=4 -DLEAN_DISPATCH -DC4_DUAL_PAIR -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
 
 fc2-w3-lean-clock: fc2_w3.cu
