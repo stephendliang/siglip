@@ -172,8 +172,8 @@ static __device__ __forceinline__ void mbar_arrive_local(uint32_t addr) {
 }
 
 static __device__ __forceinline__
-void mbar_arrive_expect_tx_local(uint32_t addr, uint32_t bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+void mbar_expect_tx(uint32_t addr, uint32_t bytes) {
+    asm volatile("mbarrier.expect_tx.shared::cta.b64 [%0], %1;"
         :: "r"(addr), "r"(bytes) : "memory");
 }
 
@@ -325,14 +325,15 @@ fc2_w3_c4_kernel(
                           (uint16_t)0xC;
 
     /*── Mbar init.  Each CTA has its own tma/mma/mainloop/epilogue mbars.
-       tma_mbar[s]     count=1  (self expect_tx 32KB)
+       tma_mbar[s]     count=2  (two mcast arrivals per K-iter: A-peer + B-peer;
+                                 tx=32KB set by local expect_tx)
        mma_mbar[s]     count=1  (MMA commit, cta_group::1 → 1 arrive)
        mainloop_mbar[b] count=1 (final MMA commit)
        epilogue_mbar[b] count=(NUM_EPI_WARPS+1)*32
     */
     if (tid == 0) {
         for (int s = 0; s < N_STAGES; s++) {
-            mbar_init(smem_to_uint(smem + OFF_TMA_MBAR + s * 8), 1);
+            mbar_init(smem_to_uint(smem + OFF_TMA_MBAR + s * 8), 2);
             mbar_init(smem_to_uint(smem + OFF_MMA_MBAR + s * 8), 1);
         }
         for (int i = 0; i < 2; i++) {
@@ -368,16 +369,12 @@ fc2_w3_c4_kernel(
     }
 
     /*
-       Multicast routing: the loader CTA issues a TMA with multicast mask
-       and a peer-bit-clear mbar address.  HW delivers tx bytes to each
-       destination CTA's local mbar at the SAME cluster-relative offset.
-       Each CTA expects 32KB on its own tma_mbar[s] regardless of who
-       physically loads the data.
+       Multicast routing: the loader CTA issues a TMA with multicast mask and
+       the LOCAL mbar address.  Hardware routes tx bytes AND an arrival to
+       each destination CTA's mbar at the same local offset.  Each CTA is
+       the destination of 2 mcasts per K-iter (one A + one B), so tma_mbar[s]
+       count=2 and expect_tx=32KB (set locally before the mcasts can fire).
     */
-    uint32_t tma_mbar_mc[N_STAGES];
-    for (int s = 0; s < N_STAGES; s++)
-        tma_mbar_mc[s] = tma_mbar_local[s] & SM100_PEER_BIT_MASK;
-
     const uint32_t mainloop_mbar_addr = smem_to_uint(smem + OFF_MAINLOOP_MBAR);
     const uint32_t epilogue_mbar_local = smem_to_uint(smem + OFF_EPILOGUE_MBAR);
 
@@ -457,16 +454,20 @@ fc2_w3_c4_kernel(
                 const int tma_b_c1 = (my_n_tile * K_ITERS + ki) * TN;
                 const uint32_t a_dst = smem_a[s];
                 const uint32_t b_dst = smem_b[s];
-                const uint32_t mbar_mc = tma_mbar_mc[s];
+                const uint32_t mbar_local = tma_mbar_local[s];
 
                 if (lane == 0) {
+                    /* Set expect_tx=32KB BEFORE issuing the mcast so pending_tx
+                       can't race to completion on the 2nd arrival.  No arrive:
+                       the 2 mcasts provide both arrivals (count=2).           */
+                    mbar_expect_tx(mbar_local, TMA_BYTES_TOTAL);
                     if (is_a_loader) {
                         asm volatile(
                             "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
                             ".mbarrier::complete_tx::bytes.multicast::cluster"
                             " [%0], [%1, {%2, %3}], [%4], %5;"
                             :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(tma_a_c1),
-                               "r"(mbar_mc), "h"(mcast_mask)
+                               "r"(mbar_local), "h"(mcast_mask)
                             : "memory");
                     } else {
                         asm volatile(
@@ -474,13 +475,9 @@ fc2_w3_c4_kernel(
                             ".mbarrier::complete_tx::bytes.multicast::cluster"
                             " [%0], [%1, {%2, %3}], [%4], %5;"
                             :: "r"(b_dst), "l"(&tma_b), "r"(tma_c0), "r"(tma_b_c1),
-                               "r"(mbar_mc), "h"(mcast_mask)
+                               "r"(mbar_local), "h"(mcast_mask)
                             : "memory");
                     }
-                    /* Each CTA arrives expect_tx=32KB on its own tma_mbar.
-                       Total bytes delivered via 2 mcast streams (one A from
-                       a-loader peer, one B from b-loader peer).            */
-                    mbar_arrive_expect_tx_local(tma_mbar_local[s], TMA_BYTES_TOTAL);
                 }
             }
         }
