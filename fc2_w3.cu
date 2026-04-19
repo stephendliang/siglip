@@ -913,7 +913,7 @@ __device__ ClockData g_clock;
 
 __global__ void __launch_bounds__(THREADS, 1)
 #ifdef C4_DUAL_PAIR
-__cluster_dims__(4, 1, 1)
+__cluster_dims__(2, 2, 1)
 #else
 __cluster_dims__(2, 1, 1)
 #endif
@@ -935,6 +935,15 @@ fc2_w3_kernel(
 #if TILE_DISPATCH == 3
     /* Grid-based: blockIdx.x = CTA rank (0..1), blockIdx.y = tile index */
     const int cta_rank = blockIdx.x;
+#elif defined(C4_DUAL_PAIR)
+    /* Grid (74,2,1), cluster (2,2,1).  Linear within-cluster rank is
+       (bx&1) + 2*by.  Pair ranks {0,1} span M (bx axis), pair id = by.
+       sm_id is remapped so that existing math (cluster_id = sm_id/2,
+       cta_rank = sm_id&1, pair_id = (sm_id&2)>>1) continues to work
+       and pair 0/pair 1 of the same 4-CTA cluster get consecutive
+       cluster_ids — required by TD=14/20 swizzles.                 */
+    const int sm_id = 4 * (blockIdx.x >> 1) + 2 * blockIdx.y + (blockIdx.x & 1);
+    const int cta_rank = sm_id & 1;
 #else
     const int sm_id = blockIdx.x;
     const int cta_rank = sm_id & 1;
@@ -944,8 +953,8 @@ fc2_w3_kernel(
     const int lane  = tid % 32;
 
 #ifdef C4_DUAL_PAIR
-    /* cluster_dims(4,1,1): two independent cta_group::2 pairs per cluster.
-       Pair 0 = CTAs {0,1}, Pair 1 = CTAs {2,3}. cta_rank (sm_id&1) is pair-local.
+    /* cluster_dims(2,2,1): 2×2 grid of CTAs per cluster, 2 cta_group::2 pairs.
+       Pair 0 = CTAs {0,1} (by=0), Pair 1 = CTAs {2,3} (by=1).
        pair_mask selects the 2 CTAs of my pair for tcgen05 commit multicast. */
     const int pair_id = (sm_id & 2) >> 1;
     const uint16_t pair_mask = (uint16_t)(0x3U << (pair_id * 2));
@@ -3472,6 +3481,13 @@ int main() {
 #define _KERN_AB_ARGS  h_tma_a, h_tma_b
 #endif
 
+#ifdef C4_DUAL_PAIR
+    /* cluster_dims(2,2,1) needs 2D grid: (SM_COUNT/2, 2, 1) gives SM_COUNT CTAs,
+       SM_COUNT/4 clusters of 4 CTAs each (2 cta_group::2 pairs per cluster). */
+    dim3 w3_grid(SM_COUNT / 2, 2, 1);
+#else
+    dim3 w3_grid(SM_COUNT, 1, 1);
+#endif
 #if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4 || TILE_DISPATCH == 6 || TILE_DISPATCH == 7
     int* d_tile_ctr_ptr;
     CUDA_CHECK(cudaGetSymbolAddress((void**)&d_tile_ctr_ptr, g_tile_ctr));
@@ -3481,13 +3497,13 @@ int main() {
 #define LAUNCH_KERNEL() do { \
     cudaMemsetAsync(d_tile_ctr_ptr, 0, sizeof(int)); \
     cudaMemsetAsync(d_col_ctr_ptr, 0, 4 * sizeof(int)); \
-    fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
+    fc2_w3_kernel<<<w3_grid, THREADS, SMEM_BYTES>>>( \
         _KERN_AB_ARGS, h_tma_c, d_bias, d_C, d_residual, h_tma_res); \
 } while(0)
 #else
 #define LAUNCH_KERNEL() do { \
     cudaMemsetAsync(d_tile_ctr_ptr, 0, sizeof(int)); \
-    fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
+    fc2_w3_kernel<<<w3_grid, THREADS, SMEM_BYTES>>>( \
         _KERN_AB_ARGS, h_tma_c, d_bias, d_C, d_residual, h_tma_res); \
 } while(0)
 #endif
@@ -3500,7 +3516,7 @@ int main() {
         _KERN_AB_ARGS, h_tma_c, d_bias, d_C, d_residual, h_tma_res)
 #else
 #define LAUNCH_KERNEL() \
-    fc2_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
+    fc2_w3_kernel<<<w3_grid, THREADS, SMEM_BYTES>>>( \
         _KERN_AB_ARGS, h_tma_c, d_bias, d_C, d_residual, h_tma_res)
 #endif
 
