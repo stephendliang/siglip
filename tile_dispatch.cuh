@@ -297,22 +297,39 @@ static __device__ __forceinline__ int static_swizzle(int block_idx) {
         const int row_group = block_idx / row_tiles;
         const int in_row = block_idx % row_tiles;
         const int first_m = row_group * G_M;
-        const int num_m = min(G_M, TILES_M - first_m);
-        const int denom_m = num_m > 0 ? num_m : 1;
-        const int full_ss = denom_m * G_N;
-        const int interior_total = (stripes_per_row - 1) * full_ss;
-        int stripe, in_stripe;
-        if (stripes_per_row == 1 || in_row < interior_total) {
-            stripe = (stripes_per_row == 1) ? 0 : (in_row / full_ss);
-            in_stripe = in_row - stripe * full_ss;
+
+        int tm, tn;
+        if (first_m + G_M <= TILES_M) {
+            /* Fast path: full row_group, all divisors compile-time. */
+            const int full_ss = G_M * G_N;
+            const int interior_total = (stripes_per_row - 1) * full_ss;
+            int stripe, in_stripe;
+            if (stripes_per_row == 1 || in_row < interior_total) {
+                stripe = (stripes_per_row == 1) ? 0 : (in_row / full_ss);
+                in_stripe = in_row - stripe * full_ss;
+            } else {
+                stripe = stripes_per_row - 1;
+                in_stripe = in_row - interior_total;
+            }
+            tm = first_m + in_stripe % G_M;
+            tn = stripe * G_N + in_stripe / G_M;
         } else {
-            stripe = stripes_per_row - 1;
-            in_stripe = in_row - interior_total;
+            /* Tail row_group (num_m < G_M): runtime divisors; rare. */
+            const int num_m = TILES_M - first_m;
+            const int denom_m = num_m > 0 ? num_m : 1;
+            const int full_ss = denom_m * G_N;
+            const int interior_total = (stripes_per_row - 1) * full_ss;
+            int stripe, in_stripe;
+            if (stripes_per_row == 1 || in_row < interior_total) {
+                stripe = (stripes_per_row == 1) ? 0 : (in_row / full_ss);
+                in_stripe = in_row - stripe * full_ss;
+            } else {
+                stripe = stripes_per_row - 1;
+                in_stripe = in_row - interior_total;
+            }
+            tm = first_m + in_stripe % denom_m;
+            tn = stripe * G_N + in_stripe / denom_m;
         }
-        const int local_m = in_stripe % denom_m;
-        const int local_n = in_stripe / denom_m;
-        int tm = first_m + local_m;
-        int tn = stripe * G_N + local_n;
         if (tm >= TILES_M) tm = TILES_M - 1;
         if (tn >= TILES_N) tn = TILES_N - 1;
         return tm * TILES_N + tn;

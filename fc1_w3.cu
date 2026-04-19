@@ -709,6 +709,10 @@ fc1_w3_kernel(
        MAIN TILE LOOP
        ════════════════════════════════════════════ */
 
+#if TILE_DISPATCH >= 8
+    int prev_tm = 0, prev_tn = 0;
+#endif
+
 #if TILE_DISPATCH == 4
     int _pf_tile = TOTAL_TILES;
     int _pf_slot = 1;
@@ -800,6 +804,7 @@ fc1_w3_kernel(
 #ifdef K_STAGGER
             const int k_shift_b = (cluster_id * K_STAGGER) % K_ITERS;
 #endif
+            PRAGMA_UNROLL(K_ITERS)
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
 #ifdef K_STAGGER
@@ -973,16 +978,19 @@ fc1_w3_kernel(
             const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
 
             if (has_prev) {
+#if TILE_DISPATCH >= 8
+                const int ptm = prev_tm;
+                const int ptn = prev_tn;
+#else
 #if TILE_DISPATCH == 4
                 const int prev_idx = _prev_tile;
-#elif TILE_DISPATCH >= 8
-                const int prev_idx = static_swizzle((_ti - 1) * num_clusters + cluster_id);
 #else
                 const int prev_idx = (m_rank + (_ti - 1) * my_m_stride) * TILES_N + tn_fixed;
 #endif
                 int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
+#endif
 #ifdef PACKED_TILES
                 const int prev_m = ((ptm * 2 + cta_rank) * TILES_N + ptn) * TM;
                 const int prev_n = 0;
@@ -1079,16 +1087,19 @@ fc1_w3_kernel(
             const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
 
             if (has_prev) {
+#if TILE_DISPATCH >= 8
+                const int ptm = prev_tm;
+                const int ptn = prev_tn;
+#else
 #if TILE_DISPATCH == 4
                 const int prev_idx = _prev_tile;
-#elif TILE_DISPATCH >= 8
-                const int prev_idx = static_swizzle((_ti - 1) * num_clusters + cluster_id);
 #else
                 const int prev_idx = (m_rank + (_ti - 1) * my_m_stride) * TILES_N + tn_fixed;
 #endif
                 int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
+#endif
 #ifdef PACKED_TILES
                 const int prev_m = ((ptm * 2 + cta_rank) * TILES_N + ptn) * TM;
                 const int prev_n = 0;
@@ -1256,6 +1267,10 @@ fc1_w3_kernel(
         /* W2-W5 termination handled via goto _lean_done inside tile body
            (after detecting bcast[prev_buf] >= TOTAL_TILES) */
 #endif
+#endif
+#if TILE_DISPATCH >= 8
+        prev_tm = tm;
+        prev_tn = tn;
 #endif
     }
 
