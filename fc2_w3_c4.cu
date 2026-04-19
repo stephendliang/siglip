@@ -461,27 +461,32 @@ fc2_w3_c4_kernel(
                 const uint32_t mbar_local = tma_mbar_local[s];
 
                 if (lane == 0) {
-                    /* Arrive + expect_tx=32KB on own mbar (1 arrival, count=1).
-                       Self TMA + peer's mcast TMA together decrement 32KB of tx.
-                       Multicast only routes tx decrement, not arrivals.        */
+                    /* Multicast stripped: each CTA loads its own A and own B
+                       independently (no inter-CTA sharing, 2× DRAM for both).
+                       cta_group::1 + multicast::cluster is UNSUPPORTED on
+                       SM100 — PTX accepts the syntax but HW silently drops
+                       multicast to local-only delivery, so peers never see
+                       tx bytes and tma_mbar never completes.  CUTLASS
+                       corroborates: zero cta_group::1 mcast examples across
+                       the entire codebase.  Any real multicast savings
+                       require cta_group::2.  Observed 3.024ms at K=3072
+                       vs 1.11ms baseline (2.7× slower due to 4× DRAM).    */
                     mbar_arrive_expect_tx(mbar_local, TMA_BYTES_TOTAL);
-                    if (is_a_loader) {
-                        asm volatile(
-                            "cp.async.bulk.tensor.2d.cta_group::1.shared::cluster.global"
-                            ".mbarrier::complete_tx::bytes.multicast::cluster"
-                            " [%0], [%1, {%2, %3}], [%4], %5;"
-                            :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(tma_a_c1),
-                               "r"(mbar_local), "h"(mcast_mask)
-                            : "memory");
-                    } else {
-                        asm volatile(
-                            "cp.async.bulk.tensor.2d.cta_group::1.shared::cluster.global"
-                            ".mbarrier::complete_tx::bytes.multicast::cluster"
-                            " [%0], [%1, {%2, %3}], [%4], %5;"
-                            :: "r"(b_dst), "l"(&tma_b), "r"(tma_c0), "r"(tma_b_c1),
-                               "r"(mbar_local), "h"(mcast_mask)
-                            : "memory");
-                    }
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.tile"
+                        ".mbarrier::complete_tx::bytes"
+                        " [%0], [%1, {%2, %3}], [%4];"
+                        :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(tma_a_c1),
+                           "r"(mbar_local)
+                        : "memory");
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.tile"
+                        ".mbarrier::complete_tx::bytes"
+                        " [%0], [%1, {%2, %3}], [%4];"
+                        :: "r"(b_dst), "l"(&tma_b), "r"(tma_c0), "r"(tma_b_c1),
+                           "r"(mbar_local)
+                        : "memory");
+                    (void)is_a_loader; (void)mcast_mask;
                 }
             }
         }
