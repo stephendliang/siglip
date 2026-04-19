@@ -105,11 +105,13 @@ Build
 
 /*
    IDESC for tcgen05.mma.cta_group::1.kind::f8f6f4 with 128M × 128N × 32K.
-   Existing cta_group::2 IDESC is 0x10400010 for 128M × 256N × 32K; the N
-   field (bits 16-22, in lanes of 4 cols) changes from 64→32 for N=128 vs
-   N=256, giving 0x10200010.
+   Fields (CUTLASS mma_sm100_desc.hpp InstrDescriptor):
+     c_format_=1 (F32)    → bit 4          = 0x00000010
+     n_dim_   =N>>3 =16   → bits[17,23)=16 = 0x00200000
+     m_dim_   =M>>4 =8    → bits[24,29)= 8 = 0x08000000
+   Total: 0x08200010.
 */
-#define IDESC     0x10200010U
+#define IDESC     0x08200010U
 #define SBO       1024
 #define BAR_EPI_SYNC "bar.sync 1, 128;"
 
@@ -504,9 +506,10 @@ fc2_w3_c4_kernel(
                         ".reg .pred p;\n\t"
                         "setp.ne.b32 p, 0, 0;\n\t"
                         "tcgen05.mma.cta_group::1.kind::f8f6f4 "
-                        "[%0], %1, %2, %3, p;\n\t"
+                        "[%0], %1, %2, %3, {%4,%5,%6,%7}, p;\n\t"
                         "}"
-                        :: "r"(_buf * TN), "l"(da), "l"(db), "r"(IDESC));
+                        :: "r"(_buf * TN), "l"(da), "l"(db), "r"(IDESC),
+                           "r"(0),"r"(0),"r"(0),"r"(0));
                     for (int sub = 1; sub < MMA_PER_KI; sub++) {
                         da += 2; db += 2;
                         asm volatile(
@@ -514,9 +517,10 @@ fc2_w3_c4_kernel(
                             ".reg .pred p;\n\t"
                             "setp.ne.b32 p, 1, 0;\n\t"
                             "tcgen05.mma.cta_group::1.kind::f8f6f4 "
-                            "[%0], %1, %2, %3, p;\n\t"
+                            "[%0], %1, %2, %3, {%4,%5,%6,%7}, p;\n\t"
                             "}"
-                            :: "r"(_buf * TN), "l"(da), "l"(db), "r"(IDESC));
+                            :: "r"(_buf * TN), "l"(da), "l"(db), "r"(IDESC),
+                               "r"(0),"r"(0),"r"(0),"r"(0));
                     }
                 }
                 asm volatile(
@@ -537,9 +541,10 @@ fc2_w3_c4_kernel(
                             ".reg .pred p;\n\t"
                             "setp.ne.b32 p, 1, 0;\n\t"
                             "tcgen05.mma.cta_group::1.kind::f8f6f4 "
-                            "[%0], %1, %2, %3, p;\n\t"
+                            "[%0], %1, %2, %3, {%4,%5,%6,%7}, p;\n\t"
                             "}"
-                            :: "r"(_buf * TN), "l"(da), "l"(db), "r"(IDESC));
+                            :: "r"(_buf * TN), "l"(da), "l"(db), "r"(IDESC),
+                               "r"(0),"r"(0),"r"(0),"r"(0));
                         da += 2; db += 2;
                     }
                     asm volatile(
