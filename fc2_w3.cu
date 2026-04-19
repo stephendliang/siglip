@@ -1750,19 +1750,15 @@ fc2_w3_kernel(
                            "r"(tma_b_c1), "l"(L2_B_HINT),
                            "r"(TMA_BYTES)
 #elif defined(C4_B_MULTICAST)
-                    /* C4 dual-pair with B multicast:
-                       Requires TD=14 (ncycle) so pair 0 and pair 1 share tn within
-                       a super-tick → pair 1 CTAs have SAME (cta_rank, c1) as pair 0.
-                       All 4 CTAs issue cta_group::2 + multicast::cluster mask=0xF.
-                       Hardware coalesces coordinated issues (same c1 across pairs
-                       for each cta_rank) into ONE DRAM fetch, split-delivers to
-                       all 4 CTAs per cta_rank. Each CTA's mbar receives tx-bytes
-                       once (from its pair's cta_group::2 split).
-                       Mask=0xF keeps both pairs complete so cta_group::2 pair
-                       invariant holds for both pairs.
-                       A remains pair-local (no multicast). */
+                    /* C4 dual-pair with B multicast.  Requires TD=14 (ncycle) so
+                       pair 0 and pair 1 share tn.  Mask is per-cta_rank (0x5/0xA)
+                       per CuTe sm100 pattern: cta_rank=0 targets ranks {0,2},
+                       cta_rank=1 targets ranks {1,3}.  Pair-split half goes to
+                       matching-rank CTA in other pair; 0xF would deliver both
+                       halves to all 4 CTAs and break expect_tx accounting.
+                       A remains pair-local (no multicast).                    */
                     {
-                        const uint16_t b_mcast = (uint16_t)0xF;
+                        const uint16_t b_mcast = cta_rank ? (uint16_t)0xA : (uint16_t)0x5;
                         asm volatile(
                             "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global"
                             ".mbarrier::complete_tx::bytes"
@@ -1778,16 +1774,11 @@ fc2_w3_kernel(
                     }
 #elif defined(C4_A_MULTICAST)
                     /* C4 dual-pair with A multicast (symmetric to C4_B_MULTICAST):
-                       Requires TD=20 (mcycle) so pair 0 and pair 1 share tm within
-                       a step.  All 4 CTAs issue cta_group::2 + multicast::cluster
-                       mask=0xF for A.  HW coalesces identical A coords (same tm,
-                       same ki, same cta_rank across both pairs) into ONE DRAM
-                       fetch, split-delivers to all 4 CTAs per cta_rank.
-                       B remains pair-local (different tn per pair).
-                       Cluster DRAM: 1× A + 2× B per 4-CTA cluster-tile vs 2× A +
-                       2× B without mcast — half the A traffic.                  */
+                       Requires TD=20 (mcycle) so pair 0 and pair 1 share tm.
+                       Mask per-cta_rank (0x5/0xA) matches CuTe sm100 pattern —
+                       see C4_B_MULTICAST above.                                */
                     {
-                        const uint16_t a_mcast = (uint16_t)0xF;
+                        const uint16_t a_mcast = cta_rank ? (uint16_t)0xA : (uint16_t)0x5;
                         asm volatile(
                             "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global"
                             ".mbarrier::complete_tx::bytes.multicast::cluster"
