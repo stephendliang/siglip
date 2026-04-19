@@ -37,6 +37,8 @@ outlier worth investigating.
 
 | Variant | fused | gemm | strip | f-g | g-s |
 |---|---|---|---|---|---|
+| **zigzag + K_STAGGER=1** (TD=11) | **1.998** | — | — | — | — |
+| dgswizzle + K_STAGGER=1 (TD=8) | 2.023 | — | — | — | — |
 | zigzag (TD=11) | 2.024 | 1.894 | 1.382 | 0.130 | 0.512 |
 | rowmajor | 2.027 | 1.894 | 1.383 | 0.133 | 0.511 |
 | nflat | 2.035 | 1.721 | 1.339 | 0.314 | 0.382 |
@@ -55,6 +57,13 @@ a 216us gap. zigzag/rowmajor have the fastest fused (2.024ms) despite mediocre g
 (fused == gemm), meaning those variants get no epilogue/mainloop overlap at all.
 Strip floor spread is 100us (1.336 nsnake → 1.435 hilbert), so tile order affects
 even the GEMM compute ceiling for FC1.
+
+**K_STAGGER compose (2026-04-18)**: FC1 is sensitive to odd K_STAGGER (ks=1 or 3
+help, ks=2 hurts). zigzag+ks=1 → 1.998 (−14 µs vs zigzag alone); dgswizzle+ks=1 →
+2.023 (−115 µs vs dgswizzle baseline 2.138); default+ks=1 → 2.051 (−49 µs). The
+ks=1/ks=3 parity on FC1 (K_ITERS=6) suggests phase alignment at the DRAM/L2
+boundary, not raw phase count, is the mechanism. FC2 is near-wash across all
+(disp, ks); zigzag+ks=2 = 1.065 ties dgswizzle but no new ceiling break.
 
 ## Tile dispatch: static swizzles win (updated 2026-04-18)
 
@@ -278,7 +287,7 @@ citing.
 |---|---|---|
 | N_STAGES | NS6 for N<=1536, NS5 for N>1536 | SMEM per stage grows with N |
 | PREFILL | On for K_ITERS>=20, off otherwise | Short K-loop deadlocks (parity wrap) |
-| Dispatch | FC2: zigzag or dgswizzle (1.065–1.073 ms). FC1: zigzag (2.012 ms). Both decouple-search open. | Under PACKED_TILES parity static swizzles beat LEAN/sched by ~30 µs on FC2. Open axes (mainloop/store decoupling, K_STAGGER × good dispatch, cluster-heterogeneous) not yet explored. |
+| Dispatch | FC2: zigzag or dgswizzle (1.065 ms). FC1: **zigzag + K_STAGGER=1** (1.998 ms). | PACKED_TILES + odd K_STAGGER on FC1. FC2 is near-wash on K_STAGGER. Open axes: mainloop/store decoupling, cluster-heterogeneous dispatch. |
 
 ## Dead ends — do NOT retry
 
@@ -380,9 +389,14 @@ are separable:
    `tn` by `c × TILES_N / NC` — preserves within-cluster B-reuse, breaks
    cross-cluster store synchrony. Predicted FC1 gemm 2.02 → ~1.65 if the
    hypothesis holds.
-2. **K_STAGGER × tight-locality dispatch**: kstagger was only tested on
-   `default`. Compose with dgswizzle/zigzag/checkered/dg16 — decorrelates
-   K-arrival within a locality band. Cheap matrix test (~6 binaries).
+2. **K_STAGGER × tight-locality dispatch** (TESTED 2026-04-18): swept
+   {default, dgswizzle, zigzag, checkered, dg16} × ks={0,1,2,3} × {fused, gemm,
+   strip} on both layers. **FC1 wins measurably**: zigzag+ks=1 → 1.998 (new
+   best), dgswizzle+ks=1 → 2.023, default+ks=1 → 2.051. Odd ks helps, ks=2
+   hurts (K_ITERS=6 phase-alignment effect). **FC2 is near-wash** (±0.013 ms);
+   zigzag+ks=2 = 1.065 ties dgswizzle, no ceiling break. Open: strip+gemm
+   decomp on (zigzag, ks=1) to diagnose whether the FC1 gain lives on strip
+   (L2/TMA arrival) or g-s (store phase).
 3. **Cluster-heterogeneous dispatch**: first half dgswizzle, second half
    column-first. Tests whether cluster-wavefront diversity is an independent
    axis from the single-cluster ordering.

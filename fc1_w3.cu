@@ -772,7 +772,15 @@ fc1_w3_kernel(
 #else
     for (int _ti = 0; _ti < tile_count; _ti++) {
 #if TILE_DISPATCH >= 8
-        const int block_idx = _ti * num_clusters + cluster_id;
+#ifdef N_STAGGER
+        /* Per-cluster rotation of the tile-visit order.  tile_count *
+           num_clusters == TOTAL_TILES exactly (no invalid slots), so this
+           is a bijective permutation of each cluster's tile set. */
+        const int _ti_eff = (_ti + cluster_id * N_STAGGER) % tile_count;
+#else
+        const int _ti_eff = _ti;
+#endif
+        const int block_idx = _ti_eff * num_clusters + cluster_id;
         if (block_idx >= TOTAL_TILES) break;
         const int tile_idx = static_swizzle(block_idx);
 #else
