@@ -172,8 +172,8 @@ static __device__ __forceinline__ void mbar_arrive_local(uint32_t addr) {
 }
 
 static __device__ __forceinline__
-void mbar_expect_tx(uint32_t addr, uint32_t bytes) {
-    asm volatile("mbarrier.expect_tx.shared::cta.b64 [%0], %1;"
+void mbar_arrive_expect_tx(uint32_t addr, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
         :: "r"(addr), "r"(bytes) : "memory");
 }
 
@@ -325,15 +325,19 @@ fc2_w3_c4_kernel(
                           (uint16_t)0xC;
 
     /*── Mbar init.  Each CTA has its own tma/mma/mainloop/epilogue mbars.
-       tma_mbar[s]     count=2  (two mcast arrivals per K-iter: A-peer + B-peer;
-                                 tx=32KB set by local expect_tx)
+       tma_mbar[s]     count=1  (each CTA arrives once on own mbar via
+                                 mbarrier.arrive.expect_tx; multicast TMA
+                                 decrements tx at peers but does NOT add
+                                 arrivals — verified against CUTLASS
+                                 sm90_pipeline.hpp init which uses
+                                 producer_arv_cnt=1 regardless of mcast set)
        mma_mbar[s]     count=1  (MMA commit, cta_group::1 → 1 arrive)
        mainloop_mbar[b] count=1 (final MMA commit)
        epilogue_mbar[b] count=(NUM_EPI_WARPS+1)*32
     */
     if (tid == 0) {
         for (int s = 0; s < N_STAGES; s++) {
-            mbar_init(smem_to_uint(smem + OFF_TMA_MBAR + s * 8), 2);
+            mbar_init(smem_to_uint(smem + OFF_TMA_MBAR + s * 8), 1);
             mbar_init(smem_to_uint(smem + OFF_MMA_MBAR + s * 8), 1);
         }
         for (int i = 0; i < 2; i++) {
@@ -457,10 +461,10 @@ fc2_w3_c4_kernel(
                 const uint32_t mbar_local = tma_mbar_local[s];
 
                 if (lane == 0) {
-                    /* Set expect_tx=32KB BEFORE issuing the mcast so pending_tx
-                       can't race to completion on the 2nd arrival.  No arrive:
-                       the 2 mcasts provide both arrivals (count=2).           */
-                    mbar_expect_tx(mbar_local, TMA_BYTES_TOTAL);
+                    /* Arrive + expect_tx=32KB on own mbar (1 arrival, count=1).
+                       Self TMA + peer's mcast TMA together decrement 32KB of tx.
+                       Multicast only routes tx decrement, not arrivals.        */
+                    mbar_arrive_expect_tx(mbar_local, TMA_BYTES_TOTAL);
                     if (is_a_loader) {
                         asm volatile(
                             "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
@@ -587,7 +591,7 @@ fc2_w3_c4_kernel(
                     if (lane == 0) {
                         const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING
                             + stage * EPI_STAGE_BYTES);
-                        mbar_arrive_expect_tx_local(load_mbar[stage], EPI_STAGE_BYTES);
+                        mbar_arrive_expect_tx(load_mbar[stage], EPI_STAGE_BYTES);
                         tma_load_2d_cta(res_dst, &tma_res,
                                         prev_n + si * 64, prev_m, load_mbar[stage]);
                     }
@@ -788,7 +792,7 @@ fc2_w3_c4_kernel(
                     }
                     if (lane == 0) {
                         const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING + stage * EPI_STAGE_BYTES);
-                        mbar_arrive_expect_tx_local(load_mbar[stage], EPI_STAGE_BYTES);
+                        mbar_arrive_expect_tx(load_mbar[stage], EPI_STAGE_BYTES);
                         tma_load_2d_cta(res_dst, &tma_res,
                                         last_n + si * 64, last_m, load_mbar[stage]);
                     }
