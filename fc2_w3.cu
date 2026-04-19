@@ -958,6 +958,15 @@ fc2_w3_kernel(
 #if defined(C4_B_MULTICAST) && (TILE_DISPATCH != 14)
 #error "C4_B_MULTICAST requires TILE_DISPATCH=14 (ncycle) so pair 0 and pair 1 share tn"
 #endif
+#if defined(C4_A_MULTICAST) && !defined(C4_DUAL_PAIR)
+#error "C4_A_MULTICAST requires C4_DUAL_PAIR"
+#endif
+#if defined(C4_A_MULTICAST) && (TILE_DISPATCH != 20)
+#error "C4_A_MULTICAST requires TILE_DISPATCH=20 (mcycle) so pair 0 and pair 1 share tm"
+#endif
+#if defined(C4_A_MULTICAST) && defined(C4_B_MULTICAST)
+#error "C4_A_MULTICAST and C4_B_MULTICAST are mutually exclusive"
+#endif
 
 #if TILE_DISPATCH == 0 || TILE_DISPATCH >= 8
     const int cluster_id = sm_id / 2;
@@ -1767,6 +1776,31 @@ fc2_w3_kernel(
                                "r"(tma_b_c1), "r"(TMA_BYTES), "h"(b_mcast)
                             : "memory");
                     }
+#elif defined(C4_A_MULTICAST)
+                    /* C4 dual-pair with A multicast (symmetric to C4_B_MULTICAST):
+                       Requires TD=20 (mcycle) so pair 0 and pair 1 share tm within
+                       a step.  All 4 CTAs issue cta_group::2 + multicast::cluster
+                       mask=0xF for A.  HW coalesces identical A coords (same tm,
+                       same ki, same cta_rank across both pairs) into ONE DRAM
+                       fetch, split-delivers to all 4 CTAs per cta_rank.
+                       B remains pair-local (different tn per pair).
+                       Cluster DRAM: 1× A + 2× B per 4-CTA cluster-tile vs 2× A +
+                       2× B without mcast — half the A traffic.                  */
+                    {
+                        const uint16_t a_mcast = (uint16_t)0xF;
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global"
+                            ".mbarrier::complete_tx::bytes.multicast::cluster"
+                            " [%0], [%1, {%2, %3}], [%4], %9;\n\t"
+                            "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global"
+                            ".mbarrier::complete_tx::bytes"
+                            " [%5], [%6, {%2, %7}], [%4];\n\t"
+                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %8;"
+                            :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(tma_a_c1),
+                               "r"(tma_mbar_s), "r"(a_dst + 16384), "l"(&tma_b),
+                               "r"(tma_b_c1), "r"(TMA_BYTES), "h"(a_mcast)
+                            : "memory");
+                    }
 #else
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
@@ -1780,7 +1814,7 @@ fc2_w3_kernel(
                            "r"(tma_mbar_s), "r"(a_dst + 16384), "l"(&tma_b),
                            "r"(tma_b_c1), "r"(TMA_BYTES)
 #endif
-#if !defined(PRESWIZZLE) && !defined(C4_B_MULTICAST)
+#if !defined(PRESWIZZLE) && !defined(C4_B_MULTICAST) && !defined(C4_A_MULTICAST)
                         : "memory");
 #endif
                 }

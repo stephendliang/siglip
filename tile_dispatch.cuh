@@ -360,6 +360,31 @@ static __device__ __forceinline__ int static_swizzle(int block_idx) {
         if (tm >= TILES_M) tm = TILES_M - 1;
         return tm * TILES_N + local_n;
     }
+
+#elif TILE_DISPATCH == 20
+    /* Cluster-M-cycle: pair 0 and pair 1 within a 4-CTA cluster share tm and
+       take adjacent tn.  Symmetric twin of TD=14 (N-cycle), designed for
+       C4_A_MULTICAST (A shared across pairs).
+
+       Requires C4_DUAL_PAIR and TILES_N % 2 == 0.
+
+       Mapping: block_idx = _ti * NC + pair_cluster_id, where consecutive
+       pair_cluster_ids (2k, 2k+1) live in the same 4-CTA cluster.  Group by
+       2:  q = block_idx >> 1 indexes the 4-CTA-cluster step, pair = block_idx
+       & 1 selects tn offset.  tn = 2*tn_base + pair so the two pairs land
+       at adjacent tn with matching tm → mcast coalesces. */
+    {
+        static_assert(TILES_N % 2 == 0,
+            "TILE_DISPATCH=20 (mcycle / C4_A_MULTICAST) requires TILES_N % 2 == 0");
+        const int q       = block_idx >> 1;
+        const int pair    = block_idx & 1;
+        const int tn_pairs = TILES_N / 2;
+        int tm      = q / tn_pairs;
+        int tn_base = q % tn_pairs;
+        int tn = 2 * tn_base + pair;
+        if (tm >= TILES_M) { tm = TILES_M - 1; tn = TILES_N - 1; }
+        return tm * TILES_N + tn;
+    }
 #endif
 }
 
