@@ -353,6 +353,8 @@ tools/dim_sweep.sh              # M/N/K grid search benchmark
 tools/fc2_cutlass_vs_w3.sh      # Head-to-head comparison
 tools/ncu_bench.sh              # ncu profiling all variants
 tools/ncu_anova.py              # ncu data analysis
+tools/tile_regress.py           # simulates TDs in Python, regresses ms on tile-sequence features
+tools/stagger_sweep.sh          # K_STAGGER × N_STAGGER × dispatch × mode sweep (WIP)
 tools/sass_edit.py              # SASS binary editor + CP-SAT scheduler (~5500 lines)
 bench/                          # Microbenchmarks (TMA, MMA, stmatrix, warp scaling)
 data/                           # All benchmark + ncu results
@@ -407,6 +409,53 @@ Structural ideas (not pure-ordering; defer until axes 1–3 are explored):
   K-iters). Removes the f-g constraint that forces zigzag over ncycle.
 - Bigger N-tile: 256 → 512. Doubles K-iters-per-tile effectively; gives FC1 the
   overlap budget FC2 has.
+
+## Tile-feature regression (initial pass, WIP)
+
+`tools/tile_regress.py` replicates TD=0,8–21 in pure Python, emits per-cluster
+tile visit sequences, extracts ordering features, and fits ridge/lasso against
+measured ms from `data/bench_20260418_034637/*_wall_r1.txt` (9 simulatable
+dispatches × 3 modes × 2 layers). Features: `a_reuse`, `b_reuse`, `tm_jump`,
+`tn_jump`, `store_conc`/`store_max`, `tn_entropy`, `tm_entropy`, `n_active_tn`,
+`n_active_tm`, plus `ks`/`ns` columns (zero-variance on bench data alone; become
+informative once stagger_sweep CSV is merged via `--extra`).
+
+### First-pass findings
+
+| layer | mode  | LOOCV R² | top univariate (|r| ≥ 0.9) |
+|---|---|---|---|
+| fc2   | fused | **0.80** | `a_reuse` +0.99, `tm_jump` −0.94, `tm_entropy` +0.93, `n_active_tm` +0.94 |
+| fc2   | gemm  | **0.95** | same axes |
+| fc1   | gemm  | 0.47     | `store_conc` +0.75, `tn_entropy` −0.73 |
+| fc1   | strip | 0.10     | `a_reuse` −0.83, `n_active_tm` −0.83, `tm_entropy` −0.83 |
+| fc1   | fused | **−0.39**| model fails — hilbert (2.249) vs zorder (2.087) have near-identical features |
+
+**FC2 fused/gemm quantified.** Lasso reduces to 3 features: `a_reuse(+) +
+store_max(+) + b_reuse(−)`. ncycle/nsnake/nflat all share `a_reuse=0.671` (each
+cluster stays on same tm for TILES_N steps) and land at 1.20–1.23 ms;
+dgswizzle/zigzag/rowmajor have `a_reuse=0` and land at 1.07 ms. The
+synchronous-A-wavefront → `long_scoreboard` mechanism from the 2026-04-18
+section is now predictive, not just observational.
+
+**Cross-layer sign flip on `a_reuse`.** +0.99 on FC2 fused vs −0.83 on FC1 strip.
+Same mechanism, opposite sign: FC1 K=6 strip is TMA-bound (packing clusters on
+same N-column shares B-tile in L2 → fast strip), FC2 K=24 fused is MMA-bound
+(synchronous A-arrival stalls MMA). Confirms: **no universal dispatch exists.**
+
+**FC1 fused has a missing feature.** hilbert and zorder have nearly identical
+sequence features but differ 162 µs on fused. Candidate missing axes: tile-to-
+tile L2 carry-over (fraction of (tm,tn) from step s that reappears at s±1 across
+all clusters), or a structural K_ITERS×epilogue-duration term the tile sequence
+alone doesn't capture.
+
+### Next iterations (not yet run)
+
+- Add L2-carry-over feature to attack the hilbert vs zorder FC1 fused gap.
+- Merge stagger_sweep.sh CSV output once B200-tested → `ks`/`ns` columns gain
+  variance and regression tells us whether stagger hits a different axis than
+  static swizzle does.
+- Regress against ncu metrics (`dram__bytes_read`, `long_scoreboard`,
+  `mbarrier_wait`) directly to validate the proposed mechanism per feature.
 
 ## Key constraints
 
