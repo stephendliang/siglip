@@ -410,52 +410,68 @@ Structural ideas (not pure-ordering; defer until axes 1–3 are explored):
 - Bigger N-tile: 256 → 512. Doubles K-iters-per-tile effectively; gives FC1 the
   overlap budget FC2 has.
 
-## Tile-feature regression (initial pass, WIP)
+## Tile-feature regression (v2, WIP)
 
 `tools/tile_regress.py` replicates TD=0,8–21 in pure Python, emits per-cluster
-tile visit sequences, extracts ordering features, and fits ridge/lasso against
-measured ms from `data/bench_20260418_034637/*_wall_r1.txt` (9 simulatable
-dispatches × 3 modes × 2 layers). Features: `a_reuse`, `b_reuse`, `tm_jump`,
-`tn_jump`, `store_conc`/`store_max`, `tn_entropy`, `tm_entropy`, `n_active_tn`,
-`n_active_tm`, plus `ks`/`ns` columns (zero-variance on bench data alone; become
-informative once stagger_sweep CSV is merged via `--extra`).
+tile visit sequences, extracts 51-feature vectors covering: within-cluster
+1-hop and 2-hop locality, cross-cluster synchronous contention, drift-windowed
+contention at w∈{2,4} (SMs don't march in lockstep), L2 carry-over at
+w∈{1,2,4,8,16,32}, `collide_K` (mainloop/epilogue asymmetry at lag=K_ITERS),
+`tm/tn_autocorr_{4,8,16}`, `path_curve` (2-hop direction continuity), K-phase
+stats, and K_ITERS interactions.  Fits against
+`data/bench_20260418_034637/*_wall_r1.txt` with Ridge, LassoCV, GBR, and
+exhaustive best-subset k=3 under LOOCV.
 
-### First-pass findings
+### Findings (2026-04-19, v2)
 
-| layer | mode  | LOOCV R² | top univariate (|r| ≥ 0.9) |
-|---|---|---|---|
-| fc2   | fused | **0.80** | `a_reuse` +0.99, `tm_jump` −0.94, `tm_entropy` +0.93, `n_active_tm` +0.94 |
-| fc2   | gemm  | **0.95** | same axes |
-| fc1   | gemm  | 0.47     | `store_conc` +0.75, `tn_entropy` −0.73 |
-| fc1   | strip | 0.10     | `a_reuse` −0.83, `n_active_tm` −0.83, `tm_entropy` −0.83 |
-| fc1   | fused | **−0.39**| model fails — hilbert (2.249) vs zorder (2.087) have near-identical features |
+| layer | mode  | best model      | rmse_loo (ms) | R²_loo  | (v1 R²_loo) |
+|---|---|---|---|---|---|
+| fc2   | strip | ridge_top5      | **0.0022**    | +0.99   | —      |
+| fc2   | gemm  | ridge_all       | **0.0111**    | +0.96   | +0.95  |
+| fc2   | fused | ridge_top3      | **0.0125**    | +0.97   | +0.80  |
+| fc1   | strip | ridge_top3      | 0.0212        | +0.56   | +0.10  |
+| fc1   | gemm  | best_subset k=3 | 0.0677        | +0.75   | +0.47  |
+| fc1   | fused | best_subset k=3 | 0.0606        | +0.22   | −0.39  |
 
-**FC2 fused/gemm quantified.** Lasso reduces to 3 features: `a_reuse(+) +
-store_max(+) + b_reuse(−)`. ncycle/nsnake/nflat all share `a_reuse=0.671` (each
-cluster stays on same tm for TILES_N steps) and land at 1.20–1.23 ms;
-dgswizzle/zigzag/rowmajor have `a_reuse=0` and land at 1.07 ms. The
-synchronous-A-wavefront → `long_scoreboard` mechanism from the 2026-04-18
-section is now predictive, not just observational.
+**FC2 fused/gemm.** `a_reuse` (synchronous-A-wavefront) is univariately
+dominant (r=+0.99).  ncycle/nsnake/nflat share `a_reuse=0.671` and land at
+1.20–1.23 ms; dgswizzle/zigzag/rowmajor have `a_reuse=0` and land at 1.07 ms.
+The `long_scoreboard` mechanism is now predictive.
 
-**Cross-layer sign flip on `a_reuse`.** +0.99 on FC2 fused vs −0.83 on FC1 strip.
-Same mechanism, opposite sign: FC1 K=6 strip is TMA-bound (packing clusters on
-same N-column shares B-tile in L2 → fast strip), FC2 K=24 fused is MMA-bound
-(synchronous A-arrival stalls MMA). Confirms: **no universal dispatch exists.**
+**FC1 strip.** `a_reuse` flips sign (r=−0.83): FC1 K=6 strip is TMA-bound, so
+same-tm packing is a cache win, not a stall cause.  Confirms no universal
+dispatch exists.
 
-**FC1 fused has a missing feature.** hilbert and zorder have nearly identical
-sequence features but differ 162 µs on fused. Candidate missing axes: tile-to-
-tile L2 carry-over (fraction of (tm,tn) from step s that reappears at s±1 across
-all clusters), or a structural K_ITERS×epilogue-duration term the tile sequence
-alone doesn't capture.
+**FC1 gemm.** Best triple `{path_curve, unique_tn_w2, tm_carry_w16}`.  The 16-
+step window matches 4×4 block traversal timescale — picks up that hilbert
+retires each block before moving on while zorder bit-interleaves.
 
-### Next iterations (not yet run)
+**FC1 fused — the hilbert problem.** Univariate-filtered Ridge (top-k by |r|)
+never picks `b_reuse_w2` because only hilbert has non-zero value (0.25 vs 0.00
+for all others).  Exhaustive best-subset search over C(51,3) triples finds
+`{tn_jump, b_reuse_w2, tm_carry_w1}` — rmse_loo 0.061 ms vs 0.077 for
+univariate.  `b_reuse_w2` is the mechanism: hilbert holds the same N-column
+across 2 consecutive steps 25% of the time, and with FC1 K_ITERS=6 the 4
+epilogue warps keep hammering the same store port → contention.  R²_loo still
+only +0.22 because with n=9 we have one sample (hilbert) lighting up the
+feature; predictions extrapolate badly beyond the training feature range.
 
-- Add L2-carry-over feature to attack the hilbert vs zorder FC1 fused gap.
-- Merge stagger_sweep.sh CSV output once B200-tested → `ks`/`ns` columns gain
-  variance and regression tells us whether stagger hits a different axis than
-  static swizzle does.
+### Using it to predict a new curve
+
+Workflow for a new dispatch you can implement in Python `static_swizzle()`:
+add the TD to `DISPATCH_TD`, call `features()`, plug into the best-subset fit
+for each (layer, mode).  Expected accuracy: ±0.2–1.5% for FC2 across all
+modes, ±1.4% for FC1 strip, ±3–4% for FC1 gemm/fused.  Flag: any feature
+value outside training range is pure extrapolation — n=9 gives no cover for
+OOD dispatches.
+
+### Next iterations
+
+- Merge `stagger_sweep.sh` CSV via `--extra` once B200-tested — 75×3 rows
+  gives `ks`/`ns` columns variance and quadruples n.
 - Regress against ncu metrics (`dram__bytes_read`, `long_scoreboard`,
-  `mbarrier_wait`) directly to validate the proposed mechanism per feature.
+  `mbarrier_wait`) directly as targets.
+- Add `--predict <dispatch>` CLI for quick what-if evaluation.
 
 ## Key constraints
 

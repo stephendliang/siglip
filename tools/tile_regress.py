@@ -310,27 +310,166 @@ def emit_sequence(layer, td, ks=0, ns=0):
     return seq
 
 
+def _drift_cross_features(tn_seq, tm_seq, cfg, windows=(2, 4)):
+    """Drift-windowed cross-cluster features.  SMs don't march in lockstep — at
+    any wall-clock moment, cluster c is at step s_c and cluster c' is at
+    s_c' ≠ s_c.  For window w, we approximate "clusters that are currently
+    co-active" as those within |Δs| ≤ w.  Pairs of clusters hitting the same
+    tn (B-column) within this window contend on the store path; the cluster
+    × (2w+1) set of (tm,tn) currently in flight is the rough L2 working set.
+    """
+    NC, tc = tn_seq.shape
+    TN, TM = cfg["TILES_N"], cfg["TILES_M"]
+    out = {}
+    for w in windows:
+        tot_store = 0.0
+        tot_uniq_ab = 0.0
+        tot_uniq_tn = 0.0
+        tot_uniq_tm = 0.0
+        tot_pairs_norm = 0.0
+        count = 0
+        K = 2 * w + 1
+        for s in range(tc):
+            lo, hi = max(0, s - w), min(tc, s + w + 1)
+            tns_w = tn_seq[:, lo:hi].ravel()
+            tms_w = tm_seq[:, lo:hi].ravel()
+            slots = tns_w.size
+            # Drift-windowed store contention
+            tn_counts = np.bincount(tns_w, minlength=TN).astype(np.float64)
+            tot_store += (tn_counts * (tn_counts - 1) / 2).sum()
+            tot_pairs_norm += slots * (slots - 1) / 2
+            # Working-set size in window
+            flat = tms_w.astype(np.int64) * TN + tns_w.astype(np.int64)
+            tot_uniq_ab += np.unique(flat).size / slots
+            tot_uniq_tn += np.unique(tns_w).size / TN
+            tot_uniq_tm += np.unique(tms_w).size / min(slots, TM)
+            count += 1
+        out[f"store_drift_w{w}"] = tot_store / max(1e-9, tot_pairs_norm)
+        out[f"unique_ab_w{w}"] = tot_uniq_ab / count
+        out[f"unique_tn_w{w}"] = tot_uniq_tn / count
+        out[f"unique_tm_w{w}"] = tot_uniq_tm / count
+    return out
+
+
+def _carry_features(tn_seq, tm_seq, windows=(1, 2, 4)):
+    """L2 carry-over: at step s, fraction of cluster-tile events whose tile
+    appeared at step s-w..s-1 across any cluster.  High → same (tm,tn) still
+    hot in L2 when the next cluster needs it.  tn_carry_w captures B-tile
+    temporal locality; ab_carry captures full-tile reuse (rare but free)."""
+    NC, tc = tn_seq.shape
+    out = {}
+    # pre-flatten per-step sets once
+    tn_sets = [set(tn_seq[:, s].tolist()) for s in range(tc)]
+    tm_sets = [set(tm_seq[:, s].tolist()) for s in range(tc)]
+    ab_sets = [set(zip(tm_seq[:, s].tolist(), tn_seq[:, s].tolist()))
+               for s in range(tc)]
+    for w in windows:
+        tot_tn = tot_tm = tot_ab = 0.0
+        count = 0
+        for s in range(w, tc):
+            prev_tn, prev_tm, prev_ab = set(), set(), set()
+            for d in range(1, w + 1):
+                if s - d >= 0:
+                    prev_tn |= tn_sets[s - d]
+                    prev_tm |= tm_sets[s - d]
+                    prev_ab |= ab_sets[s - d]
+            cur_tn_arr = tn_seq[:, s]
+            cur_tm_arr = tm_seq[:, s]
+            hit_tn = sum(1 for v in cur_tn_arr if v in prev_tn)
+            hit_tm = sum(1 for v in cur_tm_arr if v in prev_tm)
+            hit_ab = sum(1 for p in zip(cur_tm_arr.tolist(), cur_tn_arr.tolist())
+                         if p in prev_ab)
+            tot_tn += hit_tn / NC
+            tot_tm += hit_tm / NC
+            tot_ab += hit_ab / NC
+            count += 1
+        out[f"tn_carry_w{w}"] = tot_tn / max(1, count)
+        out[f"tm_carry_w{w}"] = tot_tm / max(1, count)
+        out[f"ab_carry_w{w}"] = tot_ab / max(1, count)
+    return out
+
+
+def _load_store_collide(tn_seq, K):
+    """P(tn[c, s] == tn[c', s - K])  — models mainloop/epilogue asymmetry:
+    tile_s's mainloop loads column tn[c,s] while tile_(s-K)'s epilogue still
+    drains column tn[c,s-K] across any cluster.  K is the number of K-loop
+    iterations (tile lifetime in mainloop units)."""
+    NC, tc = tn_seq.shape
+    if tc <= K:
+        return 0.0
+    hits = 0
+    total = 0
+    for s in range(K, tc):
+        prev_tn = set(tn_seq[:, s - K].tolist())
+        cur = tn_seq[:, s]
+        hits += sum(1 for v in cur if v in prev_tn)
+        total += NC
+    return hits / max(1, total)
+
+
+def _autocorr(seq, lag):
+    """Mean across clusters of Pearson autocorrelation at given lag."""
+    NC, tc = seq.shape
+    if tc <= lag + 1:
+        return 0.0
+    accs = []
+    for c in range(NC):
+        x = seq[c].astype(np.float64)
+        a = x[:-lag]
+        b = x[lag:]
+        va = a - a.mean()
+        vb = b - b.mean()
+        denom = math.sqrt((va * va).sum() * (vb * vb).sum())
+        if denom < 1e-12:
+            continue
+        accs.append(float((va * vb).sum() / denom))
+    return float(np.mean(accs)) if accs else 0.0
+
+
+def _two_hop_features(tn_seq, tm_seq):
+    """2-step sequence features.  hilbert vs zorder differ in path smoothness:
+    hilbert's 2-hop jumps are bounded, zorder's alternate.  Captures something
+    per-step jump alone misses."""
+    if tm_seq.shape[1] < 3:
+        return dict(tm_jump2=0.0, tn_jump2=0.0, a_reuse_w2=0.0, b_reuse_w2=0.0,
+                    path_curve=0.0)
+    tm_d2 = np.abs(tm_seq[:, 2:].astype(np.int64) - tm_seq[:, :-2])
+    tn_d2 = np.abs(tn_seq[:, 2:].astype(np.int64) - tn_seq[:, :-2])
+    a_r_w2 = float(((tm_seq[:, 2:] == tm_seq[:, 1:-1]) |
+                    (tm_seq[:, 2:] == tm_seq[:, :-2])).mean())
+    b_r_w2 = float(((tn_seq[:, 2:] == tn_seq[:, 1:-1]) |
+                    (tn_seq[:, 2:] == tn_seq[:, :-2])).mean())
+    # path_curve: |Δ2hop| / (|Δ1| + |Δ2|).  1.0 = collinear, <1.0 = curved.
+    d1_tm = tm_seq[:, 1:].astype(np.int64) - tm_seq[:, :-1]
+    d1_tn = tn_seq[:, 1:].astype(np.int64) - tn_seq[:, :-1]
+    step1 = np.abs(d1_tm[:, :-1]) + np.abs(d1_tn[:, :-1])
+    step2 = np.abs(d1_tm[:, 1:]) + np.abs(d1_tn[:, 1:])
+    cum = np.abs(d1_tm[:, :-1] + d1_tm[:, 1:]) + np.abs(d1_tn[:, :-1] + d1_tn[:, 1:])
+    denom = step1 + step2
+    mask = denom > 0
+    curve = float((cum[mask] / denom[mask]).mean()) if mask.any() else 1.0
+    return dict(tm_jump2=float(tm_d2.mean()), tn_jump2=float(tn_d2.mean()),
+                a_reuse_w2=a_r_w2, b_reuse_w2=b_r_w2, path_curve=curve)
+
+
 def features(layer, td, ks=0, ns=0):
     """Compute tile-sequence features for a (layer, td, ks, ns) variant.
 
-    Features:
-      Within-cluster locality:
-        a_reuse:  fraction of (c, s) where tm[c,s+1] == tm[c,s]  (A stays → A hit)
-        b_reuse:  fraction where tn[c,s+1] == tn[c,s]            (B stays → B hit)
-        tm_jump:  mean |tm[c,s+1] - tm[c,s]|                     (DRAM amp proxy for A)
-      Cross-cluster synchrony (at each step s):
-        store_conc:  mean_s (sum_tn (count_clusters_on_tn choose 2)) / (NC choose 2)
-        tn_entropy:  mean_s entropy of tn distribution across NC clusters
-        tm_entropy:  mean_s entropy of tm distribution across NC clusters
-        n_active_tn: mean_s distinct tn values / TILES_N
-        n_active_tm: mean_s distinct tm values / NC
-      K-phase:
-        ks:          raw K_STAGGER
-        ks_odd:      1 if K_STAGGER is odd else 0
-        k_phase_div: distinct (c*ks) % K_ITERS values / K_ITERS
-      N-stagger:
-        ns:          raw N_STAGGER
-        ns_nontriv:  1 if ns > 0 else 0
+    Categories:
+      Within-cluster locality (1-hop and 2-hop):
+        a_reuse, b_reuse, tm_jump, tn_jump
+        a_reuse_w2, b_reuse_w2, tm_jump2, tn_jump2, path_curve
+      Cross-cluster synchronous (step-aligned):
+        store_conc, store_max, tn_entropy, tm_entropy, n_active_tn, n_active_tm
+      Cross-cluster drift-windowed (w=2,4):
+        store_drift_w2, store_drift_w4
+        unique_ab_w{2,4}, unique_tn_w{2,4}, unique_tm_w{2,4}
+      L2 carry-over (tile reappearance across time):
+        tn_carry_w{1,2,4}, tm_carry_w{1,2,4}, ab_carry_w{1,2,4}
+      K-phase: ks, ks_odd, k_phase_div, k_phase_max
+      N-stagger: ns, ns_nontriv
+      Layer-scaling interactions (K_ITERS as stall multiplier):
+        a_reuse_KI, b_reuse_KI, store_conc_KI
     """
     cfg = LAYERS[layer]
     NC, TN, TM, KI = cfg["NC"], cfg["TILES_N"], cfg["TILES_M"], cfg["K_ITERS"]
@@ -378,8 +517,10 @@ def features(layer, td, ks=0, ns=0):
     # K-phase
     k_phases = [(c * ks) % KI for c in range(NC)]
     k_phase_div = len(set(k_phases)) / KI
+    phase_counts = Counter(k_phases)
+    k_phase_max = max(phase_counts.values()) / NC
 
-    return {
+    feats = {
         "a_reuse":      a_reuse,
         "b_reuse":      b_reuse,
         "tm_jump":      tm_jump,
@@ -393,9 +534,25 @@ def features(layer, td, ks=0, ns=0):
         "ks":           float(ks),
         "ks_odd":       float(ks & 1),
         "k_phase_div":  k_phase_div,
+        "k_phase_max":  k_phase_max,
         "ns":           float(ns),
         "ns_nontriv":   float(ns > 0),
     }
+    feats.update(_two_hop_features(tn_seq, tm_seq))
+    feats.update(_drift_cross_features(tn_seq, tm_seq, cfg, windows=(2, 4)))
+    feats.update(_carry_features(tn_seq, tm_seq, windows=(1, 2, 4, 8, 16, 32)))
+    # Mainloop/epilogue asymmetry: load_tn now vs store_tn K steps ago
+    feats["collide_K"]  = _load_store_collide(tn_seq, KI)
+    feats["collide_K2"] = _load_store_collide(tn_seq, KI // 2 or 1)
+    # Autocorrelation of (tm, tn) sequences
+    for lag in (4, 8, 16):
+        feats[f"tm_autocorr_{lag}"] = _autocorr(tm_seq, lag)
+        feats[f"tn_autocorr_{lag}"] = _autocorr(tn_seq, lag)
+    # Layer-scaling interactions: same feature, different weight per layer via K_ITERS.
+    feats["a_reuse_KI"]    = a_reuse * KI
+    feats["b_reuse_KI"]    = b_reuse * KI
+    feats["store_conc_KI"] = store_conc * KI
+    return feats
 
 
 RESULT_RE = re.compile(r'@@RESULT\s+ms=([0-9.]+)')
@@ -469,11 +626,82 @@ def build_feature_frame(df):
 
 
 FEATURE_COLS = [
+    # within-cluster 1-hop
     "a_reuse", "b_reuse", "tm_jump", "tn_jump",
+    # within-cluster 2-hop
+    "a_reuse_w2", "b_reuse_w2", "tm_jump2", "tn_jump2", "path_curve",
+    # cross-cluster synchronous
     "store_conc", "store_max", "tn_entropy", "tm_entropy",
     "n_active_tn", "n_active_tm",
-    "ks", "ks_odd", "k_phase_div", "ns", "ns_nontriv",
+    # cross-cluster drift-windowed
+    "store_drift_w2", "store_drift_w4",
+    "unique_ab_w2", "unique_ab_w4",
+    "unique_tn_w2", "unique_tn_w4",
+    "unique_tm_w2", "unique_tm_w4",
+    # L2 carry-over short window
+    "tn_carry_w1", "tm_carry_w1", "ab_carry_w1",
+    "tn_carry_w2", "tm_carry_w2", "ab_carry_w2",
+    "tn_carry_w4", "tm_carry_w4", "ab_carry_w4",
+    # L2 carry-over long window (block-lifetime scale)
+    "tn_carry_w8", "tm_carry_w8", "ab_carry_w8",
+    "tn_carry_w16", "tm_carry_w16", "ab_carry_w16",
+    "tn_carry_w32", "tm_carry_w32", "ab_carry_w32",
+    # mainloop/epilogue asymmetry (K-lag collision)
+    "collide_K", "collide_K2",
+    # sequence autocorrelation at multi-scale lags
+    "tm_autocorr_4", "tn_autocorr_4",
+    "tm_autocorr_8", "tn_autocorr_8",
+    "tm_autocorr_16", "tn_autocorr_16",
+    # K-phase / stagger
+    "ks", "ks_odd", "k_phase_div", "k_phase_max", "ns", "ns_nontriv",
+    # layer-scaling interactions
+    "a_reuse_KI", "b_reuse_KI", "store_conc_KI",
 ]
+
+
+def _ridge_loo_rmse(Xk, y, alpha=1.0):
+    """Fast LOOCV rmse for Ridge at a fixed feature subset.  Centers y so that
+    the no-intercept Ridge on standardized X behaves like a standard ridge fit
+    with intercept (the intercept is the LOO-train mean of y)."""
+    n, k = Xk.shape
+    y_pred = np.empty(n)
+    I = np.eye(k) * alpha
+    for i in range(n):
+        tr = np.delete(np.arange(n), i)
+        Xtr = Xk[tr]
+        ytr = y[tr]
+        ymean = ytr.mean()
+        try:
+            beta = np.linalg.solve(Xtr.T @ Xtr + I, Xtr.T @ (ytr - ymean))
+        except np.linalg.LinAlgError:
+            return float('inf')
+        y_pred[i] = Xk[i] @ beta + ymean
+    return float(np.sqrt(((y - y_pred) ** 2).mean()))
+
+
+def _best_subset(Xs, y, cols, k, top_n=5, alpha=1.0):
+    """Exhaustive best-subset: pick k features minimizing LOOCV rmse."""
+    from itertools import combinations
+    p = Xs.shape[1]
+    if k > p:
+        return []
+    results = []
+    for idx in combinations(range(p), k):
+        rmse = _ridge_loo_rmse(Xs[:, list(idx)], y, alpha=alpha)
+        results.append((rmse, idx))
+    results.sort(key=lambda t: t[0])
+    return [(r, [cols[i] for i in idx]) for r, idx in results[:top_n]]
+
+
+def _loo_rmse(model_ctor, Xs, y):
+    loo = LeaveOneOut()
+    y_preds = np.zeros_like(y)
+    for tr, te in loo.split(Xs):
+        m = model_ctor().fit(Xs[tr], y[tr])
+        y_preds[te] = m.predict(Xs[te])
+    rmse = float(np.sqrt(((y - y_preds) ** 2).mean()))
+    r2 = 1.0 - float(((y - y_preds) ** 2).sum() / ((y - y.mean()) ** 2).sum())
+    return rmse, r2, y_preds
 
 
 def fit_report(df, layer, mode, feature_cols=FEATURE_COLS):
@@ -492,13 +720,22 @@ def fit_report(df, layer, mode, feature_cols=FEATURE_COLS):
 
     scaler = StandardScaler().fit(X)
     Xs = scaler.transform(X)
+    y_std = float(y.std())
 
-    # Feature table sorted by y
+    # Univariate correlations (used both for reporting and top-k filter)
+    corrs = []
+    for i, c in enumerate(cols):
+        r = np.corrcoef(X[:, i], y)[0, 1]
+        if not np.isnan(r):
+            corrs.append((i, c, r))
+    corrs.sort(key=lambda t: -abs(t[2]))
+
     sub_sorted = sub.sort_values("ms").reset_index(drop=True)
-    print(f"\n=== {layer} {mode}   n={len(sub)} ===")
-    print("  Per-variant features (sorted by ms):")
+    print(f"\n=== {layer} {mode}   n={len(sub)}   σ(ms)={y_std:.3f} ===")
+    print("  Per-variant features (sorted by ms, top-6 correlators):")
+    top6 = [c for _, c, _ in corrs[:6]]
     tag_w = 20
-    hdr = f"  {'variant':<{tag_w}} {'ms':>6}  " + "  ".join(f"{c:>7}" for c in cols)
+    hdr = f"  {'variant':<{tag_w}} {'ms':>6}  " + "  ".join(f"{c:>9}" for c in top6)
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
     for _, r in sub_sorted.iterrows():
@@ -506,59 +743,103 @@ def fit_report(df, layer, mode, feature_cols=FEATURE_COLS):
         if r["kstagger"] or r["nstagger"]:
             tag += f" k{r['kstagger']}n{r['nstagger']}"
         row = f"  {tag:<{tag_w}} {r['ms']:>6.3f}  " + "  ".join(
-            f"{r[c]:>7.3f}" for c in cols)
+            f"{r[c]:>9.3f}" for c in top6)
         print(row)
 
-    # Feature correlation with y (univariate) — safer than multi-feature coefs at n=9
-    print("\n  Univariate correlations with ms:")
-    corrs = []
-    for i, c in enumerate(cols):
-        if X[:, i].std() < 1e-9:
+    print(f"\n  Univariate correlations with ms  (|r|>0.3 shown):")
+    for _, c, r in corrs:
+        if abs(r) < 0.30:
             continue
-        r = np.corrcoef(X[:, i], y)[0, 1]
-        corrs.append((c, r))
-    corrs.sort(key=lambda t: -abs(t[1]))
-    for c, r in corrs:
-        bar = "+" if r > 0 else "-"
-        print(f"    {c:<14}  r={r:+.3f}  {bar * int(abs(r) * 20)}")
+        bar = ("+" if r > 0 else "-") * int(abs(r) * 20)
+        print(f"    {c:<16}  r={r:+.3f}  {bar}")
 
-    # Ridge coefficients (reference — unstable at n=9)
+    # Ridge (all features) — baseline
     ridge = Ridge(alpha=1.0).fit(Xs, y)
-    y_pred_train = ridge.predict(Xs)
-    r2_train = 1.0 - np.var(y - y_pred_train) / np.var(y)
-
-    # LOOCV R² (honest)
+    rmse_ridge_train = float(np.sqrt(((y - ridge.predict(Xs)) ** 2).mean()))
     if len(sub) >= 5:
-        loo = LeaveOneOut()
-        y_preds_loo = np.zeros_like(y)
-        for tr, te in loo.split(Xs):
-            m = Ridge(alpha=1.0).fit(Xs[tr], y[tr])
-            y_preds_loo[te] = m.predict(Xs[te])
-        r2_loo = 1.0 - np.var(y - y_preds_loo) / np.var(y)
+        rmse_ridge_loo, r2_ridge_loo, _ = _loo_rmse(lambda: Ridge(alpha=1.0), Xs, y)
     else:
-        r2_loo = float('nan')
+        rmse_ridge_loo, r2_ridge_loo = float('nan'), float('nan')
 
-    print(f"\n  Ridge fit  R²_train={r2_train:.3f}  R²_loo={r2_loo:.3f}")
-    order = np.argsort(-np.abs(ridge.coef_))
-    print(f"  {'feature':<14}  {'β (std)':>9}")
-    for i in order[:6]:
-        print(f"    {cols[i]:<14}  {ridge.coef_[i]:>+9.4f}")
+    # Ridge on top-k features (k=3, 5) — reduce overfit at small n
+    reports = [(f"ridge_all ({len(cols)}f)", rmse_ridge_train, rmse_ridge_loo, r2_ridge_loo)]
+    for k in (3, 5):
+        if k >= len(cols):
+            continue
+        idx = [i for i, _, _ in corrs[:k]]
+        Xk = Xs[:, idx]
+        m = Ridge(alpha=1.0).fit(Xk, y)
+        tr = float(np.sqrt(((y - m.predict(Xk)) ** 2).mean()))
+        if len(sub) >= 5:
+            lo_rmse, lo_r2, _ = _loo_rmse(lambda: Ridge(alpha=1.0), Xk, y)
+        else:
+            lo_rmse, lo_r2 = float('nan'), float('nan')
+        reports.append((f"ridge_top{k}", tr, lo_rmse, lo_r2))
 
-    # Lasso for sparse selection
+    # Exhaustive best-subset k=3 — finds combos that beat univariate filtering
+    # when signal lives in outlier-rare features (e.g. b_reuse_w2 only fires on hilbert).
+    best3 = _best_subset(Xs, y, cols, k=3, top_n=3)
+    if best3:
+        rmse_bs3 = best3[0][0]
+        r2_bs3 = 1.0 - (rmse_bs3 ** 2 * len(y)) / ((y - y.mean()) ** 2).sum()
+        reports.append(("best_subset k=3", float('nan'), rmse_bs3, r2_bs3))
+
+    # LassoCV — sparse selection
     try:
-        lasso = LassoCV(cv=min(5, len(sub) - 1), max_iter=10000).fit(Xs, y)
+        lasso = LassoCV(cv=min(5, len(sub) - 1), max_iter=50000).fit(Xs, y)
+        rmse_lasso_train = float(np.sqrt(((y - lasso.predict(Xs)) ** 2).mean()))
+        if len(sub) >= 5:
+            rmse_lasso_loo, r2_lasso_loo, _ = _loo_rmse(
+                lambda: LassoCV(cv=min(5, len(sub) - 1), max_iter=50000), Xs, y)
+        else:
+            rmse_lasso_loo, r2_lasso_loo = float('nan'), float('nan')
         picked = [(cols[i], lasso.coef_[i]) for i in range(len(cols))
                   if abs(lasso.coef_[i]) > 1e-6]
         picked.sort(key=lambda t: -abs(t[1]))
-        print(f"\n  Lasso (α={lasso.alpha_:.4f}) kept {len(picked)}/{len(cols)} features:")
-        for c, b in picked:
-            print(f"    {c:<14}  {b:>+9.4f}")
+        reports.append((f"lasso ({len(picked)}f, α={lasso.alpha_:.4f})",
+                        rmse_lasso_train, rmse_lasso_loo, r2_lasso_loo))
     except Exception as e:
+        picked = []
         print(f"  Lasso failed: {e}")
 
-    # Residuals
+    # Gradient boosting — catches nonlinear interactions, reg'd hard for small n
+    try:
+        gbr_kwargs = dict(n_estimators=30, max_depth=2, learning_rate=0.1,
+                          min_samples_leaf=2, random_state=0)
+        gbr = GradientBoostingRegressor(**gbr_kwargs).fit(Xs, y)
+        rmse_gbr_train = float(np.sqrt(((y - gbr.predict(Xs)) ** 2).mean()))
+        if len(sub) >= 5:
+            rmse_gbr_loo, r2_gbr_loo, _ = _loo_rmse(
+                lambda: GradientBoostingRegressor(**gbr_kwargs), Xs, y)
+        else:
+            rmse_gbr_loo, r2_gbr_loo = float('nan'), float('nan')
+        reports.append(("gbr(d=2,n=30)", rmse_gbr_train, rmse_gbr_loo, r2_gbr_loo))
+    except Exception as e:
+        print(f"  GBR failed: {e}")
+
+    print(f"\n  Model                       rmse_train  rmse_loo  R²_loo")
+    print(f"  --------------------------- ----------- --------- -------")
+    for name, tr, lo, r2 in reports:
+        print(f"  {name:<28} {tr:>10.4f}  {lo:>8.4f}  {r2:>+6.3f}")
+
+    # Lasso selected features
+    if picked:
+        print(f"\n  Lasso features (kept {len(picked)}/{len(cols)}):")
+        for c, b in picked:
+            print(f"    {c:<16}  {b:>+9.4f}")
+
+    # Top-3 best-subset triples
+    if best3:
+        print(f"\n  Top best-subset k=3 triples (exhaustive search over {len(cols)} features):")
+        for rmse, feats in best3:
+            print(f"    rmse_loo={rmse:.4f}  {{{', '.join(feats)}}}")
+
+    # Residuals under best-LOO model
+    best = min(reports, key=lambda r: r[2] if not np.isnan(r[2]) else float('inf'))
+    print(f"\n  Best LOO model: {best[0]}  rmse={best[2]:.4f} ms")
+    y_pred_train = ridge.predict(Xs)
     sub2 = sub.assign(pred=y_pred_train, resid=y - y_pred_train).sort_values("resid")
-    print(f"\n  Residuals (negative = faster than model predicts):")
+    print(f"  Ridge-all residuals (negative = faster than model predicts):")
     for _, r in sub2.iterrows():
         tag = f"{r['dispatch']}"
         if r["kstagger"] or r["nstagger"]:
