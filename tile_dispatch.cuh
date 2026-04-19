@@ -361,6 +361,49 @@ static __device__ __forceinline__ int static_swizzle(int block_idx) {
         return tm * TILES_N + local_n;
     }
 
+#elif TILE_DISPATCH == 21
+    /*
+    ncyrot: ncycle + per-cluster tn rotation.
+
+    Preserves ncycle's within-cluster A-reuse (same tm for TILES_N ticks)
+    while rotating tn per cluster-band so the 74 clusters hold DIFFERENT tn
+    at each tick — breaks ncycle's simultaneous-same-N-column store
+    contention (FC1 g-s = 0.681 ms on vanilla ncycle).
+
+    Hypothesis: within-cluster A-reuse is the source of ncycle's fast strip.
+    If across-cluster B-reuse via L2 is actually what matters, strip will
+    regress toward rowmajor-class (~1.38 ms FC1).  Experiment.
+
+    Avoids runtime '%' operators.  '/' appears only on compile-time const
+    divisors (NC, TILES_N) — nvcc magic-multiplies these.  Band thresholds
+    are hand-tabulated for SM_COUNT=148 × TILES_N ∈ {3, 12}; extend the
+    #if ladder for other configs.
+    */
+    {
+        const int NC = SM_COUNT / 2;
+        const int _ti_local = block_idx / NC;
+        const int c = block_idx - _ti_local * NC;
+        const int super = _ti_local / TILES_N;
+        const int sub = _ti_local - super * TILES_N;
+
+        int tn_shift;
+#if (SM_COUNT == 148) && (TILES_N == 3)
+        tn_shift = (c >= 25) + (c >= 50);
+#elif (SM_COUNT == 148) && (TILES_N == 12)
+        tn_shift = (c >= 7) + (c >= 13) + (c >= 19) + (c >= 25)
+                 + (c >= 31) + (c >= 37) + (c >= 44) + (c >= 50)
+                 + (c >= 56) + (c >= 62) + (c >= 68);
+#else
+#error "TILE_DISPATCH=21 (ncyrot) needs per-(SM_COUNT, TILES_N) threshold table"
+#endif
+        int tn = sub + tn_shift;
+        if (tn >= TILES_N) tn -= TILES_N;
+
+        int tm = super * NC + c;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + tn;
+    }
+
 #elif TILE_DISPATCH == 20
     /* Cluster-M-cycle: pair 0 and pair 1 within a 4-CTA cluster share tm and
        take adjacent tn.  Symmetric twin of TD=14 (N-cycle), designed for

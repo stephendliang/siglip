@@ -5,7 +5,7 @@
 #   layer     : fc1 | fc2
 #   dispatch  : default, sched, lean, tail*, tail-lean*, rowsteal*,
 #               dgswizzle, zorder, hilbert, zigzag, rowmajor,
-#               ncycle, nflat, nsnake    (* = fc2-only)
+#               ncycle, ncyrot, nflat, nsnake    (* = fc2-only)
 #   packed    : yes (DPACKED_TILES) | no
 #   mode      : fused | gemm (DGEMM_ONLY) | strip (DSTRIP_EPILOGUE)
 #   epi-warps : 4 (default) | 2 | 1  — rebuilds with -DNUM_EPI_WARPS=N (e2 is dead: FC1 regresses 1.6x, FC2 often deadlocks/mismatches; flag kept for explicit one-offs)
@@ -77,8 +77,8 @@ done
 # ─── Dispatch sets ─────────────────────────────────────────────────────
 
 DISP_CORE="default dgswizzle zigzag"
-DISP_FC1_ALL="default dgswizzle zorder hilbert zigzag rowmajor ncycle nflat nsnake nlock checkered dgsnake kstagger dg4 dg6 dg10 dg12 dg16 dg24 dg32 ck2 ck3 ck4 ck5 ck6 ck7 ck8 ck11"
-DISP_FC2_ALL="default dgswizzle zorder hilbert zigzag rowmajor ncycle nflat nsnake nlock checkered dgsnake kstagger kstagger2 kstagger3 dg2 dg3 dg4 dg6 dg10 dg12 dg16 dg20 dg24 dg32 ck2"
+DISP_FC1_ALL="default dgswizzle zorder hilbert zigzag rowmajor ncycle ncyrot nflat nsnake nlock checkered dgsnake kstagger dg4 dg6 dg10 dg12 dg16 dg24 dg32 ck2 ck3 ck4 ck5 ck6 ck7 ck8 ck11"
+DISP_FC2_ALL="default dgswizzle zorder hilbert zigzag rowmajor ncycle ncyrot nflat nsnake nlock checkered dgsnake kstagger kstagger2 kstagger3 dg2 dg3 dg4 dg6 dg10 dg12 dg16 dg20 dg24 dg32 ck2"
 
 resolve_dispatches() {
     local layer="$1" spec="$2"
@@ -130,7 +130,7 @@ dispatch_spec() {
         tail)       suffix="-tail" ;;
         tail-lean)  suffix="-tail-lean" ;;
         rowsteal)   suffix="-rowsteal" ;;
-        dgswizzle|zorder|hilbert|zigzag|rowmajor|ncycle|nflat|nsnake| \
+        dgswizzle|zorder|hilbert|zigzag|rowmajor|ncycle|ncyrot|nflat|nsnake| \
         nlock|checkered|dgsnake| \
         kstagger|kstagger2|kstagger3| \
         dg2|dg3|dg4|dg6|dg10|dg12|dg16|dg20|dg24|dg32| \

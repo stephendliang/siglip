@@ -167,9 +167,9 @@ and `K_DIM=4096` to confirm.
 - **TD=6 inline atomic**: W0 does atomicAdd at tile boundary. 1.370ms — blocks W0, delays TMA loads.
 - **TD=7 inline atomic in K-loop**: atomicAdd at ki=0. 1.257ms — disrupts W0's TMA pipeline (+41% tma_issue). Proves W0's K-loop is memory-pipeline-sensitive; ANY global memory op degrades TMA throughput.
 - **COL_LOCK**: Column-locked dispatch (fixed tn, dynamic M-row). 1.137ms — TMA penalty is inherent to the W7 mbarrier path, not tile ordering. Strip 62us slower than sched (load imbalance: 74 clusters / 3 cols = 25/25/24).
-- **Tile reordering (striding variants)**: N-batch (+12% regression), phase-offset N-batch (+6-11%), Group-3 (neutral). Static dispatch can't match work-stealing's L2 efficiency.
-- **Space-filling curves (TD=9-12)**: Z-order/Morton, Hilbert, zigzag-N, column-first (1.707ms DEAD, catastrophic: all clusters hit same N-column → TMA store contention + enormous A-tile L2 working set). Pre-2026-04-17 numbers (no PACKED_TILES) put these at 1.11-1.13ms. **Under PACKED_TILES parity (2026-04-17) dgswizzle landed at 1.074ms — tied with stride, ~30us under LEAN — so the "tile ordering doesn't matter" conclusion is under review.** hilbert/zorder/zigzag under PACKED_TILES not yet measured head-to-head.
-- **L2 cache hints**: EVICT_FIRST/LAST/NORMAL on TMA loads. Zero effect — amplification is a capacity problem, not eviction policy.
+- **Tile reordering (pre-PACKED_TILES)**: N-batch (+12%), phase-offset N-batch (+6–11%), Group-3 (neutral). Old framing "static can't match work-stealing's L2 efficiency" is **reversed under parity** — see status table; re-test any of these before declaring dead.
+- **Space-filling curves (TD=9–12) under PACKED_TILES**: zigzag (TD=11), zorder (TD=9), hilbert (TD=10), dgswizzle (TD=8) are all in the **winning cluster** (FC2 1.065–1.085 ms). Pre-parity "catastrophic" label was wrong. Only TD=12 (pure column-first) is consistently slow on FC2 fused; on FC1 strip it's actually the fastest known (1.337 ms ncycle) — it just pays at the store phase.
+- **L2 cache hints (EVICT_FIRST/LAST/NORMAL)**: zero effect on `long_scoreboard` arrival-pattern stalls. Accurate conclusion; the old rationale ("amplification is a capacity problem") is superseded — amplification isn't the bottleneck, but L2 hints still don't move the needle.
 
 ## Pipeline depth: why NS6 matters
 
@@ -197,19 +197,33 @@ Warp-specialized, 7 warps (224 threads), `cta_group::2`, `__cluster_dims__(2,1,1
 
 Tile: 256x256x128. K_ITERS=K_DIM/128. FC2: K=3072 (24 iters), FC1: K=768 (6 iters).
 
-## Compute floor and epilogue
+## Compute floor and decomposition (not a ceiling)
 
-From bench/mma_bench.cu: MMA K-iteration 665 cyc raw, 525.6 cyc/iter pipelined. Per FC2 tile (24 iters): ~12,614 cyc. Theoretical strip floor at 1.813 GHz = ~1.048ms (matches observed).
+Hard MMA compute floor: 525.6 cyc/iter pipelined × K_ITERS × tiles / (74 clusters × 2 CTAs × 1.813 GHz). FC2 = ~1.048 ms. FC1 strip floor is NOT compute-bound (K=6 is so short that TMA load latency dominates).
 
-**Epilogue is 100% hidden in MMA shadow.** The fused-strip gap (~45us across
-all variants under PACKED_TILES) is entirely memory-side: `long_scoreboard`
-bubbles on A+B arrival + TMA store contention. NOT compute, NOT instruction
-scheduling, NOT cross-warp STS clustering. Note: older text in git history
-attributed this gap to "DRAM amplification" — 2026-04-18 data shows
-amplification is a red herring; what matters is the *pattern* of arrivals,
-not the byte count.
+**Strip itself is ordering-sensitive, not a floor.** The 2026-04-18 sweep shows
+FC2 strip spans 0.987–1.031 ms (44 µs spread) and FC1 strip spans 1.336–1.501 ms
+(165 µs spread) purely from tile ordering. "Strip ≈ physics floor" is wrong —
+strip includes TMA load + L2 state + mbarrier handoff, all ordering-addressable.
+ncycle/nsnake minimize FC1 strip by maximizing within-cluster B-tile reuse.
 
-Our BF16 epilogue (HFMA2/HADD2) costs ~44us vs CUTLASS's FP32 (FFMA+F2FP) ~72us. Cross-warp STS clustering is real (barrier stalls +753% in ncu) but is a symptom, not a bottleneck — proven by STRIP_EPILOGUE isolating the gap to memory traffic.
+**fused = strip + (g-s) + (f-g).** Each gap is a separate, partially-decoupled
+axis:
+
+| gap | what it measures | moves with |
+|---|---|---|
+| g-s | store phase (bias load, residual TMA, STS+TMA store) | **cluster-wavefront N-column diversity** (dgswizzle minimizes, column-sync maximizes) |
+| f-g | epilogue overlap with next-tile mainloop | **K_ITERS** (FC1 K=6 can't hide), PREFILL, epilogue duration |
+
+The FC1 ncycle anomaly proves the axes separate: f-g ≈ 0 (epilogue fully hidden)
+but g-s = 0.681 ms (store contention). Best dispatch on g-s (dgswizzle) costs
+0.315 ms for FC1 — 366 µs of ordering-addressable reducible cost between
+ncycle's mainloop and dgswizzle's store pattern. No dispatch today combines both.
+
+BF16 epilogue compute cost (HFMA2/HADD2) ~44 µs. Cross-warp STS clustering
+(barrier stalls +753%) is a symptom that changes with ordering, not a fixed
+bottleneck. Source-level STS layout is ptxas-immutable (proven), but the
+*inter-cluster* arrival pattern into STS/TMA-store is fully ordering-controlled.
 
 ## DRAM read amplification (historical note — NOT the bottleneck)
 
@@ -244,7 +258,7 @@ Infrastructure: `tools/dim_sweep.sh`. Dims: `-DM_TOTAL=X -DN_DIM=Y -DK_DIM=Z`. C
 | 928256 | 1.110 | 1.226 | -9.5% |
 | 1856512 | 2.206 | 2.433 | -9.3% |
 
-### K scaling — NS6 advantage fades, work-stealing advantage grows
+### K scaling — NEEDS RE-RUN under PACKED_TILES + full dispatch set
 
 | K | K_ITERS | w3_fused (stride) | w3_sched (TD=4) | cutlass_fused |
 |---|---|---|---|---|
@@ -252,7 +266,11 @@ Infrastructure: `tools/dim_sweep.sh`. Dims: `-DM_TOTAL=X -DN_DIM=Y -DK_DIM=Z`. C
 | 4096 | 32 | 1.538 | 1.545 | 1.551 |
 | 6144 | 48 | 2.257 | **2.098** | 2.263 |
 
-At K=3072, NS6 pipeline depth = 25% of K-loop, hiding DRAM latency effectively. At K=6144, it's 12.5% — compute dominates, amplification penalty is fully exposed. Work-stealing's zero amplification wins.
+Pre-PACKED_TILES, pre-dgswizzle/zigzag data. The sched advantage at K=6144 was
+interpreted as "amplification dominates at long K" but that thesis died on
+2026-04-18: amplification is not the bottleneck. The actual K=6144 winner under
+parity across dgswizzle/zigzag/ncycle-derivatives is unknown. Re-run before
+citing.
 
 ### Adaptive tuning knobs
 
@@ -260,15 +278,15 @@ At K=3072, NS6 pipeline depth = 25% of K-loop, hiding DRAM latency effectively. 
 |---|---|---|
 | N_STAGES | NS6 for N<=1536, NS5 for N>1536 | SMEM per stage grows with N |
 | PREFILL | On for K_ITERS>=20, off otherwise | Short K-loop deadlocks (parity wrap) |
-| Dispatch | **UNSETTLED (2026-04-17)** | LEAN previously claimed best; one PACKED_TILES ncu run had stride/dgswizzle ~30us ahead of LEAN. Needs reps. |
+| Dispatch | FC2: zigzag or dgswizzle (1.065–1.073 ms). FC1: zigzag (2.012 ms). Both decouple-search open. | Under PACKED_TILES parity static swizzles beat LEAN/sched by ~30 µs on FC2. Open axes (mainloop/store decoupling, K_STAGGER × good dispatch, cluster-heterogeneous) not yet explored. |
 
 ## Dead ends — do NOT retry
 
-### Epilogue optimization (all futile — epilogue is hidden in MMA shadow)
+### Source-level epilogue tuning (all futile — ptxas controls STS layout)
 
 **Source-level SASS immutability**: CUTLASS_LOOP, FP32_EPILOGUE, CUTLASS_EPILOGUE, CPP_EPILOGUE, CUTE_STORE, @!PT LDS, cvta.shared, NO_PRE/POST_STORE_BAR, NUM_EPI_STAGES, stmatrix, EPI_REORDER, NUM_EPI_WARPS=1/2. ptxas generates identical STS clustering regardless of source — the compiler controls it, not us. 6+ approaches tried, all produce the same SASS.
 
-**Cross-warp STS clustering**: The real cause of barrier stalls (+753%), but irrelevant because epilogue is hidden in MMA shadow. SELF_LOAD (per-warp TMA), SELF_STAGGER (nanosleep 50-200ns) — zero effect. SASS intra-warp reorder (CP-SAT scheduler) — targets wrong bottleneck. All proven on B200.
+**Cross-warp STS clustering (intra-warp-only attempts)**: The real cause of barrier stalls (+753%). SELF_LOAD (per-warp TMA), SELF_STAGGER (nanosleep 50–200 ns) — zero effect on FC2. SASS intra-warp reorder (CP-SAT scheduler) — targets wrong axis. Note: these attempts only tried to stagger warps *within a CTA*; they did not touch the much larger *inter-cluster* store-arrival pattern which IS ordering-addressable (see `g-s` gap on FC1).
 
 ### CUTLASS hybrid (fc2_hybrid.cu)
 
@@ -352,6 +370,30 @@ No decorated block comments. Bare `/*` open, undecorated lines, `*/` close.
 Don't narrate tool calls. Don't echo file contents. Keep explanations proportional.
 Parallelize independent tool calls. Use offset/limit for large files.
 
+## Open frontiers (2026-04-18) — axes not yet decoupled
+
+Current dispatches couple mainloop-order with store-order. The data shows these
+are separable:
+
+1. **mainloop-order ≠ store-order**: ncycle has best strip (max B-reuse) but
+   worst g-s (max store contention). Modify TD=14 so cluster `c` rotates its
+   `tn` by `c × TILES_N / NC` — preserves within-cluster B-reuse, breaks
+   cross-cluster store synchrony. Predicted FC1 gemm 2.02 → ~1.65 if the
+   hypothesis holds.
+2. **K_STAGGER × tight-locality dispatch**: kstagger was only tested on
+   `default`. Compose with dgswizzle/zigzag/checkered/dg16 — decorrelates
+   K-arrival within a locality band. Cheap matrix test (~6 binaries).
+3. **Cluster-heterogeneous dispatch**: first half dgswizzle, second half
+   column-first. Tests whether cluster-wavefront diversity is an independent
+   axis from the single-cluster ordering.
+
+Structural ideas (not pure-ordering; defer until axes 1–3 are explored):
+- Streaming epilogue: start storing TMEM columns as they retire instead of after
+  full tile. Breaks FC1's K=6 pathology (~400 µs epilogue that can't hide in 6
+  K-iters). Removes the f-g constraint that forces zigzag over ncycle.
+- Bigger N-tile: 256 → 512. Doubles K-iters-per-tile effectively; gives FC1 the
+  overlap budget FC2 has.
+
 ## Key constraints
 
 - Target: sm_100a (B200, 148 SMs), cta_group::2, 74 clusters
@@ -365,4 +407,4 @@ Parallelize independent tool calls. Use offset/limit for large files.
 - NO_PREFILL always on for FC1 (K_ITERS=6)
 - BIAS_SMEM=1 default (-15us free)
 - Custom dims require `make -B` (Make doesn't track DFLAGS)
-- W0's K-loop is memory-pipeline-sensitive — no global memory ops allowed
+- W0's K-loop is TMA-sensitive: atomicAdd at ki=0 (TD=7) costs +41–77% tma_issue. Non-critical-path global ops (W7 scheduler TD=4, tile-boundary) are fine.
