@@ -292,8 +292,8 @@ multicast axis (h=along N, v=along M). `bz_bias` = bias-only epilogue.
 
 | rank | tile (enum)    | NS | cluster | cta_grp | ms     |
 |------|----------------|----|---------|---------|--------|
-| **1**| 176x128 (201)  | 8  | 1x2     | **2**   | 1.0454 |
-| **2**| 128x256 (23)   | 6  | 2x1     | **2**   | 1.0457 |
+| 1    | 176x128 (201)  | 8  | 1x2     | **2**   | 1.0454 |
+| **2†**| 128x256 (23)  | 6  | 2x1     | **2**   | 1.0457 |
 | 3    | 128x192 (32)   | 7  | 2x1     | 2       | 1.094  |
 | 4    | 256x256 (513)  | 4  | 2x1     | 2       | 1.192  |
 | 5    | 320x192 (535)  | 4  | 2x1     | 2       | 1.196  |
@@ -301,19 +301,29 @@ multicast axis (h=along N, v=along M). `bz_bias` = bias-only epilogue.
 | 7    | 168x128 (197)  | 5  | 1x2     | 1       | 1.358  |
 | 8    | 256x96  (495)  | 4  | 1x2     | 1       | 1.440  |
 
+† **Rank-2 is the real target, not rank-1.** Rank-1 (176x128 NS=8 1x2) edges
+rank-2 by **0.3 µs — run-to-run noise**. Rank-2 (128x256 NS=6 2x1 2cta) is
+our exact per-CTA MMA geometry + cluster layout. Treat rank-2 as the true
+1.046 ms target; rank-1 is a fluke of heuristic ordering and a different
+architecture (NS=8 doesn't fit at our tile, so it's not reachable anyway).
+The dumped SASS file on disk is named `rank1.sass` but contains rank-2's
+kernel — filename is a historical misnomer, kernel identity (see line 16 of
+the dump: `nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_bias_TNT`) is
+authoritative.
+
 ### Hard-won conclusions
 
 1. **cuBLASLt's top 5 all use `cta_group::2`**. Our 2sm-MMA architecture is
    aligned with cuBLASLt's winning designs; cta_group::1 (ranks 6–8) is
    uniformly slower here.
-2. **Rank-2 is OUR exact geometry**: 128x256 per-CTA, 2x1 cluster, cta_group::2,
-   NS=6, v-mcast (along M). Times at **1.046 ms**. Our best (dgsw) is 1.064.
-   **We're +18 µs behind our architectural twin** — the gap is NOT
-   architectural, it's pure epilogue/dispatch/scheduling. Most important
-   comparison point going forward.
-3. **Rank-1 wins via NS=8 at a smaller 176x128 tile**, not by any clever trick.
-   NS=8 at our 256x256 is not SMEM-feasible (we jam at NS=6). Rank-1 only
-   edges rank-2 by 0.3 µs — the tile-vs-NS tradeoff is marginal.
+2. **Rank-2 is OUR exact geometry** (the real target): 128x256 per-CTA, 2x1
+   cluster, cta_group::2, NS=6, v-mcast (along M). Times at **1.046 ms**.
+   Our best (dgsw) is 1.064. **We're +18 µs behind our architectural twin**
+   — the gap is NOT architectural, it's pure epilogue/dispatch/scheduling.
+   Most important comparison point going forward.
+3. **Rank-1 is a fluke**. NS=8 at 176x128 wins by 0.3 µs — within noise, and
+   NS=8 at our 256x256 isn't SMEM-feasible (we jam at NS=6). Not reachable,
+   not meaningful.
 4. **cuBLASLt also ships a `256x256_128x4_2x1_2cta` variant** (rank-4 at 1.192).
    Same cluster-output as ours but NS=4 — we beat it by ~125 µs. The 256x256
    variant is a fallback in cuBLASLt's grid.
@@ -333,7 +343,7 @@ geometry → the 18 µs gap localizes to the epilogue path:
 ```bash
 cuobjdump --dump-sass \
     --function 'nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_bias_TNT' \
-    /opt/cuda/lib64/libcublasLt.so.13 > rank2.sass
+    /opt/cuda/lib64/libcublasLt.so.13 > rank1.sass   # filename is misnomer, content = rank-2 kernel
 cuobjdump --dump-sass ./fc2-w3-dgswizzle > ours.sass
 ```
 
