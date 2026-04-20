@@ -49,10 +49,26 @@ DISPATCH_TD = {
     "ncycle":    14,
     "nflat":     15,
     "nsnake":    16,
+    "nlock":     17,
     "checkered": 18,
     "dgsnake":   19,
     "ncyrot":    21,
 }
+
+
+def variant_to_spec(name):
+    """Parse a bench-variant name like 'dg4', 'ck11', 'kstagger2', 'dgswizzle'
+    into (td, params_override, ks, ns).  Returns None if not simulatable.
+    Recognises the parametric families baked into the 2026-04-18 ncu sweep."""
+    m = re.match(r'^dg(\d+)$', name)
+    if m: return (8, {"DG_GROUP_SIZE": int(m.group(1))}, 0, 0)
+    m = re.match(r'^ck(\d+)$', name)
+    if m: return (18, {"CK_GROUP_N": int(m.group(1))}, 0, 0)
+    m = re.match(r'^kstagger(\d*)$', name)
+    if m: return (0, {}, int(m.group(1) or "1"), 0)
+    if name in DISPATCH_TD:
+        return (DISPATCH_TD[name], {}, 0, 0)
+    return None
 
 
 def static_swizzle(td, block_idx, cfg):
@@ -215,6 +231,46 @@ def static_swizzle(td, block_idx, cfg):
         if tm >= TM: tm = TM - 1
         return tm * TN + tn
 
+    if td == 17:
+        NC = cfg["NC"]
+        c = block_idx % NC
+        _ti = block_idx // NC
+        TC = (TM * TN) // NC
+        fcpb = NC // TN
+        ex = NC - fcpb * TN
+        bb = fcpb + 1
+        bcap = bb * ex
+        if c < bcap:
+            tn_p = c // bb; idx = c - tn_p * bb; bs = bb
+        else:
+            tn_p = ex + (c - bcap) // fcpb
+            idx = (c - bcap) - (tn_p - ex) * fcpb
+            bs = fcpb
+        pa_ideal = TM // bs
+        pr = min(pa_ideal, TC)
+        own_uncov = TM - pr * bs
+        if _ti < pr:
+            tm = _ti * bs + idx; tn = tn_p
+        else:
+            spill = (_ti - pr) * bs + idx
+            if spill < own_uncov:
+                tm = pr * bs + spill; tn = tn_p
+            else:
+                help_local = spill - own_uncov
+                big_sto = (TC - pr) * bs - own_uncov
+                gh = tn_p * big_sto + help_local
+                spi = TM // fcpb
+                spr = min(spi, TC)
+                su = TM - spr * fcpb
+                if su <= 0: su = 1
+                so = gh // su
+                within = gh - so * su
+                tn = ex + so
+                tm = spr * fcpb + within
+        if tm >= TM: tm = TM - 1
+        if tn >= TN: tn = TN - 1
+        return tm * TN + tn
+
     if td == 18:
         GM = cfg["CK_GROUP_M"]
         GN = cfg["CK_GROUP_N"]
@@ -288,11 +344,15 @@ def static_swizzle(td, block_idx, cfg):
     raise ValueError(f"Unknown TD={td}")
 
 
-def emit_sequence(layer, td, ks=0, ns=0):
+def emit_sequence(layer, td, ks=0, ns=0, params=None):
     """Returns per-cluster tile sequences as np.array of shape [NC, tile_count, 2]
     with (tm, tn) pairs.  ks shifts per-cluster K-iter start offset (does not
-    change tile order).  ns rotates the per-cluster tile-visit order."""
-    cfg = LAYERS[layer]
+    change tile order).  ns rotates the per-cluster tile-visit order.  params
+    overrides cfg entries (e.g., DG_GROUP_SIZE, CK_GROUP_N) for parametric
+    families."""
+    cfg = dict(LAYERS[layer])
+    if params:
+        cfg.update(params)
     NC = cfg["NC"]
     TN = cfg["TILES_N"]
     tc = cfg["tile_count"]
@@ -389,6 +449,138 @@ def _carry_features(tn_seq, tm_seq, windows=(1, 2, 4)):
     return out
 
 
+L2_BYTES  = 96 * 1024 * 1024
+SLAB_BYTES = 256 * 128        # TMA K-slab: 256 rows × 128 cols FP8 = 32 KB
+ASSOC      = 16
+NUM_SETS   = (L2_BYTES // SLAB_BYTES) // ASSOC  # 192
+
+
+def _set_id(key):
+    """Stable 64-bit FNV hash → set index.  Python's built-in hash() is
+    randomized per-run, which would make features non-deterministic."""
+    h = 0xcbf29ce484222325
+    for it in key:
+        v = ord(it[0]) if isinstance(it, str) else int(it)
+        h = ((h ^ (v & 0xFFFFFFFF)) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return h % NUM_SETS
+
+
+def _l2_simulate(layer, td, ks=0, ns=0, drift_windows=(0, 2, 4, 8), params=None):
+    """Replay A/B/residual loads through a 16-way set-associative L2.  Grain:
+    K-slab (32 KB), matching TMA load quantum.  Each (kind, tile, ki) slab
+    hashes to one of 192 sets; within a set, LRU over 16 slabs (capacity =
+    3072 slabs = 96 MB).
+
+    Drift: each cluster c has a per-cluster time offset drift_c ∈ [-w, w]
+    (fixed across all its steps).  Events are globally ordered by
+    step + drift_c, which interleaves step-s of fast clusters with step-(s-w)
+    of slow clusters.  Captures the "SMs don't march in lockstep" axis that
+    tile-grain step-major can't see.
+
+    Emitted features:
+      l2_{a,b,r}_hit, l2_hit_rate, l2_evict_rate  (w=0 baseline)
+      l2_a_hit_cold, l2_a_hit_warm                (first/last quartile)
+      l2_{a,}hit_drift_w{2,4,8}                    (drifted-order re-runs)
+
+    Known approximations:
+      - Slab-grain set-assoc coarsens real 128B-line SA by 256×.  A real
+        slab spans 256 sets; we collapse it to 1.  Over-estimates conflict
+        misses, under-estimates capacity pressure.
+      - Within-slab line reuse invisible (matters if cluster touches only
+        part of a slab — our kernels don't).
+      - Bias (small enough to always hit) omitted.
+    """
+    from collections import OrderedDict
+    cfg = LAYERS[layer]
+    K_ITERS = cfg["K_ITERS"]
+    NC = cfg["NC"]
+    seq = emit_sequence(layer, td, ks, ns, params=params)
+    _, tc, _ = seq.shape
+    is_fc2 = (layer == "fc2")
+
+    out = {}
+    for w in drift_windows:
+        if w == 0:
+            drifts = np.zeros(NC, dtype=np.float64)
+        else:
+            rng = np.random.default_rng(12345 + w)
+            drifts = rng.uniform(-w, w, NC)
+        times = (np.arange(tc)[None, :] + drifts[:, None]).flatten()
+        cs = np.repeat(np.arange(NC), tc)
+        ss = np.tile(np.arange(tc), NC)
+        order = np.argsort(times, kind='stable')
+
+        cache = [OrderedDict() for _ in range(NUM_SETS)]
+        a_hit = a_miss = b_hit = b_miss = r_hit = r_miss = 0
+        evictions = 0
+        q_size = max(1, tc // 4)
+        a_cold_hit = a_cold_total = 0
+        a_warm_hit = a_warm_total = 0
+        warm_start = tc - q_size
+
+        for idx in order:
+            c = int(cs[idx]); s = int(ss[idx])
+            tm = int(seq[c, s, 0]); tn = int(seq[c, s, 1])
+            cold = s < q_size
+            warm = s >= warm_start
+
+            for ki in range(K_ITERS):
+                for kind, tile in (("A", tm), ("B", tn)):
+                    key = (kind, tile, ki)
+                    sid = _set_id(key)
+                    st  = cache[sid]
+                    if key in st:
+                        st.move_to_end(key)
+                        if kind == "A":
+                            a_hit += 1
+                            if cold: a_cold_hit += 1
+                            if warm: a_warm_hit += 1
+                        else:
+                            b_hit += 1
+                    else:
+                        st[key] = True
+                        if len(st) > ASSOC:
+                            st.popitem(last=False)
+                            evictions += 1
+                        if kind == "A":
+                            a_miss += 1
+                        else:
+                            b_miss += 1
+                    if kind == "A":
+                        if cold: a_cold_total += 1
+                        if warm: a_warm_total += 1
+
+            if is_fc2:
+                for rs in range(4):  # residual 256x256 BF16 = 128 KB = 4 slabs
+                    key = ("R", tm, tn, rs)
+                    sid = _set_id(key)
+                    st  = cache[sid]
+                    if key in st:
+                        st.move_to_end(key); r_hit += 1
+                    else:
+                        st[key] = True
+                        if len(st) > ASSOC:
+                            st.popitem(last=False); evictions += 1
+                        r_miss += 1
+
+        a_t = a_hit + a_miss
+        b_t = b_hit + b_miss
+        r_t = r_hit + r_miss
+        if w == 0:
+            out["l2_a_hit"]      = a_hit / max(1, a_t)
+            out["l2_b_hit"]      = b_hit / max(1, b_t)
+            out["l2_hit_rate"]   = (a_hit + b_hit) / max(1, a_t + b_t)
+            out["l2_evict_rate"] = evictions / max(1, a_t + b_t)
+            out["l2_a_hit_cold"] = a_cold_hit / max(1, a_cold_total)
+            out["l2_a_hit_warm"] = a_warm_hit / max(1, a_warm_total)
+            out["l2_r_hit"]      = (r_hit / r_t) if r_t else 0.0
+        else:
+            out[f"l2_a_hit_drift_w{w}"] = a_hit / max(1, a_t)
+            out[f"l2_hit_drift_w{w}"]   = (a_hit + b_hit) / max(1, a_t + b_t)
+
+    return out
+
+
 def _load_store_collide(tn_seq, K):
     """P(tn[c, s] == tn[c', s - K])  — models mainloop/epilogue asymmetry:
     tile_s's mainloop loads column tn[c,s] while tile_(s-K)'s epilogue still
@@ -452,7 +644,7 @@ def _two_hop_features(tn_seq, tm_seq):
                 a_reuse_w2=a_r_w2, b_reuse_w2=b_r_w2, path_curve=curve)
 
 
-def features(layer, td, ks=0, ns=0):
+def features(layer, td, ks=0, ns=0, params=None):
     """Compute tile-sequence features for a (layer, td, ks, ns) variant.
 
     Categories:
@@ -473,7 +665,7 @@ def features(layer, td, ks=0, ns=0):
     """
     cfg = LAYERS[layer]
     NC, TN, TM, KI = cfg["NC"], cfg["TILES_N"], cfg["TILES_M"], cfg["K_ITERS"]
-    seq = emit_sequence(layer, td, ks, ns)
+    seq = emit_sequence(layer, td, ks, ns, params=params)
     tm_seq = seq[..., 0]
     tn_seq = seq[..., 1]
 
@@ -541,6 +733,7 @@ def features(layer, td, ks=0, ns=0):
     feats.update(_two_hop_features(tn_seq, tm_seq))
     feats.update(_drift_cross_features(tn_seq, tm_seq, cfg, windows=(2, 4)))
     feats.update(_carry_features(tn_seq, tm_seq, windows=(1, 2, 4, 8, 16, 32)))
+    feats.update(_l2_simulate(layer, td, ks, ns, params=params))
     # Mainloop/epilogue asymmetry: load_tn now vs store_tn K steps ago
     feats["collide_K"]  = _load_store_collide(tn_seq, KI)
     feats["collide_K2"] = _load_store_collide(tn_seq, KI // 2 or 1)
@@ -571,19 +764,115 @@ def parse_wall_file(path):
 
 def load_bench(bench_dir):
     """Parse */_wall_r1.txt files in a bench dir. Returns DataFrame with cols
-    layer, dispatch, mode, ms."""
+    layer, dispatch, mode, ms, kstagger, nstagger, td, params (frozenset).
+    Dispatch names that can't be mapped to a simulable spec are dropped."""
     rows = []
     for path in sorted(glob.glob(os.path.join(bench_dir, "*_wall_r1.txt"))):
         name = os.path.basename(path).replace("_wall_r1.txt", "")
-        # name like fc1_zigzag_p_fused, fc2_tail_lean_p_fused, cutlass_fc2_fused
         m = re.match(r'^(fc[12])_(.+)_p_(fused|gemm|strip)$', name)
         if not m:
             continue
         layer, disp, mode = m.group(1), m.group(2), m.group(3)
+        spec = variant_to_spec(disp)
+        if spec is None:
+            continue
+        td, params, ks, ns = spec
         ms = parse_wall_file(path)
         if ms is None: continue
         rows.append(dict(layer=layer, dispatch=disp, mode=mode, ms=ms,
-                         kstagger=0, nstagger=0))
+                         kstagger=ks, nstagger=ns, td=td,
+                         params=frozenset(params.items()),
+                         basename=name))
+    return pd.DataFrame(rows)
+
+
+NCU_METRICS_OF_INTEREST = [
+    "smsp__warps_issue_stalled_long_scoreboard.avg",
+    "smsp__warps_issue_stalled_barrier.avg",
+    "smsp__warps_issue_stalled_wait.avg",
+    "smsp__warps_issue_stalled_short_scoreboard.avg",
+    "smsp__warps_issue_stalled_mio_throttle.avg",
+    "smsp__warps_issue_stalled_math_pipe_throttle.avg",
+    "smsp__warps_issue_stalled_not_selected.avg",
+    "smsp__warps_issue_stalled_sleeping.avg",
+    "smsp__warps_issue_stalled_membar.avg",
+    "smsp__warps_issue_stalled_dispatch_stall.avg",
+    "smsp__warps_issue_stalled_drain.avg",
+    "smsp__warps_issue_stalled_imc_miss.avg",
+    "smsp__warps_issue_stalled_lg_throttle.avg",
+    "smsp__warps_issue_stalled_branch_resolving.avg",
+    "smsp__cycles_active.avg",
+    "lts__t_sector_hit_rate.pct",
+    "lts__t_sectors.sum",
+    "lts__t_sectors_op_read.sum",
+    "dram__bytes_read.sum",
+    "dram__bytes_write.sum",
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+    "l1tex__t_requests_pipe_tma_opc_read.sum",
+    "l1tex__t_bytes_pipe_tma_opc_read.sum",
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+]
+
+STALL_TARGETS = frozenset({
+    "smsp__warps_issue_stalled_long_scoreboard.avg",
+    "smsp__warps_issue_stalled_barrier.avg",
+    "smsp__warps_issue_stalled_wait.avg",
+    "smsp__warps_issue_stalled_short_scoreboard.avg",
+    "smsp__warps_issue_stalled_mio_throttle.avg",
+    "smsp__warps_issue_stalled_math_pipe_throttle.avg",
+    "smsp__warps_issue_stalled_not_selected.avg",
+    "smsp__warps_issue_stalled_sleeping.avg",
+    "smsp__warps_issue_stalled_membar.avg",
+    "smsp__warps_issue_stalled_dispatch_stall.avg",
+    "smsp__warps_issue_stalled_drain.avg",
+    "smsp__warps_issue_stalled_imc_miss.avg",
+    "smsp__warps_issue_stalled_lg_throttle.avg",
+    "smsp__warps_issue_stalled_branch_resolving.avg",
+})
+
+
+def parse_ncu_csv(path):
+    """Parse a single-kernel ncu csv -> {metric_name: float}.  Takes the last
+    occurrence when a metric appears multiple times (ncu occasionally emits
+    dupes across sections)."""
+    out = {}
+    try:
+        with open(path) as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header: return out
+            name_i = header.index("Metric Name")
+            unit_i = header.index("Metric Unit") if "Metric Unit" in header else None
+            val_i  = header.index("Metric Value")
+            for row in reader:
+                if len(row) <= val_i: continue
+                name = row[name_i]
+                raw = row[val_i].replace(",", "")
+                try:
+                    v = float(raw)
+                except ValueError:
+                    continue
+                unit = row[unit_i] if unit_i is not None else ""
+                if unit == "Gbyte":         v *= 1e9
+                elif unit == "Mbyte":       v *= 1e6
+                elif unit == "Kbyte":       v *= 1e3
+                out[name] = v
+    except (FileNotFoundError, StopIteration):
+        pass
+    return out
+
+
+def load_ncu_metrics(bench_dir, df):
+    """For each row in df, find the matching .csv (same basename) and attach
+    per-row ncu metric columns."""
+    rows = []
+    for _, r in df.iterrows():
+        csv_path = os.path.join(bench_dir, f"{r['basename']}.csv")
+        metrics = parse_ncu_csv(csv_path) if os.path.exists(csv_path) else {}
+        new = dict(r)
+        for m in NCU_METRICS_OF_INTEREST:
+            new[m] = metrics.get(m, float('nan'))
+        rows.append(new)
     return pd.DataFrame(rows)
 
 
@@ -601,20 +890,29 @@ def load_stagger_csv(path):
 
 
 def build_feature_frame(df):
-    """Attach feature columns to each (layer, dispatch, kstagger, nstagger) row
-    where the dispatch is simulatable."""
+    """Attach feature columns to each row where the dispatch is simulatable.
+    Rows carrying `td` and `params` are simulated directly; otherwise we fall
+    back to DISPATCH_TD lookup (stagger-CSV path)."""
     cache = {}
     rows = []
     for _, r in df.iterrows():
-        disp = r["dispatch"]
-        if disp not in DISPATCH_TD:
-            continue
-        td = DISPATCH_TD[disp]
-        key = (r["layer"], td, int(r["kstagger"]), int(r["nstagger"]))
+        td_val = r.get("td") if "td" in df.columns else None
+        has_td = td_val is not None and not (isinstance(td_val, float) and math.isnan(td_val))
+        if has_td:
+            td = int(td_val)
+            p = r.get("params") if "params" in df.columns else None
+            params = dict(p) if isinstance(p, (frozenset, set, list, tuple, dict)) else {}
+        else:
+            disp = r.get("dispatch")
+            if disp not in DISPATCH_TD:
+                continue
+            td = DISPATCH_TD[disp]
+            params = {}
+        ks, ns = int(r["kstagger"]), int(r["nstagger"])
+        key = (r["layer"], td, ks, ns, frozenset(params.items()))
         if key not in cache:
             try:
-                cache[key] = features(r["layer"], td,
-                                      int(r["kstagger"]), int(r["nstagger"]))
+                cache[key] = features(r["layer"], td, ks, ns, params=params)
             except Exception as e:
                 print(f"  feature fail for {key}: {e}", file=sys.stderr)
                 cache[key] = None
@@ -656,6 +954,11 @@ FEATURE_COLS = [
     "ks", "ks_odd", "k_phase_div", "k_phase_max", "ns", "ns_nontriv",
     # layer-scaling interactions
     "a_reuse_KI", "b_reuse_KI", "store_conc_KI",
+    # L2 simulation: 16-way set-assoc, K-slab grain (32 KB), drift-jittered
+    "l2_a_hit", "l2_b_hit", "l2_r_hit", "l2_hit_rate", "l2_evict_rate",
+    "l2_a_hit_cold", "l2_a_hit_warm",
+    "l2_a_hit_drift_w2", "l2_a_hit_drift_w4", "l2_a_hit_drift_w8",
+    "l2_hit_drift_w2",   "l2_hit_drift_w4",   "l2_hit_drift_w8",
 ]
 
 
@@ -704,13 +1007,16 @@ def _loo_rmse(model_ctor, Xs, y):
     return rmse, r2, y_preds
 
 
-def fit_report(df, layer, mode, feature_cols=FEATURE_COLS):
+def fit_report(df, layer, mode, feature_cols=FEATURE_COLS,
+               target_col="ms", target_unit="ms"):
     sub = df[(df.layer == layer) & (df["mode"] == mode)].copy()
+    sub = sub.dropna(subset=[target_col])
     if len(sub) < 4:
-        print(f"[{layer} {mode}]  n={len(sub)} — too few samples, skip")
+        print(f"[{layer} {mode} → {target_col}]  n={len(sub)} — too few samples, skip")
         return
+    is_stall_target = target_col in STALL_TARGETS
     X = sub[feature_cols].values.astype(np.float64)
-    y = sub["ms"].values
+    y = sub[target_col].values.astype(np.float64)
     keep = [i for i in range(X.shape[1]) if X[:, i].std() > 1e-9]
     cols = [feature_cols[i] for i in keep]
     X = X[:, keep]
@@ -730,23 +1036,23 @@ def fit_report(df, layer, mode, feature_cols=FEATURE_COLS):
             corrs.append((i, c, r))
     corrs.sort(key=lambda t: -abs(t[2]))
 
-    sub_sorted = sub.sort_values("ms").reset_index(drop=True)
-    print(f"\n=== {layer} {mode}   n={len(sub)}   σ(ms)={y_std:.3f} ===")
-    print("  Per-variant features (sorted by ms, top-6 correlators):")
+    sub_sorted = sub.sort_values(target_col).reset_index(drop=True)
+    print(f"\n=== {layer} {mode} → {target_col}   n={len(sub)}   σ={y_std:.4g} {target_unit} ===")
+    print(f"  Per-variant features (sorted by {target_col}, top-6 correlators):")
     top6 = [c for _, c, _ in corrs[:6]]
     tag_w = 20
-    hdr = f"  {'variant':<{tag_w}} {'ms':>6}  " + "  ".join(f"{c:>9}" for c in top6)
+    hdr = f"  {'variant':<{tag_w}} {target_col[:8]:>9}  " + "  ".join(f"{c:>9}" for c in top6)
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
     for _, r in sub_sorted.iterrows():
         tag = r["dispatch"]
         if r["kstagger"] or r["nstagger"]:
             tag += f" k{r['kstagger']}n{r['nstagger']}"
-        row = f"  {tag:<{tag_w}} {r['ms']:>6.3f}  " + "  ".join(
+        row = f"  {tag:<{tag_w}} {r[target_col]:>9.4g}  " + "  ".join(
             f"{r[c]:>9.3f}" for c in top6)
         print(row)
 
-    print(f"\n  Univariate correlations with ms  (|r|>0.3 shown):")
+    print(f"\n  Univariate correlations with {target_col}  (|r|>0.3 shown):")
     for _, c, r in corrs:
         if abs(r) < 0.30:
             continue
@@ -802,20 +1108,38 @@ def fit_report(df, layer, mode, feature_cols=FEATURE_COLS):
         picked = []
         print(f"  Lasso failed: {e}")
 
-    # Gradient boosting — catches nonlinear interactions, reg'd hard for small n
-    try:
-        gbr_kwargs = dict(n_estimators=30, max_depth=2, learning_rate=0.1,
-                          min_samples_leaf=2, random_state=0)
-        gbr = GradientBoostingRegressor(**gbr_kwargs).fit(Xs, y)
-        rmse_gbr_train = float(np.sqrt(((y - gbr.predict(Xs)) ** 2).mean()))
-        if len(sub) >= 5:
-            rmse_gbr_loo, r2_gbr_loo, _ = _loo_rmse(
-                lambda: GradientBoostingRegressor(**gbr_kwargs), Xs, y)
-        else:
-            rmse_gbr_loo, r2_gbr_loo = float('nan'), float('nan')
-        reports.append(("gbr(d=2,n=30)", rmse_gbr_train, rmse_gbr_loo, r2_gbr_loo))
-    except Exception as e:
-        print(f"  GBR failed: {e}")
+    # Gradient boosting — catches nonlinear interactions. For stall targets
+    # (wait, long_sb, etc.) we expect rectified-linear "consumer wait vs
+    # producer supply" shapes that ridge can't represent, so GBM becomes the
+    # primary model. At n ≈ 28 we can afford a richer tree.
+    gbr_variants = []
+    if is_stall_target:
+        gbr_variants.append(("gbr(d=3,n=120)",
+                             dict(n_estimators=120, max_depth=3, learning_rate=0.05,
+                                  min_samples_leaf=2, subsample=0.8, random_state=0)))
+        gbr_variants.append(("gbr(d=2,n=60)",
+                             dict(n_estimators=60, max_depth=2, learning_rate=0.08,
+                                  min_samples_leaf=2, random_state=0)))
+    else:
+        gbr_variants.append(("gbr(d=2,n=30)",
+                             dict(n_estimators=30, max_depth=2, learning_rate=0.1,
+                                  min_samples_leaf=2, random_state=0)))
+    gbr_model = None
+    for gname, gbr_kwargs in gbr_variants:
+        try:
+            gbr = GradientBoostingRegressor(**gbr_kwargs).fit(Xs, y)
+            rmse_gbr_train = float(np.sqrt(((y - gbr.predict(Xs)) ** 2).mean()))
+            if len(sub) >= 5:
+                rmse_gbr_loo, r2_gbr_loo, _ = _loo_rmse(
+                    lambda kw=gbr_kwargs: GradientBoostingRegressor(**kw), Xs, y)
+            else:
+                rmse_gbr_loo, r2_gbr_loo = float('nan'), float('nan')
+            reports.append((gname, rmse_gbr_train, rmse_gbr_loo, r2_gbr_loo))
+            if gbr_model is None or (not np.isnan(r2_gbr_loo) and
+                                     r2_gbr_loo > gbr_model[1]):
+                gbr_model = (gbr, r2_gbr_loo, gname)
+        except Exception as e:
+            print(f"  {gname} failed: {e}")
 
     print(f"\n  Model                       rmse_train  rmse_loo  R²_loo")
     print(f"  --------------------------- ----------- --------- -------")
@@ -834,36 +1158,79 @@ def fit_report(df, layer, mode, feature_cols=FEATURE_COLS):
         for rmse, feats in best3:
             print(f"    rmse_loo={rmse:.4f}  {{{', '.join(feats)}}}")
 
-    # Residuals under best-LOO model
+    # Residuals under the primary model. For stall targets, GBM (captures
+    # rectified-linear producer/consumer shapes); for everything else, Ridge.
     best = min(reports, key=lambda r: r[2] if not np.isnan(r[2]) else float('inf'))
-    print(f"\n  Best LOO model: {best[0]}  rmse={best[2]:.4f} ms")
-    y_pred_train = ridge.predict(Xs)
-    sub2 = sub.assign(pred=y_pred_train, resid=y - y_pred_train).sort_values("resid")
-    print(f"  Ridge-all residuals (negative = faster than model predicts):")
+    print(f"\n  Best LOO model: {best[0]}  rmse={best[2]:.4g} {target_unit}   R²={best[3]:+.3f}")
+    if is_stall_target and gbr_model is not None:
+        primary_name = f"GBM ({gbr_model[2]})"
+        y_pred_primary = gbr_model[0].predict(Xs)
+    else:
+        primary_name = "Ridge-all"
+        y_pred_primary = ridge.predict(Xs)
+    sub2 = sub.assign(pred=y_pred_primary, resid=y - y_pred_primary).sort_values("resid")
+    print(f"  {primary_name} residuals (negative = actual < predicted):")
     for _, r in sub2.iterrows():
         tag = f"{r['dispatch']}"
         if r["kstagger"] or r["nstagger"]:
             tag += f" k{r['kstagger']}n{r['nstagger']}"
-        print(f"    {tag:<22} ms={r['ms']:.3f}  pred={r['pred']:.3f}  resid={r['resid']:+.3f}")
+        print(f"    {tag:<22} obs={r[target_col]:.4g}  pred={r['pred']:.4g}  resid={r['resid']:+.4g}")
+
+
+def validate_l2_simulator(feat_df):
+    """Scatter sim l2_hit_rate against real lts__t_sector_hit_rate.pct."""
+    col_real = "lts__t_sector_hit_rate.pct"
+    if col_real not in feat_df.columns:
+        print("\n[l2 validate]  no ncu hit-rate column present — skipping")
+        return
+    sub = feat_df.dropna(subset=[col_real]).copy()
+    if len(sub) < 3:
+        print(f"\n[l2 validate]  only {len(sub)} rows with ncu hit-rate — skipping")
+        return
+    for layer in sorted(sub["layer"].unique()):
+        for mode in sorted(sub["mode"].unique()):
+            g = sub[(sub.layer == layer) & (sub["mode"] == mode)]
+            if len(g) < 3: continue
+            sim = g["l2_hit_rate"].values * 100.0  # → pct
+            real = g[col_real].values
+            r = float(np.corrcoef(sim, real)[0, 1]) if len(g) > 1 else float('nan')
+            bias = float((sim - real).mean())
+            mae = float(np.abs(sim - real).mean())
+            print(f"\n[l2 sim vs ncu]  {layer} {mode}   n={len(g)}   "
+                  f"r={r:+.3f}   bias(sim-real)={bias:+.2f} pp   MAE={mae:.2f} pp")
+            print(f"  {'variant':<22} {'sim%':>7}  {'real%':>7}  {'Δ':>7}")
+            for _, row in g.sort_values(col_real).iterrows():
+                tag = row["dispatch"]
+                if row["kstagger"] or row["nstagger"]:
+                    tag += f" k{row['kstagger']}n{row['nstagger']}"
+                s = row["l2_hit_rate"] * 100
+                r_ = row[col_real]
+                print(f"  {tag:<22} {s:>7.2f}  {r_:>7.2f}  {s - r_:>+7.2f}")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bench", default="data/bench_20260418_034637",
-                    help="bench dir with _wall_r1.txt files")
+    ap.add_argument("--bench", default="data/bench_20260418_175934",
+                    help="bench dir with _wall_r1.txt and _.csv files")
     ap.add_argument("--extra", nargs="*", default=[],
                     help="extra stagger/kstagger CSV files to merge")
     ap.add_argument("--dump-features", action="store_true")
     ap.add_argument("--layer", choices=["fc1", "fc2", "both"], default="both")
+    ap.add_argument("--targets", nargs="*", default=["ms"],
+                    help="regression targets: ms, or any NCU metric in the csv "
+                         "(e.g., long_scoreboard, l2_hit, barrier, dram_read)")
+    ap.add_argument("--validate-l2", action="store_true",
+                    help="scatter sim l2_hit_rate vs ncu lts__t_sector_hit_rate")
     args = ap.parse_args()
 
     os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     frames = []
+    bench_df = None
     if args.bench and os.path.isdir(args.bench):
-        df = load_bench(args.bench)
-        print(f"loaded {len(df)} rows from {args.bench}")
-        frames.append(df)
+        bench_df = load_bench(args.bench)
+        print(f"loaded {len(bench_df)} rows from {args.bench}")
+        frames.append(bench_df)
     for p in args.extra:
         for mp in glob.glob(p):
             df = load_stagger_csv(mp)
@@ -875,9 +1242,19 @@ def main():
         sys.exit(1)
 
     df = pd.concat(frames, ignore_index=True)
-    # collapse duplicates (same config seen twice across sources) by taking mean
+    # collapse duplicates (same config seen twice across sources); keep the
+    # first td/params/basename of each group.
+    agg = {"ms": "mean"}
+    for col in ("td", "params", "basename"):
+        if col in df.columns:
+            agg[col] = "first"
     df = df.groupby(["layer", "dispatch", "kstagger", "nstagger", "mode"],
-                    as_index=False)["ms"].mean()
+                    as_index=False).agg(agg)
+
+    if bench_df is not None and "basename" in df.columns:
+        df = load_ncu_metrics(args.bench, df)
+        ncu_attached = [c for c in NCU_METRICS_OF_INTEREST if c in df.columns]
+        print(f"  attached {len(ncu_attached)} ncu metrics from per-variant csvs")
 
     feat_df = build_feature_frame(df)
     print(f"\n{len(feat_df)} rows with features (out of {len(df)}; dropped "
@@ -888,10 +1265,43 @@ def main():
         feat_df.to_csv("data/tile_features.csv", index=False)
         print("wrote data/tile_features.csv")
 
+    if args.validate_l2:
+        validate_l2_simulator(feat_df)
+
+    alias = {
+        "ms":             ("ms", "ms"),
+        "long_scoreboard":("smsp__warps_issue_stalled_long_scoreboard.avg", "warps"),
+        "long_sb":        ("smsp__warps_issue_stalled_long_scoreboard.avg", "warps"),
+        "barrier":        ("smsp__warps_issue_stalled_barrier.avg", "warps"),
+        "wait":           ("smsp__warps_issue_stalled_wait.avg", "warps"),
+        "mio":            ("smsp__warps_issue_stalled_mio_throttle.avg", "warps"),
+        "math_thr":       ("smsp__warps_issue_stalled_math_pipe_throttle.avg", "warps"),
+        "short_sb":       ("smsp__warps_issue_stalled_short_scoreboard.avg", "warps"),
+        "membar":         ("smsp__warps_issue_stalled_membar.avg", "warps"),
+        "dispatch":       ("smsp__warps_issue_stalled_dispatch_stall.avg", "warps"),
+        "drain":          ("smsp__warps_issue_stalled_drain.avg", "warps"),
+        "imc_miss":       ("smsp__warps_issue_stalled_imc_miss.avg", "warps"),
+        "lg_thr":         ("smsp__warps_issue_stalled_lg_throttle.avg", "warps"),
+        "branch":         ("smsp__warps_issue_stalled_branch_resolving.avg", "warps"),
+        "not_selected":   ("smsp__warps_issue_stalled_not_selected.avg", "warps"),
+        "sleeping":       ("smsp__warps_issue_stalled_sleeping.avg", "warps"),
+        "cycles":         ("smsp__cycles_active.avg", "cyc"),
+        "l2_hit":         ("lts__t_sector_hit_rate.pct", "pct"),
+        "dram_read":      ("dram__bytes_read.sum", "B"),
+        "sm_thru":        ("sm__throughput.avg.pct_of_peak_sustained_elapsed", "pct"),
+    }
+
     layers = ["fc1", "fc2"] if args.layer == "both" else [args.layer]
-    for layer in layers:
-        for mode in ["fused", "gemm", "strip"]:
-            fit_report(feat_df, layer, mode)
+    for tgt_name in args.targets:
+        tgt_col, tgt_unit = alias.get(tgt_name, (tgt_name, ""))
+        if tgt_col not in feat_df.columns:
+            print(f"\n[skip] target '{tgt_name}' -> {tgt_col!r} not in frame")
+            continue
+        print(f"\n##### target = {tgt_col} ({tgt_unit}) #####")
+        for layer in layers:
+            for mode in ["fused", "gemm", "strip"]:
+                fit_report(feat_df, layer, mode,
+                           target_col=tgt_col, target_unit=tgt_unit)
 
 
 if __name__ == "__main__":

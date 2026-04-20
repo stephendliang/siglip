@@ -312,7 +312,7 @@ if [ "$DO_NCU" = "1" ]; then
     log ""
     log "── Phase 3: ncu metrics ──"
 
-    METRICS_STALL="smsp__warps_issue_stalled_long_scoreboard.avg,smsp__warps_issue_stalled_short_scoreboard.avg,smsp__warps_issue_stalled_wait.avg,smsp__warps_issue_stalled_barrier.avg,smsp__warps_issue_stalled_sleeping.avg,smsp__warps_issue_stalled_not_selected.avg,smsp__warps_issue_stalled_mio_throttle.avg,smsp__warps_issue_stalled_math_pipe_throttle.avg"
+    METRICS_STALL="smsp__warps_issue_stalled_long_scoreboard.avg,smsp__warps_issue_stalled_short_scoreboard.avg,smsp__warps_issue_stalled_wait.avg,smsp__warps_issue_stalled_barrier.avg,smsp__warps_issue_stalled_sleeping.avg,smsp__warps_issue_stalled_not_selected.avg,smsp__warps_issue_stalled_mio_throttle.avg,smsp__warps_issue_stalled_math_pipe_throttle.avg,smsp__warps_issue_stalled_membar.avg,smsp__warps_issue_stalled_dispatch_stall.avg,smsp__warps_issue_stalled_drain.avg,smsp__warps_issue_stalled_imc_miss.avg,smsp__warps_issue_stalled_lg_throttle.avg,smsp__warps_issue_stalled_branch_resolving.avg"
     METRICS_MEM="dram__throughput.avg.pct_of_peak_sustained_elapsed,dram__bytes_read.sum,dram__bytes_write.sum,dram__sectors_read.sum,dram__sectors_write.sum,lts__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sectors.sum,lts__t_sectors_op_read.sum,lts__t_sectors_op_write.sum,lts__t_sector_hit_rate.pct,l1tex__throughput.avg.pct_of_peak_sustained_elapsed"
     METRICS_PIPE="sm__throughput.avg.pct_of_peak_sustained_elapsed,sm__pipe_shared_cycles_active.avg.pct_of_peak_sustained_elapsed,sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_elapsed,sm__mio_pq_read_cycles_active.avg.pct_of_peak_sustained_elapsed,sm__mio_pq_write_cycles_active.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.per_cycle_active,smsp__cycles_active.avg,smsp__inst_executed.sum"
     METRICS_SCHED="smsp__warps_eligible.avg.per_cycle_active,launch__registers_per_thread,launch__occupancy"
@@ -560,6 +560,12 @@ if ncu_rows:
         ("not_selected",      "smsp__warps_issue_stalled_not_selected.avg"),
         ("mio_thr",           "smsp__warps_issue_stalled_mio_throttle.avg"),
         ("math_thr",          "smsp__warps_issue_stalled_math_pipe_throttle.avg"),
+        ("membar",            "smsp__warps_issue_stalled_membar.avg"),
+        ("dispatch",          "smsp__warps_issue_stalled_dispatch_stall.avg"),
+        ("drain",             "smsp__warps_issue_stalled_drain.avg"),
+        ("imc_miss",          "smsp__warps_issue_stalled_imc_miss.avg"),
+        ("lg_thr",            "smsp__warps_issue_stalled_lg_throttle.avg"),
+        ("branch",            "smsp__warps_issue_stalled_branch_resolving.avg"),
         # DRAM
         ("dram_rd_B",         "dram__bytes_read.sum"),
         ("dram_wr_B",         "dram__bytes_write.sum"),
