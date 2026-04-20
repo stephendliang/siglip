@@ -1106,7 +1106,10 @@ void try_config_family(
     // instead of hitting CUTLASS's static_assert.
 
 #if CUTLASS_COMPREHENSIVE_SWEEP
-    if constexpr (CM == 1 && CN == 1 && TM <= 128) {
+    // 1sm path: cluster = {1x1, 1x2, 2x1}. Multi-CTA linear clusters still
+    // work with cta_group::1 because each CTA owns its own MMA; TMA can
+    // multicast across the 2 CTAs along whichever axis is ≥2.
+    if constexpr (TM <= 128 && CM*CN <= 2 && (CM == 1 || CN == 1)) {
         try_config_policy<TM,TN,TK,CM,CN,
             cutlass::gemm::KernelTmaWarpSpecialized1SmSm100,
             cutlass::epilogue::TmaWarpSpecialized1Sm,
@@ -1134,6 +1137,35 @@ void try_config_family(
                 "1sm/1sm/S4",
                 d_A, d_B, d_C, d_D, epilogue_data,
                 M, N, K, seq_len, hw_info, ms_post_ref, d_bytes, results);
+#if CUTLASS_EXTENDED_SWEEP
+        try_config_policy<TM,TN,TK,CM,CN,
+            cutlass::gemm::KernelTmaWarpSpecialized1SmSm100,
+            cutlass::epilogue::TmaWarpSpecialized1Sm,
+            5>(
+                tile_name.c_str(),
+                clust_name.c_str(),
+                "1sm/1sm/S5",
+                d_A, d_B, d_C, d_D, epilogue_data,
+                M, N, K, seq_len, hw_info, ms_post_ref, d_bytes, results);
+        try_config_policy<TM,TN,TK,CM,CN,
+            cutlass::gemm::KernelTmaWarpSpecialized1SmSm100,
+            cutlass::epilogue::TmaWarpSpecialized1Sm,
+            6>(
+                tile_name.c_str(),
+                clust_name.c_str(),
+                "1sm/1sm/S6",
+                d_A, d_B, d_C, d_D, epilogue_data,
+                M, N, K, seq_len, hw_info, ms_post_ref, d_bytes, results);
+        try_config_policy<TM,TN,TK,CM,CN,
+            cutlass::gemm::KernelTmaWarpSpecialized1SmSm100,
+            cutlass::epilogue::TmaWarpSpecialized1Sm,
+            7>(
+                tile_name.c_str(),
+                clust_name.c_str(),
+                "1sm/1sm/S7",
+                d_A, d_B, d_C, d_D, epilogue_data,
+                M, N, K, seq_len, hw_info, ms_post_ref, d_bytes, results);
+#endif
     }
 
     if constexpr (TM >= 128 && (CM % 2 == 0)) {
@@ -1172,6 +1204,24 @@ void try_config_family(
                 tile_name.c_str(),
                 clust_name.c_str(),
                 "2sm/2sm/S5",
+                d_A, d_B, d_C, d_D, epilogue_data,
+                M, N, K, seq_len, hw_info, ms_post_ref, d_bytes, results);
+        try_config_policy<TM,TN,TK,CM,CN,
+            cutlass::gemm::KernelTmaWarpSpecialized2SmSm100,
+            cutlass::epilogue::TmaWarpSpecialized2Sm,
+            6>(
+                tile_name.c_str(),
+                clust_name.c_str(),
+                "2sm/2sm/S6",
+                d_A, d_B, d_C, d_D, epilogue_data,
+                M, N, K, seq_len, hw_info, ms_post_ref, d_bytes, results);
+        try_config_policy<TM,TN,TK,CM,CN,
+            cutlass::gemm::KernelTmaWarpSpecialized2SmSm100,
+            cutlass::epilogue::TmaWarpSpecialized2Sm,
+            7>(
+                tile_name.c_str(),
+                clust_name.c_str(),
+                "2sm/2sm/S7",
                 d_A, d_B, d_C, d_D, epilogue_data,
                 M, N, K, seq_len, hw_info, ms_post_ref, d_bytes, results);
 #endif
@@ -1407,7 +1457,7 @@ int main(int argc, char** argv) {
         TRY(128, 128,  64, 1, 1);
 
 #if CUTLASS_EXTENDED_SWEEP
-        // Extended 2SM configs (cluster_n=2)
+        // Extended 2SM configs (cluster_n=2, 4-CTA clusters)
         TRY(256, 256, 128, 2, 2);
         TRY(256, 128, 128, 2, 2);
         TRY(256, 192, 128, 2, 2);
@@ -1415,17 +1465,28 @@ int main(int argc, char** argv) {
         TRY(128, 128, 128, 2, 2);
         TRY(128, 192, 128, 2, 2);
 
+        // Extended 2SM configs (cluster_m=4, M-direction 4-CTA clusters —
+        // cuBLASLt uses 4-CTA 2x2 for tile=128x192, worth trying the M-only
+        // 4-CTA variant too since our hand-tuned fc2_w3_c4* deadlocks there)
+        TRY(128, 128, 128, 4, 1);
+        TRY(128, 256, 128, 4, 1);
+        TRY(256, 128, 128, 4, 1);
+        TRY(256, 256, 128, 4, 1);
+
         // Extended K=64 variants
         TRY(256, 192,  64, 2, 1);
         TRY(128, 192,  64, 2, 1);
         TRY(128, 128,  64, 2, 1);
         TRY(128, 192,  64, 1, 1);
 
-        // Extended 1SM configs
+        // Extended 1SM configs (linear clusters now allowed)
         TRY(128, 128, 128, 1, 1);
         TRY(128, 256, 128, 1, 1);
         TRY(128, 192, 128, 1, 1);
         TRY( 64, 192, 128, 1, 1);
+        TRY(128, 128, 128, 1, 2);
+        TRY(128, 256, 128, 1, 2);
+        TRY(128, 192, 128, 1, 2);
 #endif
     }
 
