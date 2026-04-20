@@ -114,6 +114,39 @@ if ! skip_probe 2; then
         nk=$(wc -l < "$OUT_DIR/${shape}_kernels.txt")
         log "  [${shape}] captured $nk distinct kernel-like strings"
         head -6 "$OUT_DIR/${shape}_kernels.txt" | sed "s/^/    /" | tee -a "$OUT_DIR/session.log"
+
+        summary="$OUT_DIR/${shape}_algo_summary.txt"
+        python3 - "$OUT_DIR/${shape}_cublaslt.log" "$summary" <<'PY'
+import re, sys, collections
+log, out = sys.argv[1], sys.argv[2]
+rows = []
+try: text = open(log).read()
+except Exception as e: open(out, "w").write(f"ERR: {e}\n"); sys.exit(0)
+tre = re.compile(r'\[Trace\]\[cublasLtMatmul\].*?'
+                 r'(?:aScaleMode=(?P<aSM>[A-Z0-9_]+).*?)?'
+                 r'algo=\[(?P<algo>[^\]]+)\].*?')
+epi = re.compile(r'epilogue=(EPILOGUE_[A-Z_0-9]+)')
+for line in text.splitlines():
+    m = tre.search(line)
+    if not m: continue
+    algo = m.group("algo")
+    ascale = m.group("aSM") or "R_32F_scalar"
+    em = epi.search(line)
+    epi_str = em.group(1) if em else "NONE"
+    rows.append((ascale, epi_str, algo))
+seen = collections.Counter()
+for r in rows: seen[r] += 1
+with open(out, "w") as f:
+    f.write(f"### {log}\n")
+    f.write(f"### {len(rows)} Trace cublasLtMatmul launches grouped below\n\n")
+    for (ascale, epi_str, algo), n in seen.most_common():
+        f.write(f"[x{n:>3}] scale={ascale:<14} epilogue={epi_str:<24}\n")
+        f.write(f"         algo=[{algo}]\n\n")
+PY
+        if [ -s "$summary" ]; then
+            log "  [${shape}] algo summary → $(basename "$summary"):"
+            sed "s/^/      /" "$summary" | tee -a "$OUT_DIR/session.log"
+        fi
     done
 fi
 
