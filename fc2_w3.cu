@@ -428,10 +428,19 @@ void mbar_wait(uint32_t addr, uint32_t phase) {
         asm volatile(
             "{\n\t"
             ".reg .pred p;\n\t"
+#ifdef NANOSLEEP_TRYWAIT_CYC
+            "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2;\n\t"
+#else
             "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2, 0x989680;\n\t"
+#endif
             "selp.b32 %0, 1, 0, p;\n\t"
             "}"
             : "=r"(done) : "r"(addr), "r"(phase));
+#ifdef NANOSLEEP_TRYWAIT_CYC
+        if (!done) {
+            asm volatile("nanosleep.u32 %0;" :: "r"((uint32_t)NANOSLEEP_TRYWAIT_CYC));
+        }
+#endif
     } while (!done);
 }
 
@@ -1059,6 +1068,17 @@ fc2_w3_kernel(
     }
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
+#ifdef ACQBULK_FENCE
+#if ACQBULK_FENCE == 1
+    asm volatile("fence.proxy.async.shared::cluster;" ::: "memory");
+#elif ACQBULK_FENCE == 2
+    asm volatile("fence.proxy.async;" ::: "memory");
+#elif ACQBULK_FENCE == 3
+    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+#else
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#endif
+#endif
 
     /* ── TMEM alloc ── */
     if (warp == 1) {
