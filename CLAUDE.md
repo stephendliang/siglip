@@ -274,25 +274,68 @@ cuBLASLt's **default heuristic pick**, not rank-1.
 **FC1 rank-1 (K=768, M=928256, N=3072, gelu_bias): cuBLASLt 1.894 ms** vs best
 ours 1.998 (zigzag+ks=1) → **+104 µs (+5.5%) — wider gap than FC2**.
 
-### Winner config (FC2)
+### Enum decode — authoritative (do NOT re-derive)
 
-Stable across K: `stages=36 splitk=1 swizzle=0 customOption=0 clusterShape=2x1x1`
-(from probe 2 verbose log). Tile enum winner is near-tied between `tile=23` and
-`tile=201` at K=3072 (winner flips run-to-run). At K≥4096 `tile=23` wins stably.
-Tile IDs are `CUBLASLT_MATMUL_TILE_*` enums (ordinals, not sizes); still need
-decode against `cublasLt.h`.
+From `/opt/cuda/targets/x86_64-linux/include/cublasLt.h`:
+- **`CUBLASLT_MATMUL_TILE_*`** — per-CTA tile shape. Lookups: `23=128x256`,
+  `24=256x128`, `32=128x192`, `197=168x128`, `201=176x128`, `495=256x96`,
+  `535=320x192`. Enum is per-CTA; cluster output = tile × clusterShape.
+- **`stages=36 = CUBLASLT_MATMUL_STAGES_128xAUTO`** — K-stage=128, pipeline
+  depth is AUTO, **resolved at kernel-compile time per variant** (not runtime).
+  cuBLASLt ships multiple prebuilt variants with different NS; heuristic picks.
 
-### Implications
+### Full rank-1..8 decode via nsys (FC2 K=3072 on B200, 2026-04-20)
 
-- The cuBLASLt advantage is NOT split-K (splitk=1 throughout). It's a single
-  fast MMA-only kernel config we haven't matched.
-- Our `-9.5%` vs CUTLASS-reference is real, but CUTLASS is not the ceiling.
-- Within our kernels, **dgswizzle leads FC2 at K=3072–6144, lean takes over at
-  short K (1024/2048, NO_PREFILL kicks in) and at K=8192** (0.003 ms under dgsw).
-- FC1 K=768 cuBLASLt heuristics include **no 2x2x1 (4-CTA) entry** — 4-CTA is
-  ruled out at short K, so our `fc2_w3_c4*` multicast deadlocks are not the FC1
-  lever to chase. 4-CTA remains interesting only for FC2 per-tensor FP8 where
-  cuBLASLt lists a `tile=128x192 clusterShape=2x2x1` heuristic.
+Kernel names: `nvjet_sm100_qqtst_<M>x<N>_128x<NS>_<CM>x<CN>_[2cta_]<h|v>_<...>_T<A><B>`.
+Token `2cta` = **cta_group::2** present, absent = cta_group::1. `h/v` = TMA
+multicast axis (h=along N, v=along M). `bz_bias` = bias-only epilogue.
+
+| rank | tile (enum)    | NS | cluster | cta_grp | ms     |
+|------|----------------|----|---------|---------|--------|
+| **1**| 176x128 (201)  | 8  | 1x2     | **2**   | 1.0454 |
+| **2**| 128x256 (23)   | 6  | 2x1     | **2**   | 1.0457 |
+| 3    | 128x192 (32)   | 7  | 2x1     | 2       | 1.094  |
+| 4    | 256x256 (513)  | 4  | 2x1     | 2       | 1.192  |
+| 5    | 320x192 (535)  | 4  | 2x1     | 2       | 1.196  |
+| 6    | 256x128 (24)   | 4  | 1x2     | 1       | 1.267  |
+| 7    | 168x128 (197)  | 5  | 1x2     | 1       | 1.358  |
+| 8    | 256x96  (495)  | 4  | 1x2     | 1       | 1.440  |
+
+### Hard-won conclusions
+
+1. **cuBLASLt's top 5 all use `cta_group::2`**. Our 2sm-MMA architecture is
+   aligned with cuBLASLt's winning designs; cta_group::1 (ranks 6–8) is
+   uniformly slower here.
+2. **Rank-2 is OUR exact geometry**: 128x256 per-CTA, 2x1 cluster, cta_group::2,
+   NS=6, v-mcast (along M). Times at **1.046 ms**. Our best (dgsw) is 1.064.
+   **We're +18 µs behind our architectural twin** — the gap is NOT
+   architectural, it's pure epilogue/dispatch/scheduling. Most important
+   comparison point going forward.
+3. **Rank-1 wins via NS=8 at a smaller 176x128 tile**, not by any clever trick.
+   NS=8 at our 256x256 is not SMEM-feasible (we jam at NS=6). Rank-1 only
+   edges rank-2 by 0.3 µs — the tile-vs-NS tradeoff is marginal.
+4. **cuBLASLt also ships a `256x256_128x4_2x1_2cta` variant** (rank-4 at 1.192).
+   Same cluster-output as ours but NS=4 — we beat it by ~125 µs. The 256x256
+   variant is a fallback in cuBLASLt's grid.
+5. **The cuBLASLt advantage is NOT split-K** (`splitk=1` throughout) and NOT
+   a CUTLASS-style swizzle (`swizzle=0` throughout). It's a single fast
+   MMA-only kernel config — rank-2's per-CTA MMA geometry is identical to
+   ours but with an epilogue/dispatch we haven't matched.
+6. FC1 K=768 cuBLASLt heuristics have **no 2x2x1 (4-CTA) entry** — 4-CTA ruled
+   out at short K. Our `fc2_w3_c4*` multicast deadlocks are not the FC1 lever.
+   4-CTA remains interesting only for FC2 per-tensor FP8 (`tile=128x192
+   clusterShape=2x2x1` is in the FC2 list).
+
+### Next action
+
+SASS-diff the FC2 rank-2 kernel against our fc2-w3-dgswizzle. Same per-CTA
+geometry → the 18 µs gap localizes to the epilogue path:
+```bash
+cuobjdump --dump-sass \
+    --function 'nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_bias_TNT' \
+    /opt/cuda/lib64/libcublasLt.so.13 > rank2.sass
+cuobjdump --dump-sass ./fc2-w3-dgswizzle > ours.sass
+```
 
 Known caveat: K=1024/2048 still report ERR — one heuristic IMAs on the device
 (`cublasLtMatmul` returns SUCCESS but `cudaDeviceSynchronize()` aborts). A
