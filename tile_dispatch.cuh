@@ -19,13 +19,20 @@
 static __device__ __forceinline__ int static_swizzle(int block_idx) {
 #if TILE_DISPATCH == 8
     /* DeepGEMM 2D swizzle: group DG_GROUP_SIZE M-blocks, sweep all N within
-       group.  (m0,n0)(m1,n0)...(m7,n0)(m0,n1)... */
+       group.  (m0,n0)(m1,n0)...(m7,n0)(m0,n1)...
+       Hot path uses compile-time DG_GROUP_SIZE divisor so ptxas emits a
+       shift, not MUFU.RCP.  Tail group (TILES_M % DG_GROUP_SIZE != 0) is
+       the only case with a variable divisor. */
     const int group_tiles = TILES_N * DG_GROUP_SIZE;
     const int group_idx = block_idx / group_tiles;
     const int first_m = group_idx * DG_GROUP_SIZE;
     const int in_group = block_idx % group_tiles;
-    const int num_in_group = min(DG_GROUP_SIZE, TILES_M - first_m);
-    return (first_m + in_group % num_in_group) * TILES_N + in_group / num_in_group;
+    if (first_m + DG_GROUP_SIZE <= TILES_M) {
+        return (first_m + in_group % DG_GROUP_SIZE) * TILES_N
+             + in_group / DG_GROUP_SIZE;
+    }
+    const int tail = TILES_M - first_m;
+    return (first_m + in_group % tail) * TILES_N + in_group / tail;
 
 #elif TILE_DISPATCH == 9
     /* Z-order (Morton): 4x4 super-blocks tiled over (TILES_M, TILES_N) in
