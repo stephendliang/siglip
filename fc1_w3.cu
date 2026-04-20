@@ -26,6 +26,13 @@ Compile-time flags:
 #include <cstdlib>
 #include <cmath>
 
+/* PACKED_TILES is default-on. Opt out with -DNO_PACKED_TILES. */
+#ifndef NO_PACKED_TILES
+#ifndef PACKED_TILES
+#define PACKED_TILES
+#endif
+#endif
+
 /* ── Hardware ── */
 #define SM_COUNT       148
 

@@ -28,11 +28,12 @@ Compile-time flags:
   -DCUTLASS_LOOP=N      Loop structure: 1=nounroll si, 2=+nounroll chunk, 3=+C++ FP32 compute
   -DSTRIP_EPILOGUE      Skip epilogue (benchmark GEMM core only, valid=0)
   -DGEMM_ONLY           Write D=BF16(A×B), no residual/bias (apples-to-apples vs cutlass strip)
-  -DPACKED_TILES        Tile-contiguous DRAM layout. Each tile is a contiguous block.
-                        TMA loads/stores are sequential DRAM bursts (no page misses).
+  -DNO_PACKED_TILES     Opt OUT of tile-contiguous DRAM layout. PACKED is default-on
+                        (was -DPACKED_TILES until 2026-04-19; flipped because PACKED is
+                        proven-better across all dispatches and tile dims tested).
   -DPRESWIZZLE          Pre-swizzle A/B in DRAM (SWIZZLE_128B applied during packing).
                         W0 uses cp.async.bulk 1D raw memcpy (no TMA descriptor/swizzle).
-                        Requires PACKED_TILES.
+                        Requires PACKED_TILES (i.e., do NOT combine with -DNO_PACKED_TILES).
   -DSINGLE_WARP_STORE=1 Only ew==0 issues TMA stores (4 per sub-iter, 1 commit group)
   -DDELAY_TMA_STORE=1   Issue TMA store from sub-iter N at start of sub-iter N+1
   -DNUM_EPI_STAGES=N    Epilogue staging depth (default 2, try 3/4)
@@ -63,6 +64,13 @@ Compile-time flags:
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+
+/* PACKED_TILES is default-on. Opt out with -DNO_PACKED_TILES. */
+#ifndef NO_PACKED_TILES
+#ifndef PACKED_TILES
+#define PACKED_TILES
+#endif
+#endif
 
 /* ── Hardware ── */
 #define SM_COUNT       148
