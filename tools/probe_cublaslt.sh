@@ -303,8 +303,10 @@ if ! skip_probe 4; then
         # Our kernel at the same K (zigzag default, since it's FC2-champion-ish)
         for variant in zigzag dgswizzle lean; do
             target="fc2-w3-$variant"
-            log "  K=$K: rebuilding $target ..."
-            make -B "$target" DFLAGS="-DPACKED_TILES -DK_DIM=$K" \
+            extra_dflags=""
+            if [ "$K" -lt 2560 ]; then extra_dflags="-DNO_PREFILL"; fi
+            log "  K=$K: rebuilding $target (DFLAGS=-DPACKED_TILES -DK_DIM=$K $extra_dflags) ..."
+            make -B "$target" DFLAGS="-DPACKED_TILES -DK_DIM=$K $extra_dflags" \
                  > "$OUT_DIR/k${K}_${variant}_build.log" 2>&1 || {
                      log "  [$target K=$K] build FAIL"; continue; }
             cp "$target" "$OUT_DIR/bin_${variant}_K${K}"
