@@ -144,17 +144,17 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n; i++) {
         // warm + time
         for (int w=0;w<N_WARM;w++) {
-            auto s = cublasLtMatmul(lt, desc, &alpha, dB, layA, dA, layB, &beta,
+            auto s = cublasLtMatmul(lt, desc, &alpha, dA, layA, dB, layB, &beta,
                                     dD, layD, dD, layD, &heur[i].algo, dWS, WS, 0);
             if (s != CUBLAS_STATUS_SUCCESS) { break; }
         }
-        auto s = cublasLtMatmul(lt, desc, &alpha, dB, layA, dA, layB, &beta,
+        auto s = cublasLtMatmul(lt, desc, &alpha, dA, layA, dB, layB, &beta,
                                 dD, layD, dD, layD, &heur[i].algo, dWS, WS, 0);
         if (s != CUBLAS_STATUS_SUCCESS) continue;
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaEventRecord(t0));
         for (int r=0;r<N_TIME;r++) {
-            cublasLtMatmul(lt, desc, &alpha, dB, layA, dA, layB, &beta,
+            cublasLtMatmul(lt, desc, &alpha, dA, layA, dB, layB, &beta,
                            dD, layD, dD, layD, &heur[i].algo, dWS, WS, 0);
         }
         CUDA_CHECK(cudaEventRecord(t1));

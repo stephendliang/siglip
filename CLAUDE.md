@@ -253,6 +253,38 @@ are. See tile dispatch section above.
 
 Root cause of striding's 1.13x: 74 clusters striding through M-rows with different N-tile phases creates a working set that exceeds L2 capacity. Work-stealing processes tiles in global order, keeping the wavefront narrow.
 
+## cuBLASLt rank-1 comparison (2026-04-19)
+
+`tools/probe_cublaslt.sh` (probe 1 = `bench/cublaslt_introspect.cu`) enumerates
+every heuristic cuBLASLt returns for the FC2 shape, times each, and reports
+rank-1. This is the true ceiling to beat. Earlier comparisons against
+`cublas-bench-fc2` measured cuBLASLt's **default heuristic pick**, not rank-1.
+
+| K    | cuBLASLt rank-1 | best ours          | gap     |
+|------|-----------------|--------------------|---------|
+| 1024 | ERR             | 0.859 (lean)       | n/a     |
+| 2048 | ERR             | 0.922 (zigzag)     | n/a     |
+| 3072 | **1.044**       | 1.063 (dgswizzle)  | +19 µs  |
+| 4096 | **1.360**       | 1.475 (dgswizzle)  | +115 µs |
+| 6144 | **1.997**       | 2.007 (dgswizzle)  | +10 µs  |
+| 8192 | **2.677**       | 2.729 (lean)       | +52 µs  |
+
+**cuBLASLt rank-1 beats us at every K ≥ 3072** with the *same* winning config
+at every K: `tile=23 stages=36 splitk=1 swizzle=0`. Implications:
+
+- The cuBLASLt advantage is NOT split-K (splitk=1 throughout). It's a single
+  fast MMA-only kernel config we haven't matched.
+- Our `-9.5%` vs CUTLASS-reference (1.226 ms @ K=3072) is real, but CUTLASS is
+  not the ceiling. cuBLASLt rank-1 is 1.044 ms — we're 19 µs behind it at
+  K=3072 and 115 µs behind at K=4096.
+- Gap is largest at K=4096 (+115 µs, +8.4%), smaller at the extremes. Worth
+  decoding tile=23 / stages=36 against the cuBLASLt enums to see what
+  concrete tile size / staging cuBLASLt is using.
+
+Known caveat: K=1024 and K=2048 still report ERR — introspect aborts on a
+device-side IMA from one of the heuristics (cublasLtMatmul returns SUCCESS
+but `cudaDeviceSynchronize()` fails). Separate fix pending.
+
 ## Dimension sweep (B200-verified)
 
 Infrastructure: `tools/dim_sweep.sh`. Dims: `-DM_TOTAL=X -DN_DIM=Y -DK_DIM=Z`. Constraints: M%256==0, N%256==0, K%128==0. Must use `make -B`.
@@ -267,19 +299,20 @@ Infrastructure: `tools/dim_sweep.sh`. Dims: `-DM_TOTAL=X -DN_DIM=Y -DK_DIM=Z`. C
 | 928256 | 1.110 | 1.226 | -9.5% |
 | 1856512 | 2.206 | 2.433 | -9.3% |
 
-### K scaling — NEEDS RE-RUN under PACKED_TILES + full dispatch set
+### K scaling under PACKED_TILES + best-of-dispatch (2026-04-19)
 
-| K | K_ITERS | w3_fused (stride) | w3_sched (TD=4) | cutlass_fused |
-|---|---|---|---|---|
-| 3072 | 24 | **1.110** | 1.134 | 1.226 |
-| 4096 | 32 | 1.538 | 1.545 | 1.551 |
-| 6144 | 48 | 2.257 | **2.098** | 2.263 |
+| K    | K_ITERS | w3 best (dispatch) | cuBLASLt rank-1 | gap to cuBLASLt |
+|------|---------|--------------------|-----------------|-----------------|
+| 1024 | 8       | 0.859 (lean)       | ERR             | n/a             |
+| 2048 | 16      | 0.922 (zigzag)     | ERR             | n/a             |
+| 3072 | 24      | 1.063 (dgswizzle)  | 1.044           | +19 µs          |
+| 4096 | 32      | 1.475 (dgswizzle)  | 1.360           | +115 µs         |
+| 6144 | 48      | 2.007 (dgswizzle)  | 1.997           | +10 µs          |
+| 8192 | 64      | 2.729 (lean)       | 2.677           | +52 µs          |
 
-Pre-PACKED_TILES, pre-dgswizzle/zigzag data. The sched advantage at K=6144 was
-interpreted as "amplification dominates at long K" but that thesis died on
-2026-04-18: amplification is not the bottleneck. The actual K=6144 winner under
-parity across dgswizzle/zigzag/ncycle-derivatives is unknown. Re-run before
-citing.
+dgswizzle leads on K=3072–6144, lean takes over at K=8192 (and at the short-K
+end where NO_PREFILL kicks in). The earlier "sched wins at K=6144" thesis
+(from pre-PACKED_TILES, pre-dgswizzle data) is superseded.
 
 ### Adaptive tuning knobs
 
