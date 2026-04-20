@@ -36,6 +36,17 @@ skip_probe() { [[ ",${SKIP}," == *",${1},"* ]]; }
 
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT_DIR/session.log"; }
 
+extract_per_tensor_fused_ms() {
+    awk '
+        /^Per-tensor FP8:/ { in_pt = 1; next }
+        in_pt && /fused/  { for(i=1;i<=NF;i++) if ($i=="ms"){print $(i-1); exit} }
+        in_pt && /^$/     { in_pt = 0 }
+    ' "$1"
+}
+extract_result_ms() {
+    grep -oP '@@RESULT.*ms=\K[0-9.]+' "$1" | head -1
+}
+
 log "========================================"
 log "  cuBLASLt probe  ${STAMP}"
 log "  out=$OUT_DIR  skip=$SKIP"
@@ -91,12 +102,15 @@ if ! skip_probe 2; then
         CUBLAS_LOGDEST_DBG="$OUT_DIR/${shape}_cublas.log" \
         CUBLAS_LOGINFO_DBG=1 \
             timeout 60 "$binary" > "$OUT_DIR/${shape}_stdout.txt" 2>&1 || true
-        # Extract every kernel name hit during the verbose log
-        grep -hoE '[A-Za-z_][A-Za-z0-9_]*sm100[A-Za-z0-9_]*' \
+        for f in "$OUT_DIR/${shape}_cublaslt.log" "$OUT_DIR/${shape}_cublas.log"; do
+            sz=$( [ -f "$f" ] && stat -c%s "$f" 2>/dev/null || echo 0 )
+            log "  [${shape}] $(basename "$f") size=${sz}B"
+        done
+        grep -hoE '[A-Za-z_][A-Za-z0-9_:]*sm_?100[A-Za-z0-9_:]*|ampere_?100[A-Za-z0-9_:]*|cutlass[A-Za-z0-9_:]*|_Z[A-Za-z0-9_]+' \
             "$OUT_DIR/${shape}_cublaslt.log" "$OUT_DIR/${shape}_cublas.log" 2>/dev/null \
             | sort -u > "$OUT_DIR/${shape}_kernels.txt"
         nk=$(wc -l < "$OUT_DIR/${shape}_kernels.txt")
-        log "  [${shape}] captured $nk distinct sm100* symbol strings"
+        log "  [${shape}] captured $nk distinct kernel-like strings"
         head -6 "$OUT_DIR/${shape}_kernels.txt" | sed "s/^/    /" | tee -a "$OUT_DIR/session.log"
     done
 fi
@@ -116,20 +130,29 @@ if ! skip_probe 3; then
 
     if [ -n "$LIB" ] && command -v cuobjdump >/dev/null 2>&1; then
         log "  enumerating sm_100 kernels (this is slow) ..."
-        cuobjdump --dump-elf-symbols "$LIB" 2>/dev/null \
-            | grep -E '^[0-9a-f]+\s+[^\s]*\s+(FUNC|OBJECT)' \
-            | awk '{print $NF}' | sort -u > "$OUT_DIR/libcublaslt_symbols.txt"
-        nsym=$(wc -l < "$OUT_DIR/libcublaslt_symbols.txt")
-        log "    $nsym symbols total"
+        cuobjdump --list-text "$LIB" 2>/dev/null \
+            | sed -n 's/.*x-\(.*\)\.sm_100\.elf\.bin/\1/p' \
+            | sort -u > "$OUT_DIR/libcublaslt_sm100_kernels.txt"
+        nsym=$(wc -l < "$OUT_DIR/libcublaslt_sm100_kernels.txt")
+        log "    $nsym sm_100 kernels in libcublasLt"
 
-        # For each kernel name seen in the verbose log, try to find a matching
-        # symbol in libcublasLt and dump its SASS.
         for shape in fc1 fc2; do
-            [ -f "$OUT_DIR/${shape}_kernels.txt" ] || continue
-            # Pick the longest sm100* string — that's typically the kernel name.
-            target=$(awk '{print length, $0}' "$OUT_DIR/${shape}_kernels.txt" \
-                     | sort -rn | head -1 | cut -d' ' -f2-)
-            [ -z "$target" ] && { log "  [${shape}] no sm100 kernel name to probe"; continue; }
+            target=""
+            if [ -f "$OUT_DIR/${shape}_kernels.txt" ] && [ -s "$OUT_DIR/${shape}_kernels.txt" ]; then
+                while read -r name; do
+                    hit=$(grep -Fx "$name" "$OUT_DIR/libcublaslt_sm100_kernels.txt" | head -1)
+                    [ -n "$hit" ] && { target="$hit"; break; }
+                done < <(awk '{print length, $0}' "$OUT_DIR/${shape}_kernels.txt" | sort -rn | cut -d' ' -f2-)
+            fi
+            if [ -z "$target" ]; then
+                if [ "$shape" = "fc1" ]; then
+                    pat='fp8.*e4m3|e4m3.*fp8|scaled.*mm.*fp8|fp8.*gemm'
+                else
+                    pat='fp8.*e4m3|e4m3.*fp8|scaled.*mm.*fp8|fp8.*gemm'
+                fi
+                target=$(grep -iE "$pat" "$OUT_DIR/libcublaslt_sm100_kernels.txt" | head -1)
+            fi
+            [ -z "$target" ] && { log "  [${shape}] no matching sm_100 kernel — skip SASS"; continue; }
             log "  [${shape}] target symbol: $target"
 
             # cuobjdump matches by function name (demangled substring)
@@ -200,19 +223,18 @@ if ! skip_probe 4; then
     echo "layer,variant,K,ms" > "$csv"
 
     for K in 1024 2048 3072 4096 6144 8192; do
-        # FC2 has K≠constant; need to rebuild cublas-bench-fc2 with -DBENCH_K=$K
         log "  K=$K: rebuilding cublas-bench-fc2 ..."
-        make -B cublas-bench-fc2 \
-             NVCC=nvcc "CFLAGS=-gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --cudart=static -DBENCH_K=$K" \
+        nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --cudart=static \
+             -DBENCH_N=768 -DBENCH_EPILOGUE=3 -DBENCH_K=$K \
+             bench/cublas_bench.cu -o "$OUT_DIR/bin_cublas_fc2_K${K}" -lcublasLt -lcublas \
              > "$OUT_DIR/k${K}_cublas_build.log" 2>&1 || {
                  log "  [K=$K] cublas build FAIL"; continue; }
-        cp cublas-bench-fc2 "$OUT_DIR/bin_cublas_fc2_K${K}"
 
         log "  K=$K: timing cublas-bench-fc2 ..."
-        ms=$(timeout 60 "$OUT_DIR/bin_cublas_fc2_K${K}" 2>&1 \
-             | grep -oP 'Per-tensor FP8.*?\K[0-9.]+(?= ms)' | head -1)
-        [ -z "$ms" ] && ms=$(timeout 60 "$OUT_DIR/bin_cublas_fc2_K${K}" 2>&1 \
-             | grep -oP 'best.*?ms=\K[0-9.]+' | head -1)
+        out="$OUT_DIR/k${K}_cublas_fc2.out"
+        timeout 120 "$OUT_DIR/bin_cublas_fc2_K${K}" > "$out" 2>&1 || true
+        ms=$(extract_per_tensor_fused_ms "$out")
+        [ -z "$ms" ] && ms=$(extract_result_ms "$out")
         echo "fc2,cublaslt,${K},${ms:-ERR}" >> "$csv"
         log "    cublaslt fc2 K=$K  ms=${ms:-ERR}"
 
@@ -224,8 +246,9 @@ if ! skip_probe 4; then
                  > "$OUT_DIR/k${K}_${variant}_build.log" 2>&1 || {
                      log "  [$target K=$K] build FAIL"; continue; }
             cp "$target" "$OUT_DIR/bin_${variant}_K${K}"
-            ms=$(timeout 60 "$OUT_DIR/bin_${variant}_K${K}" 2>&1 \
-                | grep -oP '@@RESULT.*ms=\K[0-9.]+' | head -1)
+            out="$OUT_DIR/k${K}_${variant}.out"
+            timeout 120 "$OUT_DIR/bin_${variant}_K${K}" > "$out" 2>&1 || true
+            ms=$(extract_result_ms "$out")
             echo "fc2,${variant},${K},${ms:-ERR}" >> "$csv"
             log "    $variant fc2 K=$K  ms=${ms:-ERR}"
         done
@@ -261,7 +284,9 @@ if ! skip_probe 5; then
         [ -x "$binary" ] || { log "  skip: no $binary"; continue; }
 
         # Baseline
-        ms=$(timeout 60 "$binary" 2>&1 | grep -oP 'Per-tensor FP8.*?\K[0-9.]+(?= ms)' | head -1)
+        out="$OUT_DIR/env_${shape}_baseline.out"
+        timeout 60 "$binary" > "$out" 2>&1 || true
+        ms=$(extract_per_tensor_fused_ms "$out"); [ -z "$ms" ] && ms=$(extract_result_ms "$out")
         echo "baseline,${shape},${ms:-ERR}" >> "$csv"
         log "  [${shape}] baseline                       ms=${ms:-ERR}"
 
@@ -277,7 +302,9 @@ if ! skip_probe 5; then
         )
         for ec in "${env_cfgs[@]}"; do
             k="${ec%%=*}"
-            ms=$(env "$ec" timeout 60 "$binary" 2>&1 | grep -oP 'Per-tensor FP8.*?\K[0-9.]+(?= ms)' | head -1)
+            out="$OUT_DIR/env_${shape}_${k}.out"
+            env "$ec" timeout 60 "$binary" > "$out" 2>&1 || true
+            ms=$(extract_per_tensor_fused_ms "$out"); [ -z "$ms" ] && ms=$(extract_result_ms "$out")
             echo "${k},${shape},${ms:-ERR}" >> "$csv"
             log "  [${shape}] $ec   ms=${ms:-ERR}"
         done
