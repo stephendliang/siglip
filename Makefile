@@ -502,6 +502,9 @@ cublas-bench-fc1-ncu: bench/cublas_bench.cu
 cublas-bench-fc2-ncu: bench/cublas_bench.cu
 	$(NVCC) $(CFLAGS) -std=c++17 -DBENCH_N=768 -DBENCH_K=3072 -DBENCH_EPILOGUE=3 -DNCU_MODE $< -o $@ -lcublasLt -lcublas
 
+cublaslt-introspect: bench/cublaslt_introspect.cu
+	$(NVCC) $(CFLAGS) -std=c++17 $< -o $@ -lcublasLt -lcublas
+
 # ── SASS analysis C++ tool ──
 sass-tool:
 	$(MAKE) -C tools/sass
