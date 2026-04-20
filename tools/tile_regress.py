@@ -322,6 +322,33 @@ def static_swizzle(td, block_idx, cfg):
         if tm >= TM: tm = TM - 1
         return tm * TN + local_n
 
+    if td == 22:
+        d1        = cfg.get("RK_D1", TM * TN)
+        d2        = cfg.get("RK_D2", TM)
+        d3a       = cfg.get("RK_D3A", 1)
+        d3b       = cfg.get("RK_D3B", 1)
+        threshold = cfg.get("RK_THRESHOLD", 0)
+        flip_base = cfg.get("RK_FLIP_BASE", TM - 1)
+
+        r1 = (block_idx % d1) if d1 > 0 else block_idx
+        q2 = (r1 // d2) if d2 > 0 else 0
+        r2 = (r1 %  d2) if d2 > 0 else r1
+        if q2 >= threshold:
+            q3 = (r2 // d3a) if d3a > 0 else r2
+            r3 = (r2 %  d3a) if d3a > 0 else 0
+        else:
+            q3 = (r2 // d3b) if d3b > 0 else r2
+            r3 = (r2 %  d3b) if d3b > 0 else 0
+        r3 += q2 * d3b
+        if (q2 & 1) == 0:
+            q3 = flip_base - q3
+        tm, tn = q3, r3
+        if tm < 0: tm = 0
+        if tn < 0: tn = 0
+        if tm >= TM: tm = TM - 1
+        if tn >= TN: tn = TN - 1
+        return tm * TN + tn
+
     if td == 21:
         if NC != 148 // 2:
             raise ValueError("TD=21 expects SM_COUNT=148")

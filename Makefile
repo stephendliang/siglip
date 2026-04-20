@@ -243,6 +243,9 @@ fc2-w3-inline7: fc2_w3.cu
 fc2-w3-dgswizzle: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 $< -o $@ $(LDFLAGS)
 
+fc2-w3-rk: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=22 $< -o $@ $(LDFLAGS)
+
 fc2-w3-cbmimic: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DPACKED_TILES -DTILE_DISPATCH=8 \
 	    -DNANOSLEEP_TRYWAIT_CYC=50000 -DACQBULK_FENCE=1 \

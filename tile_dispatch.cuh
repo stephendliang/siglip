@@ -428,6 +428,91 @@ static __device__ __forceinline__ int static_swizzle(int block_idx) {
         if (tm >= TILES_M) { tm = TILES_M - 1; tn = TILES_N - 1; }
         return tm * TILES_N + tn;
     }
+
+#elif TILE_DISPATCH == 22
+    /*
+       cuBLASLt nvjet_sm100_qqtst rank-1/2 tile swizzle (3-level hierarchical
+       divmod with main/tail split and boustrophedon).  Faithful port of the
+       SASS at rank1.sass:+2272..+2880.
+
+       Flow:
+         r1 = block_idx mod RK_D1              (outer wrap; q1 discarded)
+         (q2, r2) = divmod(r1, RK_D2)          (raster-row stride)
+         if q2 >= RK_THRESHOLD:
+             (q3, r3) = divmod(r2, RK_D3A)     (main body)
+         else:
+             (q3, r3) = divmod(r2, RK_D3B)     (tail region)
+         r3 += q2 * RK_D3B                      (SASS adds q2*d3b; d3b=0 disables)
+         if q2 even: q3 = RK_FLIP_BASE - q3     (boustrophedon on M)
+         tm = q3; tn = r3
+
+       RK_D3A=0 or RK_D3B=0 in the picked branch disables inner divmod
+       (q3 = r2, r3 = 0) to mirror the @UP2 UMOV path in SASS.
+
+       Defaults reproduce the geometry interpretation fit from rank-2's SASS:
+       column-major with full-M boustrophedon.  With these values:
+         q2 = cluster_tn (N-column index)
+         r2 = cluster_tm within N-column
+         q3 = r2, r3 = 0
+         tn = r3 + q2*1 = q2
+         tm = boustrophedon(q3) = (q2 even) ? (TM-1)-r2 : r2
+       i.e. all clusters in a wave share the same tn (maximum B-tile L2 reuse),
+       M-direction flips per N-column to kill the "jump back to tm=0" cache
+       cliff.  Override RK_D2/RK_D3A/RK_D3B/RK_FLIP_BASE via -D to explore
+       other decompositions (e.g. dgswizzle-style blocks).
+    */
+    {
+#ifndef RK_D1
+#define RK_D1 (TILES_M * TILES_N)
+#endif
+#ifndef RK_D2
+#define RK_D2 TILES_M
+#endif
+#ifndef RK_D3A
+#define RK_D3A 1
+#endif
+#ifndef RK_D3B
+#define RK_D3B 1
+#endif
+#ifndef RK_THRESHOLD
+#define RK_THRESHOLD 0
+#endif
+#ifndef RK_FLIP_BASE
+#define RK_FLIP_BASE (TILES_M - 1)
+#endif
+
+        const int d1        = RK_D1;
+        const int d2        = RK_D2;
+        const int d3a       = RK_D3A;
+        const int d3b       = RK_D3B;
+        const int threshold = RK_THRESHOLD;
+        const int flip_base = RK_FLIP_BASE;
+
+        int r1 = (d1 > 0) ? (block_idx % d1) : block_idx;
+        int q2 = (d2 > 0) ? (r1 / d2) : 0;
+        int r2 = (d2 > 0) ? (r1 % d2) : r1;
+
+        int q3, r3;
+        if (q2 >= threshold) {
+            q3 = (d3a > 0) ? (r2 / d3a) : r2;
+            r3 = (d3a > 0) ? (r2 % d3a) : 0;
+        } else {
+            q3 = (d3b > 0) ? (r2 / d3b) : r2;
+            r3 = (d3b > 0) ? (r2 % d3b) : 0;
+        }
+
+        r3 += q2 * d3b;
+
+        if ((q2 & 1) == 0) q3 = flip_base - q3;
+
+        int tm = q3;
+        int tn = r3;
+        if (tm < 0) tm = 0;
+        if (tn < 0) tn = 0;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        if (tn >= TILES_N) tn = TILES_N - 1;
+        return tm * TILES_N + tn;
+    }
 #endif
 }
 
