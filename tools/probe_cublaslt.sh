@@ -126,7 +126,20 @@ if ! skip_probe 3; then
         LIB=$(find /usr/local/cuda*/lib64 /usr/lib/x86_64-linux-gnu -maxdepth 3 \
               -name 'libcublasLt.so*' 2>/dev/null | head -1)
     fi
-    log "  libcublasLt: ${LIB:-not found}"
+    if [ -n "$LIB" ] && [ -f "$LIB" ]; then
+        sz=$(stat -c%s "$LIB" 2>/dev/null || echo 0)
+        if [ "$sz" -lt 10000 ]; then
+            real=$(grep -oE 'libcublasLt[A-Za-z0-9._-]+' "$LIB" 2>/dev/null | head -1)
+            [ -n "$real" ] && real_path="$(dirname "$LIB")/$real"
+            if [ -n "$real" ] && [ -f "$real_path" ]; then
+                log "  libcublasLt: $LIB is a linker script (${sz}B) → $real_path"
+                LIB="$real_path"
+            else
+                log "  libcublasLt: $LIB is a linker script (${sz}B) but real library not found alongside"
+            fi
+        fi
+    fi
+    log "  libcublasLt: ${LIB:-not found}  size=$([ -f "$LIB" ] && stat -c%s "$LIB" || echo 0)"
 
     if [ -n "$LIB" ] && command -v cuobjdump >/dev/null 2>&1; then
         log "  enumerating sm_100 kernels (this is slow) ..."
@@ -136,21 +149,31 @@ if ! skip_probe 3; then
         nsym=$(wc -l < "$OUT_DIR/libcublaslt_sm100_kernels.txt")
         log "    $nsym sm_100 kernels in libcublasLt"
 
+        SKIP_NAMES='splitKreduce_kernel|nopClusterDiscoveryTool|transpose|zeroInit|copy_kernel|memset|batchedReduce'
         for shape in fc1 fc2; do
+            captured="$OUT_DIR/${shape}_kernels.txt"
+            if [ -f "$captured" ] && [ -s "$captured" ]; then
+                log "  [${shape}] captured candidate kernels:"
+                head -20 "$captured" | sed "s/^/      /" | tee -a "$OUT_DIR/session.log"
+            fi
+
             target=""
-            if [ -f "$OUT_DIR/${shape}_kernels.txt" ] && [ -s "$OUT_DIR/${shape}_kernels.txt" ]; then
+            if [ -f "$captured" ] && [ -s "$captured" ]; then
                 while read -r name; do
+                    echo "$name" | grep -qE "$SKIP_NAMES" && continue
                     hit=$(grep -Fx "$name" "$OUT_DIR/libcublaslt_sm100_kernels.txt" | head -1)
-                    [ -n "$hit" ] && { target="$hit"; break; }
-                done < <(awk '{print length, $0}' "$OUT_DIR/${shape}_kernels.txt" | sort -rn | cut -d' ' -f2-)
+                    if [ -n "$hit" ]; then
+                        if echo "$hit" | grep -qiE 'gemm|mma|fp8|e4m3|cutlass_|xmma_'; then
+                            target="$hit"; break
+                        fi
+                        [ -z "$target" ] && target="$hit"
+                    fi
+                done < <(awk '{print length, $0}' "$captured" | sort -rn | cut -d' ' -f2-)
             fi
             if [ -z "$target" ]; then
-                if [ "$shape" = "fc1" ]; then
-                    pat='fp8.*e4m3|e4m3.*fp8|scaled.*mm.*fp8|fp8.*gemm'
-                else
-                    pat='fp8.*e4m3|e4m3.*fp8|scaled.*mm.*fp8|fp8.*gemm'
-                fi
-                target=$(grep -iE "$pat" "$OUT_DIR/libcublaslt_sm100_kernels.txt" | head -1)
+                target=$(grep -iE 'fp8.*e4m3|e4m3.*fp8|fp8.*gemm|xmma_.*fp8|cutlass.*fp8' \
+                         "$OUT_DIR/libcublaslt_sm100_kernels.txt" \
+                         | grep -vE "$SKIP_NAMES" | head -1)
             fi
             [ -z "$target" ] && { log "  [${shape}] no matching sm_100 kernel — skip SASS"; continue; }
             log "  [${shape}] target symbol: $target"
@@ -166,7 +189,7 @@ if ! skip_probe 3; then
 
             cat > "$OUT_DIR/${shape}_sass_summary.txt" <<SASS_EOF
 ### SASS summary for ${shape} (target=$target)
-### libcublasLt.so  size=$(stat -c%s "$LIB" 2>/dev/null)
+### libcublasLt.so  path=$LIB  size=$(stat -c%s "$LIB" 2>/dev/null)
 ### instruction lines: $nins
 
 ## CLC / cluster dispatch
