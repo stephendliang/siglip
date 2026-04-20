@@ -253,37 +253,50 @@ are. See tile dispatch section above.
 
 Root cause of striding's 1.13x: 74 clusters striding through M-rows with different N-tile phases creates a working set that exceeds L2 capacity. Work-stealing processes tiles in global order, keeping the wavefront narrow.
 
-## cuBLASLt rank-1 comparison (2026-04-19)
+## cuBLASLt rank-1 comparison (2026-04-20)
 
 `tools/probe_cublaslt.sh` (probe 1 = `bench/cublaslt_introspect.cu`) enumerates
-every heuristic cuBLASLt returns for the FC2 shape, times each, and reports
-rank-1. This is the true ceiling to beat. Earlier comparisons against
-`cublas-bench-fc2` measured cuBLASLt's **default heuristic pick**, not rank-1.
+every heuristic cuBLASLt returns, times each, reports rank-1. This is the true
+ceiling to beat. Earlier comparisons against `cublas-bench-fc2` measured
+cuBLASLt's **default heuristic pick**, not rank-1.
 
-| K    | cuBLASLt rank-1 | best ours          | gap     |
-|------|-----------------|--------------------|---------|
-| 1024 | ERR             | 0.859 (lean)       | n/a     |
-| 2048 | ERR             | 0.922 (zigzag)     | n/a     |
-| 3072 | **1.044**       | 1.063 (dgswizzle)  | +19 µs  |
-| 4096 | **1.360**       | 1.475 (dgswizzle)  | +115 µs |
-| 6144 | **1.997**       | 2.007 (dgswizzle)  | +10 µs  |
-| 8192 | **2.677**       | 2.729 (lean)       | +52 µs  |
+### FC2 K-sweep vs our static-swizzle/lean variants (data/cublaslt_probe_20260420_043659)
 
-**cuBLASLt rank-1 beats us at every K ≥ 3072** with the *same* winning config
-at every K: `tile=23 stages=36 splitk=1 swizzle=0`. Implications:
+| K    | cuBLASLt  | zigzag    | dgsw      | lean      | gap (best ours − cuBLASLt) |
+|------|-----------|-----------|-----------|-----------|----------------------------|
+| 1024 | ERR       | 0.862     | 0.866     | **0.859** | n/a                        |
+| 2048 | ERR       | **0.922** | 0.922     | 0.925     | n/a                        |
+| 3072 | **1.045** | 1.073     | **1.064** | 1.113     | +19 µs                     |
+| 4096 | **1.360** | 1.498     | **1.476** | 1.503     | +116 µs                    |
+| 6144 | **1.997** | 2.015     | **2.007** | 2.052     | +10 µs                     |
+| 8192 | **2.682** | 2.742     | 2.734     | **2.731** | +49 µs                     |
+
+**FC1 rank-1 (K=768, M=928256, N=3072, gelu_bias): cuBLASLt 1.894 ms** vs best
+ours 1.998 (zigzag+ks=1) → **+104 µs (+5.5%) — wider gap than FC2**.
+
+### Winner config (FC2)
+
+Stable across K: `stages=36 splitk=1 swizzle=0 customOption=0 clusterShape=2x1x1`
+(from probe 2 verbose log). Tile enum winner is near-tied between `tile=23` and
+`tile=201` at K=3072 (winner flips run-to-run). At K≥4096 `tile=23` wins stably.
+Tile IDs are `CUBLASLT_MATMUL_TILE_*` enums (ordinals, not sizes); still need
+decode against `cublasLt.h`.
+
+### Implications
 
 - The cuBLASLt advantage is NOT split-K (splitk=1 throughout). It's a single
   fast MMA-only kernel config we haven't matched.
-- Our `-9.5%` vs CUTLASS-reference (1.226 ms @ K=3072) is real, but CUTLASS is
-  not the ceiling. cuBLASLt rank-1 is 1.044 ms — we're 19 µs behind it at
-  K=3072 and 115 µs behind at K=4096.
-- Gap is largest at K=4096 (+115 µs, +8.4%), smaller at the extremes. Worth
-  decoding tile=23 / stages=36 against the cuBLASLt enums to see what
-  concrete tile size / staging cuBLASLt is using.
+- Our `-9.5%` vs CUTLASS-reference is real, but CUTLASS is not the ceiling.
+- Within our kernels, **dgswizzle leads FC2 at K=3072–6144, lean takes over at
+  short K (1024/2048, NO_PREFILL kicks in) and at K=8192** (0.003 ms under dgsw).
+- FC1 K=768 cuBLASLt heuristics include **no 2x2x1 (4-CTA) entry** — 4-CTA is
+  ruled out at short K, so our `fc2_w3_c4*` multicast deadlocks are not the FC1
+  lever to chase. 4-CTA remains interesting only for FC2 per-tensor FP8 where
+  cuBLASLt lists a `tile=128x192 clusterShape=2x2x1` heuristic.
 
-Known caveat: K=1024 and K=2048 still report ERR — introspect aborts on a
-device-side IMA from one of the heuristics (cublasLtMatmul returns SUCCESS
-but `cudaDeviceSynchronize()` fails). Separate fix pending.
+Known caveat: K=1024/2048 still report ERR — one heuristic IMAs on the device
+(`cublasLtMatmul` returns SUCCESS but `cudaDeviceSynchronize()` aborts). A
+resilient mode (skip past IMA, report what worked) is pending.
 
 ## Dimension sweep (B200-verified)
 
@@ -299,20 +312,20 @@ Infrastructure: `tools/dim_sweep.sh`. Dims: `-DM_TOTAL=X -DN_DIM=Y -DK_DIM=Z`. C
 | 928256 | 1.110 | 1.226 | -9.5% |
 | 1856512 | 2.206 | 2.433 | -9.3% |
 
-### K scaling under PACKED_TILES + best-of-dispatch (2026-04-19)
+### K scaling under PACKED_TILES + best-of-dispatch (2026-04-20)
 
 | K    | K_ITERS | w3 best (dispatch) | cuBLASLt rank-1 | gap to cuBLASLt |
 |------|---------|--------------------|-----------------|-----------------|
 | 1024 | 8       | 0.859 (lean)       | ERR             | n/a             |
 | 2048 | 16      | 0.922 (zigzag)     | ERR             | n/a             |
-| 3072 | 24      | 1.063 (dgswizzle)  | 1.044           | +19 µs          |
-| 4096 | 32      | 1.475 (dgswizzle)  | 1.360           | +115 µs         |
+| 3072 | 24      | 1.064 (dgswizzle)  | 1.045           | +19 µs          |
+| 4096 | 32      | 1.476 (dgswizzle)  | 1.360           | +116 µs         |
 | 6144 | 48      | 2.007 (dgswizzle)  | 1.997           | +10 µs          |
-| 8192 | 64      | 2.729 (lean)       | 2.677           | +52 µs          |
+| 8192 | 64      | 2.731 (lean)       | 2.682           | +49 µs          |
 
-dgswizzle leads on K=3072–6144, lean takes over at K=8192 (and at the short-K
-end where NO_PREFILL kicks in). The earlier "sched wins at K=6144" thesis
-(from pre-PACKED_TILES, pre-dgswizzle data) is superseded.
+dgswizzle leads on K=3072–6144, lean takes over at K=8192 (0.003 ms under dgsw)
+and at the short-K end where NO_PREFILL kicks in. The earlier "sched wins at
+K=6144" thesis (from pre-PACKED_TILES, pre-dgswizzle data) is superseded.
 
 ### Adaptive tuning knobs
 
