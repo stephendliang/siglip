@@ -27,6 +27,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+trap 'echo; echo "[INT] caught Ctrl+C — exiting probe_cublaslt.sh"; exit 130' INT TERM
+
 STAMP=$(date +%Y%m%d_%H%M%S)
 OUT_DIR="${OUT_DIR:-data/cublaslt_probe_${STAMP}}"
 SKIP="${SKIP:-}"
