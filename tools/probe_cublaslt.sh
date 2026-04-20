@@ -11,11 +11,10 @@
 #                           selected kernel → grep for CLC / UTMA / MULTICAST /
 #                           UCGABAR; counts register banks, smem ops, mbar ops)
 #   4. K-sweep             (K ∈ {1024, 2048, 3072, 4096, 6144, 8192} —
-#                           cuBLASLt vs fc2-w3-zigzag/dgswizzle/lean/sched;
-#                           looks for split-K signature)
-#   5. env-sweep           (CUBLASLT_* env vars to disable reduction
-#                           schemes / split-K / force workspace — sees which
-#                           optimization they depend on)
+#                           cuBLASLt rank-1 (full heuristic search) vs
+#                           fc2-w3-zigzag/dgswizzle/lean)
+#   5. env-sweep           (CUBLASLT_* env vars — does disabling workspace
+#                           or split-K move cuBLASLt's rank-1 time?)
 #
 # Usage:
 #   ./tools/probe_cublaslt.sh
@@ -47,6 +46,9 @@ extract_per_tensor_fused_ms() {
 }
 extract_result_ms() {
     grep -oP '@@RESULT.*ms=\K[0-9.]+' "$1" | head -1
+}
+extract_introspect_best_ms() {
+    grep -oP '^# Winner.*ms=\K[0-9.]+' "$1" | head -1
 }
 
 log "========================================"
@@ -280,21 +282,23 @@ if ! skip_probe 4; then
     csv="$OUT_DIR/k_sweep.csv"
     echo "layer,variant,K,ms" > "$csv"
 
-    for K in 1024 2048 3072 4096 6144 8192; do
-        log "  K=$K: rebuilding cublas-bench-fc2 ..."
-        nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --cudart=static \
-             -DBENCH_N=768 -DBENCH_EPILOGUE=3 -DBENCH_K=$K \
-             bench/cublas_bench.cu -o "$OUT_DIR/bin_cublas_fc2_K${K}" -lcublasLt -lcublas \
-             > "$OUT_DIR/k${K}_cublas_build.log" 2>&1 || {
-                 log "  [K=$K] cublas build FAIL"; continue; }
+    # cublaslt-introspect does a full max-optimal search across every heuristic
+    # cuBLASLt returns for the shape, times each, and emits "# Winner ... ms=X".
+    # M/N/K/epi are runtime args, so no rebuild per K.
+    if [ ! -x ./cublaslt-introspect ]; then
+        log "  building cublaslt-introspect ..."
+        make -B cublaslt-introspect > "$OUT_DIR/introspect_build_for_ksweep.log" 2>&1 \
+            || log "  introspect build FAIL — cublaslt column will be ERR"
+    fi
 
-        log "  K=$K: timing cublas-bench-fc2 ..."
+    for K in 1024 2048 3072 4096 6144 8192; do
+        log "  K=$K: cublaslt-introspect full heuristic search ..."
         out="$OUT_DIR/k${K}_cublas_fc2.out"
-        timeout 120 "$OUT_DIR/bin_cublas_fc2_K${K}" > "$out" 2>&1 || true
-        ms=$(extract_per_tensor_fused_ms "$out")
-        [ -z "$ms" ] && ms=$(extract_result_ms "$out")
+        timeout 180 ./cublaslt-introspect "$M_FC" "$FC2_N" "$K" "$FC2_EPI" > "$out" 2>&1 || true
+        ms=$(extract_introspect_best_ms "$out")
         echo "fc2,cublaslt,${K},${ms:-ERR}" >> "$csv"
-        log "    cublaslt fc2 K=$K  ms=${ms:-ERR}"
+        winner=$(grep '^# Winner' "$out" | head -1 | sed 's/^# //')
+        log "    cublaslt fc2 K=$K  rank-1 ms=${ms:-ERR}  ${winner}"
         if [ -z "$ms" ]; then
             log "      tail of $(basename "$out"):"
             tail -8 "$out" 2>/dev/null | sed 's/^/        /' | tee -a "$OUT_DIR/session.log"
@@ -347,36 +351,38 @@ if ! skip_probe 5; then
     log "── Probe 5: env-sweep ──"
     csv="$OUT_DIR/env_sweep.csv"
     echo "config,fc,ms" > "$csv"
-    for shape in fc1 fc2; do
-        binary="./cublas-bench-${shape}"
-        [ -x "$binary" ] || { log "  skip: no $binary"; continue; }
+    if [ ! -x ./cublaslt-introspect ]; then
+        log "  skip env-sweep: cublaslt-introspect not built"
+    else
+        for shape in fc1 fc2; do
+            if [ "$shape" = "fc1" ]; then N=$FC1_N; K=$FC1_K; E=$FC1_EPI; else N=$FC2_N; K=$FC2_K; E=$FC2_EPI; fi
 
-        # Baseline
-        out="$OUT_DIR/env_${shape}_baseline.out"
-        timeout 60 "$binary" > "$out" 2>&1 || true
-        ms=$(extract_per_tensor_fused_ms "$out"); [ -z "$ms" ] && ms=$(extract_result_ms "$out")
-        echo "baseline,${shape},${ms:-ERR}" >> "$csv"
-        log "  [${shape}] baseline                       ms=${ms:-ERR}"
+            # Baseline: full heuristic search, pick rank-1 by measured ms.
+            out="$OUT_DIR/env_${shape}_baseline.out"
+            timeout 180 ./cublaslt-introspect "$M_FC" "$N" "$K" "$E" > "$out" 2>&1 || true
+            ms=$(extract_introspect_best_ms "$out")
+            echo "baseline,${shape},${ms:-ERR}" >> "$csv"
+            log "  [${shape}] baseline                       rank-1 ms=${ms:-ERR}"
 
-        # Force disable the algorithm-id the heuristic first picked
-        # (checks whether there's a materially slower-but-close second choice).
-
-        # CUBLASLT_MATMUL_DISABLE_* env vars known on CUDA 12.x / 13:
-        declare -a env_cfgs=(
-            "CUBLASLT_DISABLE_REQUIRED_WORKSPACE=1"
-            "CUBLASLT_MATMUL_WORKSPACE_SIZE=0"
-            "CUBLAS_WORKSPACE_CONFIG=:0:0"
-            "CUDA_LAUNCH_BLOCKING=1"
-        )
-        for ec in "${env_cfgs[@]}"; do
-            k="${ec%%=*}"
-            out="$OUT_DIR/env_${shape}_${k}.out"
-            env "$ec" timeout 60 "$binary" > "$out" 2>&1 || true
-            ms=$(extract_per_tensor_fused_ms "$out"); [ -z "$ms" ] && ms=$(extract_result_ms "$out")
-            echo "${k},${shape},${ms:-ERR}" >> "$csv"
-            log "  [${shape}] $ec   ms=${ms:-ERR}"
+            # Env vars restrict the heuristic search space / pipeline behavior.
+            # If rank-1 ms shifts, the restriction cost out an algorithm we'd
+            # otherwise have picked.
+            declare -a env_cfgs=(
+                "CUBLASLT_DISABLE_REQUIRED_WORKSPACE=1"
+                "CUBLASLT_MATMUL_WORKSPACE_SIZE=0"
+                "CUBLAS_WORKSPACE_CONFIG=:0:0"
+                "CUDA_LAUNCH_BLOCKING=1"
+            )
+            for ec in "${env_cfgs[@]}"; do
+                k_name="${ec%%=*}"
+                out="$OUT_DIR/env_${shape}_${k_name}.out"
+                env "$ec" timeout 180 ./cublaslt-introspect "$M_FC" "$N" "$K" "$E" > "$out" 2>&1 || true
+                ms=$(extract_introspect_best_ms "$out")
+                echo "${k_name},${shape},${ms:-ERR}" >> "$csv"
+                log "  [${shape}] $ec   rank-1 ms=${ms:-ERR}"
+            done
         done
-    done
+    fi
     log "  env-sweep CSV: $csv"
 fi
 
