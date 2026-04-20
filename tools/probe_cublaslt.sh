@@ -237,6 +237,10 @@ if ! skip_probe 4; then
         [ -z "$ms" ] && ms=$(extract_result_ms "$out")
         echo "fc2,cublaslt,${K},${ms:-ERR}" >> "$csv"
         log "    cublaslt fc2 K=$K  ms=${ms:-ERR}"
+        if [ -z "$ms" ]; then
+            log "      tail of $(basename "$out"):"
+            tail -8 "$out" 2>/dev/null | sed 's/^/        /' | tee -a "$OUT_DIR/session.log"
+        fi
 
         # Our kernel at the same K (zigzag default, since it's FC2-champion-ish)
         for variant in zigzag dgswizzle lean; do
@@ -251,6 +255,10 @@ if ! skip_probe 4; then
             ms=$(extract_result_ms "$out")
             echo "fc2,${variant},${K},${ms:-ERR}" >> "$csv"
             log "    $variant fc2 K=$K  ms=${ms:-ERR}"
+            if [ -z "$ms" ]; then
+                log "      tail of $(basename "$out"):"
+                tail -8 "$out" 2>/dev/null | sed 's/^/        /' | tee -a "$OUT_DIR/session.log"
+            fi
         done
     done
     log "  k-sweep CSV: $csv"
