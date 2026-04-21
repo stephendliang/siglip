@@ -3388,6 +3388,22 @@ __global__ void init_residual(__nv_bfloat16* __restrict__ res, int n_dim, long l
     }
 }
 
+/*
+Row-varying A init for Lever C diagnostic.
+A[row, k] = 0x38 + (row & 7), giving 8 distinct E4M3 values per 8-row block:
+    0x38=1.0, 0x39=1.125, 0x3A=1.25, 0x3B=1.375,
+    0x3C=1.5, 0x3D=1.625, 0x3E=1.75, 0x3F=1.875.
+Cycle of 8 matches LDTM.16dp256bit's 8-row stride, so STSM row-permutation bugs
+surface as deterministic offsets.
+*/
+__global__ void init_A_row_varying(uint8_t* __restrict__ A, int M, int K) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)M * K;
+    if (idx >= total) return;
+    int row = (int)(idx / K);
+    A[idx] = (uint8_t)(0x38 + (row & 7));
+}
+
 #ifdef PACKED_TILES
 /*
 Packing kernels: rearrange row-major matrices into tile-contiguous layout.
@@ -3472,8 +3488,17 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_residual, (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&d_C,        (size_t)M_TOTAL * N_DIM * sizeof(__nv_bfloat16)));
 
-    /* A: uniform 0x3C (1.5 in FP8 E4M3) */
-    CUDA_CHECK(cudaMemset(d_A, 0x3C, (size_t)M_TOTAL * K_DIM));
+    /* A: row-varying FP8 pattern — A[row, k] = 0x38 + (row & 7).
+       8 distinct values cycle every 8 rows, matching LDTM's 8-row stride so
+       STSM row-permutation bugs (Lever C) become visible in the validator. */
+    {
+        long long total = (long long)M_TOTAL * K_DIM;
+        int tpb = 256;
+        int bpg = (int)((total + tpb - 1) / tpb);
+        init_A_row_varying<<<bpg, tpb>>>(d_A, M_TOTAL, K_DIM);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
     /* B: alternating rows — even=0x3C(1.5), odd=0x38(1.0) */
     {
         uint8_t* h_B = (uint8_t*)malloc((size_t)N_DIM * K_DIM);
@@ -3770,12 +3795,18 @@ int main() {
             cksum += (double)__bfloat162float(h_C[(long long)i * stride]);
     }
 
+    /* a_val(row) matches init_A_row_varying: 8 distinct FP8 values per 8-row cycle. */
+    auto a_val_of = [](long long r) {
+        return 1.0f + 0.125f * (float)((int)r & 7);
+    };
+
     int errors = 0;
     for (int spot = 0; spot < 32; spot++) {
         long long row = (long long)spot * M_TOTAL / 32;
         int col = (spot * 47) % N_DIM;
         float b_val = (col & 1) ? 1.0f : 1.5f;
-        float gemm = (float)K_DIM * 1.5f * b_val;
+        float a_val = a_val_of(row);
+        float gemm = (float)K_DIM * a_val * b_val;
         float res_bf16_f = __bfloat162float(__float2bfloat16(
             (float)((int)row % 128) * 0.25f + (float)col * 0.125f));
         float bias_bf16_f = __bfloat162float(__float2bfloat16((float)(col + 1)));
@@ -3814,6 +3845,78 @@ int main() {
     printf("C[0,0..3] = %.1f %.1f %.1f %.1f\n",
            __bfloat162float(h_C[0]), __bfloat162float(h_C[1]),
            __bfloat162float(h_C[2]), __bfloat162float(h_C[3]));
+
+    /*
+    Lever C diagnostic: dump tile [0,0] first 8 rows × 8 cols, show inferred
+    source row by back-solving a_val from the observed BF16 value. If STSM
+    permutes rows, we'll see e.g. row 0 dst holding data from src row 8. If
+    STSM collides addresses (3/4 of SMEM stale), we'll see zeros or garbage.
+    Always prints — useful both to confirm correct behavior and to diagnose.
+    */
+    if (valid == 0 || getenv("FC2_DIAG") != nullptr) {
+        printf("\n=== Lever C DIAGNOSTIC: tile[0,0] rows 0..7 × cols 0..7 ===\n");
+        printf("a_val table: row&7=0:1.000 1:1.125 2:1.250 3:1.375 4:1.500 5:1.625 6:1.750 7:1.875\n");
+        printf("%-4s %-52s %-16s %s\n", "row", "observed cols 0..7", "src_row", "note");
+        for (int row = 0; row < 8; row++) {
+            char obs_str[256]; int pos = 0;
+            char src_str[32]; int spos = 0;
+            int inferred_src[8];
+            for (int col = 0; col < 8; col++) {
+#ifdef PACKED_TILES
+                long long packed_idx = (long long)((row / TM) * TILES_N + col / TN) * TM * TN
+                                     + (long long)(row % TM) * TN + (col % TN);
+                float obs = __bfloat162float(h_C[packed_idx]);
+#else
+                float obs = __bfloat162float(h_C[(long long)row * N_DIM + col]);
+#endif
+                pos += snprintf(obs_str + pos, sizeof(obs_str) - pos, "%6.0f ", obs);
+
+                float b_val = (col & 1) ? 1.0f : 1.5f;
+                float res = __bfloat162float(__float2bfloat16(
+                    (float)(row % 128) * 0.25f + (float)col * 0.125f));
+                float bias = __bfloat162float(__float2bfloat16((float)(col + 1)));
+                /* Back-solve for the gemm portion: undo residual, then bias. */
+#ifdef GEMM_ONLY
+                float gemm_back = obs;
+#elif defined(FP32_EPILOGUE)
+                float gemm_back = obs - bias - res;
+#else
+                float after_bias = obs - res;
+                float acc_rounded = after_bias - bias;
+                float gemm_back = acc_rounded;
+#endif
+                /* gemm_back ≈ K_DIM * a_val * b_val → a_val = gemm_back / (K*b) */
+                float a_back = gemm_back / ((float)K_DIM * b_val);
+                /* Snap to nearest a_val in {1.0, 1.125, ..., 1.875}. */
+                int src_r = (int)lrintf((a_back - 1.0f) / 0.125f);
+                if (src_r < 0 || src_r > 7) src_r = -1;
+                inferred_src[col] = src_r;
+            }
+            /* Collapse src_row across cols: if all identical, print single digit. */
+            int uniform = 1;
+            for (int c = 1; c < 8; c++)
+                if (inferred_src[c] != inferred_src[0]) { uniform = 0; break; }
+            if (uniform) {
+                if (inferred_src[0] < 0) spos += snprintf(src_str + spos, sizeof(src_str) - spos, "??");
+                else spos += snprintf(src_str + spos, sizeof(src_str) - spos, "%d", inferred_src[0]);
+            } else {
+                for (int c = 0; c < 8; c++) {
+                    if (inferred_src[c] < 0) spos += snprintf(src_str + spos, sizeof(src_str) - spos, "? ");
+                    else spos += snprintf(src_str + spos, sizeof(src_str) - spos, "%d ", inferred_src[c]);
+                }
+            }
+            const char* note = (uniform && inferred_src[0] == row) ? "ok" :
+                               (uniform && inferred_src[0] == (row & 7)) ? "row%8 match" :
+                               (uniform && inferred_src[0] < 0) ? "STALE/zero" :
+                               "PERMUTED";
+            printf("r%-3d %-52s %-16s %s\n", row, obs_str, src_str, note);
+        }
+        printf("Legend: note='ok' → row writes src row. 'row%%8 match' → row t stored src row t%%8 (Bug 1).\n");
+        printf("        'PERMUTED' → per-col src_row differs (mixed-matrix collision).\n");
+        printf("        'STALE/zero' → SMEM never written (Bug 2, stale pipeline stage).\n");
+        printf("=== end diagnostic ===\n\n");
+    }
+
     printf("@@RESULT ms=%.3f tflops=%.2f checksum=%f valid=%d c0=%.1f\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9, cksum, valid,
            __bfloat162float(h_C[0]));
