@@ -157,6 +157,31 @@ fc2-w3-epi-111: fc2_w3.cu
 
 fc2-w3-epi-all: fc2-w3-epi-000 fc2-w3-epi-001 fc2-w3-epi-100 fc2-w3-epi-101 fc2-w3-epi-010 fc2-w3-epi-011 fc2-w3-epi-110 fc2-w3-epi-111
 
+# ── Store-sync experiments: XYZ 3-bit name (X=NO_PROXY_FENCE, Y=ELECT_SYNC, Z=NO_INTRA_WAIT)
+# Chase rank-1's lean store path. Rank-1 emits 0 MEMBAR.ALL.CTA, 0 CCTL.IVALL,
+# 0 DEPBAR.LE in the epi loop; we emit 8/10/10. Each bit kills one source:
+#   X = drop fence.proxy.async.shared::cta before EPI_STORE -> kills MEMBAR.ALL.CTA
+#   Y = embed elect.sync inside store/commit/wait asm    -> kills R2UR + BSYNC retry
+#   Z = skip wait_group between sub-iters              -> kills DEPBAR.LE + CCTL.IVALL
+fc2-w3-snc-000: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PROXY_FENCE=0 -DELECT_SYNC=0 -DNO_INTRA_WAIT=0 $< -o $@ $(LDFLAGS)
+fc2-w3-snc-001: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PROXY_FENCE=0 -DELECT_SYNC=0 -DNO_INTRA_WAIT=1 $< -o $@ $(LDFLAGS)
+fc2-w3-snc-010: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PROXY_FENCE=0 -DELECT_SYNC=1 -DNO_INTRA_WAIT=0 $< -o $@ $(LDFLAGS)
+fc2-w3-snc-011: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PROXY_FENCE=0 -DELECT_SYNC=1 -DNO_INTRA_WAIT=1 $< -o $@ $(LDFLAGS)
+fc2-w3-snc-100: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PROXY_FENCE=1 -DELECT_SYNC=0 -DNO_INTRA_WAIT=0 $< -o $@ $(LDFLAGS)
+fc2-w3-snc-101: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PROXY_FENCE=1 -DELECT_SYNC=0 -DNO_INTRA_WAIT=1 $< -o $@ $(LDFLAGS)
+fc2-w3-snc-110: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PROXY_FENCE=1 -DELECT_SYNC=1 -DNO_INTRA_WAIT=0 $< -o $@ $(LDFLAGS)
+fc2-w3-snc-111: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PROXY_FENCE=1 -DELECT_SYNC=1 -DNO_INTRA_WAIT=1 $< -o $@ $(LDFLAGS)
+
+fc2-w3-snc-all: fc2-w3-snc-000 fc2-w3-snc-001 fc2-w3-snc-010 fc2-w3-snc-011 fc2-w3-snc-100 fc2-w3-snc-101 fc2-w3-snc-110 fc2-w3-snc-111
+
 # ── GEMM-only lever combinations (no bias, no residual, no W2 load pipe)
 # Architectural parity with rank-2 (nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_bias_TNT)
 # is fc2-w3-epi-101-gemm (NS=6, wide TMA multi-pass, stmatrix, no residual).

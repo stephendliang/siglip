@@ -147,6 +147,22 @@ Compile-time flags:
 #define USE_STMATRIX 0
 #endif
 
+/* Store-sync experiments — chase rank-1's lean store path.
+   Bitmap XYZ where X=NO_PROXY_FENCE, Y=ELECT_SYNC, Z=NO_INTRA_WAIT.
+   X: drop fence.proxy.async.shared::cta before EPI_STORE — kills MEMBAR.ALL.CTA.
+   Y: use elect.sync uniform predicate — kills R2UR/BSYNC retry around UTMASTG.
+   Z: skip wait_group between sub-iters — kills DEPBAR.LE + CCTL.IVALL.
+   Rank-1 emits 0 of each; we emit 8/8/10. */
+#ifndef NO_PROXY_FENCE
+#define NO_PROXY_FENCE   0
+#endif
+#ifndef ELECT_SYNC
+#define ELECT_SYNC       0
+#endif
+#ifndef NO_INTRA_WAIT
+#define NO_INTRA_WAIT    0
+#endif
+
 /* All levers keep 64-col, 128B-row SMEM staging — only TMA descriptor +
    issue pattern changes under Lever A. */
 #define EPI_COL_STRIDE            64
@@ -906,10 +922,24 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
    EPI_STORE: issue TMA store(s) + commit_group.
    EPI_WAIT:  wait_group + __syncwarp + bar.sync.
    Under TMA_STORE_WIDE=1, only even warps (ew 0, 2) issue TMAs, each
-   covering 2 adjacent row groups = 64 rows per TMA (halves UTMASTG count). */
+   covering 2 adjacent row groups = 64 rows per TMA (halves UTMASTG count).
+
+   ELECT_SYNC=1: embed PTX `elect.sync` inside each issuing asm so ptxas
+   sees a uniform predicate (UP) — kills the per-MMA R2UR retry + BSYNC
+   reconvergence wrapper around UTMASTG. Outer guard drops `lane == 0`. */
+#if ELECT_SYNC
+#define EPI_ELECT_OPEN  "{ .reg .b32 _eld_; .reg .pred _elp_; elect.sync _eld_|_elp_, 0xFFFFFFFF; @_elp_ "
+#define EPI_ELECT_CLOSE " }"
+#define EPI_LANE_GUARD  /* embedded via elect.sync */
+#else
+#define EPI_ELECT_OPEN  ""
+#define EPI_ELECT_CLOSE ""
+#define EPI_LANE_GUARD  && lane == 0
+#endif
+
 #if SINGLE_WARP_STORE
 #define EPI_STORE(STAGE, NC, PN, PM) do { \
-    if (ew == 0 && lane == 0) { \
+    if (ew == 0 EPI_LANE_GUARD) { \
         _Pragma("unroll") \
         for (int _ti_ = 0; _ti_ < EPI_TMAS_PER_WARP; _ti_++) { \
             for (int rg_ = 0; rg_ < NUM_EPI_WARPS; rg_ += WARP_PAIR_STRIDE) { \
@@ -917,56 +947,65 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
                     + (STAGE) * EPI_STAGE_BYTES + rg_ * STAGING_REGION_BYTES \
                     + _ti_ * STAGE_BLOCK_BYTES); \
                 asm volatile( \
+                    EPI_ELECT_OPEN \
                     "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group" \
                     " [%0, {%1, %2}], [%3];" \
+                    EPI_ELECT_CLOSE \
                     :: "l"(&tma_c), "r"((PN) + (NC) + _ti_ * TMA_BOX_COLS), "r"((PM) + rg_ * 32), \
                        "r"(s_) : "memory"); \
             } \
         } \
-        asm volatile("cp.async.bulk.commit_group;" ::: "memory"); \
+        asm volatile(EPI_ELECT_OPEN "cp.async.bulk.commit_group;" EPI_ELECT_CLOSE ::: "memory"); \
     } \
 } while(0)
-#define EPI_WAIT_PRED (ew == 0 && lane == 0)
+#define EPI_WAIT_PRED (ew == 0 EPI_LANE_GUARD)
 #else
 #define EPI_STORE(STAGE, NC, PN, PM) do { \
-    if ((ew & (WARP_PAIR_STRIDE - 1)) == 0 && lane == 0) { \
+    if ((ew & (WARP_PAIR_STRIDE - 1)) == 0 EPI_LANE_GUARD) { \
         _Pragma("unroll") \
         for (int _ti_ = 0; _ti_ < EPI_TMAS_PER_WARP; _ti_++) { \
             const uint32_t s_ = smem_to_uint(smem + OFF_STAGING \
                 + (STAGE) * EPI_STAGE_BYTES + row_group * STAGING_REGION_BYTES \
                 + _ti_ * STAGE_BLOCK_BYTES); \
             asm volatile( \
+                EPI_ELECT_OPEN \
                 "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group" \
                 " [%0, {%1, %2}], [%3];" \
+                EPI_ELECT_CLOSE \
                 :: "l"(&tma_c), "r"((PN) + (NC) + _ti_ * TMA_BOX_COLS), "r"((PM) + row_group * 32), \
                    "r"(s_) : "memory"); \
         } \
-        asm volatile("cp.async.bulk.commit_group;" ::: "memory"); \
+        asm volatile(EPI_ELECT_OPEN "cp.async.bulk.commit_group;" EPI_ELECT_CLOSE ::: "memory"); \
     } \
 } while(0)
-#define EPI_WAIT_PRED ((ew & (WARP_PAIR_STRIDE - 1)) == 0 && lane == 0)
+#define EPI_WAIT_PRED ((ew & (WARP_PAIR_STRIDE - 1)) == 0 EPI_LANE_GUARD)
 #endif
 
+/* NO_INTRA_WAIT=1: skip wait_group 1 between sub-iters (rely on disjoint
+   staging regions). Only emit wait_group 0 at LAST. Kills DEPBAR.LE +
+   CCTL.IVALL on every non-final sub-iter. */
 #if NO_POST_STORE_BAR
+#define EPI_WAIT_TAIL() __syncwarp()
+#else
+#define EPI_WAIT_TAIL() do { __syncwarp(); asm volatile(BAR_EPI_SYNC ::: "memory"); } while(0)
+#endif
+
+#if NO_INTRA_WAIT
 #define EPI_WAIT(LAST) do { \
-    if (EPI_WAIT_PRED) { \
-        if (LAST) \
-            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory"); \
-        else \
-            asm volatile("cp.async.bulk.wait_group 1;" ::: "memory"); \
+    if ((LAST) && EPI_WAIT_PRED) { \
+        asm volatile(EPI_ELECT_OPEN "cp.async.bulk.wait_group 0;" EPI_ELECT_CLOSE ::: "memory"); \
     } \
-    __syncwarp(); \
+    EPI_WAIT_TAIL(); \
 } while(0)
 #else
 #define EPI_WAIT(LAST) do { \
     if (EPI_WAIT_PRED) { \
         if (LAST) \
-            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory"); \
+            asm volatile(EPI_ELECT_OPEN "cp.async.bulk.wait_group 0;" EPI_ELECT_CLOSE ::: "memory"); \
         else \
-            asm volatile("cp.async.bulk.wait_group 1;" ::: "memory"); \
+            asm volatile(EPI_ELECT_OPEN "cp.async.bulk.wait_group 1;" EPI_ELECT_CLOSE ::: "memory"); \
     } \
-    __syncwarp(); \
-    asm volatile(BAR_EPI_SYNC ::: "memory"); \
+    EPI_WAIT_TAIL(); \
 } while(0)
 #endif
 
@@ -2330,7 +2369,9 @@ fc2_w3_kernel(
                     }
                     } /* close row_group */
 
+#if !NO_PROXY_FENCE
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#endif
                     asm volatile(BAR_EPI_SYNC ::: "memory");
 
 #if GROUPS_PER_WARP > 1
@@ -2706,7 +2747,9 @@ fc2_w3_kernel(
 #ifdef CUTLASS_EPILOGUE
                     LDS_DRAIN_AND_FENCE(stage_drain);
 #else
+#if !NO_PROXY_FENCE
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#endif
 #endif
 #if !NO_PRE_STORE_BAR
                     asm volatile(BAR_EPI_SYNC ::: "memory");
@@ -2968,7 +3011,9 @@ _lean_done:
                 }
                 } /* close row_group */
 
+#if !NO_PROXY_FENCE
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#endif
                 asm volatile(BAR_EPI_SYNC ::: "memory");
 
 #if GROUPS_PER_WARP > 1
@@ -3285,7 +3330,9 @@ _lean_done:
 #ifdef CUTLASS_EPILOGUE
                 LDS_DRAIN_AND_FENCE(stage_drain);
 #else
+#if !NO_PROXY_FENCE
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#endif
 #endif
 #if !NO_PRE_STORE_BAR
                 asm volatile(BAR_EPI_SYNC ::: "memory");
