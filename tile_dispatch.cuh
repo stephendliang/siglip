@@ -436,6 +436,101 @@ static __device__ __forceinline__ int static_swizzle(int block_idx) {
         return tm * TILES_N + tn;
     }
 
+#elif TILE_DISPATCH == 23
+    /*
+    dgphase: dgswizzle with cluster-dependent time-shift.
+
+    Rationale: in TD=8, all NC clusters at tick t visit the same dgswizzle
+    group_idx range.  Cluster c here is time-shifted by c ticks (block_idx
+    offset of c * NC), so at any given tick the 74 clusters are spread across
+    different M-row groups — decorrelating DRAM arrival patterns without
+    changing per-cluster locality (within-cluster sequence is a cyclic
+    rotation, so A/B reuse within a cluster is unchanged).
+
+    Bijection: (block_idx + c*NC) mod TOTAL preserves c = block_idx % NC
+    (because c*NC % NC = 0), and within a cluster is a cyclic permutation
+    of the tick range.  TD=8 is bijective on the shifted block_idx, so the
+    overall map is bijective.
+
+    Open question: is decorrelation helpful at K=3072 where L2 is the
+    bottleneck (arrival-pattern stalls)?  Empirical test. */
+    {
+#ifndef DG_GROUP_SIZE
+#define DG_GROUP_SIZE 8
+#endif
+        const int NC = SM_COUNT / 2;
+        const int TOTAL = TILES_M * TILES_N;
+        const int c = block_idx - (block_idx / NC) * NC;   /* block_idx % NC */
+        int bi = block_idx + c * NC;
+        if (bi >= TOTAL) bi -= TOTAL;
+
+        const int group_tiles = TILES_N * DG_GROUP_SIZE;
+        const int group_idx = bi / group_tiles;
+        const int first_m = group_idx * DG_GROUP_SIZE;
+        const int in_group = bi - group_idx * group_tiles;
+        int tm, tn;
+        if (first_m + DG_GROUP_SIZE <= TILES_M) {
+            tm = first_m + in_group % DG_GROUP_SIZE;
+            tn = in_group / DG_GROUP_SIZE;
+        } else {
+            const int tail = TILES_M - first_m;
+            tm = first_m + in_group % tail;
+            tn = in_group / tail;
+        }
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        if (tn >= TILES_N) tn = TILES_N - 1;
+        return tm * TILES_N + tn;
+    }
+
+#elif TILE_DISPATCH == 24
+    /*
+    dgnrot: dgswizzle with within-group diagonal tn rotation.
+
+    Within each full M-row group, the 24 (lm, ln) pairs map to
+      tn = (ln + lm) mod TILES_N
+    so the 8 clusters at different lm values visit 8 different (lm, tn)
+    combinations that distribute evenly across all TILES_N columns
+    simultaneously — rather than 8 clusters hitting the same tn in lockstep
+    (as vanilla TD=8 does) before all advancing to the next tn together.
+
+    For FC2 (TILES_N=3) this cuts peak same-tn cluster count within a group
+    from 8 → 3, which should reduce store-phase HBM-page contention.
+
+    Bijection (within a group): fix target (tm, tn).  tm → lm determined.
+    Given lm, solve ln = (tn - lm + TILES_N) mod TILES_N — unique
+    ln ∈ [0, TILES_N).  Across groups, first_m differs, so no cross-group
+    collision.  Tail group (num_m < DG_GROUP_SIZE) uses num_m in place of 8
+    — same diagonal logic remains bijective.  */
+    {
+#ifndef DG_GROUP_SIZE
+#define DG_GROUP_SIZE 8
+#endif
+        const int group_tiles = TILES_N * DG_GROUP_SIZE;
+        const int group_idx = block_idx / group_tiles;
+        const int first_m = group_idx * DG_GROUP_SIZE;
+        const int in_group = block_idx - group_idx * group_tiles;
+        int tm, tn;
+        if (first_m + DG_GROUP_SIZE <= TILES_M) {
+            const int lm = in_group % DG_GROUP_SIZE;
+            const int ln = in_group / DG_GROUP_SIZE;
+            int tn_rot = ln + lm;
+            while (tn_rot >= TILES_N) tn_rot -= TILES_N;
+            tm = first_m + lm;
+            tn = tn_rot;
+        } else {
+            const int num_m = TILES_M - first_m;
+            const int lm = in_group % num_m;
+            const int ln = in_group / num_m;
+            int tn_rot = ln + lm;
+            while (tn_rot >= TILES_N) tn_rot -= TILES_N;
+            tm = first_m + lm;
+            tn = tn_rot;
+        }
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        if (tn >= TILES_N) tn = TILES_N - 1;
+        return tm * TILES_N + tn;
+    }
+
 #elif TILE_DISPATCH == 22
     /*
        cuBLASLt nvjet_sm100_qqtst rank-1/2 tile swizzle (3-level hierarchical
