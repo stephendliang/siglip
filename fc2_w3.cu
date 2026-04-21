@@ -115,9 +115,65 @@ Compile-time flags:
 #include "tile_dispatch.cuh"
 
 
+/* ── Epilogue store levers (A, B, C) ── */
+/* Lever A: TMA_STORE_WIDE=1 — tma_c box {64,32}->{128,32}, halves UTMASTG.
+   Requires widening STAGING row stride 128B->256B and extending chunk mux 2->4.
+   Lever B: EPI_SINGLE_PASS=1 — collapses NUM_EPI_SUBITERS 4->1 (full TN in
+   one pass), eliminates 3 inter-sub-iter BAR_EPI_SYNC + 3 wait_group 1 stalls,
+   batches all TMAs under one commit_group.  Default forces N_STAGES=5 and
+   NUM_EPI_STAGES=1 to fit SMEM budget (full-tile staging doubles epilogue SMEM).
+   Lever C: USE_STMATRIX=1 — stmatrix.sync.aligned.x4.m8n8.shared.b16 instead
+   of st.shared.v4.b32. Same 16-B/lane payload; correctness subject to
+   TMEM→register layout matching stmatrix's lane→row mapping. */
+#ifndef TMA_STORE_WIDE
+#define TMA_STORE_WIDE   0
+#endif
+#ifndef EPI_SINGLE_PASS
+#define EPI_SINGLE_PASS  0
+#endif
+#ifndef USE_STMATRIX
+#define USE_STMATRIX 0
+#endif
+
+#if TMA_STORE_WIDE
+#define EPI_COL_STRIDE            128
+#define CHUNKS_PER_SUBITER        4
+#define TMA_BOX_COLS              128
+#else
+#define EPI_COL_STRIDE            64
+#define CHUNKS_PER_SUBITER        2
+#define TMA_BOX_COLS              64
+#endif
+#if TMA_STORE_WIDE
+#define STAGING_REGION_ROW_BYTES  256   /* row stride within a TMA block */
+#else
+#define STAGING_REGION_ROW_BYTES  128
+#endif
+#define CHUNKS_PER_TMA_BLOCK      (TMA_BOX_COLS / 32)   /* 2 narrow, 4 wide */
+#if EPI_SINGLE_PASS
+#define EPI_TMAS_PER_WARP         (TN / TMA_BOX_COLS)
+#else
+#define EPI_TMAS_PER_WARP         1
+#endif
+
 /* ── Pipeline ── */
+/* EPI_REUSE_SMEM (last-stage SMEM overlap) is slower than NS=5 on this kernel
+   (measured). Default: drop one mainloop stage (NS=6 → NS=5) when a lever
+   needs +32 KB staging, rather than forcing EPI_REUSE_SMEM. To force
+   REUSE at NS=6 instead, pass -DEPI_REUSE_FORCE=1.
+   GEMM_ONLY/STRIP_EPILOGUE skip W2 residual prefetch so NUM_EPI_STAGES=1
+   suffices — wide TMA (32 KB/stage) × 1 stage = 32 KB fits NS=6 at 224 KB.
+   Only true single-pass (needs 64 KB/stage regardless) still forces NS=5. */
 #ifndef N_STAGES
+#if defined(EPI_REUSE_FORCE) && EPI_REUSE_FORCE
 #define N_STAGES       6
+#elif EPI_SINGLE_PASS
+#define N_STAGES       5
+#elif TMA_STORE_WIDE && !defined(GEMM_ONLY) && !defined(STRIP_EPILOGUE)
+#define N_STAGES       5
+#else
+#define N_STAGES       6
+#endif
 #endif
 #ifndef K_LOOP_UNROLL
 #define K_LOOP_UNROLL  N_STAGES
@@ -170,9 +226,15 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define OFF_MAINLOOP_MBAR  (OFF_MMA_MBAR + N_STAGES * 8)
 #define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
 
-/* New barriers for W2↔epilogue coordination (2-stage circular load pipe). */
+/* New barriers for W2↔epilogue coordination (2-stage circular load pipe).
+   GEMM_ONLY/STRIP_EPILOGUE have no W2 residual prefetch → no tile-to-tile
+   double-buffer benefit → NUM_EPI_STAGES=1 is sufficient. */
 #ifndef NUM_EPI_STAGES
+#if EPI_SINGLE_PASS || defined(GEMM_ONLY) || defined(STRIP_EPILOGUE)
+#define NUM_EPI_STAGES     1
+#else
 #define NUM_EPI_STAGES     2
+#endif
 #endif
 #ifndef SINGLE_WARP_STORE
 #define SINGLE_WARP_STORE  0
@@ -257,7 +319,16 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define L2_RES_HINT 0x12F0000000000000ULL  /* EVICT_FIRST: stream residual through */
 #endif
 
+#if EPI_SINGLE_PASS
+#define NUM_EPI_SUBITERS   1
+#define EPI_PASS_CHUNKS    (TN / 32)
+#elif TMA_STORE_WIDE
+#define NUM_EPI_SUBITERS   2
+#define EPI_PASS_CHUNKS    CHUNKS_PER_SUBITER
+#else
 #define NUM_EPI_SUBITERS   4
+#define EPI_PASS_CHUNKS    CHUNKS_PER_SUBITER
+#endif
 #ifdef SELF_LOAD
 /* Per-warp TMA load barriers replace W2's shared circular pipe */
 #define OFF_SELF_LOAD_MBAR (OFF_EPILOGUE_MBAR + 16)
@@ -325,19 +396,25 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #endif
 
 /*
-EPI_REUSE_SMEM: borrow the last mainloop stage for epilogue staging.
-Epilogue uses 2×16KB = 32KB, which fits in one 32KB mainloop stage.
-W0 waits on epi_done_mbar before loading ki=EPI_FIRST_BORROW_KI.
-Auto-enabled when N_STAGES >= 7 (NS6 fits without reuse, NS7+ doesn't).
+EPI_REUSE_SMEM: borrow the last mainloop stage(s) for epilogue staging.
+Empirically slower than dropping N_STAGES on FC2 (see note above on levers).
+Auto-enabled only when NS>=7 (mainloop alone doesn't fit).
+Opt-in for lever configs via -DEPI_REUSE_FORCE=1.
 */
 #if N_STAGES >= 7
 #define EPI_REUSE_SMEM     1
 #define EPI_BORROW_STAGES  1
+#elif defined(EPI_REUSE_FORCE) && EPI_REUSE_FORCE && (EPI_SINGLE_PASS || TMA_STORE_WIDE) && N_STAGES >= 5
+#define EPI_REUSE_SMEM     1
+#define EPI_BORROW_STAGES  ((EPI_SINGLE_PASS || (TMA_STORE_WIDE && NUM_EPI_STAGES >= 2)) ? 2 : 1)
+#else
+#define EPI_REUSE_SMEM     0
+#endif
+#if EPI_REUSE_SMEM
 #define EPI_FIRST_BORROW_KI (N_STAGES - EPI_BORROW_STAGES)
 #define OFF_EPI_DONE_MBAR  _LAYOUT_END
 #define _CTRL_END          (OFF_EPI_DONE_MBAR + 8)
 #else
-#define EPI_REUSE_SMEM     0
 #define _CTRL_END          _LAYOUT_END
 #endif
 
@@ -346,10 +423,18 @@ Auto-enabled when N_STAGES >= 7 (NS6 fits without reuse, NS7+ doesn't).
 #define BIAS_SMEM_BYTES    (N_DIM * 2)
 
 /* Epilogue staging: ReuseSmemC — 2-stage circular pipe.
-   Each stage holds 128 rows × 64 cols × 2B = 16 KB, used for BOTH residual
-   load and output store sequentially (residual overwritten by output after LDS). */
-#define STAGING_REGION_BYTES  (32 * 128)                        /* 4096 B: 32 rows × 64 cols × 2B */
-#define EPI_STAGE_BYTES    (4 * STAGING_REGION_BYTES)           /* 16384: 128 rows × 64 cols × 2B */
+   Baseline: each stage holds 128 rows × 64 cols × 2B = 16 KB, used for BOTH
+   residual load and output store sequentially.
+   TMA_STORE_WIDE=1: row stride doubles (128->256B), so per-warp region
+   doubles (4KB->8KB). Per-stage becomes 4 × 8KB = 32 KB, × NUM_EPI_STAGES.
+   EPI_SINGLE_PASS=1: per-warp region holds full TN cols (32 × TN × 2B); each
+   stage holds all the output data for one tile. */
+#define STAGING_TMA_REGION_BYTES  (32 * STAGING_REGION_ROW_BYTES)   /* per TMA block per row group (4/8 KB) */
+#define STAGE_BLOCK_BYTES         (4 * STAGING_TMA_REGION_BYTES)     /* per TMA block across 4 row groups (16/32 KB) */
+#define EPI_STAGE_BYTES           (EPI_TMAS_PER_WARP * STAGE_BLOCK_BYTES)
+/* Legacy name: stride between row groups *within* a TMA block. W2's natural
+   TMA-load layout packs row groups row-contiguous, so rg stride = TMA region. */
+#define STAGING_REGION_BYTES      STAGING_TMA_REGION_BYTES
 
 #if EPI_REUSE_SMEM
 /* Staging overlaps with last mainloop stage. SMEM ends at bias region. */
@@ -520,6 +605,26 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
 #define TMEM_WAIT() \
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory")
 
+/*
+Lever C: stmatrix.sync.aligned.x4.m8n8.shared.b16 instead of st.shared.v4.b32.
+Same 16 B/lane payload, but routed through the dedicated stmatrix unit.
+
+CAVEAT (untested): our TMEM load (tcgen05.ld.sync x64.b32) produces a
+row-contiguous register layout (lane i = row i, regs hold 64 consecutive
+cols of that row). stmatrix.x4 expects each lane's 4 regs to hold 2 BF16
+from each of 4 different rows (same col pair). A drop-in substitution
+will write a different SMEM byte pattern than STS.128 — the TMA then reads
+garbage unless TMEM load layout is also adapted. Enabled by default for
+B200 empirical test; if output is wrong, opt out with -DUSE_STMATRIX=0.
+*/
+#if USE_STMATRIX
+#define _EPI_STORE_V4_B32(SADDR, o0, o1, o2, o3) \
+    "stmatrix.sync.aligned.x4.m8n8.shared.b16 [" #SADDR "], {" #o0 "," #o1 "," #o2 "," #o3 "};\n\t"
+#define _EPI_STORE_ASM "stmatrix.sync.aligned.x4.m8n8.shared.b16 [%8], {o0,o1,o2,o3};\n\t"
+#else
+#define _EPI_STORE_ASM "st.shared.v4.b32 [%8], {o0,o1,o2,o3};\n\t"
+#endif
+
 #ifdef FP32_EPILOGUE
 /* FP32 epilogue: unpack BF16 to FP32, add in FP32, CVT to BF16, STS.
    FFMA/FADD have ~0% STS conflict (vs 7.5% for HFMA2). Matches CUTLASS. */
@@ -538,7 +643,7 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
         "cvt.rn.bf16x2.f32 o1, %3, %2;\n\t" \
         "cvt.rn.bf16x2.f32 o2, %5, %4;\n\t" \
         "cvt.rn.bf16x2.f32 o3, %7, %6;\n\t" \
-        "st.shared.v4.b32 [%8], {o0,o1,o2,o3};\n\t" \
+        _EPI_STORE_ASM \
         "}" \
         :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
            "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
@@ -557,6 +662,11 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 #else /* BF16 epilogue (default) */
 
 /* BF16 compute: 8 FP32 acc + 4 BF16x2 bias + 4 BF16x2 residual → CVT+ADD+ADD → STS */
+#if USE_STMATRIX
+#define _BIAS_RES_STORE_ASM "stmatrix.sync.aligned.x4.m8n8.shared.b16 [%16], {o0,o1,o2,o3};\n\t"
+#else
+#define _BIAS_RES_STORE_ASM "st.shared.v4.b32 [%16], {o0,o1,o2,o3};\n\t"
+#endif
 #define BIAS_RES_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3, r0,r1,r2,r3, SADDR) \
     asm volatile( \
         "{\n\t" \
@@ -573,7 +683,7 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
         "add.rn.bf16x2 o1, o1, %13;\n\t" \
         "add.rn.bf16x2 o2, o2, %14;\n\t" \
         "add.rn.bf16x2 o3, o3, %15;\n\t" \
-        "st.shared.v4.b32 [%16], {o0,o1,o2,o3};\n\t" \
+        _BIAS_RES_STORE_ASM \
         "}" \
         :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
            "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
@@ -593,7 +703,7 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
         "cvt.rn.bf16x2.f32 o1, %3, %2;\n\t" \
         "cvt.rn.bf16x2.f32 o2, %5, %4;\n\t" \
         "cvt.rn.bf16x2.f32 o3, %7, %6;\n\t" \
-        "st.shared.v4.b32 [%8], {o0,o1,o2,o3};\n\t" \
+        _EPI_STORE_ASM \
         "}" \
         :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
            "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
@@ -799,14 +909,18 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 #if SINGLE_WARP_STORE
 #define EPI_STORE(STAGE, NC, PN, PM) do { \
     if (ew == 0 && lane == 0) { \
-        for (int rg_ = 0; rg_ < NUM_EPI_WARPS; rg_++) { \
-            const uint32_t s_ = smem_to_uint(smem + OFF_STAGING \
-                + (STAGE) * EPI_STAGE_BYTES + rg_ * STAGING_REGION_BYTES); \
-            asm volatile( \
-                "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group" \
-                " [%0, {%1, %2}], [%3];" \
-                :: "l"(&tma_c), "r"((PN) + (NC)), "r"((PM) + rg_ * 32), \
-                   "r"(s_) : "memory"); \
+        _Pragma("unroll") \
+        for (int _ti_ = 0; _ti_ < EPI_TMAS_PER_WARP; _ti_++) { \
+            for (int rg_ = 0; rg_ < NUM_EPI_WARPS; rg_++) { \
+                const uint32_t s_ = smem_to_uint(smem + OFF_STAGING \
+                    + (STAGE) * EPI_STAGE_BYTES + rg_ * STAGING_REGION_BYTES \
+                    + _ti_ * STAGE_BLOCK_BYTES); \
+                asm volatile( \
+                    "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group" \
+                    " [%0, {%1, %2}], [%3];" \
+                    :: "l"(&tma_c), "r"((PN) + (NC) + _ti_ * TMA_BOX_COLS), "r"((PM) + rg_ * 32), \
+                       "r"(s_) : "memory"); \
+            } \
         } \
         asm volatile("cp.async.bulk.commit_group;" ::: "memory"); \
     } \
@@ -815,13 +929,17 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 #else
 #define EPI_STORE(STAGE, NC, PN, PM) do { \
     if (lane == 0) { \
-        const uint32_t s_ = smem_to_uint(smem + OFF_STAGING \
-            + (STAGE) * EPI_STAGE_BYTES + row_group * STAGING_REGION_BYTES); \
-        asm volatile( \
-            "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group" \
-            " [%0, {%1, %2}], [%3];" \
-            :: "l"(&tma_c), "r"((PN) + (NC)), "r"((PM) + row_group * 32), \
-               "r"(s_) : "memory"); \
+        _Pragma("unroll") \
+        for (int _ti_ = 0; _ti_ < EPI_TMAS_PER_WARP; _ti_++) { \
+            const uint32_t s_ = smem_to_uint(smem + OFF_STAGING \
+                + (STAGE) * EPI_STAGE_BYTES + row_group * STAGING_REGION_BYTES \
+                + _ti_ * STAGE_BLOCK_BYTES); \
+            asm volatile( \
+                "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group" \
+                " [%0, {%1, %2}], [%3];" \
+                :: "l"(&tma_c), "r"((PN) + (NC) + _ti_ * TMA_BOX_COLS), "r"((PM) + row_group * 32), \
+                   "r"(s_) : "memory"); \
+        } \
         asm volatile("cp.async.bulk.commit_group;" ::: "memory"); \
     } \
 } while(0)
@@ -1988,7 +2106,7 @@ fc2_w3_kernel(
                 const int pf_m = pf_tm * TM * 2 + cta_rank * TM;
                 const int pf_n = pf_tn * TN;
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++)
-                    tma_prefetch_2d(&tma_res, pf_n + si * 64, pf_m);
+                    tma_prefetch_2d(&tma_res, pf_n + si * EPI_COL_STRIDE, pf_m);
             }
 #endif
             /* W2 must wait on mainloop_mbar EVERY tile (including tile_start)
@@ -2053,8 +2171,12 @@ fc2_w3_kernel(
                     if (lane == 0) {
                         const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING + stage * EPI_STAGE_BYTES);
                         mbar_arrive_expect_tx(load_mbar[stage], EPI_STAGE_BYTES);
-                        tma_load_2d_cta(res_dst, &tma_res,
-                                        prev_n + si * 64, prev_m, load_mbar[stage]);
+                        _Pragma("unroll")
+                        for (int _ti = 0; _ti < EPI_TMAS_PER_WARP; _ti++) {
+                            tma_load_2d_cta(res_dst + _ti * STAGE_BLOCK_BYTES, &tma_res,
+                                            prev_n + si * EPI_COL_STRIDE + _ti * TMA_BOX_COLS, prev_m,
+                                            load_mbar[stage]);
+                        }
                     }
                     load_issue_count++;
                 }
@@ -2144,7 +2266,7 @@ fc2_w3_kernel(
 
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                     const int stage = si % NUM_EPI_STAGES;
-                    const int nc_base = si * 64;
+                    const int nc_base = si * EPI_COL_STRIDE;
 
 #if GROUPS_PER_WARP > 1
                     #pragma unroll
@@ -2160,9 +2282,9 @@ fc2_w3_kernel(
                     const uint32_t stage_base = smem_to_uint(smem + OFF_STAGING
                         + stage * EPI_STAGE_BYTES
                         + row_group * STAGING_REGION_BYTES
-                        + lane * 128);
+                        + lane * STAGING_REGION_ROW_BYTES);
 
-                    for (int _ci = 0; _ci < 2; _ci++) {
+                    for (int _ci = 0; _ci < EPI_PASS_CHUNKS; _ci++) {
                         const int chunk = _ci;
                         const int nc = nc_base + chunk * 32;
 
@@ -2172,10 +2294,13 @@ fc2_w3_kernel(
                                       a24,a25,a26,a27,a28,a29,a30,a31,
                                       taddr_base + nc);
 
-                        const uint32_t rsw0 = chunk ? sw4 : sw0;
-                        const uint32_t rsw1 = chunk ? sw5 : sw1;
-                        const uint32_t rsw2 = chunk ? sw6 : sw2;
-                        const uint32_t rsw3 = chunk ? sw7 : sw3;
+                        const uint32_t _cblk = chunk / CHUNKS_PER_TMA_BLOCK;
+                        const uint32_t _cinb = chunk % CHUNKS_PER_TMA_BLOCK;
+                        const uint32_t _boff = (_cinb >> 1) * 128u + _cblk * STAGE_BLOCK_BYTES;
+                        const uint32_t rsw0 = ((_cinb & 1) ? sw4 : sw0) + _boff;
+                        const uint32_t rsw1 = ((_cinb & 1) ? sw5 : sw1) + _boff;
+                        const uint32_t rsw2 = ((_cinb & 1) ? sw6 : sw2) + _boff;
+                        const uint32_t rsw3 = ((_cinb & 1) ? sw7 : sw3) + _boff;
 
                         TMEM_WAIT();
 
@@ -2286,7 +2411,7 @@ fc2_w3_kernel(
 #endif
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                     const int stage = si % NUM_EPI_STAGES;
-                    const int nc_base = si * 64;   /* column offset within tile */
+                    const int nc_base = si * EPI_COL_STRIDE;   /* column offset within tile */
 
 #if DELAY_TMA_STORE
                     /* Issue delayed TMA store from previous sub-iter */
@@ -2308,14 +2433,17 @@ fc2_w3_kernel(
                             asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
                         __syncwarp();
                     }
-                    /* Issue per-warp TMA load: 32 rows × 64 cols */
+                    /* Issue per-warp TMA load(s): 32 rows × TMA_BOX_COLS cols per TMA */
                     if (lane == 0) {
                         const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING
                             + stage * EPI_STAGE_BYTES + ew * STAGING_REGION_BYTES);
-                        mbar_arrive_expect_tx(self_mbar_arr[stage], STAGING_REGION_BYTES);
-                        tma_load_2d_cta(res_dst, &tma_res,
-                                        prev_n + si * 64, prev_m + ew * 32,
-                                        self_mbar_arr[stage]);
+                        mbar_arrive_expect_tx(self_mbar_arr[stage], STAGING_REGION_BYTES * EPI_TMAS_PER_WARP);
+                        _Pragma("unroll")
+                        for (int _ti = 0; _ti < EPI_TMAS_PER_WARP; _ti++) {
+                            tma_load_2d_cta(res_dst + _ti * STAGE_BLOCK_BYTES, &tma_res,
+                                            prev_n + si * EPI_COL_STRIDE + _ti * TMA_BOX_COLS, prev_m + ew * 32,
+                                            self_mbar_arr[stage]);
+                        }
                     }
                     mbar_wait(self_mbar_arr[stage], self_mbar_phase[stage]);
                     self_mbar_phase[stage] ^= 1;
@@ -2327,7 +2455,7 @@ fc2_w3_kernel(
 
                     /* Staging SMEM base for drain/fence (row_group=0, valid for any group) */
                     const uint32_t stage_drain = smem_to_uint(smem + OFF_STAGING
-                        + stage * EPI_STAGE_BYTES + lane * 128);
+                        + stage * EPI_STAGE_BYTES + lane * STAGING_REGION_ROW_BYTES);
 
                     /* Process 2 chunks of 32 cols each, looping over row groups */
 #if GROUPS_PER_WARP > 1
@@ -2349,18 +2477,18 @@ fc2_w3_kernel(
                     const uint32_t stage_base = smem_to_uint(smem + OFF_STAGING
                         + stage * EPI_STAGE_BYTES
                         + row_group * STAGING_REGION_BYTES
-                        + lane * 128);
+                        + lane * STAGING_REGION_ROW_BYTES);
 #ifdef CUTE_STORE
                     char* stage_cptr = smem + OFF_STAGING
                         + stage * EPI_STAGE_BYTES
                         + row_group * STAGING_REGION_BYTES
-                        + lane * 128;
+                        + lane * STAGING_REGION_ROW_BYTES;
 #endif
 
 #if CUTLASS_LOOP >= 2
                     PRAGMA_UNROLL(1)
 #endif
-                    for (int _ci = 0; _ci < 2; _ci++) {
+                    for (int _ci = 0; _ci < EPI_PASS_CHUNKS; _ci++) {
 #ifdef CHUNK_REORDER
                         const int chunk = (ew & 1) ? (1 - _ci) : _ci;
 #else
@@ -2377,14 +2505,17 @@ fc2_w3_kernel(
 
 #if CUTLASS_LOOP >= 3
                         {
-                            const uint32_t rsw0 = chunk ? sw4 : sw0;
-                            const uint32_t rsw1 = chunk ? sw5 : sw1;
-                            const uint32_t rsw2 = chunk ? sw6 : sw2;
-                            const uint32_t rsw3 = chunk ? sw7 : sw3;
+                            const uint32_t _cblk = chunk / CHUNKS_PER_TMA_BLOCK;
+                            const uint32_t _cinb = chunk % CHUNKS_PER_TMA_BLOCK;
+                            const uint32_t _boff = (_cinb >> 1) * 128u + _cblk * STAGE_BLOCK_BYTES;
+                            const uint32_t rsw0 = ((_cinb & 1) ? sw4 : sw0) + _boff;
+                            const uint32_t rsw1 = ((_cinb & 1) ? sw5 : sw1) + _boff;
+                            const uint32_t rsw2 = ((_cinb & 1) ? sw6 : sw2) + _boff;
+                            const uint32_t rsw3 = ((_cinb & 1) ? sw7 : sw3) + _boff;
                             char* sptr = smem + OFF_STAGING
                                 + stage * EPI_STAGE_BYTES
                                 + row_group * STAGING_REGION_BYTES
-                                + lane * 128;
+                                + lane * STAGING_REGION_ROW_BYTES;
 
                             /* C++ reads: bias from linear SMEM */
                             const char* bp = smem + OFF_BIAS_SMEM + (prev_n_bias + nc) * 2;
@@ -2421,10 +2552,13 @@ fc2_w3_kernel(
                             : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
 
                         /* LDS residual from shared staging (swizzled, ReuseSmemC) */
-                        const uint32_t rsw0 = chunk ? sw4 : sw0;
-                        const uint32_t rsw1 = chunk ? sw5 : sw1;
-                        const uint32_t rsw2 = chunk ? sw6 : sw2;
-                        const uint32_t rsw3 = chunk ? sw7 : sw3;
+                        const uint32_t _cblk = chunk / CHUNKS_PER_TMA_BLOCK;
+                        const uint32_t _cinb = chunk % CHUNKS_PER_TMA_BLOCK;
+                        const uint32_t _boff = (_cinb >> 1) * 128u + _cblk * STAGE_BLOCK_BYTES;
+                        const uint32_t rsw0 = ((_cinb & 1) ? sw4 : sw0) + _boff;
+                        const uint32_t rsw1 = ((_cinb & 1) ? sw5 : sw1) + _boff;
+                        const uint32_t rsw2 = ((_cinb & 1) ? sw6 : sw2) + _boff;
+                        const uint32_t rsw3 = ((_cinb & 1) ? sw7 : sw3) + _boff;
                         uint4 rv0, rv1, rv2, rv3;
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(stage_base + rsw0));
@@ -2711,8 +2845,12 @@ _lean_done:
                 if (lane == 0) {
                     const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING + stage * EPI_STAGE_BYTES);
                     mbar_arrive_expect_tx(load_mbar[stage], EPI_STAGE_BYTES);
-                    tma_load_2d_cta(res_dst, &tma_res,
-                                    last_n + si * 64, last_m, load_mbar[stage]);
+                    _Pragma("unroll")
+                    for (int _ti = 0; _ti < EPI_TMAS_PER_WARP; _ti++) {
+                        tma_load_2d_cta(res_dst + _ti * STAGE_BLOCK_BYTES, &tma_res,
+                                        last_n + si * EPI_COL_STRIDE + _ti * TMA_BOX_COLS, last_m,
+                                        load_mbar[stage]);
+                    }
                 }
                 load_issue_count++;
             }
@@ -2756,7 +2894,7 @@ _lean_done:
 
             for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                 const int stage = si % NUM_EPI_STAGES;
-                const int nc_base = si * 64;
+                const int nc_base = si * EPI_COL_STRIDE;
 
 #if GROUPS_PER_WARP > 1
                 #pragma unroll
@@ -2772,9 +2910,9 @@ _lean_done:
                 const uint32_t stage_base = smem_to_uint(smem + OFF_STAGING
                     + stage * EPI_STAGE_BYTES
                     + row_group * STAGING_REGION_BYTES
-                    + lane * 128);
+                    + lane * STAGING_REGION_ROW_BYTES);
 
-                for (int _ci = 0; _ci < 2; _ci++) {
+                for (int _ci = 0; _ci < EPI_PASS_CHUNKS; _ci++) {
                     const int chunk = _ci;
                     const int nc = nc_base + chunk * 32;
 
@@ -2784,10 +2922,13 @@ _lean_done:
                                   a24,a25,a26,a27,a28,a29,a30,a31,
                                   taddr_base + nc);
 
-                    const uint32_t rsw0 = chunk ? sw4 : sw0;
-                    const uint32_t rsw1 = chunk ? sw5 : sw1;
-                    const uint32_t rsw2 = chunk ? sw6 : sw2;
-                    const uint32_t rsw3 = chunk ? sw7 : sw3;
+                    const uint32_t _cblk = chunk / CHUNKS_PER_TMA_BLOCK;
+                    const uint32_t _cinb = chunk % CHUNKS_PER_TMA_BLOCK;
+                    const uint32_t _boff = (_cinb >> 1) * 128u + _cblk * STAGE_BLOCK_BYTES;
+                    const uint32_t rsw0 = ((_cinb & 1) ? sw4 : sw0) + _boff;
+                    const uint32_t rsw1 = ((_cinb & 1) ? sw5 : sw1) + _boff;
+                    const uint32_t rsw2 = ((_cinb & 1) ? sw6 : sw2) + _boff;
+                    const uint32_t rsw3 = ((_cinb & 1) ? sw7 : sw3) + _boff;
 
                     TMEM_WAIT();
 
@@ -2868,7 +3009,7 @@ _lean_done:
 #endif
             for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                 const int stage = si % NUM_EPI_STAGES;
-                const int nc_base = si * 64;
+                const int nc_base = si * EPI_COL_STRIDE;
 
 #if DELAY_TMA_STORE
                 if (have_pending) {
@@ -2888,14 +3029,17 @@ _lean_done:
                         asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
                     __syncwarp();
                 }
-                /* Issue per-warp TMA load: 32 rows × 64 cols */
+                /* Issue per-warp TMA load(s): 32 rows × TMA_BOX_COLS cols per TMA */
                 if (lane == 0) {
                     const uint32_t res_dst = smem_to_uint(smem + OFF_STAGING
                         + stage * EPI_STAGE_BYTES + ew * STAGING_REGION_BYTES);
-                    mbar_arrive_expect_tx(self_mbar_arr[stage], STAGING_REGION_BYTES);
-                    tma_load_2d_cta(res_dst, &tma_res,
-                                    last_n + si * 64, last_m + ew * 32,
-                                    self_mbar_arr[stage]);
+                    mbar_arrive_expect_tx(self_mbar_arr[stage], STAGING_REGION_BYTES * EPI_TMAS_PER_WARP);
+                    _Pragma("unroll")
+                    for (int _ti = 0; _ti < EPI_TMAS_PER_WARP; _ti++) {
+                        tma_load_2d_cta(res_dst + _ti * STAGE_BLOCK_BYTES, &tma_res,
+                                        last_n + si * EPI_COL_STRIDE + _ti * TMA_BOX_COLS, last_m + ew * 32,
+                                        self_mbar_arr[stage]);
+                    }
                 }
                 mbar_wait(self_mbar_arr[stage], self_mbar_phase[stage]);
                 self_mbar_phase[stage] ^= 1;
@@ -2905,7 +3049,7 @@ _lean_done:
 #endif
 
                 const uint32_t stage_drain = smem_to_uint(smem + OFF_STAGING
-                    + stage * EPI_STAGE_BYTES + lane * 128);
+                    + stage * EPI_STAGE_BYTES + lane * STAGING_REGION_ROW_BYTES);
 
 #if GROUPS_PER_WARP > 1
                 #pragma unroll
@@ -2925,18 +3069,18 @@ _lean_done:
                 const uint32_t stage_base = smem_to_uint(smem + OFF_STAGING
                     + stage * EPI_STAGE_BYTES
                     + row_group * STAGING_REGION_BYTES
-                    + lane * 128);
+                    + lane * STAGING_REGION_ROW_BYTES);
 #ifdef CUTE_STORE
                 char* stage_cptr = smem + OFF_STAGING
                     + stage * EPI_STAGE_BYTES
                     + row_group * STAGING_REGION_BYTES
-                    + lane * 128;
+                    + lane * STAGING_REGION_ROW_BYTES;
 #endif
 
 #if CUTLASS_LOOP >= 2
                 PRAGMA_UNROLL(1)
 #endif
-                for (int _ci = 0; _ci < 2; _ci++) {
+                for (int _ci = 0; _ci < EPI_PASS_CHUNKS; _ci++) {
 #ifdef CHUNK_REORDER
                     const int chunk = (ew & 1) ? (1 - _ci) : _ci;
 #else
@@ -2952,14 +3096,17 @@ _lean_done:
 
 #if CUTLASS_LOOP >= 3
                     {
-                        const uint32_t rsw0 = chunk ? sw4 : sw0;
-                        const uint32_t rsw1 = chunk ? sw5 : sw1;
-                        const uint32_t rsw2 = chunk ? sw6 : sw2;
-                        const uint32_t rsw3 = chunk ? sw7 : sw3;
+                        const uint32_t _cblk = chunk / CHUNKS_PER_TMA_BLOCK;
+                        const uint32_t _cinb = chunk % CHUNKS_PER_TMA_BLOCK;
+                        const uint32_t _boff = (_cinb >> 1) * 128u + _cblk * STAGE_BLOCK_BYTES;
+                        const uint32_t rsw0 = ((_cinb & 1) ? sw4 : sw0) + _boff;
+                        const uint32_t rsw1 = ((_cinb & 1) ? sw5 : sw1) + _boff;
+                        const uint32_t rsw2 = ((_cinb & 1) ? sw6 : sw2) + _boff;
+                        const uint32_t rsw3 = ((_cinb & 1) ? sw7 : sw3) + _boff;
                         char* sptr = smem + OFF_STAGING
                             + stage * EPI_STAGE_BYTES
                             + row_group * STAGING_REGION_BYTES
-                            + lane * 128;
+                            + lane * STAGING_REGION_ROW_BYTES;
 
                         const char* bp = smem + OFF_BIAS_SMEM + (last_n_bias + nc) * 2;
                         uint4 bv0 = *(const uint4*)(bp);
@@ -2992,10 +3139,13 @@ _lean_done:
                         : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
 
                     /* LDS residual (swizzled, ReuseSmemC) */
-                    const uint32_t rsw0 = chunk ? sw4 : sw0;
-                    const uint32_t rsw1 = chunk ? sw5 : sw1;
-                    const uint32_t rsw2 = chunk ? sw6 : sw2;
-                    const uint32_t rsw3 = chunk ? sw7 : sw3;
+                    const uint32_t _cblk = chunk / CHUNKS_PER_TMA_BLOCK;
+                    const uint32_t _cinb = chunk % CHUNKS_PER_TMA_BLOCK;
+                    const uint32_t _boff = (_cinb >> 1) * 128u + _cblk * STAGE_BLOCK_BYTES;
+                    const uint32_t rsw0 = ((_cinb & 1) ? sw4 : sw0) + _boff;
+                    const uint32_t rsw1 = ((_cinb & 1) ? sw5 : sw1) + _boff;
+                    const uint32_t rsw2 = ((_cinb & 1) ? sw6 : sw2) + _boff;
+                    const uint32_t rsw3 = ((_cinb & 1) ? sw7 : sw3) + _boff;
                     uint4 rv0, rv1, rv2, rv3;
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(stage_base + rsw0));
@@ -3414,7 +3564,7 @@ int main() {
         uint64_t c_total_rows = (uint64_t)(M_TOTAL / TM) * TILES_N * TM;
         uint64_t dims[2]    = {(uint64_t)TN, c_total_rows};
         uint64_t strides[1] = {(uint64_t)TN * sizeof(__nv_bfloat16)};
-        uint32_t box[2]     = {64, 32};
+        uint32_t box[2]     = {TMA_BOX_COLS, 32};
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_c,
             CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_C,
@@ -3431,9 +3581,9 @@ int main() {
         uint64_t dims[2]    = {(uint64_t)TN, r_total_rows};
         uint64_t strides[1] = {(uint64_t)TN * sizeof(__nv_bfloat16)};
 #ifdef SELF_LOAD
-        uint32_t box[2]     = {64, 32};   /* Per-warp: 32 rows × 64 cols */
+        uint32_t box[2]     = {TMA_BOX_COLS, 32};   /* Per-warp: 32 rows × TMA_BOX_COLS cols */
 #else
-        uint32_t box[2]     = {64, 128};  /* W2 loads full 128 rows × 64 cols per sub-iter */
+        uint32_t box[2]     = {TMA_BOX_COLS, 128};  /* W2 loads full 128 rows × TMA_BOX_COLS cols per sub-iter */
 #endif
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_res,
@@ -3476,7 +3626,7 @@ int main() {
     {
         uint64_t dims[2]    = {(uint64_t)N_DIM, (uint64_t)M_TOTAL};
         uint64_t strides[1] = {(uint64_t)N_DIM * sizeof(__nv_bfloat16)};
-        uint32_t box[2]     = {64, 32};
+        uint32_t box[2]     = {TMA_BOX_COLS, 32};
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_c,
             CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_C,
@@ -3492,9 +3642,9 @@ int main() {
         uint64_t dims[2]    = {(uint64_t)N_DIM, (uint64_t)M_TOTAL};
         uint64_t strides[1] = {(uint64_t)N_DIM * sizeof(__nv_bfloat16)};
 #ifdef SELF_LOAD
-        uint32_t box[2]     = {64, 32};   /* Per-warp: 32 rows × 64 cols */
+        uint32_t box[2]     = {TMA_BOX_COLS, 32};
 #else
-        uint32_t box[2]     = {64, 128};  /* W2 loads full 128 rows × 64 cols per sub-iter */
+        uint32_t box[2]     = {TMA_BOX_COLS, 128};
 #endif
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_res,

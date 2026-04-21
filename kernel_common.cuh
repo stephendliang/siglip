@@ -203,7 +203,7 @@ Usage: #define N_DIM and K_DIM before including this header.
 #define EPI_BAR_CHUNK 0          // 1=bar.sync after each 32-col chunk within epilogue (finest granularity)
 #endif
 #ifndef NUM_PASSES_PARAM
-#define NUM_PASSES_PARAM 0       // 0=auto (128 cols/pass), 4=4-pass (64 cols/pass), FC2 TMA_RESIDUAL only
+#define NUM_PASSES_PARAM 0       // 0=auto (see EPI_SINGLE_PASS), 4=4-pass (64 cols/pass), FC2 TMA_RESIDUAL only
 #endif
 #ifndef BIAS_SMEM
 #define BIAS_SMEM 0              // 0=LDG bias per-chunk, 1=load bias to SMEM once per tile (fc2/fc1 only)

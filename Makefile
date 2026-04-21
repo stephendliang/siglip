@@ -131,6 +131,58 @@ fc2-w3-epi1: fc2_w3.cu
 fc2-w3-epi2: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNUM_EPI_WARPS=2 $< -o $@ $(LDFLAGS)
 
+# ── Epilogue lever combinations: ABC 3-bit name (A=TMA_STORE_WIDE, B=EPI_SINGLE_PASS, C=USE_STMATRIX)
+fc2-w3-epi-000: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTMA_STORE_WIDE=0 -DEPI_SINGLE_PASS=0 -DUSE_STMATRIX=0 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-001: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTMA_STORE_WIDE=0 -DEPI_SINGLE_PASS=0 -DUSE_STMATRIX=1 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-100: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTMA_STORE_WIDE=1 -DEPI_SINGLE_PASS=0 -DUSE_STMATRIX=0 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-101: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTMA_STORE_WIDE=1 -DEPI_SINGLE_PASS=0 -DUSE_STMATRIX=1 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-010: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTMA_STORE_WIDE=0 -DEPI_SINGLE_PASS=1 -DUSE_STMATRIX=0 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-011: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTMA_STORE_WIDE=0 -DEPI_SINGLE_PASS=1 -DUSE_STMATRIX=1 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-110: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTMA_STORE_WIDE=1 -DEPI_SINGLE_PASS=1 -DUSE_STMATRIX=0 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-111: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTMA_STORE_WIDE=1 -DEPI_SINGLE_PASS=1 -DUSE_STMATRIX=1 $< -o $@ $(LDFLAGS)
+
+fc2-w3-epi-all: fc2-w3-epi-000 fc2-w3-epi-001 fc2-w3-epi-100 fc2-w3-epi-101 fc2-w3-epi-010 fc2-w3-epi-011 fc2-w3-epi-110 fc2-w3-epi-111
+
+# ── GEMM-only lever combinations (no bias, no residual, no W2 load pipe)
+# Architectural parity with rank-2 (nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_bias_TNT)
+# is fc2-w3-epi-101-gemm (NS=6, wide TMA multi-pass, stmatrix, no residual).
+fc2-w3-epi-000-gemm: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY -DTMA_STORE_WIDE=0 -DEPI_SINGLE_PASS=0 -DUSE_STMATRIX=0 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-001-gemm: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY -DTMA_STORE_WIDE=0 -DEPI_SINGLE_PASS=0 -DUSE_STMATRIX=1 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-100-gemm: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY -DTMA_STORE_WIDE=1 -DEPI_SINGLE_PASS=0 -DUSE_STMATRIX=0 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-101-gemm: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY -DTMA_STORE_WIDE=1 -DEPI_SINGLE_PASS=0 -DUSE_STMATRIX=1 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-010-gemm: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY -DTMA_STORE_WIDE=0 -DEPI_SINGLE_PASS=1 -DUSE_STMATRIX=0 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-011-gemm: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY -DTMA_STORE_WIDE=0 -DEPI_SINGLE_PASS=1 -DUSE_STMATRIX=1 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-110-gemm: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY -DTMA_STORE_WIDE=1 -DEPI_SINGLE_PASS=1 -DUSE_STMATRIX=0 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-111-gemm: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY -DTMA_STORE_WIDE=1 -DEPI_SINGLE_PASS=1 -DUSE_STMATRIX=1 $< -o $@ $(LDFLAGS)
+
+# NS=6 single-pass via EPI_REUSE_SMEM (borrow mainloop stages). REUSE was slow
+# with residual (W2-load/epi-store conflict); GEMM_ONLY removes W2 so retest.
+fc2-w3-epi-010-gemm-reuse: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY -DTMA_STORE_WIDE=0 -DEPI_SINGLE_PASS=1 -DUSE_STMATRIX=0 -DEPI_REUSE_FORCE=1 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-011-gemm-reuse: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY -DTMA_STORE_WIDE=0 -DEPI_SINGLE_PASS=1 -DUSE_STMATRIX=1 -DEPI_REUSE_FORCE=1 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-110-gemm-reuse: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY -DTMA_STORE_WIDE=1 -DEPI_SINGLE_PASS=1 -DUSE_STMATRIX=0 -DEPI_REUSE_FORCE=1 $< -o $@ $(LDFLAGS)
+fc2-w3-epi-111-gemm-reuse: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY -DTMA_STORE_WIDE=1 -DEPI_SINGLE_PASS=1 -DUSE_STMATRIX=1 -DEPI_REUSE_FORCE=1 $< -o $@ $(LDFLAGS)
+
+fc2-w3-epi-all-gemm: fc2-w3-epi-000-gemm fc2-w3-epi-001-gemm fc2-w3-epi-100-gemm fc2-w3-epi-101-gemm fc2-w3-epi-010-gemm fc2-w3-epi-011-gemm fc2-w3-epi-110-gemm fc2-w3-epi-111-gemm fc2-w3-epi-010-gemm-reuse fc2-w3-epi-011-gemm-reuse fc2-w3-epi-110-gemm-reuse fc2-w3-epi-111-gemm-reuse
 
 fc2-w3-fp32: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DFP32_EPILOGUE $< -o $@ $(LDFLAGS)
