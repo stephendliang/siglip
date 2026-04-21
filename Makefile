@@ -115,14 +115,14 @@ fc2: fc2.cu kernel_common.cuh kernel_body.cuh
 fc2-timing: fc2.cu kernel_common.cuh kernel_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTIMING $< -o $@ $(LDFLAGS)
 
-# ── FC2 WG kernel (standalone, warpgroup-specialized, dgswizzle+PACKED only) ──
-fc2-wg: fc2_wg.cu
+# ── FC2 WS kernel (standalone, warp-specialized mimicking rank-1, dgswizzle+PACKED only) ──
+fc2-ws: fc2_ws.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
 
-fc2-wg-gemm: fc2_wg.cu
+fc2-ws-gemm: fc2_ws.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY $< -o $@ $(LDFLAGS)
 
-fc2-wg-strip: fc2_wg.cu
+fc2-ws-strip: fc2_ws.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
 
 # ── FC2 W3 kernel (standalone, CUTLASS-style shared-SMEM epilogue) ──
