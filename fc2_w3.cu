@@ -116,15 +116,27 @@ Compile-time flags:
 
 
 /* ── Epilogue store levers (A, B, C) ── */
-/* Lever A: TMA_STORE_WIDE=1 — tma_c box {64,32}->{128,32}, halves UTMASTG.
-   Requires widening STAGING row stride 128B->256B and extending chunk mux 2->4.
+/* Lever A: TMA_STORE_WIDE=1 — tma_c box {64,32}->{64,64}, halves UTMASTG by
+   doubling rows (NOT cols: CU_TENSOR_MAP_SWIZZLE_128B caps boxDim[0]*esize
+   at 128B, so 128 BF16 cols = 256B is illegal).  Wide-rows packs 2 warps
+   worth of row groups into one TMA issue: warp 0 row group + warp 1 row
+   group = 64 rows × 64 cols = 8 KB per TMA.  Only the even warp in each
+   pair issues the TMA (the odd warp's STS completes before BAR_EPI_SYNC).
+   SMEM layout is unchanged vs narrow — 4 row groups × 4 KB each — the TMA
+   descriptor is the only thing that widens.
    Lever B: EPI_SINGLE_PASS=1 — collapses NUM_EPI_SUBITERS 4->1 (full TN in
    one pass), eliminates 3 inter-sub-iter BAR_EPI_SYNC + 3 wait_group 1 stalls,
    batches all TMAs under one commit_group.  Default forces N_STAGES=5 and
    NUM_EPI_STAGES=1 to fit SMEM budget (full-tile staging doubles epilogue SMEM).
    Lever C: USE_STMATRIX=1 — stmatrix.sync.aligned.x4.m8n8.shared.b16 instead
-   of st.shared.v4.b32. Same 16-B/lane payload; correctness subject to
-   TMEM→register layout matching stmatrix's lane→row mapping. */
+   of st.shared.v4.b32.  NOT a drop-in correctness-wise on this kernel —
+   rank-2 uses LDTM.16dp256bit.x4 which produces a 16-row x4-matrix register
+   layout that matches stmatrix, whereas our tcgen05.ld.32x32b.x32.b32 gives
+   lane-per-row.  STSM writes the same bytes but interprets them under the
+   (row t/4, cols (t%4)*2..+1) mapping, permuting rows.  Invisible to the
+   GEMM_ONLY test because A=FP8(1.0) uniform makes every row identical; the
+   full-residual test catches it (INVALID).  Fixing properly requires a
+   TMEM_LOAD_X32 -> 16x... variant rewrite; keep the flag for timing only. */
 #ifndef TMA_STORE_WIDE
 #define TMA_STORE_WIDE   0
 #endif
@@ -135,24 +147,25 @@ Compile-time flags:
 #define USE_STMATRIX 0
 #endif
 
-#if TMA_STORE_WIDE
-#define EPI_COL_STRIDE            128
-#define CHUNKS_PER_SUBITER        4
-#define TMA_BOX_COLS              128
-#else
+/* All levers keep 64-col, 128B-row SMEM staging — only TMA descriptor +
+   issue pattern changes under Lever A. */
 #define EPI_COL_STRIDE            64
-#define CHUNKS_PER_SUBITER        2
 #define TMA_BOX_COLS              64
-#endif
-#if TMA_STORE_WIDE
-#define STAGING_REGION_ROW_BYTES  256   /* row stride within a TMA block */
-#else
 #define STAGING_REGION_ROW_BYTES  128
+#if TMA_STORE_WIDE
+#define TMA_BOX_ROWS              64
+#define WARP_PAIR_STRIDE          2    /* only ew 0 & 2 issue TMAs */
+#else
+#define TMA_BOX_ROWS              32
+#define WARP_PAIR_STRIDE          1    /* every ew issues its own TMA */
 #endif
-#define CHUNKS_PER_TMA_BLOCK      (TMA_BOX_COLS / 32)   /* 2 narrow, 4 wide */
 #if EPI_SINGLE_PASS
+#define NUM_EPI_SUBITERS_DERIVED  1
+#define EPI_PASS_CHUNKS_DERIVED   (TN / 32)
 #define EPI_TMAS_PER_WARP         (TN / TMA_BOX_COLS)
 #else
+#define NUM_EPI_SUBITERS_DERIVED  4
+#define EPI_PASS_CHUNKS_DERIVED   2
 #define EPI_TMAS_PER_WARP         1
 #endif
 
@@ -161,15 +174,13 @@ Compile-time flags:
    (measured). Default: drop one mainloop stage (NS=6 → NS=5) when a lever
    needs +32 KB staging, rather than forcing EPI_REUSE_SMEM. To force
    REUSE at NS=6 instead, pass -DEPI_REUSE_FORCE=1.
-   GEMM_ONLY/STRIP_EPILOGUE skip W2 residual prefetch so NUM_EPI_STAGES=1
-   suffices — wide TMA (32 KB/stage) × 1 stage = 32 KB fits NS=6 at 224 KB.
-   Only true single-pass (needs 64 KB/stage regardless) still forces NS=5. */
+   Lever A wide-rows keeps the SMEM footprint identical to narrow (same row
+   stride, same region size), so NS=6 always fits under A alone.
+   Only true single-pass (needs 64 KB/stage regardless) forces NS=5. */
 #ifndef N_STAGES
 #if defined(EPI_REUSE_FORCE) && EPI_REUSE_FORCE
 #define N_STAGES       6
 #elif EPI_SINGLE_PASS
-#define N_STAGES       5
-#elif TMA_STORE_WIDE && !defined(GEMM_ONLY) && !defined(STRIP_EPILOGUE)
 #define N_STAGES       5
 #else
 #define N_STAGES       6
@@ -319,16 +330,8 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define L2_RES_HINT 0x12F0000000000000ULL  /* EVICT_FIRST: stream residual through */
 #endif
 
-#if EPI_SINGLE_PASS
-#define NUM_EPI_SUBITERS   1
-#define EPI_PASS_CHUNKS    (TN / 32)
-#elif TMA_STORE_WIDE
-#define NUM_EPI_SUBITERS   2
-#define EPI_PASS_CHUNKS    CHUNKS_PER_SUBITER
-#else
-#define NUM_EPI_SUBITERS   4
-#define EPI_PASS_CHUNKS    CHUNKS_PER_SUBITER
-#endif
+#define NUM_EPI_SUBITERS   NUM_EPI_SUBITERS_DERIVED
+#define EPI_PASS_CHUNKS    EPI_PASS_CHUNKS_DERIVED
 #ifdef SELF_LOAD
 /* Per-warp TMA load barriers replace W2's shared circular pipe */
 #define OFF_SELF_LOAD_MBAR (OFF_EPILOGUE_MBAR + 16)
@@ -423,18 +426,14 @@ Opt-in for lever configs via -DEPI_REUSE_FORCE=1.
 #define BIAS_SMEM_BYTES    (N_DIM * 2)
 
 /* Epilogue staging: ReuseSmemC — 2-stage circular pipe.
-   Baseline: each stage holds 128 rows × 64 cols × 2B = 16 KB, used for BOTH
-   residual load and output store sequentially.
-   TMA_STORE_WIDE=1: row stride doubles (128->256B), so per-warp region
-   doubles (4KB->8KB). Per-stage becomes 4 × 8KB = 32 KB, × NUM_EPI_STAGES.
-   EPI_SINGLE_PASS=1: per-warp region holds full TN cols (32 × TN × 2B); each
-   stage holds all the output data for one tile. */
-#define STAGING_TMA_REGION_BYTES  (32 * STAGING_REGION_ROW_BYTES)   /* per TMA block per row group (4/8 KB) */
-#define STAGE_BLOCK_BYTES         (4 * STAGING_TMA_REGION_BYTES)     /* per TMA block across 4 row groups (16/32 KB) */
+   Each per-warp region holds 32 rows × 64 cols × 2B = 4 KB.
+   Lever A widens the TMA box rows 32->64 but NOT the SMEM layout — the wide
+   TMA just reads 2 adjacent warp regions as one 64-row × 128B block (8 KB).
+   EPI_SINGLE_PASS=1: one stage holds all 4 sub-iter's data for a tile
+   (EPI_TMAS_PER_WARP=4), so stage size scales by TN/TMA_BOX_COLS. */
+#define STAGING_REGION_BYTES      (32 * STAGING_REGION_ROW_BYTES)    /* 4 KB per warp per sub-iter */
+#define STAGE_BLOCK_BYTES         (4 * STAGING_REGION_BYTES)         /* 16 KB per sub-iter across 4 warps */
 #define EPI_STAGE_BYTES           (EPI_TMAS_PER_WARP * STAGE_BLOCK_BYTES)
-/* Legacy name: stride between row groups *within* a TMA block. W2's natural
-   TMA-load layout packs row groups row-contiguous, so rg stride = TMA region. */
-#define STAGING_REGION_BYTES      STAGING_TMA_REGION_BYTES
 
 #if EPI_REUSE_SMEM
 /* Staging overlaps with last mainloop stage. SMEM ends at bias region. */
@@ -905,13 +904,15 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 
 /* TMA store + wait helpers — shared between main loop and drain.
    EPI_STORE: issue TMA store(s) + commit_group.
-   EPI_WAIT:  wait_group + __syncwarp + bar.sync. */
+   EPI_WAIT:  wait_group + __syncwarp + bar.sync.
+   Under TMA_STORE_WIDE=1, only even warps (ew 0, 2) issue TMAs, each
+   covering 2 adjacent row groups = 64 rows per TMA (halves UTMASTG count). */
 #if SINGLE_WARP_STORE
 #define EPI_STORE(STAGE, NC, PN, PM) do { \
     if (ew == 0 && lane == 0) { \
         _Pragma("unroll") \
         for (int _ti_ = 0; _ti_ < EPI_TMAS_PER_WARP; _ti_++) { \
-            for (int rg_ = 0; rg_ < NUM_EPI_WARPS; rg_++) { \
+            for (int rg_ = 0; rg_ < NUM_EPI_WARPS; rg_ += WARP_PAIR_STRIDE) { \
                 const uint32_t s_ = smem_to_uint(smem + OFF_STAGING \
                     + (STAGE) * EPI_STAGE_BYTES + rg_ * STAGING_REGION_BYTES \
                     + _ti_ * STAGE_BLOCK_BYTES); \
@@ -928,7 +929,7 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
 #define EPI_WAIT_PRED (ew == 0 && lane == 0)
 #else
 #define EPI_STORE(STAGE, NC, PN, PM) do { \
-    if (lane == 0) { \
+    if ((ew & (WARP_PAIR_STRIDE - 1)) == 0 && lane == 0) { \
         _Pragma("unroll") \
         for (int _ti_ = 0; _ti_ < EPI_TMAS_PER_WARP; _ti_++) { \
             const uint32_t s_ = smem_to_uint(smem + OFF_STAGING \
@@ -943,7 +944,7 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
         asm volatile("cp.async.bulk.commit_group;" ::: "memory"); \
     } \
 } while(0)
-#define EPI_WAIT_PRED (lane == 0)
+#define EPI_WAIT_PRED ((ew & (WARP_PAIR_STRIDE - 1)) == 0 && lane == 0)
 #endif
 
 #if NO_POST_STORE_BAR
@@ -2294,13 +2295,19 @@ fc2_w3_kernel(
                                       a24,a25,a26,a27,a28,a29,a30,a31,
                                       taddr_base + nc);
 
-                        const uint32_t _cblk = chunk / CHUNKS_PER_TMA_BLOCK;
-                        const uint32_t _cinb = chunk % CHUNKS_PER_TMA_BLOCK;
-                        const uint32_t _boff = (_cinb >> 1) * 128u + _cblk * STAGE_BLOCK_BYTES;
-                        const uint32_t rsw0 = ((_cinb & 1) ? sw4 : sw0) + _boff;
-                        const uint32_t rsw1 = ((_cinb & 1) ? sw5 : sw1) + _boff;
-                        const uint32_t rsw2 = ((_cinb & 1) ? sw6 : sw2) + _boff;
-                        const uint32_t rsw3 = ((_cinb & 1) ? sw7 : sw3) + _boff;
+                        const uint32_t sub_ofs = (chunk >> 1) * STAGE_BLOCK_BYTES;
+
+
+                        const uint32_t rsw0 = ((chunk & 1) ? sw4 : sw0) + sub_ofs;
+
+
+                        const uint32_t rsw1 = ((chunk & 1) ? sw5 : sw1) + sub_ofs;
+
+
+                        const uint32_t rsw2 = ((chunk & 1) ? sw6 : sw2) + sub_ofs;
+
+
+                        const uint32_t rsw3 = ((chunk & 1) ? sw7 : sw3) + sub_ofs;
 
                         TMEM_WAIT();
 
@@ -2505,13 +2512,15 @@ fc2_w3_kernel(
 
 #if CUTLASS_LOOP >= 3
                         {
-                            const uint32_t _cblk = chunk / CHUNKS_PER_TMA_BLOCK;
-                            const uint32_t _cinb = chunk % CHUNKS_PER_TMA_BLOCK;
-                            const uint32_t _boff = (_cinb >> 1) * 128u + _cblk * STAGE_BLOCK_BYTES;
-                            const uint32_t rsw0 = ((_cinb & 1) ? sw4 : sw0) + _boff;
-                            const uint32_t rsw1 = ((_cinb & 1) ? sw5 : sw1) + _boff;
-                            const uint32_t rsw2 = ((_cinb & 1) ? sw6 : sw2) + _boff;
-                            const uint32_t rsw3 = ((_cinb & 1) ? sw7 : sw3) + _boff;
+                            const uint32_t sub_ofs = (chunk >> 1) * STAGE_BLOCK_BYTES;
+
+                            const uint32_t rsw0 = ((chunk & 1) ? sw4 : sw0) + sub_ofs;
+
+                            const uint32_t rsw1 = ((chunk & 1) ? sw5 : sw1) + sub_ofs;
+
+                            const uint32_t rsw2 = ((chunk & 1) ? sw6 : sw2) + sub_ofs;
+
+                            const uint32_t rsw3 = ((chunk & 1) ? sw7 : sw3) + sub_ofs;
                             char* sptr = smem + OFF_STAGING
                                 + stage * EPI_STAGE_BYTES
                                 + row_group * STAGING_REGION_BYTES
@@ -2552,13 +2561,15 @@ fc2_w3_kernel(
                             : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
 
                         /* LDS residual from shared staging (swizzled, ReuseSmemC) */
-                        const uint32_t _cblk = chunk / CHUNKS_PER_TMA_BLOCK;
-                        const uint32_t _cinb = chunk % CHUNKS_PER_TMA_BLOCK;
-                        const uint32_t _boff = (_cinb >> 1) * 128u + _cblk * STAGE_BLOCK_BYTES;
-                        const uint32_t rsw0 = ((_cinb & 1) ? sw4 : sw0) + _boff;
-                        const uint32_t rsw1 = ((_cinb & 1) ? sw5 : sw1) + _boff;
-                        const uint32_t rsw2 = ((_cinb & 1) ? sw6 : sw2) + _boff;
-                        const uint32_t rsw3 = ((_cinb & 1) ? sw7 : sw3) + _boff;
+                        const uint32_t sub_ofs = (chunk >> 1) * STAGE_BLOCK_BYTES;
+
+                        const uint32_t rsw0 = ((chunk & 1) ? sw4 : sw0) + sub_ofs;
+
+                        const uint32_t rsw1 = ((chunk & 1) ? sw5 : sw1) + sub_ofs;
+
+                        const uint32_t rsw2 = ((chunk & 1) ? sw6 : sw2) + sub_ofs;
+
+                        const uint32_t rsw3 = ((chunk & 1) ? sw7 : sw3) + sub_ofs;
                         uint4 rv0, rv1, rv2, rv3;
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(stage_base + rsw0));
@@ -2922,13 +2933,19 @@ _lean_done:
                                   a24,a25,a26,a27,a28,a29,a30,a31,
                                   taddr_base + nc);
 
-                    const uint32_t _cblk = chunk / CHUNKS_PER_TMA_BLOCK;
-                    const uint32_t _cinb = chunk % CHUNKS_PER_TMA_BLOCK;
-                    const uint32_t _boff = (_cinb >> 1) * 128u + _cblk * STAGE_BLOCK_BYTES;
-                    const uint32_t rsw0 = ((_cinb & 1) ? sw4 : sw0) + _boff;
-                    const uint32_t rsw1 = ((_cinb & 1) ? sw5 : sw1) + _boff;
-                    const uint32_t rsw2 = ((_cinb & 1) ? sw6 : sw2) + _boff;
-                    const uint32_t rsw3 = ((_cinb & 1) ? sw7 : sw3) + _boff;
+                    const uint32_t sub_ofs = (chunk >> 1) * STAGE_BLOCK_BYTES;
+
+
+                    const uint32_t rsw0 = ((chunk & 1) ? sw4 : sw0) + sub_ofs;
+
+
+                    const uint32_t rsw1 = ((chunk & 1) ? sw5 : sw1) + sub_ofs;
+
+
+                    const uint32_t rsw2 = ((chunk & 1) ? sw6 : sw2) + sub_ofs;
+
+
+                    const uint32_t rsw3 = ((chunk & 1) ? sw7 : sw3) + sub_ofs;
 
                     TMEM_WAIT();
 
@@ -3096,13 +3113,15 @@ _lean_done:
 
 #if CUTLASS_LOOP >= 3
                     {
-                        const uint32_t _cblk = chunk / CHUNKS_PER_TMA_BLOCK;
-                        const uint32_t _cinb = chunk % CHUNKS_PER_TMA_BLOCK;
-                        const uint32_t _boff = (_cinb >> 1) * 128u + _cblk * STAGE_BLOCK_BYTES;
-                        const uint32_t rsw0 = ((_cinb & 1) ? sw4 : sw0) + _boff;
-                        const uint32_t rsw1 = ((_cinb & 1) ? sw5 : sw1) + _boff;
-                        const uint32_t rsw2 = ((_cinb & 1) ? sw6 : sw2) + _boff;
-                        const uint32_t rsw3 = ((_cinb & 1) ? sw7 : sw3) + _boff;
+                        const uint32_t sub_ofs = (chunk >> 1) * STAGE_BLOCK_BYTES;
+
+                        const uint32_t rsw0 = ((chunk & 1) ? sw4 : sw0) + sub_ofs;
+
+                        const uint32_t rsw1 = ((chunk & 1) ? sw5 : sw1) + sub_ofs;
+
+                        const uint32_t rsw2 = ((chunk & 1) ? sw6 : sw2) + sub_ofs;
+
+                        const uint32_t rsw3 = ((chunk & 1) ? sw7 : sw3) + sub_ofs;
                         char* sptr = smem + OFF_STAGING
                             + stage * EPI_STAGE_BYTES
                             + row_group * STAGING_REGION_BYTES
@@ -3139,13 +3158,15 @@ _lean_done:
                         : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "r"(bs + 48));
 
                     /* LDS residual (swizzled, ReuseSmemC) */
-                    const uint32_t _cblk = chunk / CHUNKS_PER_TMA_BLOCK;
-                    const uint32_t _cinb = chunk % CHUNKS_PER_TMA_BLOCK;
-                    const uint32_t _boff = (_cinb >> 1) * 128u + _cblk * STAGE_BLOCK_BYTES;
-                    const uint32_t rsw0 = ((_cinb & 1) ? sw4 : sw0) + _boff;
-                    const uint32_t rsw1 = ((_cinb & 1) ? sw5 : sw1) + _boff;
-                    const uint32_t rsw2 = ((_cinb & 1) ? sw6 : sw2) + _boff;
-                    const uint32_t rsw3 = ((_cinb & 1) ? sw7 : sw3) + _boff;
+                    const uint32_t sub_ofs = (chunk >> 1) * STAGE_BLOCK_BYTES;
+
+                    const uint32_t rsw0 = ((chunk & 1) ? sw4 : sw0) + sub_ofs;
+
+                    const uint32_t rsw1 = ((chunk & 1) ? sw5 : sw1) + sub_ofs;
+
+                    const uint32_t rsw2 = ((chunk & 1) ? sw6 : sw2) + sub_ofs;
+
+                    const uint32_t rsw3 = ((chunk & 1) ? sw7 : sw3) + sub_ofs;
                     uint4 rv0, rv1, rv2, rv3;
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(stage_base + rsw0));
@@ -3564,7 +3585,7 @@ int main() {
         uint64_t c_total_rows = (uint64_t)(M_TOTAL / TM) * TILES_N * TM;
         uint64_t dims[2]    = {(uint64_t)TN, c_total_rows};
         uint64_t strides[1] = {(uint64_t)TN * sizeof(__nv_bfloat16)};
-        uint32_t box[2]     = {TMA_BOX_COLS, 32};
+        uint32_t box[2]     = {TMA_BOX_COLS, TMA_BOX_ROWS};
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_c,
             CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_C,
@@ -3626,7 +3647,7 @@ int main() {
     {
         uint64_t dims[2]    = {(uint64_t)N_DIM, (uint64_t)M_TOTAL};
         uint64_t strides[1] = {(uint64_t)N_DIM * sizeof(__nv_bfloat16)};
-        uint32_t box[2]     = {TMA_BOX_COLS, 32};
+        uint32_t box[2]     = {TMA_BOX_COLS, TMA_BOX_ROWS};
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_c,
             CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_C,
