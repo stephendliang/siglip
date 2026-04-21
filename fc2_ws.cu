@@ -589,6 +589,13 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
             if (lane == 0) tcgen05_commit_mcast(mbar_tmem_ready, pair_mask);
         }
     }
+
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
+    if (warp_id == 0) {
+        asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
+            :: "r"(0), "n"(TMEM_COLS));
+    }
 }
 
 int main(int argc, char** argv) {
