@@ -320,13 +320,19 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
             const uint32_t taddr_tile = taddr_base + buf * TN
                 + ((cta_rank * TM + row_group * 32) << 16);
 
+#ifdef STRIP_EPILOGUE
+            (void)prev_m; (void)prev_n; (void)taddr_tile;
+            if (tid == 0) mbar_arrive(mbar_tmem_cons_peer);
+#else
             #pragma unroll 1
             for (int sp = 0; sp < NUM_SUBPASSES; sp++) {
                 const int es = sp & (NUM_EPI_STAGES - 1);
                 const int nc = sp * SUBPASS_COLS;
 
+#ifndef GEMM_ONLY
                 mbar_wait(res_full_arr[es], res_full_phase[es]);
                 res_full_phase[es] ^= 1;
+#endif
 
                 float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
                 float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
@@ -335,6 +341,18 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
                               taddr_tile + nc);
                 TMEM_WAIT();
 
+                float o[32];
+#ifdef GEMM_ONLY
+                (void)prev_n;
+                o[0]=a0;   o[1]=a1;   o[2]=a2;   o[3]=a3;
+                o[4]=a4;   o[5]=a5;   o[6]=a6;   o[7]=a7;
+                o[8]=a8;   o[9]=a9;   o[10]=a10; o[11]=a11;
+                o[12]=a12; o[13]=a13; o[14]=a14; o[15]=a15;
+                o[16]=a16; o[17]=a17; o[18]=a18; o[19]=a19;
+                o[20]=a20; o[21]=a21; o[22]=a22; o[23]=a23;
+                o[24]=a24; o[25]=a25; o[26]=a26; o[27]=a27;
+                o[28]=a28; o[29]=a29; o[30]=a30; o[31]=a31;
+#else
                 /* Residual: lane handles row (row_group*32 + lane), cols 0..31 for this sub-pass.
                    Staging layout: row r, col c → offset (r * SUBPASS_COLS + c) * 2. */
                 const int res_row_off = (row_group * 32 + lane) * (SUBPASS_COLS * 2);
@@ -346,7 +364,6 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
                     : "=r"(rv1.x), "=r"(rv1.y), "=r"(rv1.z), "=r"(rv1.w)
                     : "r"(res_smem_arr[es] + res_row_off + 16));
 
-                /* Bias: cols (prev_n + nc .. prev_n + nc + 31) broadcast across lanes. */
                 uint4 bv0, bv1;
                 asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(bv0.x), "=r"(bv0.y), "=r"(bv0.z), "=r"(bv0.w)
@@ -366,7 +383,6 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
                 rptr[0]=rv0.x; rptr[1]=rv0.y; rptr[2]=rv0.z; rptr[3]=rv0.w;
                 rptr[4]=rv1.x; rptr[5]=rv1.y; rptr[6]=rv1.z; rptr[7]=rv1.w;
 
-                float o[32];
                 o[0]  = a0  + __bfloat162float(b[0].x)  + __bfloat162float(r[0].x);
                 o[1]  = a1  + __bfloat162float(b[0].y)  + __bfloat162float(r[0].y);
                 o[2]  = a2  + __bfloat162float(b[1].x)  + __bfloat162float(r[1].x);
@@ -399,6 +415,7 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
                 o[29] = a29 + __bfloat162float(b[14].y) + __bfloat162float(r[14].y);
                 o[30] = a30 + __bfloat162float(b[15].x) + __bfloat162float(r[15].x);
                 o[31] = a31 + __bfloat162float(b[15].y) + __bfloat162float(r[15].y);
+#endif
 
                 uint32_t p[16];
                 #pragma unroll
@@ -436,6 +453,7 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
                 asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
                 mbar_arrive(mbar_tmem_cons_peer);
             }
+#endif /* STRIP_EPILOGUE */
         }
     }
     else if (warp_id == 4) {
@@ -484,6 +502,7 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
     }
     else if (warp_id == 5) {
         /* =============== TMA residual loader (warp 5) =============== */
+#if !defined(STRIP_EPILOGUE) && !defined(GEMM_ONLY)
         uint32_t res_empty_phase[NUM_EPI_STAGES] = {0, 0};
         const bool elect = (lane == 0);
 
@@ -514,6 +533,7 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
                 }
             }
         }
+#endif
     }
     else if (warp_id == 6) {
         /* idle (mirror rank-1's dead path) */
@@ -748,6 +768,11 @@ int main(int argc, char** argv) {
     printf("FC2-WS kernel: %.3f ms  %.2f TFLOPS\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9);
 
+#if defined(STRIP_EPILOGUE)
+    int errors = 0;
+    int valid = 0;
+    float c0 = 0.0f;
+#else
     LAUNCH_KERNEL();
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -761,7 +786,11 @@ int main(int argc, char** argv) {
         float av = 1.0f + 0.125f * (float)((int)row & 7);
         float bv = (col & 1) ? 1.0f : 1.5f;
         float expected_ab = av * bv * K_DIM;
+#ifdef GEMM_ONLY
+        float expected = expected_ab;
+#else
         float expected = expected_ab + __bfloat162float(hbias[col]) + __bfloat162float(hres[row * N_DIM + col]);
+#endif
         float got = __bfloat162float(h_C[row * N_DIM + col]);
         float rel = fabsf(got - expected) / fabsf(expected);
         if (rel > 0.02f) {
@@ -770,8 +799,17 @@ int main(int argc, char** argv) {
         }
     }
     printf("%s  errors=%d/32\n", errors == 0 ? "PASS" : "FAIL", errors);
+    int valid = (errors == 0) ? 1 : 0;
+    float c0 = __bfloat162float(h_C[0]);
+#endif
 
-    free(hA); free(hB); free(hbias); free(hres); free(h_C);
+    printf("@@RESULT ms=%.4f tflops=%.2f checksum=0.000000 valid=%d c0=%.1f\n",
+           ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9, valid, c0);
+
+    free(hA); free(hB); free(hbias); free(hres);
+#ifndef STRIP_EPILOGUE
+    free(h_C);
+#endif
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_bias); cudaFree(d_residual); cudaFree(d_C);
     return errors == 0 ? 0 : 1;
 }
