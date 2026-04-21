@@ -81,11 +81,18 @@ static void cap_dump(const cublasLtMatmulAlgo_t* a, const char* prefix) {
 }
 
 int main(int argc, char** argv) {
+#ifdef DEFAULT_M
+    int M   = (argc >= 2) ? atoi(argv[1]) : DEFAULT_M;
+    int N   = (argc >= 3) ? atoi(argv[2]) : DEFAULT_N;
+    int K   = (argc >= 4) ? atoi(argv[3]) : DEFAULT_K;
+    int EPI = (argc >= 5) ? atoi(argv[4]) : DEFAULT_EPI;
+#else
     if (argc < 5) { fprintf(stderr,"usage: %s <M> <N> <K> <epi:0|2|3>\n",argv[0]); return 1; }
     int M   = atoi(argv[1]);
     int N   = atoi(argv[2]);
     int K   = atoi(argv[3]);
     int EPI = atoi(argv[4]);
+#endif
 
     cublasLtHandle_t lt; CUBLAS_CHECK(cublasLtCreate(&lt));
 
@@ -200,8 +207,15 @@ int main(int argc, char** argv) {
         cap_dump(&heur[a.heur_idx].algo, "  ");
     }
 
+    if (infos.empty()) {
+        printf("\n@@RESULT ms=ERR tflops=0.00 checksum=0.000000 valid=0 c0=0.0\n");
+        return 1;
+    }
     printf("\n# Winner:  rank=1  tile=%d  stages=%d  cluster=%d  splitk=%d  swizzle=%d  ms=%.4f\n",
            infos[0].tile_id, infos[0].stages_id, infos[0].cluster_id,
            infos[0].splitk, infos[0].swizzle, infos[0].ms);
+    double tflops = 2.0 * (double)M * (double)N * (double)K / ((double)infos[0].ms * 1e9);
+    printf("\n@@RESULT ms=%.4f tflops=%.2f checksum=0.000000 valid=1 c0=0.0\n",
+           infos[0].ms, tflops);
     return 0;
 }

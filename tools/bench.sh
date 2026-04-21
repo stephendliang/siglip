@@ -203,14 +203,14 @@ if [ "$BASELINES" = "1" ]; then
         if [ "$DO_NCU" = "1" ]; then
             CFGS+=("cublas_fc2_gemm|make -B cublas-bench-fc2-ncu && cp cublas-bench-fc2-ncu bench-cublas-fc2|./bench-cublas-fc2|regex:.")
         else
-            CFGS+=("cublas_fc2_gemm|make -B cublas-bench-fc2 && cp cublas-bench-fc2 bench-cublas-fc2|./bench-cublas-fc2|regex:.")
+            CFGS+=("cublas_fc2_gemm|make -B cublaslt-fc2 && cp cublaslt-fc2 bench-cublas-fc2|./bench-cublas-fc2|regex:.")
         fi
     fi
     if [[ "$LAYERS" == *fc1* ]]; then
         if [ "$DO_NCU" = "1" ]; then
             CFGS+=("cublas_fc1_gemm|make -B cublas-bench-fc1-ncu && cp cublas-bench-fc1-ncu bench-cublas-fc1|./bench-cublas-fc1|regex:.")
         else
-            CFGS+=("cublas_fc1_gemm|make -B cublas-bench-fc1 && cp cublas-bench-fc1 bench-cublas-fc1|./bench-cublas-fc1|regex:.")
+            CFGS+=("cublas_fc1_gemm|make -B cublaslt-fc1 && cp cublaslt-fc1 bench-cublas-fc1|./bench-cublas-fc1|regex:.")
         fi
     fi
 fi

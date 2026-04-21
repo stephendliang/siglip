@@ -620,6 +620,12 @@ cublas-bench-fc2-ncu: bench/cublas_bench.cu
 cublaslt-introspect: bench/cublaslt_introspect.cu
 	$(NVCC) $(CFLAGS) -std=c++17 $< -o $@ -lcublasLt -lcublas
 
+cublaslt-fc1: bench/cublaslt_introspect.cu
+	$(NVCC) $(CFLAGS) -std=c++17 -DDEFAULT_M=928256 -DDEFAULT_N=3072 -DDEFAULT_K=768 -DDEFAULT_EPI=2 $< -o $@ -lcublasLt -lcublas
+
+cublaslt-fc2: bench/cublaslt_introspect.cu
+	$(NVCC) $(CFLAGS) -std=c++17 -DDEFAULT_M=928256 -DDEFAULT_N=768 -DDEFAULT_K=3072 -DDEFAULT_EPI=3 $< -o $@ -lcublasLt -lcublas
+
 # ── SASS analysis C++ tool ──
 sass-tool:
 	$(MAKE) -C tools/sass
