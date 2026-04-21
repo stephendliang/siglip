@@ -380,7 +380,10 @@ static __host__ __forceinline__ float gelu_fwd(float x) {
     asm volatile(BAR_EPI_SYNC ::: "memory"); \
 } while(0)
 
-/* ── K-iteration macro (accumulating, ki >= 1) ── */
+/* K-iteration macro (accumulating, ki >= 1). Single asm block emits all 4
+   MMAs back-to-back so ptxas emits one elect+R2UR.BROADCAST wrapper for the
+   group instead of one per MMA — matching rank-1's UTCQMMA emission density. */
+static_assert(MMA_PER_KI == 4, "K_ITER_ACCUM hardcodes 4 sub-MMAs per K-iter");
 #define K_ITER_ACCUM(S) do { \
     mbar_wait(tma_mbar[S], tma_phase[S]); \
     tma_phase[S] ^= 1; \
@@ -390,28 +393,31 @@ static __host__ __forceinline__ float gelu_fwd(float x) {
         asm volatile( \
             "{\n\t" \
             ".reg .pred p;\n\t" \
+            ".reg .b64 da, db;\n\t" \
+            ".reg .b32 tc;\n\t" \
             "setp.ne.b32 p, 1, 0;\n\t" \
+            "mov.b32 tc, %0;\n\t" \
+            "mov.b64 da, %1;\n\t" \
+            "mov.b64 db, %2;\n\t" \
             "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
-            "[%0], %1, %2, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t" \
+            "[tc], da, db, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t" \
+            "add.s64 da, da, 2;\n\t" \
+            "add.s64 db, db, 2;\n\t" \
+            "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+            "[tc], da, db, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t" \
+            "add.s64 da, da, 2;\n\t" \
+            "add.s64 db, db, 2;\n\t" \
+            "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+            "[tc], da, db, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t" \
+            "add.s64 da, da, 2;\n\t" \
+            "add.s64 db, db, 2;\n\t" \
+            "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
+            "[tc], da, db, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t" \
             "}" \
             : \
             : "r"(buf * TN), "l"(desc_a), "l"(desc_b), "r"(IDESC), \
               "r"(0),"r"(0),"r"(0),"r"(0), \
               "r"(0),"r"(0),"r"(0),"r"(0)); \
-        for (int sub = 1; sub < MMA_PER_KI; sub++) { \
-            desc_a += 2; desc_b += 2; \
-            asm volatile( \
-                "{\n\t" \
-                ".reg .pred p;\n\t" \
-                "setp.ne.b32 p, 1, 0;\n\t" \
-                "tcgen05.mma.cta_group::2.kind::f8f6f4 " \
-                "[%0], %1, %2, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t" \
-                "}" \
-                : \
-                : "r"(buf * TN), "l"(desc_a), "l"(desc_b), "r"(IDESC), \
-                  "r"(0),"r"(0),"r"(0),"r"(0), \
-                  "r"(0),"r"(0),"r"(0),"r"(0)); \
-        } \
     } \
     tcgen05_commit_mcast(mma_mbar[S], 0x3); \
 } while(0)
@@ -915,34 +921,40 @@ fc1_w3_kernel(
                 tma_phase[0] ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
 
-                /* First K-iteration: initialize accumulator (p=0) */
+                /* First K-iteration: MMA #0 initializes accumulator (p_init=0),
+                   MMA #1-3 accumulate (p_acc=1). Combined into one asm block so
+                   ptxas emits one elect+broadcast wrapper for all 4 MMAs. */
                 {
                     uint64_t desc_a = desc_a_base[0], desc_b = desc_b_base[0];
                     asm volatile(
                         "{\n\t"
-                        ".reg .pred p;\n\t"
-                        "setp.ne.b32 p, 0, 0;\n\t"
+                        ".reg .pred p_init, p_acc;\n\t"
+                        ".reg .b64 da, db;\n\t"
+                        ".reg .b32 tc;\n\t"
+                        "setp.ne.b32 p_init, 0, 0;\n\t"
+                        "setp.ne.b32 p_acc,  1, 0;\n\t"
+                        "mov.b32 tc, %0;\n\t"
+                        "mov.b64 da, %1;\n\t"
+                        "mov.b64 db, %2;\n\t"
                         "tcgen05.mma.cta_group::2.kind::f8f6f4 "
-                        "[%0], %1, %2, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t"
+                        "[tc], da, db, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p_init;\n\t"
+                        "add.s64 da, da, 2;\n\t"
+                        "add.s64 db, db, 2;\n\t"
+                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                        "[tc], da, db, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p_acc;\n\t"
+                        "add.s64 da, da, 2;\n\t"
+                        "add.s64 db, db, 2;\n\t"
+                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                        "[tc], da, db, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p_acc;\n\t"
+                        "add.s64 da, da, 2;\n\t"
+                        "add.s64 db, db, 2;\n\t"
+                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                        "[tc], da, db, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p_acc;\n\t"
                         "}"
                         :
                         : "r"(buf * TN), "l"(desc_a), "l"(desc_b), "r"(IDESC),
                           "r"(0),"r"(0),"r"(0),"r"(0),
                           "r"(0),"r"(0),"r"(0),"r"(0));
-                    for (int sub = 1; sub < MMA_PER_KI; sub++) {
-                        desc_a += 2; desc_b += 2;
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .pred p;\n\t"
-                            "setp.ne.b32 p, 1, 0;\n\t"
-                            "tcgen05.mma.cta_group::2.kind::f8f6f4 "
-                            "[%0], %1, %2, %3, {%4,%5,%6,%7, %8,%9,%10,%11}, p;\n\t"
-                            "}"
-                            :
-                            : "r"(buf * TN), "l"(desc_a), "l"(desc_b), "r"(IDESC),
-                              "r"(0),"r"(0),"r"(0),"r"(0),
-                              "r"(0),"r"(0),"r"(0),"r"(0));
-                    }
                 }
                 tcgen05_commit_mcast(mma_mbar[0], 0x3);
 

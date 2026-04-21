@@ -284,66 +284,86 @@ From `/opt/cuda/targets/x86_64-linux/include/cublasLt.h`:
   depth is AUTO, **resolved at kernel-compile time per variant** (not runtime).
   cuBLASLt ships multiple prebuilt variants with different NS; heuristic picks.
 
-### Full rank-1..8 decode via nsys (FC2 K=3072 on B200, 2026-04-20)
+### Full heuristic decode via nsys (FC2 K=3072 on B200, 2026-04-20)
 
 Kernel names: `nvjet_sm100_qqtst_<M>x<N>_128x<NS>_<CM>x<CN>_[2cta_]<h|v>_<...>_T<A><B>`.
 Token `2cta` = **cta_group::2** present, absent = cta_group::1. `h/v` = TMA
 multicast axis (h=along N, v=along M). `bz_bias` = bias-only epilogue.
 
-| rank | tile (enum)    | NS | cluster | cta_grp | ms     |
-|------|----------------|----|---------|---------|--------|
-| 1    | 176x128 (201)  | 8  | 1x2     | **2**   | 1.0454 |
-| **2†**| 128x256 (23)  | 6  | 2x1     | **2**   | 1.0457 |
-| 3    | 128x192 (32)   | 7  | 2x1     | 2       | 1.094  |
-| 4    | 256x256 (513)  | 4  | 2x1     | 2       | 1.192  |
-| 5    | 320x192 (535)  | 4  | 2x1     | 2       | 1.196  |
-| 6    | 256x128 (24)   | 4  | 1x2     | 1       | 1.267  |
-| 7    | 168x128 (197)  | 5  | 1x2     | 1       | 1.358  |
-| 8    | 256x96  (495)  | 4  | 1x2     | 1       | 1.440  |
+| listed  | tile (enum)    | NS | cluster | cta_grp | ms     |
+|---------|----------------|----|---------|---------|--------|
+| L1      | 176x128 (201)  | 8  | 1x2     | **2**   | 1.0454 |
+| **L2†** | 128x256 (23)   | 6  | 2x1     | **2**   | 1.0457 |
+| L3      | 128x192 (32)   | 7  | 2x1     | 2       | 1.094  |
+| L4      | 256x256 (513)  | 4  | 2x1     | 2       | 1.192  |
+| L5      | 320x192 (535)  | 4  | 2x1     | 2       | 1.196  |
+| L6      | 256x128 (24)   | 4  | 1x2     | 1       | 1.267  |
+| L7      | 168x128 (197)  | 5  | 1x2     | 1       | 1.358  |
+| L8      | 256x96  (495)  | 4  | 1x2     | 1       | 1.440  |
 
-† **Rank-2 is the real target, not rank-1.** Rank-1 (176x128 NS=8 1x2) edges
-rank-2 by **0.3 µs — run-to-run noise**. Rank-2 (128x256 NS=6 2x1 2cta) is
-our exact per-CTA MMA geometry + cluster layout. Treat rank-2 as the true
-1.046 ms target; rank-1 is a fluke of heuristic ordering and a different
-architecture (NS=8 doesn't fit at our tile, so it's not reachable anyway).
-The dumped SASS file on disk is named `rank1.sass` but contains rank-2's
-kernel — filename is a historical misnomer, kernel identity (see line 16 of
-the dump: `nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_bias_TNT`) is
-authoritative.
+† **L2 is what we call "rank-1" from 2026-04-20 onward.** The listed L1
+(176x128 NS=8 1x2) edges L2 by 0.3 µs — pure run-to-run noise — and uses NS=8
+which isn't SMEM-feasible at our 256x256 output (we jam at NS=6), so L1 is
+neither reproducibly faster nor architecturally reachable. L2 (128x256 NS=6
+2x1 2cta) is our exact per-CTA MMA geometry + cluster layout, and is the real
+1.046 ms ceiling. "Rank-1" in all prose below = the L2 kernel:
+`nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_bias_TNT`. Dumped SASS is at
+`rank1.sass`.
 
 ### Hard-won conclusions
 
-1. **cuBLASLt's top 5 all use `cta_group::2`**. Our 2sm-MMA architecture is
-   aligned with cuBLASLt's winning designs; cta_group::1 (ranks 6–8) is
-   uniformly slower here.
-2. **Rank-2 is OUR exact geometry** (the real target): 128x256 per-CTA, 2x1
-   cluster, cta_group::2, NS=6, v-mcast (along M). Times at **1.046 ms**.
-   Our best (dgsw) is 1.064. **We're +18 µs behind our architectural twin**
-   — the gap is NOT architectural, it's pure epilogue/dispatch/scheduling.
-   Most important comparison point going forward.
-3. **Rank-1 is a fluke**. NS=8 at 176x128 wins by 0.3 µs — within noise, and
-   NS=8 at our 256x256 isn't SMEM-feasible (we jam at NS=6). Not reachable,
-   not meaningful.
-4. **cuBLASLt also ships a `256x256_128x4_2x1_2cta` variant** (rank-4 at 1.192).
+1. **cuBLASLt's top 5 listings all use `cta_group::2`**. Our 2sm-MMA architecture
+   is aligned with cuBLASLt's winning designs; cta_group::1 (L6–L8) is uniformly
+   slower here.
+2. **Rank-1 (= listed L2) is OUR exact geometry**: 128x256 per-CTA, 2x1 cluster,
+   cta_group::2, NS=6, v-mcast (along M). Times at **1.046 ms**. Our best (dgsw)
+   is 1.064. **We're +18 µs behind our architectural twin** — the gap is NOT
+   architectural, it's pure epilogue/dispatch/scheduling. Most important
+   comparison point going forward.
+3. **Listed L1 is a fluke**. NS=8 at 176x128 wins by 0.3 µs — within noise, and
+   NS=8 at our 256x256 isn't SMEM-feasible. Not reachable, not meaningful.
+4. **cuBLASLt also ships a `256x256_128x4_2x1_2cta` variant** (listed L4 at 1.192).
    Same cluster-output as ours but NS=4 — we beat it by ~125 µs. The 256x256
    variant is a fallback in cuBLASLt's grid.
 5. **The cuBLASLt advantage is NOT split-K** (`splitk=1` throughout) and NOT
-   a CUTLASS-style swizzle (`swizzle=0` throughout). It's a single fast
-   MMA-only kernel config — rank-2's per-CTA MMA geometry is identical to
-   ours but with an epilogue/dispatch we haven't matched.
+   a CUTLASS-style tile swizzle (`swizzle=0` throughout) — meaning our 18 µs
+   gap is not a tile-ordering lever, and matching rank-1 via a new dispatch
+   is unlikely to close it. The remaining levers are epilogue-local
+   (LDTM/STSM shape, TMA store box) and K-phase scheduling.
 6. FC1 K=768 cuBLASLt heuristics have **no 2x2x1 (4-CTA) entry** — 4-CTA ruled
    out at short K. Our `fc2_w3_c4*` multicast deadlocks are not the FC1 lever.
    4-CTA remains interesting only for FC2 per-tensor FP8 (`tile=128x192
    clusterShape=2x2x1` is in the FC2 list).
 
+### Live levers (2026-04-20)
+
+- **Lever A (TMA_STORE_WIDE) — DEAD** (2026-04-20). Wide-rows box {64,64}
+  halves dynamic UTMASTG 16→8 per CTA per tile, matching rank-1's 8
+  UTMASTG exactly. B200 measured `fc2-w3-epi-100` (wide+dgswizzle) 1.064 ms
+  vs `fc2-w3-epi-000` (narrow+dgswizzle) 1.066 ms — 2 µs is run-to-run
+  noise. Closes zero of the 18 µs gap. Confirms **TMA store issue count
+  is not the bottleneck.** {128,32} unreachable under SWIZZLE_128B
+  (boxDim[0]*esize cap 128 B); SWIZZLE_NONE legalizes it but would
+  reintroduce 4-way STS bank conflicts. Don't retry.
+- **Lever C (USE_STMATRIX)** — live but broken. Diagnostic (commit 909da64)
+  confirmed reg-layout + address-collision bugs. Fix requires swapping TMEM load
+  from `tcgen05.ld.sync.aligned.32x32b.x32.b32` to an stmatrix-native variant
+  (likely `16x128b.x4` or `16x256b.x4`) + reworking CVT/STS macros + fixing the
+  `(lane & 7)` address swizzle to use full lane ID. ~80-line refactor.
+- **Lever B (EPI_SINGLE_PASS) — DEAD** (2026-04-20). Single-pass restructure
+  doesn't address the 18 µs gap. Not the bottleneck.
+
 ### Next action
 
-SASS-diff the FC2 rank-2 kernel against our fc2-w3-dgswizzle. Same per-CTA
-geometry → the 18 µs gap localizes to the epilogue path:
+With Lever A + B dead and dispatch axis exhausted (dgphase/dgnrot), the
+remaining levers are (1) fix Lever C — swap TMEM load to
+`LDTM.16dp256bit.x4`, halves SMEM store instruction count 64 STS.128 → 32
+STSM; or (2) match rank-1's 4× UTCQMMA grouping in the K-loop.
+SASS-diff rank-1 against our fc2-w3-dgswizzle to localize further:
 ```bash
 cuobjdump --dump-sass \
     --function 'nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_bias_TNT' \
-    /opt/cuda/lib64/libcublasLt.so.13 > rank1.sass   # filename is misnomer, content = rank-2 kernel
+    /opt/cuda/lib64/libcublasLt.so.13 > rank1.sass
 cuobjdump --dump-sass ./fc2-w3-dgswizzle > ours.sass
 ```
 
