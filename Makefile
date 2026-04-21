@@ -115,6 +115,16 @@ fc2: fc2.cu kernel_common.cuh kernel_body.cuh
 fc2-timing: fc2.cu kernel_common.cuh kernel_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTIMING $< -o $@ $(LDFLAGS)
 
+# ── FC2 WG kernel (standalone, warpgroup-specialized, dgswizzle+PACKED only) ──
+fc2-wg: fc2_wg.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
+
+fc2-wg-gemm: fc2_wg.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY $< -o $@ $(LDFLAGS)
+
+fc2-wg-strip: fc2_wg.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
+
 # ── FC2 W3 kernel (standalone, CUTLASS-style shared-SMEM epilogue) ──
 fc2-w3: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
