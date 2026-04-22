@@ -316,7 +316,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             const int tn = swizzled % TILES_N;
             const int prev_m = tm * TM * 2;
             const int prev_n = tn * TN;
-            const int buf = lin_tile & 1;
+            const int buf = tt & 1;
 
             mbar_wait(mbar_tmem_ready_base + buf * 8, mma_phase[buf]);
             mma_phase[buf] ^= 1;
@@ -509,7 +509,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
             if (lin_tile >= TOTAL_TILES) break;
-            const int buf = lin_tile & 1;
+            const int buf = tt & 1;
 
 #ifdef NO_PREFILL
             mbar_wait(mbar_tmem_consumed_base + buf * 8, tmem_cons_phase[buf]);

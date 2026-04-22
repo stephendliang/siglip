@@ -316,10 +316,12 @@ neither reproducibly faster nor architecturally reachable. L2 (128x256 NS=6
    is aligned with cuBLASLt's winning designs; cta_group::1 (L6–L8) is uniformly
    slower here.
 2. **Rank-1 (= listed L2) is OUR exact geometry**: 128x256 per-CTA, 2x1 cluster,
-   cta_group::2, NS=6, v-mcast (along M). Times at **1.046 ms**. Our best (dgsw)
-   is 1.064. **We're +18 µs behind our architectural twin** — the gap is NOT
-   architectural, it's pure epilogue/dispatch/scheduling. Most important
-   comparison point going forward.
+   cta_group::2, NS=6, v-mcast (along M). Times at **1.046 ms**. fc2_w3 (dgsw,
+   fused-with-residual) was 1.064 (+18 µs). **fc2_w3x BIAS_ONLY beats rank-1 at
+   1.007 ms (−39 µs, 2026-04-21)** — clean-sheet 6-warp persistent kernel
+   matching rank-1's bias-only contract. Win came from PACKED_TILES + dgswizzle
+   + dropping W2/W7, NOT from any of the dispatch/epilogue levers we chased
+   pre-2026-04-21.
 3. **Listed L1 is a fluke**. NS=8 at 176x128 wins by 0.3 µs — within noise, and
    NS=8 at our 256x256 isn't SMEM-feasible. Not reachable, not meaningful.
 4. **cuBLASLt also ships a `256x256_128x4_2x1_2cta` variant** (listed L4 at 1.192).
@@ -335,36 +337,61 @@ neither reproducibly faster nor architecturally reachable. L2 (128x256 NS=6
    4-CTA remains interesting only for FC2 per-tensor FP8 (`tile=128x192
    clusterShape=2x2x1` is in the FC2 list).
 
-### Live levers (2026-04-20)
+### Live levers (2026-04-21)
 
-- **Lever A (TMA_STORE_WIDE) — DEAD** (2026-04-20). Wide-rows box {64,64}
-  halves dynamic UTMASTG 16→8 per CTA per tile, matching rank-1's 8
-  UTMASTG exactly. B200 measured `fc2-w3-epi-100` (wide+dgswizzle) 1.064 ms
-  vs `fc2-w3-epi-000` (narrow+dgswizzle) 1.066 ms — 2 µs is run-to-run
-  noise. Closes zero of the 18 µs gap. Confirms **TMA store issue count
-  is not the bottleneck.** {128,32} unreachable under SWIZZLE_128B
-  (boxDim[0]*esize cap 128 B); SWIZZLE_NONE legalizes it but would
-  reintroduce 4-way STS bank conflicts. Don't retry.
-- **Lever C (USE_STMATRIX)** — live but broken. Diagnostic (commit 909da64)
-  confirmed reg-layout + address-collision bugs. Fix requires swapping TMEM load
-  from `tcgen05.ld.sync.aligned.32x32b.x32.b32` to an stmatrix-native variant
-  (likely `16x128b.x4` or `16x256b.x4`) + reworking CVT/STS macros + fixing the
-  `(lane & 7)` address swizzle to use full lane ID. ~80-line refactor.
-- **Lever B (EPI_SINGLE_PASS) — DEAD** (2026-04-20). Single-pass restructure
-  doesn't address the 18 µs gap. Not the bottleneck.
+The +18 µs rank-1 gap is **closed and inverted** on bias-only as of
+fc2_w3x. The structural rewrite (6-warp persistent, drop W2 EpilogueLoad,
+drop W7 scheduler, dedicated W5 MMA on CTA0 only) was the lever, not any
+of the SASS-emission tweaks we spent two weeks on.
+
+- **All 2026-04-20 levers (A, B, C, store-sync, single-asm-MMA): DEAD.**
+  None of them were the bottleneck. Lever C (USE_STMATRIX) remains
+  diagnostic-only; the code is in tree but obsolete given fc2_w3x already
+  beats rank-1.
+- **fc2_w3x BIAS_ONLY (2026-04-21): 1.007 ms** beats rank-1 by 39 µs. See
+  the dedicated section below.
+
+### fc2_w3x — first sub-rank-1 result (2026-04-21)
+
+Clean-sheet 6-warp persistent bias-only kernel (`fc2_w3x.cu`):
+- W0-W3: epilogue warpgroup (TMEM load + bias add + CVT + STS + TMA store)
+- W4: TMA A+B loader + bias LDG/STS pre-cluster-barrier
+- W5: MMA issuer, lane 0 only, **CTA0 only** (W5-CTA1 early-exits)
+- PACKED_TILES + dgswizzle(DG_GROUP_SIZE=8) static dispatch, no scheduler
+- PREFILL kept; TMEM double-buffered via `buf = tt & 1` (per-iteration counter)
+- 4×UTCQMMA folded per K-iter
+- Persistent loop assumes `M % SM_COUNT == 0` (true for siglip FC2: 928256)
+
+Measured: **1.007 ms / 4347 TFLOPS / PASS errors=0/32**. Rank-1
+(`bz_bias_TNT`) at 1.046 ms, so −39 µs (−3.7%).
+
+The kernel is below the 1.048 ms compute floor we calculated — likely
+because PACKED_TILES + dgswizzle hide enough MMA stall via L2 hits that
+the 525.6 cyc/iter pipelined number wasn't the actual ceiling.
+
+**Bug worth remembering:** First three commits (`9e2b9ff`, `f0b283c`,
+`a51b1c3`) chased fence/init/phase issues. Real bug was `buf = lin_tile & 1`
+where `lin_tile = cluster_id + tt * 74`, so `lin_tile & 1` is constant per
+cluster — PREFILL silently overwrote the same TMEM half each tile. Fixed
+in `067afdb` to `buf = tt & 1`. fc2_w3 had this right via `_iter & 1`.
 
 ### Next action
 
-With Lever A + B dead and dispatch axis exhausted (dgphase/dgnrot), the
-remaining levers are (1) fix Lever C — swap TMEM load to
-`LDTM.16dp256bit.x4`, halves SMEM store instruction count 64 STS.128 → 32
-STSM; or (2) match rank-1's 4× UTCQMMA grouping in the K-loop.
-SASS-diff rank-1 against our fc2-w3-dgswizzle to localize further:
+- **Verify the win**: ncu warps_act (expect 5.5), locked-clock bench.sh
+  re-measure with multiple iterations, denser spot-check than 32 points.
+- **Port to fused-residual**: fc2_w3x today is bias-only. Fused FC2 (bias +
+  residual) is the production target. Need to add either inline residual
+  load on W4 or a small W2-equivalent without re-introducing the W2 mbar
+  drag fc2_w3 carries.
+- **Lever C still in tree** but obsolete now that we beat rank-1 without
+  it. Don't waste more time on it unless the fused port wants it.
+
+SASS-diff infrastructure for future investigations:
 ```bash
 cuobjdump --dump-sass \
     --function 'nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_bias_TNT' \
     /opt/cuda/lib64/libcublasLt.so.13 > rank1.sass
-cuobjdump --dump-sass ./fc2-w3-dgswizzle > ours.sass
+cuobjdump --dump-sass ./fc2-w3x > ours.sass
 ```
 
 Known caveat: K=1024/2048 still report ERR — one heuristic IMAs on the device
@@ -430,7 +457,10 @@ Attempted to combine our PTX mainloop with CUTLASS's C++ epilogue (for better ST
 ## Build and run
 
 ```bash
-# FC2 (best: LEAN)
+# FC2 BIAS_ONLY (BEST — beats cuBLASLt rank-1)
+make fc2-w3x && ./fc2-w3x                        # bias-only 1.007ms (NEW best)
+
+# FC2 fused-with-residual (still uses fc2_w3.cu)
 make fc2-w3-lean && ./fc2-w3-lean                # fused 1.074ms
 make fc2-w3 && ./fc2-w3                          # striding 1.113ms
 make fc2-w3-sched && ./fc2-w3-sched              # work-stealing 1.147ms
@@ -459,7 +489,8 @@ bash tools/ncu_bench.sh && python3 tools/ncu_anova.py
 ## Key files
 
 ```
-fc2_w3.cu                       # FC2 hand-tuned PTX kernel (ACTIVE — best)
+fc2_w3x.cu                      # FC2 bias-only kernel (ACTIVE — beats cuBLASLt rank-1, 1.007 ms)
+fc2_w3.cu                       # FC2 hand-tuned fused-residual PTX kernel (ACTIVE)
 fc1_w3.cu                       # FC1 hand-tuned PTX kernel (ACTIVE)
 fc2_cutlass.cu                  # CUTLASS GemmUniversal wrapper (reference)
 fc2_hybrid.cu                   # CUTLASS integration experiments (ALL DEAD)
