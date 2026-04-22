@@ -1,0 +1,8 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+smsp__warps_issue_stalled_dispatch_stall.avg                           |         122.1 |          0.99 |    -99.2% | warp
+smsp__warps_issue_stalled_short_scoreboard.avg                         |       1,592.8 |       2,298.8 |     44.3% | warp
+dram__sectors_write.sum                                                |     366,328.0 |     263,280.0 |    -28.1% | sector
+dram__sectors_read.sum                                                 |   163,708,400 |   122,088,808 |    -25.4% | sector
+lts__t_sector_hit_rate.pct                                             |         52.70 |         64.38 |     22.2% | %
+smsp__warps_issue_stalled_sleeping.avg                                 |      12,489.2 |      10,782.0 |    -13.7% | warp

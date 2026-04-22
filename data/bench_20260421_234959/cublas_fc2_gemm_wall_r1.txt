@@ -1,0 +1,6 @@
+cuBLASLt FP8 benchmark (N=768 K=3072 epilogue=bias_only)
+  Device: NVIDIA B200 (SM 10.0, SMs=148)
+  Shape: [928256,3072] x [3072,768]^T + bias  (imgs_per_sm=32)
+  Heuristics: MXFP8=3, Per-tensor=8
+NCU_MODE: cuBLAS gemm (mode=per-tensor algo #0, sweep_best=1.022ms; mxfp8_best=1.087ms plain_best=1.022ms)
+@@RESULT ms=1.030 tflops=4250.70 checksum=0.000000 valid=0 c0=0.0

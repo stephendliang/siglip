@@ -1,0 +1,29 @@
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static  -DGEMM_ONLY fc2_ws.cu -o fc2-ws-gemm -lcurand_static -lculibos -lcuda
+fc2_ws.cu(305): warning #177-D: variable "res_full_phase" was declared but never referenced
+          uint32_t res_full_phase[2] = {0, 0};
+                   ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc2_ws.cu(281): warning #550-D: variable "res_full_arr" was set but never used
+      uint32_t res_full_arr[2], res_empty_arr[2];
+               ^
+
+fc2_ws.cu(281): warning #550-D: variable "res_empty_arr" was set but never used
+      uint32_t res_full_arr[2], res_empty_arr[2];
+                                ^
+
+fc2_ws.cu(282): warning #550-D: variable "res_smem_arr" was set but never used
+      uint32_t out_smem_arr[2], res_smem_arr[2];
+                                ^
+
+fc2_ws.cu(186): warning #177-D: function "tma_load_cta" was declared but never referenced
+  void tma_load_cta(uint32_t smem_dst, const CUtensorMap* tma_desc,
+       ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z13fc2_ws_kernel14CUtensorMap_stS_S_S_PK13__nv_bfloat16PS0_S2_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc2_ws_kernel14CUtensorMap_stS_S_S_PK13__nv_bfloat16PS0_S2_
+    8 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 188.791 ms

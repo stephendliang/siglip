@@ -1,0 +1,32 @@
+FC2 W3 kernel — 7 warps (0 idle), shared-SMEM epilogue
+  GEMM: [928256,3072] x [768,3072]^T  6-stage pipeline  SMEM: 231424 bytes  EPI_REUSE=0
+  LOAD: PACKED=1  PRESWIZZLE=0
+  EPI: stages=2  SWS=0  DTS=0  FP32=0  CPP=0
+==PROF== Connected to process 28702 (/root/siglip/bench-fc2-default-p-fused)
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=231424 B)
+Launching warmup (2 iters)...
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 14 passes
+  Warmup done.
+Timing: 10 iterations...
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 14 passes
+FC2-W3 kernel: 706.947 ms  6.20 TFLOPS
+==PROF== Profiling "fc2_w3_kernel": 0%....50%....100% - 14 passes
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 7166464.000000
+C[0,0..3] = 4608.0 3072.0 4608.0 3072.0
+@@RESULT ms=706.947 tflops=6.20 checksum=7166464.000000 valid=1 c0=4608.0
+==PROF== Disconnected from process 28702
+==PROF== Report: /root/siglip/data/bench_20260421_234959/fc2_default_p_fused.ncu-rep

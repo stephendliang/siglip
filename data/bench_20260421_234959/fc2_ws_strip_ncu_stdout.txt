@@ -1,0 +1,23 @@
+==PROF== Connected to process 49391 (/root/siglip/bench-fc2-ws-strip)
+==PROF== Profiling "fc2_ws_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_ws_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_ws_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_ws_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_ws_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_ws_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_ws_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_ws_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_ws_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_ws_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_ws_kernel": 0%....50%....100% - 14 passes
+==PROF== Profiling "fc2_ws_kernel": 0%....50%....100% - 14 passes
+FC2 WS kernel — mimics rank-1 (256 thr, 8 warps, flat regs)
+  [928256,3072] x [768,3072]^T  NS=6  SMEM=231168 B  (cap 228KB)
+  Alloc + init + pack done
+  TMA descriptors + func attr done (SMEM=231168 B)
+Warmup (2 iters)...
+Timing 10 iters...
+FC2-WS kernel: 706.669 ms  6.20 TFLOPS
+@@RESULT ms=706.6691 tflops=6.20 checksum=0.000000 valid=0 c0=0.0
+==PROF== Disconnected from process 49391
+==PROF== Report: /root/siglip/data/bench_20260421_234959/fc2_ws_strip.ncu-rep

@@ -1,0 +1,4 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+launch__registers_per_thread                                           |         124.0 |         146.0 |     17.7% | register/thread
+smsp__warps_issue_stalled_dispatch_stall.avg                           |       2,929.3 |       3,427.3 |     17.0% | warp

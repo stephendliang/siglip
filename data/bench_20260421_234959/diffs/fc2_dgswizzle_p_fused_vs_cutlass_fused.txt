@@ -1,0 +1,17 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+smsp__warps_issue_stalled_sleeping.avg                                 |          0.00 |      18,361.6 |      inf% | warp
+smsp__warps_issue_stalled_barrier.avg                                  |      30,616.8 |     266,635.0 |    770.9% | warp
+smsp__warps_issue_stalled_mio_throttle.avg                             |       3,812.6 |         17.88 |    -99.5% | warp
+smsp__warps_issue_stalled_dispatch_stall.avg                           |      26,075.4 |       3,483.4 |    -86.6% | warp
+smsp__warps_issue_stalled_branch_resolving.avg                         |      46,108.8 |      83,374.5 |     80.8% | warp
+smsp__warps_issue_stalled_wait.avg                                     |     228,138.6 |     399,508.7 |     75.1% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |      21,912.1 |       6,803.9 |    -68.9% | warp
+launch__registers_per_thread                                           |         252.0 |         118.0 |    -53.2% | register/thread
+smsp__inst_executed.sum                                                |   163,087,888 |   103,957,839 |    -36.3% | inst
+smsp__warps_issue_stalled_short_scoreboard.avg                         |     134,491.6 |     180,802.3 |     34.4% | warp
+smsp__warps_issue_stalled_long_scoreboard.avg                          |     2,724,890 |     2,037,564 |    -25.2% | warp
+dram__sectors_read.sum                                                 |   133,763,048 |   159,463,016 |     19.2% | sector
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                   |    37,675,077 |    30,746,608 |    -18.4% | 
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |    60,204,979 |    50,269,474 |    -16.5% | 
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |    19,080,835 |    18,068,083 |     -5.3% | 

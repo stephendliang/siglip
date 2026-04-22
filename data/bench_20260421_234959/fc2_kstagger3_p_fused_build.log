@@ -1,0 +1,53 @@
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DPACKED_TILES -DK_STAGGER=3 fc2_w3.cu -o fc2-w3-kstagger3 -lcurand_static -lculibos -lcuda
+fc2_w3.cu(2210): warning #177-D: variable "prev_n_bias" was declared but never referenced
+                  const int prev_n_bias = ptn * 256;
+                            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc2_w3.cu(1851): warning #177-D: variable "n_global" was declared but never referenced
+          const int n_global = tn * 256;
+                    ^
+
+fc2_w3.cu(1315): warning #177-D: variable "tile_stride" was declared but never referenced
+      const int tile_stride = num_clusters;
+                ^
+
+fc2_w3.cu(1350): warning #550-D: variable "epi_phase" was set but never used
+      int epi_phase[2] = {1, 1};
+          ^
+
+fc2_w3.cu(561): warning #177-D: function "tma_load_2d" was declared but never referenced
+  void tma_load_2d(uint32_t smem_dst, const void* tma_desc,
+       ^
+
+fc2_w3.cu(589): warning #177-D: function "tma_prefetch_2d" was declared but never referenced
+  void tma_prefetch_2d(const void* tma_desc, int32_t c0, int32_t c1) {
+       ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z9pack_bf16P13__nv_bfloat16PKS_iiii' for 'sm_100a'
+ptxas info    : Function properties for _Z9pack_bf16P13__nv_bfloat16PKS_iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 9.310 ms
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 8.119 ms
+ptxas info    : Compiling entry function '_Z18init_A_row_varyingPhii' for 'sm_100a'
+ptxas info    : Function properties for _Z18init_A_row_varyingPhii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 0 barriers
+ptxas info    : Compile time = 4.719 ms
+ptxas info    : Compiling entry function '_Z13init_residualP13__nv_bfloat16ix' for 'sm_100a'
+ptxas info    : Function properties for _Z13init_residualP13__nv_bfloat16ix
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 0 barriers
+ptxas info    : Compile time = 5.157 ms
+ptxas info    : Compiling entry function '_Z13fc2_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_S2_S_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc2_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_S2_S_
+    8 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 146 registers, used 2 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 196.759 ms

@@ -1,0 +1,19 @@
+Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
+-----------------------------------------------------------------------------------------------------------------------------
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                   |         593.0 |    16,737,376 | 2822391.7% | 
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum                         |      86,114.0 |    17,935,212 |  20727.3% | 
+dram__sectors_write.sum                                                |     372,232.0 |    44,473,944 |  11847.9% | sector
+lts__t_sectors_op_write.sum                                            |     668,093.0 |    67,513,323 |  10005.4% | sector
+smsp__warps_issue_stalled_short_scoreboard.avg                         |       1,421.8 |      26,475.7 |   1762.1% | warp
+smsp__warps_issue_stalled_math_pipe_throttle.avg                       |         311.9 |       2,332.0 |    647.7% | warp
+smsp__warps_issue_stalled_not_selected.avg                             |         581.7 |       4,076.2 |    600.7% | warp
+dram__bytes_write.sum                                                  |         11.91 |          1.42 |    -88.1% | Mbyte
+smsp__warps_issue_stalled_sleeping.avg                                 |      13,191.0 |      23,653.0 |     79.3% | warp
+launch__registers_per_thread                                           |         80.00 |         142.0 |     77.5% | register/thread
+smsp__warps_issue_stalled_dispatch_stall.avg                           |         756.1 |       1,237.4 |     63.7% | warp
+smsp__inst_executed.sum                                                |    44,301,743 |    70,469,951 |     59.1% | inst
+smsp__warps_issue_stalled_wait.avg                                     |     266,906.5 |     335,385.3 |     25.7% | warp
+smsp__warps_issue_stalled_barrier.avg                                  |     224,227.2 |     281,205.2 |     25.4% | warp
+smsp__warps_issue_stalled_branch_resolving.avg                         |      66,701.7 |      78,981.6 |     18.4% | warp
+lts__t_sectors.sum                                                     |   607,343,327 |   695,648,696 |     14.5% | sector
+dram__sectors_read.sum                                                 |   164,137,448 |   152,456,312 |     -7.1% | sector

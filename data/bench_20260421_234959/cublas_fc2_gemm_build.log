@@ -1,0 +1,22 @@
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -std=c++17 -DBENCH_N=768 -DBENCH_K=3072 -DBENCH_EPILOGUE=3 -DNCU_MODE bench/cublas_bench.cu -o cublas-bench-fc2-ncu -lcublasLt -lcublas
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z15apply_bias_onlyP13__nv_bfloat16PKfix' for 'sm_100a'
+ptxas info    : Function properties for _Z15apply_bias_onlyP13__nv_bfloat16PKfix
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 24 registers, used 0 barriers
+ptxas info    : Compile time = 7.313 ms
+ptxas info    : Compiling entry function '_Z15apply_bias_geluP13__nv_bfloat16PKfix' for 'sm_100a'
+ptxas info    : Function properties for _Z15apply_bias_geluP13__nv_bfloat16PKfix
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 0 barriers
+ptxas info    : Compile time = 10.240 ms
+ptxas info    : Compiling entry function '_Z14apply_combinedP13__nv_bfloat16PKS_xii' for 'sm_100a'
+ptxas info    : Function properties for _Z14apply_combinedP13__nv_bfloat16PKS_xii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 22 registers, used 0 barriers
+ptxas info    : Compile time = 7.123 ms
+ptxas info    : Compiling entry function '_Z19precompute_combinedPKfS0_P13__nv_bfloat16ii' for 'sm_100a'
+ptxas info    : Function properties for _Z19precompute_combinedPKfS0_P13__nv_bfloat16ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 12 registers, used 0 barriers
+ptxas info    : Compile time = 2.264 ms
