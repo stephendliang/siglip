@@ -28,6 +28,7 @@ Compile-time flags:
   -DCUTLASS_LOOP=N      Loop structure: 1=nounroll si, 2=+nounroll chunk, 3=+C++ FP32 compute
   -DSTRIP_EPILOGUE      Skip epilogue (benchmark GEMM core only, valid=0)
   -DGEMM_ONLY           Write D=BF16(A×B), no residual/bias (apples-to-apples vs cutlass strip)
+  -DBIAS_ONLY           Write D=BF16(A×B)+bias, no residual (apples-to-apples vs cuBLASLt rank-1 bz_bias)
   -DNO_PACKED_TILES     Opt OUT of tile-contiguous DRAM layout. PACKED is default-on
                         (was -DPACKED_TILES until 2026-04-19; flipped because PACKED is
                         proven-better across all dispatches and tile dims tested).
@@ -257,7 +258,7 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
    GEMM_ONLY/STRIP_EPILOGUE have no W2 residual prefetch → no tile-to-tile
    double-buffer benefit → NUM_EPI_STAGES=1 is sufficient. */
 #ifndef NUM_EPI_STAGES
-#if EPI_SINGLE_PASS || defined(GEMM_ONLY) || defined(STRIP_EPILOGUE)
+#if EPI_SINGLE_PASS || defined(GEMM_ONLY) || defined(STRIP_EPILOGUE) || defined(BIAS_ONLY)
 #define NUM_EPI_STAGES     1
 #else
 #define NUM_EPI_STAGES     2
@@ -299,12 +300,20 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define NO_PRE_STORE_BAR 1
 #endif
 
-#if defined(GROUP_REORDER) && (defined(CUTLASS_EPILOGUE) || defined(CUTE_STORE) || CUTLASS_LOOP >= 3)
+#if defined(GROUP_REORDER) && (defined(CUTLASS_EPILOGUE) || defined(CUTE_STORE) || CUTLASS_LOOP >= 3 || defined(BIAS_ONLY))
 #error "GROUP_REORDER only supported with default BF16 epilogue path"
 #endif
 
 #if defined(STRIP_EPILOGUE) && defined(GEMM_ONLY)
 #error "STRIP_EPILOGUE and GEMM_ONLY are mutually exclusive"
+#endif
+
+#if defined(BIAS_ONLY) && (defined(STRIP_EPILOGUE) || defined(GEMM_ONLY))
+#error "BIAS_ONLY is mutually exclusive with STRIP_EPILOGUE and GEMM_ONLY"
+#endif
+
+#if defined(BIAS_ONLY) && (defined(CUTLASS_EPILOGUE) || defined(CUTE_STORE) || CUTLASS_LOOP >= 3 || CPP_EPILOGUE)
+#error "BIAS_ONLY only composes with the default BF16 epilogue path"
 #endif
 
 #if defined(PRESWIZZLE) && !defined(PACKED_TILES)
@@ -722,6 +731,27 @@ void unpack_add_bf16x2(float& a_lo, float& a_hi, uint32_t packed) {
         "}" \
         :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
            "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
+           "r"(SADDR) \
+        : "memory")
+
+/* BIAS_ONLY: CVT FP32→BF16 + add BF16x2 bias + STS, no residual */
+#define BIAS_CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, b0,b1,b2,b3, SADDR) \
+    asm volatile( \
+        "{\n\t" \
+        ".reg .b32 o0, o1, o2, o3;\n\t" \
+        "cvt.rn.bf16x2.f32 o0, %1, %0;\n\t" \
+        "cvt.rn.bf16x2.f32 o1, %3, %2;\n\t" \
+        "cvt.rn.bf16x2.f32 o2, %5, %4;\n\t" \
+        "cvt.rn.bf16x2.f32 o3, %7, %6;\n\t" \
+        "add.rn.bf16x2 o0, o0, %8;\n\t" \
+        "add.rn.bf16x2 o1, o1, %9;\n\t" \
+        "add.rn.bf16x2 o2, o2, %10;\n\t" \
+        "add.rn.bf16x2 o3, o3, %11;\n\t" \
+        "st.shared.v4.b32 [%12], {o0,o1,o2,o3};\n\t" \
+        "}" \
+        :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
+           "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
+           "r"(b0),"r"(b1),"r"(b2),"r"(b3), \
            "r"(SADDR) \
         : "memory")
 
@@ -2183,7 +2213,7 @@ fc2_w3_kernel(
                 goto _lean_done;
             }
 #endif
-#if defined(STRIP_EPILOGUE) || defined(SELF_LOAD) || defined(GEMM_ONLY)
+#if defined(STRIP_EPILOGUE) || defined(SELF_LOAD) || defined(GEMM_ONLY) || defined(BIAS_ONLY)
             if (has_prev)
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
 #else
@@ -2507,7 +2537,7 @@ fc2_w3_kernel(
                     }
                     mbar_wait(self_mbar_arr[stage], self_mbar_phase[stage]);
                     self_mbar_phase[stage] ^= 1;
-#else
+#elif !defined(BIAS_ONLY)
                     /* Wait for W2's TMA load to land for this sub-iteration. */
                     mbar_wait(load_mbar[stage], load_phase[stage]);
                     load_phase[stage] ^= 1;
@@ -2623,6 +2653,7 @@ fc2_w3_kernel(
                         const uint32_t rsw2 = ((chunk & 1) ? sw6 : sw2) + sub_ofs;
 
                         const uint32_t rsw3 = ((chunk & 1) ? sw7 : sw3) + sub_ofs;
+#ifndef BIAS_ONLY
                         uint4 rv0, rv1, rv2, rv3;
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(stage_base + rsw0));
@@ -2632,6 +2663,7 @@ fc2_w3_kernel(
                             : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w) : "r"(stage_base + rsw2));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w) : "r"(stage_base + rsw3));
+#endif
 
 #ifdef CUTLASS_EPILOGUE
                         /* Pre-unpack residual BF16→FP32 (hides in TMEM latency) */
@@ -2702,6 +2734,15 @@ fc2_w3_kernel(
 #undef _GR1
 #undef _GR2
 #undef _GR3
+#elif defined(BIAS_ONLY)
+                        BIAS_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                            bv0.x,bv0.y,bv0.z,bv0.w, stage_base + rsw0);
+                        BIAS_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                            bv1.x,bv1.y,bv1.z,bv1.w, stage_base + rsw1);
+                        BIAS_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                            bv2.x,bv2.y,bv2.z,bv2.w, stage_base + rsw2);
+                        BIAS_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                            bv3.x,bv3.y,bv3.z,bv3.w, stage_base + rsw3);
 #else
                         BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                             bv0.x,bv0.y,bv0.z,bv0.w,
@@ -2788,10 +2829,12 @@ fc2_w3_kernel(
                     EPI_STORE(stage, nc_base, prev_n, prev_m); }
 #endif
                     EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
+#ifndef BIAS_ONLY
                     if (si > 0)
                         mbar_arrive(consumed_mbar[(si - 1) % NUM_EPI_STAGES]);
                     if (si == NUM_EPI_SUBITERS - 1)
                         mbar_arrive(consumed_mbar[stage]);
+#endif
 #endif
                 }
 
@@ -2893,7 +2936,7 @@ _lean_done:
             if (last_idx < TOTAL_TILES)
 #endif
             {
-#if defined(STRIP_EPILOGUE) || defined(SELF_LOAD) || defined(GEMM_ONLY)
+#if defined(STRIP_EPILOGUE) || defined(SELF_LOAD) || defined(GEMM_ONLY) || defined(BIAS_ONLY)
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
             ml_phase[last_buf] ^= 1;
             mbar_arrive(epi_mbar_masked + last_buf * 8);
@@ -3117,7 +3160,7 @@ _lean_done:
                 }
                 mbar_wait(self_mbar_arr[stage], self_mbar_phase[stage]);
                 self_mbar_phase[stage] ^= 1;
-#else
+#elif !defined(BIAS_ONLY)
                 mbar_wait(load_mbar[stage], load_phase[stage]);
                 load_phase[stage] ^= 1;
 #endif
@@ -3224,6 +3267,7 @@ _lean_done:
                     const uint32_t rsw2 = ((chunk & 1) ? sw6 : sw2) + sub_ofs;
 
                     const uint32_t rsw3 = ((chunk & 1) ? sw7 : sw3) + sub_ofs;
+#ifndef BIAS_ONLY
                     uint4 rv0, rv1, rv2, rv3;
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(stage_base + rsw0));
@@ -3233,6 +3277,7 @@ _lean_done:
                         : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w) : "r"(stage_base + rsw2));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w) : "r"(stage_base + rsw3));
+#endif
 
 #ifdef CUTLASS_EPILOGUE
                     float rr0[8], rr1[8], rr2[8], rr3[8];
@@ -3298,6 +3343,15 @@ _lean_done:
 #undef _GR1
 #undef _GR2
 #undef _GR3
+#elif defined(BIAS_ONLY)
+                    BIAS_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
+                        bv0.x,bv0.y,bv0.z,bv0.w, stage_base + rsw0);
+                    BIAS_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
+                        bv1.x,bv1.y,bv1.z,bv1.w, stage_base + rsw1);
+                    BIAS_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
+                        bv2.x,bv2.y,bv2.z,bv2.w, stage_base + rsw2);
+                    BIAS_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
+                        bv3.x,bv3.y,bv3.z,bv3.w, stage_base + rsw3);
 #else
                     BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                         bv0.x,bv0.y,bv0.z,bv0.w,
@@ -3370,10 +3424,12 @@ _lean_done:
                 EPI_STORE(stage, nc_base, last_n, last_m); }
 #endif
                 EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
+#ifndef BIAS_ONLY
                 if (si > 0)
                     mbar_arrive(consumed_mbar[(si - 1) % NUM_EPI_STAGES]);
                 if (si == NUM_EPI_SUBITERS - 1)
                     mbar_arrive(consumed_mbar[stage]);
+#endif
 #endif
             }
 
@@ -3509,6 +3565,9 @@ int main() {
     setbuf(stdout, NULL);
 #ifdef GEMM_ONLY
     printf("FC2 W3 kernel — %d warps (%d idle), GEMM_ONLY (D=BF16(A*B), no residual/bias)\n",
+           NUM_WARPS, NUM_IDLE_WARPS);
+#elif defined(BIAS_ONLY)
+    printf("FC2 W3 kernel — %d warps (%d idle), BIAS_ONLY (D=BF16(A*B)+bias, no residual)\n",
            NUM_WARPS, NUM_IDLE_WARPS);
 #elif defined(SELF_LOAD)
     printf("FC2 W3 kernel — %d warps (%d idle), SELF_LOAD epilogue (per-warp TMA)\n",
@@ -3872,6 +3931,10 @@ int main() {
 #ifdef GEMM_ONLY
         /* GEMM-only: D = BF16(A×B), no bias/residual */
         __nv_bfloat16 expected = __float2bfloat16(gemm);
+#elif defined(BIAS_ONLY)
+        /* BIAS-only: bf16(bf16(gemm) + bf16(bias)) — 2 roundings */
+        float acc_rounded_bo = __bfloat162float(__float2bfloat16(gemm));
+        __nv_bfloat16 expected = __float2bfloat16(acc_rounded_bo + bias_bf16_f);
 #elif defined(FP32_EPILOGUE)
         /* FP32 path: bf16(gemm + bias_fp32 + residual_fp32) — single final rounding */
         __nv_bfloat16 expected = __float2bfloat16(gemm + bias_bf16_f + res_bf16_f);
@@ -3937,6 +4000,8 @@ int main() {
                 /* Back-solve for the gemm portion: undo residual, then bias. */
 #ifdef GEMM_ONLY
                 float gemm_back = obs;
+#elif defined(BIAS_ONLY)
+                float gemm_back = obs - bias;
 #elif defined(FP32_EPILOGUE)
                 float gemm_back = obs - bias - res;
 #else
