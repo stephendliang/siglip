@@ -238,17 +238,14 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 
     if (tid == 0) {
         for (int s = 0; s < N_STAGES; s++) {
-            if (cta_rank == 0) {
-                mbar_init(smem_to_uint(smem + MBAR_TMA_FULL + s * 8), 2);
-            }
+            mbar_init(smem_to_uint(smem + MBAR_TMA_FULL + s * 8), 2);
             mbar_init(smem_to_uint(smem + MBAR_TMA_EMPTY + s * 8), 1);
         }
         mbar_init(smem_to_uint(smem + MBAR_TMEM_READY), 1);
 #ifdef NO_PREFILL
-        if (cta_rank == 0) {
-            mbar_init(smem_to_uint(smem + MBAR_TMEM_CONSUMED), 2);
-        }
+        mbar_init(smem_to_uint(smem + MBAR_TMEM_CONSUMED), 2);
 #endif
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp_id == 0) {
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
@@ -266,7 +263,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     }
 
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
-    asm volatile("barrier.cluster.wait.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
 
     /* W5 on CTA 1 is dead — only W5 on CTA 0 issues MMA. */
     if (warp_id == 5 && cta_rank != 0) return;
