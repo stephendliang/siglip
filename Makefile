@@ -128,6 +128,49 @@ fc2-ws-strip: fc2_ws.cu
 fc2-ws-bias: fc2_ws.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DBIAS_ONLY $< -o $@ $(LDFLAGS)
 
+# ── FC2 W3X kernel (6-warp bias-only rank-1-shaped, persistent, PACKED+dgswizzle only) ──
+fc2-w3x: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
+
+fc2-w3x-noprefill: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PREFILL $< -o $@ $(LDFLAGS)
+
+fc2-w3x-strip: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
+
+fc2-w3x-gemm: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY $< -o $@ $(LDFLAGS)
+
+# Warpgroup-asymmetric regs: default LO=48 in fc2_w3x.cu, HI set via target name.
+# Pattern rule: fc2-w3x-r<HI> sweeps epilogue-warpgroup reg target (8-aligned,
+# valid range 24..256).  LO override via DFLAGS='-DSETMAXNREG_LO=N'.
+# Pool ceiling at 192 threads: HI*128 + LO*64 <= 65536 -> HI <= (65536-LO*64)/128
+# (with LO=48 -> HI<=488; never binds at sane values).
+fc2-w3x-regs: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SETMAXNREG --maxrregcount=120 $< -o $@ $(LDFLAGS)
+
+fc2-w3x-regs-strip: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SETMAXNREG -DSTRIP_EPILOGUE --maxrregcount=120 $< -o $@ $(LDFLAGS)
+
+fc2-w3x-regs-gemm: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SETMAXNREG -DGEMM_ONLY --maxrregcount=120 $< -o $@ $(LDFLAGS)
+
+# fc2-w3x-r<HI>: build w/ USE_SETMAXNREG and SETMAXNREG_HI=<HI>.
+# Example: make -B fc2-w3x-r192  ->  HI=192, LO=default(48).
+# Override LO:  make -B fc2-w3x-r192 DFLAGS='-DSETMAXNREG_LO=40'
+fc2-w3x-r%: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SETMAXNREG -DSETMAXNREG_HI=$* --maxrregcount=120 $< -o $@ $(LDFLAGS)
+
+fc2-w3x-r%-strip: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SETMAXNREG -DSETMAXNREG_HI=$* -DSTRIP_EPILOGUE --maxrregcount=120 $< -o $@ $(LDFLAGS)
+
+fc2-w3x-r%-gemm: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SETMAXNREG -DSETMAXNREG_HI=$* -DGEMM_ONLY --maxrregcount=120 $< -o $@ $(LDFLAGS)
+
+# Full HI sweep (24..240 in 8-reg steps covers the interesting range).
+# Known: HI=168 -> 88B spills, HI=192 -> 32B spills (sweet), HI=216 -> 88B spills.
+fc2-w3x-r-sweep: fc2-w3x-r120 fc2-w3x-r136 fc2-w3x-r152 fc2-w3x-r160 fc2-w3x-r168 fc2-w3x-r176 fc2-w3x-r184 fc2-w3x-r192 fc2-w3x-r200 fc2-w3x-r208 fc2-w3x-r216 fc2-w3x-r224 fc2-w3x-r232 fc2-w3x-r240
+
 # ── FC2 W3 kernel (standalone, CUTLASS-style shared-SMEM epilogue) ──
 fc2-w3: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)

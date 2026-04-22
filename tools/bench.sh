@@ -204,6 +204,9 @@ if [ "$BASELINES" = "1" ]; then
         CFGS+=("fc2_ws_bias|make -B fc2-ws-bias && cp fc2-ws-bias bench-fc2-ws-bias|./bench-fc2-ws-bias|regex:fc2_ws_kernel")
         CFGS+=("fc2_ws_gemm|make -B fc2-ws-gemm && cp fc2-ws-gemm bench-fc2-ws-gemm|./bench-fc2-ws-gemm|regex:fc2_ws_kernel")
         CFGS+=("fc2_ws_strip|make -B fc2-ws-strip && cp fc2-ws-strip bench-fc2-ws-strip|./bench-fc2-ws-strip|regex:fc2_ws_kernel")
+        CFGS+=("fc2_w3x_bias|make -B fc2-w3x && cp fc2-w3x bench-fc2-w3x-bias|./bench-fc2-w3x-bias|regex:fc2_w3x_kernel")
+        CFGS+=("fc2_w3x_regs|make -B fc2-w3x-regs && cp fc2-w3x-regs bench-fc2-w3x-regs|./bench-fc2-w3x-regs|regex:fc2_w3x_kernel")
+        CFGS+=("fc2_w3x_noprefill|make -B fc2-w3x-noprefill && cp fc2-w3x-noprefill bench-fc2-w3x-noprefill|./bench-fc2-w3x-noprefill|regex:fc2_w3x_kernel")
         if [ "$DO_NCU" = "1" ]; then
             CFGS+=("cublas_fc2_gemm|make -B cublas-bench-fc2-ncu && cp cublas-bench-fc2-ncu bench-cublas-fc2|./bench-cublas-fc2|regex:.")
         else
