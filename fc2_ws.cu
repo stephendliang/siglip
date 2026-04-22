@@ -354,23 +354,36 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
                 o[28]=a28; o[29]=a29; o[30]=a30; o[31]=a31;
 #else
                 /* Residual: lane handles row (row_group*32 + lane), cols 0..31 for this sub-pass.
-                   Staging layout: row r, col c → offset (r * SUBPASS_COLS + c) * 2. */
+                   Staging layout: row r, col c → offset (r * SUBPASS_COLS + c) * 2.
+                   64 bytes per row = 4× v4. */
                 const int res_row_off = (row_group * 32 + lane) * (SUBPASS_COLS * 2);
-                uint4 rv0, rv1;
+                uint4 rv0, rv1, rv2, rv3;
                 asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(rv0.x), "=r"(rv0.y), "=r"(rv0.z), "=r"(rv0.w)
-                    : "r"(res_smem_arr[es] + res_row_off));
+                    : "r"(res_smem_arr[es] + res_row_off + 0));
                 asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(rv1.x), "=r"(rv1.y), "=r"(rv1.z), "=r"(rv1.w)
                     : "r"(res_smem_arr[es] + res_row_off + 16));
+                asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(rv2.x), "=r"(rv2.y), "=r"(rv2.z), "=r"(rv2.w)
+                    : "r"(res_smem_arr[es] + res_row_off + 32));
+                asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(rv3.x), "=r"(rv3.y), "=r"(rv3.z), "=r"(rv3.w)
+                    : "r"(res_smem_arr[es] + res_row_off + 48));
 
-                uint4 bv0, bv1;
+                uint4 bv0, bv1, bv2, bv3;
                 asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(bv0.x), "=r"(bv0.y), "=r"(bv0.z), "=r"(bv0.w)
-                    : "r"(smem_bias + (prev_n + nc) * 2));
+                    : "r"(smem_bias + (prev_n + nc +  0) * 2));
                 asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(bv1.x), "=r"(bv1.y), "=r"(bv1.z), "=r"(bv1.w)
+                    : "r"(smem_bias + (prev_n + nc +  8) * 2));
+                asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(bv2.x), "=r"(bv2.y), "=r"(bv2.z), "=r"(bv2.w)
                     : "r"(smem_bias + (prev_n + nc + 16) * 2));
+                asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(bv3.x), "=r"(bv3.y), "=r"(bv3.z), "=r"(bv3.w)
+                    : "r"(smem_bias + (prev_n + nc + 24) * 2));
 
                 if (tid == 0) mbar_arrive(res_empty_arr[es]);
 
@@ -378,10 +391,14 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
                 __nv_bfloat162 r[16];
                 uint32_t* bptr = reinterpret_cast<uint32_t*>(b);
                 uint32_t* rptr = reinterpret_cast<uint32_t*>(r);
-                bptr[0]=bv0.x; bptr[1]=bv0.y; bptr[2]=bv0.z; bptr[3]=bv0.w;
-                bptr[4]=bv1.x; bptr[5]=bv1.y; bptr[6]=bv1.z; bptr[7]=bv1.w;
-                rptr[0]=rv0.x; rptr[1]=rv0.y; rptr[2]=rv0.z; rptr[3]=rv0.w;
-                rptr[4]=rv1.x; rptr[5]=rv1.y; rptr[6]=rv1.z; rptr[7]=rv1.w;
+                bptr[0]=bv0.x;  bptr[1]=bv0.y;  bptr[2]=bv0.z;  bptr[3]=bv0.w;
+                bptr[4]=bv1.x;  bptr[5]=bv1.y;  bptr[6]=bv1.z;  bptr[7]=bv1.w;
+                bptr[8]=bv2.x;  bptr[9]=bv2.y;  bptr[10]=bv2.z; bptr[11]=bv2.w;
+                bptr[12]=bv3.x; bptr[13]=bv3.y; bptr[14]=bv3.z; bptr[15]=bv3.w;
+                rptr[0]=rv0.x;  rptr[1]=rv0.y;  rptr[2]=rv0.z;  rptr[3]=rv0.w;
+                rptr[4]=rv1.x;  rptr[5]=rv1.y;  rptr[6]=rv1.z;  rptr[7]=rv1.w;
+                rptr[8]=rv2.x;  rptr[9]=rv2.y;  rptr[10]=rv2.z; rptr[11]=rv2.w;
+                rptr[12]=rv3.x; rptr[13]=rv3.y; rptr[14]=rv3.z; rptr[15]=rv3.w;
 
                 o[0]  = a0  + __bfloat162float(b[0].x)  + __bfloat162float(r[0].x);
                 o[1]  = a1  + __bfloat162float(b[0].y)  + __bfloat162float(r[0].y);
