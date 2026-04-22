@@ -263,6 +263,16 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.aligned;");
 
+#ifdef BIAS_ONLY
+    /*
+      rank-1 warp retirement: warps 6,7 (and W5 on CTA 1) arrive at the cluster
+      barrier above, then BRA to EXIT. Only warps 0-4 (epi+TMA) on both CTAs
+      and W5 on CTA 0 (MMA) remain — matches rank-1's warps_act=6.
+     */
+    if (warp_id >= 6) return;
+    if (warp_id == 5 && cta_rank != 0) return;
+#endif
+
     const uint32_t taddr_base = *reinterpret_cast<uint32_t*>(smem + OFF_TMEM);
 
     uint32_t smem_a_arr[N_STAGES], smem_b_arr[N_STAGES];
@@ -553,6 +563,78 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
             }
         }
     }
+#ifdef BIAS_ONLY
+    else if (warp_id == 5 /* && cta_rank == 0, ensured by early return above */) {
+        /* =============== MMA issuer (warp 5, CTA 0 only) — rank-1 layout =============== */
+        uint32_t tma_full_phase[N_STAGES] = {0};
+        uint32_t tmem_cons_phase = 0;
+
+        uint64_t desc_a_base[N_STAGES], desc_b_base[N_STAGES];
+        for (int s = 0; s < N_STAGES; s++) {
+            desc_a_base[s] = make_smem_desc(smem_a_arr[s]);
+            desc_b_base[s] = make_smem_desc(smem_b_arr[s]);
+        }
+
+        if (lane == 0) {
+            mbar_arrive(mbar_tmem_consumed);
+            mbar_arrive(mbar_tmem_consumed);
+        }
+
+        for (int tt = 0; tt < tiles_per_cluster; tt++) {
+            const int lin_tile = cluster_id + tt * num_clusters;
+            if (lin_tile >= TOTAL_TILES) break;
+            const int buf = lin_tile & 1;
+
+            mbar_wait(mbar_tmem_consumed, tmem_cons_phase);
+            tmem_cons_phase ^= 1;
+
+            for (int ki = 0; ki < K_ITERS; ki++) {
+                const int s = ki % N_STAGES;
+                mbar_wait(tma_full_arr[s], tma_full_phase[s]);
+                tma_full_phase[s] ^= 1;
+
+                if (lane == 0) {
+                    uint64_t desc_a = desc_a_base[s];
+                    uint64_t desc_b = desc_b_base[s];
+                    const int accum_flag = (ki == 0) ? 0 : 1;
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p_init, p_acc;\n\t"
+                        ".reg .b64 da, db;\n\t"
+                        ".reg .b32 tc;\n\t"
+                        "setp.ne.b32 p_init, %12, 0;\n\t"
+                        "setp.ne.b32 p_acc,  1, 0;\n\t"
+                        "mov.b32 tc, %0;\n\t"
+                        "mov.b64 da, %1;\n\t"
+                        "mov.b64 db, %2;\n\t"
+                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                        "[tc], da, db, %3, {%4,%5,%6,%7,%8,%9,%10,%11}, p_init;\n\t"
+                        "add.s64 da, da, 2;\n\t"
+                        "add.s64 db, db, 2;\n\t"
+                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                        "[tc], da, db, %3, {%4,%5,%6,%7,%8,%9,%10,%11}, p_acc;\n\t"
+                        "add.s64 da, da, 2;\n\t"
+                        "add.s64 db, db, 2;\n\t"
+                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                        "[tc], da, db, %3, {%4,%5,%6,%7,%8,%9,%10,%11}, p_acc;\n\t"
+                        "add.s64 da, da, 2;\n\t"
+                        "add.s64 db, db, 2;\n\t"
+                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                        "[tc], da, db, %3, {%4,%5,%6,%7,%8,%9,%10,%11}, p_acc;\n\t"
+                        "}"
+                        :
+                        : "r"(buf * TN), "l"(desc_a), "l"(desc_b), "r"(IDESC),
+                          "r"(0),"r"(0),"r"(0),"r"(0),
+                          "r"(0),"r"(0),"r"(0),"r"(0),
+                          "r"(accum_flag));
+                    tcgen05_commit_mcast(tma_empty_arr[s], pair_mask);
+                }
+            }
+
+            if (lane == 0) tcgen05_commit_mcast(mbar_tmem_ready, pair_mask);
+        }
+    }
+#else
     else if (warp_id == 5) {
         /* =============== TMA residual loader (warp 5) =============== */
 #if !defined(STRIP_EPILOGUE) && !defined(GEMM_ONLY) && !defined(BIAS_ONLY)
@@ -592,7 +674,7 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
         /* idle (mirror rank-1's dead path) */
     }
     else if (cta_rank == 0) {
-        /* =============== MMA issuer (warp 7, CTA 0 only) =============== */
+        /* =============== MMA issuer (warp 7, CTA 0 only, non-BIAS_ONLY layout) =============== */
         uint32_t tma_full_phase[N_STAGES] = {0};
         uint32_t tmem_cons_phase = 0;
 
@@ -662,9 +744,12 @@ fc2_ws_kernel(const __grid_constant__ CUtensorMap tma_a,
             if (lane == 0) tcgen05_commit_mcast(mbar_tmem_ready, pair_mask);
         }
     }
+#endif
 
+#ifndef BIAS_ONLY
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
+#endif
     if (warp_id == 0) {
         asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
             :: "r"(0), "n"(TMEM_COLS));
