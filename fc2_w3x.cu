@@ -321,6 +321,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 
             mbar_wait(mbar_tmem_ready, mma_phase);
             mma_phase ^= 1;
+            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
             const uint32_t taddr_tile = taddr_base + buf * TN
                 + ((cta_rank * TM + row_group * 32) << 16);
@@ -518,6 +519,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 const int s = ki % N_STAGES;
                 mbar_wait(tma_full_arr[s], tma_full_phase[s]);
                 tma_full_phase[s] ^= 1;
+                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
                 if (lane == 0) {
                     uint64_t desc_a = desc_a_base[s];
