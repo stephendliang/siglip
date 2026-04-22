@@ -208,7 +208,37 @@ Tile: 256x256x128. K_ITERS=K_DIM/128. FC2: K=3072 (24 iters), FC1: K=768 (6 iter
 
 ## Compute floor and decomposition (not a ceiling)
 
-Hard MMA compute floor: 525.6 cyc/iter pipelined × K_ITERS × tiles / (74 clusters × 2 CTAs × 1.813 GHz). FC2 = ~1.048 ms. FC1 strip floor is NOT compute-bound (K=6 is so short that TMA load latency dominates).
+**Corrected 2026-04-21.** The earlier "525.6 cyc/iter → 1.048 ms FC2 floor"
+was doubly wrong: (1) it divided by an extra `×2 CTAs` on top of the 74
+clusters, but `tcgen05.mma.cta_group::2` already produces cluster-wide work
+per instruction — no second CTA factor needed; (2) the 525.6 number is
+from `bench/mma_bench.cu` at **NS=4 with traditional (non-PACKED) TMA
+staging**, not the hardware MMA ceiling. `mma_bench` separately reports a
+`MMA compute time (commit→wait)` of **460 cyc/iter** for the pure async-MMA
+retirement rate with no staging overhead.
+
+Corrected per-cluster floor calc is `147 tiles × 24 K_iters × cyc_per_iter
+/ clock`:
+
+| cyc/iter | what | floor @ 1.813 GHz (base) | floor @ 1.965 GHz (boost) |
+|---|---|---|---|
+| 460   | hardware MMA retirement, no staging        | 0.896 ms | 0.827 ms |
+| 520.8 | bench NS=4 + W0-TMA overlap (FC2-like)     | 1.014 ms | 0.935 ms |
+| 525.6 | bench NS=4, no TMA overlap                 | 1.023 ms | 0.944 ms |
+
+**Where fc2_w3x lands (1.007 ms PASS, 2026-04-21):** back-solving cyc/iter
+from 1.007 ms gives **517 cyc/iter at base clock** or **561 cyc/iter at
+boost**. At base clock, NS=6 + PACKED_TILES apparently shaved a handful of
+cyc/iter vs the bench's NS=4 staging — consistent with deeper pipeline +
+better L2 locality, but not magic. At boost clock, we'd actually be above
+bench. Locked-clock measurement is needed to resolve which regime we're
+actually in.
+
+**What the floor means in practice:** 100+ µs of headroom between rank-1
+(1.046 ms), fc2_w3x (1.007 ms), and the pure-MMA hardware floor
+(0.83–0.90 ms). That gap is staging + pipeline bubbles + dispatch
+overhead, not MMA-compute-bound. FC1 strip is NOT compute-bound (K=6 is
+so short that TMA load latency dominates).
 
 **Strip itself is ordering-sensitive, not a floor.** The 2026-04-18 sweep shows
 FC2 strip spans 0.987–1.031 ms (44 µs spread) and FC1 strip spans 1.336–1.501 ms
