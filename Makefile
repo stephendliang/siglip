@@ -125,6 +125,9 @@ fc2-ws-gemm: fc2_ws.cu
 fc2-ws-strip: fc2_ws.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
 
+fc2-ws-bias: fc2_ws.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DBIAS_ONLY $< -o $@ $(LDFLAGS)
+
 # ── FC2 W3 kernel (standalone, CUTLASS-style shared-SMEM epilogue) ──
 fc2-w3: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)

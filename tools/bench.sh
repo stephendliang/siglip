@@ -201,6 +201,7 @@ if [ "$BASELINES" = "1" ]; then
         CFGS+=("cutlass_fc2_fused|make fc2-cutlass && cp fc2-cutlass bench-cutlass-fc2-fused|./bench-cutlass-fc2-fused|regex:^(?!init)")
         CFGS+=("cutlass_fc2_strip|make fc2-cutlass-strip && cp fc2-cutlass-strip bench-cutlass-fc2-strip|./bench-cutlass-fc2-strip|regex:^(?!init)")
         CFGS+=("fc2_ws_fused|make -B fc2-ws && cp fc2-ws bench-fc2-ws-fused|./bench-fc2-ws-fused|regex:fc2_ws_kernel")
+        CFGS+=("fc2_ws_bias|make -B fc2-ws-bias && cp fc2-ws-bias bench-fc2-ws-bias|./bench-fc2-ws-bias|regex:fc2_ws_kernel")
         CFGS+=("fc2_ws_gemm|make -B fc2-ws-gemm && cp fc2-ws-gemm bench-fc2-ws-gemm|./bench-fc2-ws-gemm|regex:fc2_ws_kernel")
         CFGS+=("fc2_ws_strip|make -B fc2-ws-strip && cp fc2-ws-strip bench-fc2-ws-strip|./bench-fc2-ws-strip|regex:fc2_ws_kernel")
         if [ "$DO_NCU" = "1" ]; then
