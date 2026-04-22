@@ -419,7 +419,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 asm volatile("bar.sync 0, 128;" ::: "memory");
 
                 if (tid == 0) {
-                    if (sp >= NUM_EPI_STAGES) {
+                    if (tt > 0 || sp >= NUM_EPI_STAGES) {
                         asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
                     }
                     tma_store(out_smem_arr[es], &tma_c,
@@ -430,13 +430,15 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 asm volatile("bar.sync 0, 128;" ::: "memory");
             }
 
-            if (tid == 0) {
-                asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
 #ifdef NO_PREFILL
+            if (tid == 0) {
                 mbar_arrive(mbar_tmem_cons_peer_base + buf * 8);
-#endif
             }
+#endif
 #endif /* STRIP_EPILOGUE */
+        }
+        if (tid == 0) {
+            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
         }
     }
     else if (warp_id == 4) {
