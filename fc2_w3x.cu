@@ -81,8 +81,8 @@
 #define MBAR_TMA_FULL       (OFF_MBARS + 0)
 #define MBAR_TMA_EMPTY      (MBAR_TMA_FULL + N_STAGES * 8)
 #define MBAR_TMEM_READY     (MBAR_TMA_EMPTY + N_STAGES * 8)
-#define MBAR_TMEM_CONSUMED  (MBAR_TMEM_READY + 8)
-#define MBARS_END           (MBAR_TMEM_CONSUMED + 8)
+#define MBAR_TMEM_CONSUMED  (MBAR_TMEM_READY + 2 * 8)
+#define MBARS_END           (MBAR_TMEM_CONSUMED + 2 * 8)
 
 #define OFF_TMEM       ((MBARS_END + 15) & ~15)
 #define SMEM_BYTES     ((OFF_TMEM + 8 + 127) & ~127)
@@ -241,10 +241,12 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             mbar_init(smem_to_uint(smem + MBAR_TMA_FULL + s * 8), 2);
             mbar_init(smem_to_uint(smem + MBAR_TMA_EMPTY + s * 8), 1);
         }
-        mbar_init(smem_to_uint(smem + MBAR_TMEM_READY), 1);
+        for (int b = 0; b < 2; b++) {
+            mbar_init(smem_to_uint(smem + MBAR_TMEM_READY + b * 8), 1);
 #ifdef NO_PREFILL
-        mbar_init(smem_to_uint(smem + MBAR_TMEM_CONSUMED), 2);
+            mbar_init(smem_to_uint(smem + MBAR_TMEM_CONSUMED + b * 8), 2);
 #endif
+        }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp_id == 0) {
@@ -288,12 +290,12 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         out_smem_arr[s]  = smem_to_uint(smem + OFF_OUT + s * SUBPASS_BYTES);
     }
 
-    const uint32_t mbar_tmem_ready        = smem_to_uint(smem + MBAR_TMEM_READY);
+    const uint32_t mbar_tmem_ready_base   = smem_to_uint(smem + MBAR_TMEM_READY);
     const uint32_t smem_bias              = smem_to_uint(smem + OFF_BIAS);
 
 #ifdef NO_PREFILL
-    const uint32_t mbar_tmem_consumed     = smem_to_uint(smem + MBAR_TMEM_CONSUMED);
-    const uint32_t mbar_tmem_cons_peer    = mbar_tmem_consumed & 0xFEFFFFFFu;
+    const uint32_t mbar_tmem_consumed_base = smem_to_uint(smem + MBAR_TMEM_CONSUMED);
+    const uint32_t mbar_tmem_cons_peer_base = mbar_tmem_consumed_base & 0xFEFFFFFFu;
 #endif
 
     const int num_clusters = SM_COUNT / CLUSTER_CTAS;
@@ -304,7 +306,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         /* =============== Epilogue warpgroup (W0-W3, tid 0..127) =============== */
         const int row_group = warp_id;
 
-        uint32_t mma_phase = 0;
+        uint32_t mma_phase[2] = {0, 0};
 
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
@@ -316,8 +318,8 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             const int prev_n = tn * TN;
             const int buf = lin_tile & 1;
 
-            mbar_wait(mbar_tmem_ready, mma_phase);
-            mma_phase ^= 1;
+            mbar_wait(mbar_tmem_ready_base + buf * 8, mma_phase[buf]);
+            mma_phase[buf] ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
             const uint32_t taddr_tile = taddr_base + buf * TN
@@ -326,7 +328,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #ifdef STRIP_EPILOGUE
             (void)prev_m; (void)prev_n; (void)taddr_tile;
 #ifdef NO_PREFILL
-            if (tid == 0) mbar_arrive(mbar_tmem_cons_peer);
+            if (tid == 0) mbar_arrive(mbar_tmem_cons_peer_base + buf * 8);
 #endif
 #else
             #pragma unroll 1
@@ -431,7 +433,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             if (tid == 0) {
                 asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
 #ifdef NO_PREFILL
-                mbar_arrive(mbar_tmem_cons_peer);
+                mbar_arrive(mbar_tmem_cons_peer_base + buf * 8);
 #endif
             }
 #endif /* STRIP_EPILOGUE */
@@ -485,7 +487,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         /* =============== W5: MMA issuer (tid 160..191, CTA 0 only) =============== */
         uint32_t tma_full_phase[N_STAGES] = {0};
 #ifdef NO_PREFILL
-        uint32_t tmem_cons_phase = 0;
+        uint32_t tmem_cons_phase[2] = {0, 0};
 #endif
 
         uint64_t desc_a_base[N_STAGES], desc_b_base[N_STAGES];
@@ -495,10 +497,12 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         }
 
 #ifdef NO_PREFILL
-        /* Prime tmem_consumed (count=2) so tile 0 doesn't block. */
+        /* Prime both consumed slots (count=2) so tiles 0, 1 don't block. */
         if (lane == 0) {
-            mbar_arrive(mbar_tmem_consumed);
-            mbar_arrive(mbar_tmem_consumed);
+            mbar_arrive(mbar_tmem_consumed_base + 0);
+            mbar_arrive(mbar_tmem_consumed_base + 0);
+            mbar_arrive(mbar_tmem_consumed_base + 8);
+            mbar_arrive(mbar_tmem_consumed_base + 8);
         }
 #endif
 
@@ -508,8 +512,8 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             const int buf = lin_tile & 1;
 
 #ifdef NO_PREFILL
-            mbar_wait(mbar_tmem_consumed, tmem_cons_phase);
-            tmem_cons_phase ^= 1;
+            mbar_wait(mbar_tmem_consumed_base + buf * 8, tmem_cons_phase[buf]);
+            tmem_cons_phase[buf] ^= 1;
 #endif
 
             for (int ki = 0; ki < K_ITERS; ki++) {
@@ -556,7 +560,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 }
             }
 
-            if (lane == 0) tcgen05_commit_mcast(mbar_tmem_ready, pair_mask);
+            if (lane == 0) tcgen05_commit_mcast(mbar_tmem_ready_base + buf * 8, pair_mask);
         }
     }
 
