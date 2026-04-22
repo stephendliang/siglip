@@ -2653,7 +2653,10 @@ fc2_w3_kernel(
                         const uint32_t rsw2 = ((chunk & 1) ? sw6 : sw2) + sub_ofs;
 
                         const uint32_t rsw3 = ((chunk & 1) ? sw7 : sw3) + sub_ofs;
-#ifndef BIAS_ONLY
+#ifdef BIAS_ONLY
+                        const uint4 rv0 = {0,0,0,0}, rv1 = {0,0,0,0};
+                        const uint4 rv2 = {0,0,0,0}, rv3 = {0,0,0,0};
+#else
                         uint4 rv0, rv1, rv2, rv3;
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(stage_base + rsw0));
@@ -2734,15 +2737,6 @@ fc2_w3_kernel(
 #undef _GR1
 #undef _GR2
 #undef _GR3
-#elif defined(BIAS_ONLY)
-                        BIAS_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
-                            bv0.x,bv0.y,bv0.z,bv0.w, stage_base + rsw0);
-                        BIAS_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
-                            bv1.x,bv1.y,bv1.z,bv1.w, stage_base + rsw1);
-                        BIAS_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
-                            bv2.x,bv2.y,bv2.z,bv2.w, stage_base + rsw2);
-                        BIAS_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
-                            bv3.x,bv3.y,bv3.z,bv3.w, stage_base + rsw3);
 #else
                         BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                             bv0.x,bv0.y,bv0.z,bv0.w,
@@ -3267,7 +3261,10 @@ _lean_done:
                     const uint32_t rsw2 = ((chunk & 1) ? sw6 : sw2) + sub_ofs;
 
                     const uint32_t rsw3 = ((chunk & 1) ? sw7 : sw3) + sub_ofs;
-#ifndef BIAS_ONLY
+#ifdef BIAS_ONLY
+                    const uint4 rv0 = {0,0,0,0}, rv1 = {0,0,0,0};
+                    const uint4 rv2 = {0,0,0,0}, rv3 = {0,0,0,0};
+#else
                     uint4 rv0, rv1, rv2, rv3;
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(stage_base + rsw0));
@@ -3343,15 +3340,6 @@ _lean_done:
 #undef _GR1
 #undef _GR2
 #undef _GR3
-#elif defined(BIAS_ONLY)
-                    BIAS_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
-                        bv0.x,bv0.y,bv0.z,bv0.w, stage_base + rsw0);
-                    BIAS_CVT_STS_V4(a8,a9,a10,a11,a12,a13,a14,a15,
-                        bv1.x,bv1.y,bv1.z,bv1.w, stage_base + rsw1);
-                    BIAS_CVT_STS_V4(a16,a17,a18,a19,a20,a21,a22,a23,
-                        bv2.x,bv2.y,bv2.z,bv2.w, stage_base + rsw2);
-                    BIAS_CVT_STS_V4(a24,a25,a26,a27,a28,a29,a30,a31,
-                        bv3.x,bv3.y,bv3.z,bv3.w, stage_base + rsw3);
 #else
                     BIAS_RES_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
                         bv0.x,bv0.y,bv0.z,bv0.w,
