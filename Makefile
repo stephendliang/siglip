@@ -144,9 +144,9 @@ fc2-w3x-gemm: fc2_w3x.cu
 # ── fc2_w3x dispatch-variant sweep (CPU-design, B200-measured) ────────────
 # All bijective on FC2 shape (TM=3626, TN=3, NC=74); verified via
 # /tmp/dg_variants_check.py.  Hypothesis-motivated by in_g-structural
-# tn=0 surplus (project_w3x_tn0_in_g_structural.md) + PROFILE_W4 (W4
-# 53%-idle, W5-bound).  Expected: all likely 0-delta given prior dgphase /
-# DG_ROT / dgnrot 0-deltas — but cheap to measure and rule out.
+# tn=0 surplus (project_w3x_tn0_in_g_structural.md) + W4 53%-idle
+# (W5-bound, PROFILE_W4 retired).  Expected: all likely 0-delta given
+# prior dgphase / DG_ROT / dgnrot 0-deltas — but cheap to measure and rule out.
 fc2-w3x-dg4: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DDG_GROUP_SIZE=4 $< -o $@ $(LDFLAGS)
 
@@ -215,6 +215,14 @@ fc2-w3x-wgread-trail: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DWAIT_GROUP_READ -DDROP_TRAIL_BARSYNC $< -o $@ $(LDFLAGS)
 
 fc2-w3x-sync-sweep: fc2-w3x-base fc2-w3x-trail fc2-w3x-wgread fc2-w3x-wgread-trail
+
+# W5 critical-path profiler.  Combine with PROFILE_TILE if you want the
+# tma_wait_sum breakdown alongside W5's tile_total / mma_asm / commit.
+fc2-w3x-prof-w5: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DPROFILE_W5 $< -o $@ $(LDFLAGS)
+
+fc2-w3x-prof-w5-full: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DPROFILE_W5 -DPROFILE_TILE $< -o $@ $(LDFLAGS)
 
 # Warpgroup-asymmetric regs: default LO=48 in fc2_w3x.cu, HI set via target name.
 # Pattern rule: fc2-w3x-r<HI> sweeps epilogue-warpgroup reg target (8-aligned,
