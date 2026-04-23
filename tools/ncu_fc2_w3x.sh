@@ -81,14 +81,19 @@ command -v ncu >/dev/null || { echo "ncu not in PATH" >&2; exit 1; }
 log "=== ncu fc2_w3x W5-diagnosis sweep → $OUT ==="
 
 log "--- build ---"
-make fc2-w3x fc2-w3x-strip fc2-w3x-gemm cublaslt-fc2 2>&1 \
+# -DNCU_PROFILE variants: 1 warmup + 1 timed launch, cudaMemset'd inputs,
+# verification skipped. Access pattern + hw counters identical to normal
+# build; only difference is elapsed wall (host setup + extra launches gone).
+# rank1 still uses cublaslt-fc2 — cuBLASLt's own warmup/timing loop lives
+# inside that binary.
+make fc2-w3x-ncu fc2-w3x-ncu-strip fc2-w3x-ncu-gemm cublaslt-fc2 2>&1 \
     | tee -a "$LOG" | tail -8
 
 TARGETS=(
-    "w3x      ./fc2-w3x        fc2_w3x_kernel"
-    "w3x-strip ./fc2-w3x-strip fc2_w3x_kernel"
-    "w3x-gemm  ./fc2-w3x-gemm  fc2_w3x_kernel"
-    "rank1    ./cublaslt-fc2   nvjet_sm100_qqtst"
+    "w3x      ./fc2-w3x-ncu        fc2_w3x_kernel     1"
+    "w3x-strip ./fc2-w3x-ncu-strip fc2_w3x_kernel     1"
+    "w3x-gemm  ./fc2-w3x-ncu-gemm  fc2_w3x_kernel     1"
+    "rank1    ./cublaslt-fc2       nvjet_sm100_qqtst  2"
 )
 
 METRICS="$(cat <<'EOF' | tr -d ' \n'
@@ -127,7 +132,7 @@ if [ "$DO_FOCUSED" = 1 ]; then
     for rep in $(seq 1 "$REPS"); do
         [ "$REPS" -gt 1 ] && log "  -- rep $rep/$REPS --"
         for entry in "${TARGETS[@]}"; do
-            read -r name bin filt <<<"$entry"
+            read -r name bin filt lskip <<<"$entry"
             if [ ! -x "$bin" ]; then
                 log "  SKIP $name: $bin missing"
                 continue
@@ -137,7 +142,7 @@ if [ "$DO_FOCUSED" = 1 ]; then
             log "  ncu $name$suffix"
             ncu --target-processes all \
                 -k "regex:$filt" \
-                --launch-skip 2 --launch-count 1 \
+                --launch-skip "$lskip" --launch-count 1 \
                 --metrics "$METRICS" \
                 --csv \
                 "$bin" > "$OUT/$name$suffix.csv" 2> "$OUT/$name$suffix.stderr" \
@@ -154,12 +159,12 @@ if [ "$DO_FULL" = 1 ]; then
     else
         log "--- phase 2: --set full (w3x + rank1 only) ($SOURCE_FLAGS) ---"
         FULL_TARGETS=(
-            "w3x ./fc2-w3x fc2_w3x_kernel"
-            "rank1 ./cublaslt-fc2 nvjet_sm100_qqtst"
+            "w3x   ./fc2-w3x-ncu   fc2_w3x_kernel     1"
+            "rank1 ./cublaslt-fc2  nvjet_sm100_qqtst  2"
         )
     fi
     for entry in "${FULL_TARGETS[@]}"; do
-        read -r name bin filt <<<"$entry"
+        read -r name bin filt lskip <<<"$entry"
         if [ ! -x "$bin" ]; then
             log "  SKIP full/$name: $bin missing"
             continue
@@ -167,7 +172,7 @@ if [ "$DO_FULL" = 1 ]; then
         log "  full/$name (3-5 min)"
         ncu --target-processes all \
             -k "regex:$filt" \
-            --launch-skip 2 --launch-count 1 \
+            --launch-skip "$lskip" --launch-count 1 \
             --set full \
             $SOURCE_FLAGS \
             --export "$OUT/full_$name" \

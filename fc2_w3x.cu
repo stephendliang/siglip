@@ -739,7 +739,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 PROF_END(e1, 1);
 
                 PROF_BEGIN(e2);
+#ifndef DROP_LEAD_BARSYNC
                 asm volatile(EPI_BARSYNC_ASM ::: "memory");
+#endif
                 PROF_END(e2, 2);
 
                 if (tid == 0) {
@@ -1073,9 +1075,24 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_bias, (size_t)N_DIM * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&d_C, sC * sizeof(__nv_bfloat16)));
 
-    __nv_fp8_e4m3 *hA = (__nv_fp8_e4m3*)malloc(sA);
-    __nv_fp8_e4m3 *hB = (__nv_fp8_e4m3*)malloc(sB);
-    __nv_bfloat16 *hbias = (__nv_bfloat16*)malloc((size_t)N_DIM * sizeof(__nv_bfloat16));
+    __nv_fp8_e4m3 *hA = nullptr;
+    __nv_fp8_e4m3 *hB = nullptr;
+    __nv_bfloat16 *hbias = nullptr;
+
+#ifdef NCU_PROFILE
+    /*
+      NCU fast path: skip host fills + H2D copies. cudaMemset to a non-NaN
+      FP8/BF16 byte pattern gives the kernel valid-looking inputs with
+      identical access pattern. Hardware counters are unchanged; only
+      numerical output differs (verification block is skipped too).
+    */
+    CUDA_CHECK(cudaMemset(d_A, 0x3c, sA));
+    CUDA_CHECK(cudaMemset(d_B, 0x3c, sB));
+    CUDA_CHECK(cudaMemset(d_bias, 0, (size_t)N_DIM * sizeof(__nv_bfloat16)));
+#else
+    hA = (__nv_fp8_e4m3*)malloc(sA);
+    hB = (__nv_fp8_e4m3*)malloc(sB);
+    hbias = (__nv_bfloat16*)malloc((size_t)N_DIM * sizeof(__nv_bfloat16));
 
     /*
       PACKED_TILES layout (fc2_w3 convention, TM per-CTA = 128):
@@ -1113,6 +1130,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(d_A, hA, sA, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_B, hB, sB, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_bias, hbias, (size_t)N_DIM * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+#endif
     CUDA_CHECK(cudaMemset(d_C, 0, sC * sizeof(__nv_bfloat16)));
     printf("  Alloc + init + pack done\n");
 
@@ -1198,8 +1216,13 @@ int main(int argc, char** argv) {
     fc2_w3x_kernel<<<grid, THREADS, SMEM_BYTES>>>( \
         h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_dbg_prof, d_dbg_prof_ki, d_dbg_prof_tile, d_dbg_prof_w5)
 
-    printf("Warmup (2 iters)...\n");
-    for (int i = 0; i < 2; i++) LAUNCH_KERNEL();
+#ifdef NCU_PROFILE
+    const int N_WARMUP = 1;
+#else
+    const int N_WARMUP = 2;
+#endif
+    printf("Warmup (%d iters)...\n", N_WARMUP);
+    for (int i = 0; i < N_WARMUP; i++) LAUNCH_KERNEL();
     CUDA_CHECK(cudaDeviceSynchronize());
 
 #ifdef PROFILE_CYCLES
@@ -1214,7 +1237,11 @@ int main(int argc, char** argv) {
 #ifdef PROFILE_W5
     CUDA_CHECK(cudaMemset(d_dbg_prof_w5, 0, prof_w5_bytes));
 #endif
+#ifdef NCU_PROFILE
+    const int N_TIMED_LAUNCHES = 1;
+#else
     const int N_TIMED_LAUNCHES = 10;
+#endif
     printf("Timing %d iters...\n", N_TIMED_LAUNCHES);
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0); cudaEventCreate(&t1);
@@ -1665,7 +1692,7 @@ int main(int argc, char** argv) {
     }
 #endif
 
-#if defined(STRIP_EPILOGUE)
+#if defined(STRIP_EPILOGUE) || defined(NCU_PROFILE)
     int errors = 0;
     int valid = 0;
     float c0 = 0.0f;
@@ -1704,7 +1731,7 @@ int main(int argc, char** argv) {
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9, valid, c0);
 
     free(hA); free(hB); free(hbias);
-#ifndef STRIP_EPILOGUE
+#if !defined(STRIP_EPILOGUE) && !defined(NCU_PROFILE)
     free(h_C);
 #endif
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_bias); cudaFree(d_C);
