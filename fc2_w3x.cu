@@ -427,7 +427,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
                 }
 
+#ifndef DROP_TRAIL_BARSYNC
                 asm volatile("bar.sync 0, 128;" ::: "memory");
+#endif
             }
 
 #ifdef NO_PREFILL
