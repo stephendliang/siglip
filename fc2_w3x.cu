@@ -334,6 +334,36 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc, int32_t c0, int32
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory")
 
 /*
+  Async bulk completion fences.  TMA-store only uses the SMEM-read side of
+  the bulk path (we never bulk-load here, so there's no global-side state
+  to reconcile), but ptxas emits CCTL.IVALL (L1 invalidate) after every
+  DEPBAR.LE SB0 sequence to cover the load case conservatively.
+
+  Macro switches:
+    NO_BULK_MEMCLBR — drop the "memory" clobber on the wait_group /
+      commit_group asm.  Ineffective: SASS is bit-identical to baseline
+      because the CCTL.IVALL isn't a clobber artifact but a semantic
+      requirement of cp.async.bulk.wait_group.
+    WAIT_GROUP_READ — use cp.async.bulk.wait_group.read variant, which
+      only waits for the SMEM-read side of bulk ops (sufficient when we
+      only bulk-store).  Goal: let ptxas skip CCTL.IVALL.
+
+  Verified that NO_BULK_MEMCLBR produces identical SASS.  WAIT_GROUP_READ
+  is the live experiment.
+*/
+#ifdef NO_BULK_MEMCLBR
+#define BULK_ASM(CODE) asm volatile(CODE)
+#else
+#define BULK_ASM(CODE) asm volatile(CODE ::: "memory")
+#endif
+
+#ifdef WAIT_GROUP_READ
+#define BULK_WAIT_GROUP(N) "cp.async.bulk.wait_group.read " #N ";"
+#else
+#define BULK_WAIT_GROUP(N) "cp.async.bulk.wait_group " #N ";"
+#endif
+
+/*
   PROFILE_CYCLES — per-warp clock64 phase accumulators.
   Each warp's lane 0 sums cycles per phase; at kernel exit, lane 0 dumps
   prof[] to d_dbg_prof[cluster*2*TOTAL_WARPS + cta_rank*TOTAL_WARPS + warp_id].
@@ -704,11 +734,11 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 if (tid == 0) {
                     PROF_BEGIN(e3);
                     if (tt > 0 || sp >= NUM_EPI_STAGES) {
-                        asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
+                        BULK_ASM(BULK_WAIT_GROUP(1));
                     }
                     tma_store(out_smem_arr[es], &tma_c,
                               prev_n + nc, prev_m + cta_rank * ROWS_PER_CTA);
-                    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+                    BULK_ASM("cp.async.bulk.commit_group;");
                     PROF_END(e3, 3);
                 }
 
@@ -727,7 +757,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #endif /* STRIP_EPILOGUE */
         }
         if (tid == 0) {
-            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+            BULK_ASM(BULK_WAIT_GROUP(0));
         }
         PROF_WALL_END();
         PROF_WRITEOUT();
