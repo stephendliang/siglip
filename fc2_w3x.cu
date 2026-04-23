@@ -113,6 +113,7 @@
 #else
 #define SMEM_BYTES     ((OFF_TMEM + 8 + 127) & ~127)
 #endif
+/* PROFILE_TILE uses only a register + one global write per tile — no SMEM. */
 
 #define TMEM_COLS    512
 #define IDESC        0x10400010U
@@ -280,9 +281,23 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc, int32_t c0, int32
 
   Independent of PROFILE_CYCLES: can be enabled alone or together.
 */
-#ifdef PROFILE_KI
+#if defined(PROFILE_KI) || defined(PROFILE_TILE)
 #define PROF_KI_READ(v) asm volatile("mov.u64 %0, %%clock64;" : "=l"(v))
 #endif
+
+/*
+  PROFILE_TILE — per-tile total of W5 MMA full-slot wait, dumped to global so
+  host can histogram by (tm, tn) and by tt (tile-sequence index within cluster).
+  Uses a single register accumulator reset per tile + one u64 global write at
+  end of tile. Packing:
+      [63:48] tm  (16 bits, max TILES_M-1)
+      [47:40] tn  (8 bits,  max TILES_N-1)
+      [39:32] reserved
+      [31:0]  cyc (total full-slot wait across K_ITERS for the tile)
+  Independent of PROFILE_CYCLES/PROFILE_KI; shares the clock64 bracket when
+  combined, so adding PROFILE_TILE on top of PROFILE_KI costs ~6 cyc/tile
+  (one add per ki) + ~5 cyc/tile (swizzle) + ~10 cyc/tile (global store).
+*/
 
 __global__ void __launch_bounds__(THREADS, 1)
 __cluster_dims__(2, 1, 1)
@@ -292,11 +307,13 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                const __nv_bfloat16* __restrict__ d_bias,
                __nv_bfloat16* __restrict__ d_C,
                uint64_t* __restrict__ d_dbg_prof,
-               uint64_t* __restrict__ d_dbg_prof_ki)
+               uint64_t* __restrict__ d_dbg_prof_ki,
+               uint64_t* __restrict__ d_dbg_prof_tile)
 {
     (void)d_C;
     (void)d_dbg_prof;
     (void)d_dbg_prof_ki;
+    (void)d_dbg_prof_tile;
 
     extern __shared__ __align__(128) uint8_t smem[];
 
@@ -663,25 +680,34 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             tmem_cons_phase[buf] ^= 1;
 #endif
 
+#ifdef PROFILE_TILE
+            uint64_t _tile_wait_sum = 0;
+#endif
+
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
-#ifdef PROFILE_KI
+#if defined(PROFILE_KI) || defined(PROFILE_TILE)
                 uint64_t _ki_start; PROF_KI_READ(_ki_start);
 #endif
                 PROF_BEGIN(m0);
                 mbar_wait(tma_full_arr[s], tma_full_phase[s]);
                 PROF_END(m0, 0);
-#ifdef PROFILE_KI
+#if defined(PROFILE_KI) || defined(PROFILE_TILE)
                 {
                     uint64_t _ki_end; PROF_KI_READ(_ki_end);
+                    uint64_t _delta = _ki_end - _ki_start;
+#ifdef PROFILE_KI
                     if (lane == 0) {
-                        uint64_t _delta = _ki_end - _ki_start;
                         uint64_t _old;
                         asm volatile("ld.shared.b64 %0, [%1];"
                             : "=l"(_old) : "r"(prof_ki_smem + ki * 8));
                         asm volatile("st.shared.b64 [%0], %1;"
                             :: "r"(prof_ki_smem + ki * 8), "l"(_old + _delta));
                     }
+#endif
+#ifdef PROFILE_TILE
+                    if (lane == 0) _tile_wait_sum += _delta;
+#endif
                 }
 #endif
                 tma_full_phase[s] ^= 1;
@@ -732,6 +758,19 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 tcgen05_commit_mcast(mbar_tmem_ready_base + buf * 8, pair_mask);
                 PROF_END(m2, 2);
             }
+
+#ifdef PROFILE_TILE
+            if (lane == 0 && d_dbg_prof_tile != nullptr) {
+                const int _sw = dgswizzle(lin_tile);
+                const int _tm = _sw / TILES_N;
+                const int _tn = _sw % TILES_N;
+                const uint64_t _pack =
+                      ((uint64_t)(_tm & 0xFFFF) << 48)
+                    | ((uint64_t)(_tn & 0xFF)   << 40)
+                    | ((uint64_t)_tile_wait_sum & 0xFFFFFFFFu);
+                d_dbg_prof_tile[cluster_id * tiles_per_cluster + tt] = _pack;
+            }
+#endif
         }
         PROF_WRITEOUT();
 #ifdef PROFILE_KI
@@ -873,8 +912,10 @@ int main(int argc, char** argv) {
 
     uint64_t* d_dbg_prof = nullptr;
     uint64_t* d_dbg_prof_ki = nullptr;
-#if defined(PROFILE_CYCLES) || defined(PROFILE_KI)
+    uint64_t* d_dbg_prof_tile = nullptr;
+#if defined(PROFILE_CYCLES) || defined(PROFILE_KI) || defined(PROFILE_TILE)
     const int num_clusters_host = SM_COUNT / CLUSTER_CTAS;
+    const int tiles_per_cluster_host = (TOTAL_TILES + num_clusters_host - 1) / num_clusters_host;
 #endif
 #ifdef PROFILE_CYCLES
     const size_t prof_slots = (size_t)num_clusters_host * CLUSTER_CTAS * TOTAL_WARPS * PROF_N_PHASES;
@@ -887,11 +928,16 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_dbg_prof_ki, prof_ki_bytes));
     CUDA_CHECK(cudaMemset(d_dbg_prof_ki, 0, prof_ki_bytes));
 #endif
+#ifdef PROFILE_TILE
+    const size_t prof_tile_bytes = (size_t)num_clusters_host * tiles_per_cluster_host * sizeof(uint64_t);
+    CUDA_CHECK(cudaMalloc(&d_dbg_prof_tile, prof_tile_bytes));
+    CUDA_CHECK(cudaMemset(d_dbg_prof_tile, 0, prof_tile_bytes));
+#endif
 
     dim3 grid(SM_COUNT, 1, 1);
 #define LAUNCH_KERNEL() \
     fc2_w3x_kernel<<<grid, THREADS, SMEM_BYTES>>>( \
-        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_dbg_prof, d_dbg_prof_ki)
+        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_dbg_prof, d_dbg_prof_ki, d_dbg_prof_tile)
 
     printf("Warmup (2 iters)...\n");
     for (int i = 0; i < 2; i++) LAUNCH_KERNEL();
@@ -902,6 +948,9 @@ int main(int argc, char** argv) {
 #endif
 #ifdef PROFILE_KI
     CUDA_CHECK(cudaMemset(d_dbg_prof_ki, 0, prof_ki_bytes));
+#endif
+#ifdef PROFILE_TILE
+    CUDA_CHECK(cudaMemset(d_dbg_prof_tile, 0, prof_tile_bytes));
 #endif
     printf("Timing 10 iters...\n");
     cudaEvent_t t0, t1;
@@ -916,8 +965,7 @@ int main(int argc, char** argv) {
     printf("FC2-W3X kernel: %.3f ms  %.2f TFLOPS\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9);
 
-#if defined(PROFILE_CYCLES) || defined(PROFILE_KI)
-    const int tiles_per_cluster_host = (TOTAL_TILES + num_clusters_host - 1) / num_clusters_host;
+#if defined(PROFILE_CYCLES) || defined(PROFILE_KI) || defined(PROFILE_TILE)
     const double tile_cyc = (double)ms * 1e-3 * 1.813e9 / tiles_per_cluster_host;
 #endif
 
@@ -1034,6 +1082,113 @@ int main(int argc, char** argv) {
     }
 #endif
 
+#ifdef PROFILE_TILE
+    {
+        uint64_t* h_prof_tile = (uint64_t*)malloc(prof_tile_bytes);
+        CUDA_CHECK(cudaMemcpy(h_prof_tile, d_dbg_prof_tile, prof_tile_bytes, cudaMemcpyDeviceToHost));
+
+        /*
+          Per-tile W5 MMA full-slot wait, last-launch-only (same as PROFILE_KI).
+          Packed u64 = [tm:16][tn:8][reserved:8][cyc:32]. Aggregate across all
+          (cluster, tt) entries, bucketed three ways:
+            (1) by tm_bin × tn                 — spatial histogram
+            (2) by tt   (sequence index)       — L2-warmup trajectory
+            (3) by tn   (aggregated over tm)   — N-column effect
+        */
+        const int TOTAL_ENTRIES = num_clusters_host * tiles_per_cluster_host;
+        const int TM_BINS = 16;
+        const int tiles_m_host = M_TOTAL / TM / 2;
+        const int tiles_n_host = N_DIM / TN;
+        const int bin_width = (tiles_m_host + TM_BINS - 1) / TM_BINS;
+
+        uint64_t bin_cyc[TM_BINS][3]   = {{0}};
+        uint32_t bin_cnt[TM_BINS][3]   = {{0}};
+        uint64_t bin_max[TM_BINS][3]   = {{0}};
+        uint64_t tt_cyc[256]           = {0};
+        uint32_t tt_cnt[256]           = {0};
+        uint64_t tn_cyc[8]             = {0};
+        uint32_t tn_cnt[8]             = {0};
+        uint64_t grand_cyc_sum = 0;
+        uint32_t grand_cnt     = 0;
+        uint32_t cyc_min = 0xFFFFFFFFu, cyc_max = 0;
+
+        for (int c = 0; c < num_clusters_host; c++) {
+            for (int t = 0; t < tiles_per_cluster_host; t++) {
+                uint64_t p = h_prof_tile[c * tiles_per_cluster_host + t];
+                if (p == 0) continue;
+                int      tm  = (int)((p >> 48) & 0xFFFFu);
+                int      tn  = (int)((p >> 40) & 0xFFu);
+                uint32_t cyc = (uint32_t)(p & 0xFFFFFFFFu);
+
+                int mb = tm / bin_width; if (mb >= TM_BINS) mb = TM_BINS - 1;
+                if (tn < 3) {
+                    bin_cyc[mb][tn] += cyc;
+                    bin_cnt[mb][tn] += 1;
+                    if (cyc > bin_max[mb][tn]) bin_max[mb][tn] = cyc;
+                }
+                if (tn < 8) {
+                    tn_cyc[tn] += cyc;
+                    tn_cnt[tn] += 1;
+                }
+                if (t < 256) {
+                    tt_cyc[t] += cyc;
+                    tt_cnt[t] += 1;
+                }
+                grand_cyc_sum += cyc;
+                grand_cnt     += 1;
+                if (cyc < cyc_min) cyc_min = cyc;
+                if (cyc > cyc_max) cyc_max = cyc;
+            }
+        }
+
+        (void)TOTAL_ENTRIES;
+        const double tile_cyc_local = tile_cyc;
+        double mean_per_tile = grand_cnt ? (double)grand_cyc_sum / grand_cnt : 0.0;
+        printf("\n[PROFILE_TILE] W5 MMA per-tile full-slot wait  (entries=%u, bin_width=%d tm)\n",
+               grand_cnt, bin_width);
+        printf("  overall: mean=%.0f cyc (%.1f%% wall)  min=%u  max=%u\n",
+               mean_per_tile, tile_cyc_local > 0 ? 100.0 * mean_per_tile / tile_cyc_local : 0.0,
+               cyc_min == 0xFFFFFFFFu ? 0 : cyc_min, cyc_max);
+
+        printf("\n  by M-row bin × N-col tile  (mean cyc/tile; max in parens)\n");
+        printf("  tm_bin   tm_range      tn=0           tn=1           tn=2           row_mean\n");
+        for (int b = 0; b < TM_BINS; b++) {
+            int tm_lo = b * bin_width;
+            int tm_hi = (b + 1) * bin_width - 1; if (tm_hi >= tiles_m_host) tm_hi = tiles_m_host - 1;
+            uint64_t row_sum = 0; uint32_t row_cnt = 0;
+            for (int n = 0; n < 3; n++) { row_sum += bin_cyc[b][n]; row_cnt += bin_cnt[b][n]; }
+            if (row_cnt == 0) continue;
+            printf("  %4d   [%4d..%4d]", b, tm_lo, tm_hi);
+            for (int n = 0; n < 3; n++) {
+                if (bin_cnt[b][n] == 0) { printf("   %4s           ", "---"); continue; }
+                double m = (double)bin_cyc[b][n] / bin_cnt[b][n];
+                printf("   %5.0f (%5lu)", m, (unsigned long)bin_max[b][n]);
+            }
+            double rm = (double)row_sum / row_cnt;
+            printf("   %5.0f\n", rm);
+        }
+
+        printf("\n  by N-col (aggregated over all tm)\n");
+        printf("  tn    cyc/tile   wall%%   count\n");
+        for (int n = 0; n < tiles_n_host && n < 8; n++) {
+            if (tn_cnt[n] == 0) continue;
+            double m = (double)tn_cyc[n] / tn_cnt[n];
+            double pct = tile_cyc_local > 0 ? 100.0 * m / tile_cyc_local : 0.0;
+            printf("  %2d    %7.0f   %4.1f%%   %u\n", n, m, pct, tn_cnt[n]);
+        }
+
+        printf("\n  by tt (tile-sequence index within cluster, averaged over clusters)\n");
+        printf("   tt   cyc/tile  (first 32 entries)\n");
+        int n_show = tiles_per_cluster_host < 32 ? tiles_per_cluster_host : 32;
+        for (int t = 0; t < n_show; t++) {
+            if (tt_cnt[t] == 0) continue;
+            double m = (double)tt_cyc[t] / tt_cnt[t];
+            printf("   %3d   %7.0f\n", t, m);
+        }
+        free(h_prof_tile);
+    }
+#endif
+
 #if defined(STRIP_EPILOGUE)
     int errors = 0;
     int valid = 0;
@@ -1082,6 +1237,9 @@ int main(int argc, char** argv) {
 #endif
 #ifdef PROFILE_KI
     if (d_dbg_prof_ki) cudaFree(d_dbg_prof_ki);
+#endif
+#ifdef PROFILE_TILE
+    if (d_dbg_prof_tile) cudaFree(d_dbg_prof_tile);
 #endif
     return errors == 0 ? 0 : 1;
 }
