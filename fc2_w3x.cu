@@ -106,7 +106,13 @@
 #define MBARS_END           (MBAR_TMEM_CONSUMED + 2 * 8)
 
 #define OFF_TMEM       ((MBARS_END + 15) & ~15)
+#ifdef PROFILE_KI
+#define PROF_KI_BYTES  (K_ITERS * 8)
+#define OFF_PROF_KI    ((OFF_TMEM + 8 + 15) & ~15)
+#define SMEM_BYTES     ((OFF_PROF_KI + PROF_KI_BYTES + 127) & ~127)
+#else
 #define SMEM_BYTES     ((OFF_TMEM + 8 + 127) & ~127)
+#endif
 
 #define TMEM_COLS    512
 #define IDESC        0x10400010U
@@ -263,6 +269,21 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc, int32_t c0, int32
 #define PROF_WRITEOUT()
 #endif
 
+/*
+  PROFILE_KI — per-K-iter clock64 bracket around W5 MMA's tma_full_mbar wait.
+  Accumulated in SMEM (one uint64 per ki, K_ITERS=24 slots) so lane 0 can
+  update without register pressure. At kernel exit, W5 lane 0 dumps prof_ki
+  to d_dbg_prof_ki[cluster_id * K_ITERS + ki]. Host aggregates across all
+  74 clusters, reports mean cyc per (ki, tile). Each SMEM update costs ~30
+  cyc so total overhead is ~720 cyc/tile (~6% of wall) — acceptable for
+  relative per-ki comparison (cold-start ki vs steady-state).
+
+  Independent of PROFILE_CYCLES: can be enabled alone or together.
+*/
+#ifdef PROFILE_KI
+#define PROF_KI_READ(v) asm volatile("mov.u64 %0, %%clock64;" : "=l"(v))
+#endif
+
 __global__ void __launch_bounds__(THREADS, 1)
 __cluster_dims__(2, 1, 1)
 fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
@@ -270,10 +291,12 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                const __grid_constant__ CUtensorMap tma_c,
                const __nv_bfloat16* __restrict__ d_bias,
                __nv_bfloat16* __restrict__ d_C,
-               uint64_t* __restrict__ d_dbg_prof)
+               uint64_t* __restrict__ d_dbg_prof,
+               uint64_t* __restrict__ d_dbg_prof_ki)
 {
     (void)d_C;
     (void)d_dbg_prof;
+    (void)d_dbg_prof_ki;
 
     extern __shared__ __align__(128) uint8_t smem[];
 
@@ -601,6 +624,17 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         uint64_t prof[PROF_N_PHASES] = {0};
 #endif
 
+#ifdef PROFILE_KI
+        const uint32_t prof_ki_smem = smem_to_uint(smem + OFF_PROF_KI);
+        if (lane == 0) {
+            #pragma unroll
+            for (int k = 0; k < K_ITERS; k++) {
+                asm volatile("st.shared.b64 [%0], %1;"
+                    :: "r"(prof_ki_smem + k * 8), "l"(0ULL));
+            }
+        }
+#endif
+
         uint64_t desc_a_base[N_STAGES], desc_b_base[N_STAGES];
         for (int s = 0; s < N_STAGES; s++) {
             desc_a_base[s] = make_smem_desc(smem_a_arr[s]);
@@ -631,9 +665,25 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
+#ifdef PROFILE_KI
+                uint64_t _ki_start; PROF_KI_READ(_ki_start);
+#endif
                 PROF_BEGIN(m0);
                 mbar_wait(tma_full_arr[s], tma_full_phase[s]);
                 PROF_END(m0, 0);
+#ifdef PROFILE_KI
+                {
+                    uint64_t _ki_end; PROF_KI_READ(_ki_end);
+                    if (lane == 0) {
+                        uint64_t _delta = _ki_end - _ki_start;
+                        uint64_t _old;
+                        asm volatile("ld.shared.b64 %0, [%1];"
+                            : "=l"(_old) : "r"(prof_ki_smem + ki * 8));
+                        asm volatile("st.shared.b64 [%0], %1;"
+                            :: "r"(prof_ki_smem + ki * 8), "l"(_old + _delta));
+                    }
+                }
+#endif
                 tma_full_phase[s] ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
@@ -684,6 +734,17 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             }
         }
         PROF_WRITEOUT();
+#ifdef PROFILE_KI
+        if (lane == 0 && d_dbg_prof_ki != nullptr) {
+            #pragma unroll
+            for (int k = 0; k < K_ITERS; k++) {
+                uint64_t _v;
+                asm volatile("ld.shared.b64 %0, [%1];"
+                    : "=l"(_v) : "r"(prof_ki_smem + k * 8));
+                d_dbg_prof_ki[cluster_id * K_ITERS + k] = _v;
+            }
+        }
+#endif
     }
 
     if (warp_id == 0) {
@@ -811,18 +872,26 @@ int main(int argc, char** argv) {
     printf("  TMA descriptors + func attr done (SMEM=%d B)\n", SMEM_BYTES);
 
     uint64_t* d_dbg_prof = nullptr;
-#ifdef PROFILE_CYCLES
+    uint64_t* d_dbg_prof_ki = nullptr;
+#if defined(PROFILE_CYCLES) || defined(PROFILE_KI)
     const int num_clusters_host = SM_COUNT / CLUSTER_CTAS;
+#endif
+#ifdef PROFILE_CYCLES
     const size_t prof_slots = (size_t)num_clusters_host * CLUSTER_CTAS * TOTAL_WARPS * PROF_N_PHASES;
     const size_t prof_bytes = prof_slots * sizeof(uint64_t);
     CUDA_CHECK(cudaMalloc(&d_dbg_prof, prof_bytes));
     CUDA_CHECK(cudaMemset(d_dbg_prof, 0, prof_bytes));
 #endif
+#ifdef PROFILE_KI
+    const size_t prof_ki_bytes = (size_t)num_clusters_host * K_ITERS * sizeof(uint64_t);
+    CUDA_CHECK(cudaMalloc(&d_dbg_prof_ki, prof_ki_bytes));
+    CUDA_CHECK(cudaMemset(d_dbg_prof_ki, 0, prof_ki_bytes));
+#endif
 
     dim3 grid(SM_COUNT, 1, 1);
 #define LAUNCH_KERNEL() \
     fc2_w3x_kernel<<<grid, THREADS, SMEM_BYTES>>>( \
-        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_dbg_prof)
+        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_dbg_prof, d_dbg_prof_ki)
 
     printf("Warmup (2 iters)...\n");
     for (int i = 0; i < 2; i++) LAUNCH_KERNEL();
@@ -830,6 +899,9 @@ int main(int argc, char** argv) {
 
 #ifdef PROFILE_CYCLES
     CUDA_CHECK(cudaMemset(d_dbg_prof, 0, prof_bytes));
+#endif
+#ifdef PROFILE_KI
+    CUDA_CHECK(cudaMemset(d_dbg_prof_ki, 0, prof_ki_bytes));
 #endif
     printf("Timing 10 iters...\n");
     cudaEvent_t t0, t1;
@@ -844,18 +916,22 @@ int main(int argc, char** argv) {
     printf("FC2-W3X kernel: %.3f ms  %.2f TFLOPS\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9);
 
+#if defined(PROFILE_CYCLES) || defined(PROFILE_KI)
+    const int tiles_per_cluster_host = (TOTAL_TILES + num_clusters_host - 1) / num_clusters_host;
+    const double tile_cyc = (double)ms * 1e-3 * 1.813e9 / tiles_per_cluster_host;
+#endif
+
 #ifdef PROFILE_CYCLES
     {
-        const int tiles_per_cluster_host = (TOTAL_TILES + num_clusters_host - 1) / num_clusters_host;
-        const int iters = 10;
         uint64_t* h_prof = (uint64_t*)malloc(prof_bytes);
         CUDA_CHECK(cudaMemcpy(h_prof, d_dbg_prof, prof_bytes, cudaMemcpyDeviceToHost));
 
         /*
           Aggregate per warp_id across all (cluster, cta) instances where the
           warp actually ran (skip all-zero rows — W_MMA on CTA 1 early-exits).
-          Values are sums over `iters` kernel launches × `tiles_per_cluster`
-          tiles/cluster. Divide by (iters * tiles) to get mean cyc/tile.
+          Each launch overwrites d_dbg_prof (no atomic accumulate), so the
+          readback contains ONLY the last launch's prof[], summed over
+          tiles_per_cluster tiles × N_phase_brackets. Divide by tiles only.
         */
         uint64_t warp_sum[TOTAL_WARPS][PROF_N_PHASES] = {{0}};
         int warp_count[TOTAL_WARPS] = {0};
@@ -875,10 +951,9 @@ int main(int argc, char** argv) {
             }
         }
 
-        const double tile_cyc = (double)ms * 1e-3 * 1.813e9 / tiles_per_cluster_host;
         printf("\n[PROFILE] mean cyc/tile per (warp, phase), averaged across %d clusters\n", num_clusters_host);
-        printf("  tiles/cluster=%d, iters=%d, wall cyc/tile @ 1.813 GHz = %.0f\n",
-               tiles_per_cluster_host, iters, tile_cyc);
+        printf("  tiles/cluster=%d, wall cyc/tile @ 1.813 GHz = %.0f\n",
+               tiles_per_cluster_host, tile_cyc);
 
         const char* epi_labels[5] = {
             "tmem_ready wait",
@@ -902,7 +977,7 @@ int main(int argc, char** argv) {
             if (warp_count[w] == 0) { printf("  [W%d %s] no data\n", w, tag); return; }
             uint64_t total = 0;
             for (int p = 0; p < nph; p++) total += warp_sum[w][p];
-            double denom = (double)warp_count[w] * iters * tiles_per_cluster_host;
+            double denom = (double)warp_count[w] * tiles_per_cluster_host;
             double total_per_tile = (double)total / denom;
             printf("  [W%d %-4s  instances=%3d]   cyc/tile  wall%%\n",
                    w, tag, warp_count[w]);
@@ -920,6 +995,42 @@ int main(int argc, char** argv) {
         dump_warp(WARP_MMA, "MMA", mma_labels, 4);
 
         free(h_prof);
+    }
+#endif
+
+#ifdef PROFILE_KI
+    {
+        uint64_t* h_prof_ki = (uint64_t*)malloc(prof_ki_bytes);
+        CUDA_CHECK(cudaMemcpy(h_prof_ki, d_dbg_prof_ki, prof_ki_bytes, cudaMemcpyDeviceToHost));
+
+        /*
+          W5 MMA per-ki full-slot wait. Aggregate across 74 clusters; each
+          cluster's slot = sum over tiles_per_cluster tiles of clock64 delta
+          around mbar_wait(tma_full). Divide by (clusters × tiles) for mean
+          cyc per ki per tile. Last-launch-only semantics (same as PROFILE_CYCLES).
+        */
+        printf("\n[PROFILE_KI] W5 MMA per-ki full-slot wait  (clusters=%d, tiles/cluster=%d)\n",
+               num_clusters_host, tiles_per_cluster_host);
+        printf("  ki  cyc/ki   wall%%   cum-cyc/tile\n");
+
+        double denom = (double)num_clusters_host * tiles_per_cluster_host;
+        double cum = 0.0;
+        uint64_t grand_total = 0;
+        for (int k = 0; k < K_ITERS; k++) {
+            uint64_t s = 0;
+            for (int c = 0; c < num_clusters_host; c++) s += h_prof_ki[c * K_ITERS + k];
+            grand_total += s;
+            double per_ki = (double)s / denom;
+            cum += per_ki;
+            double pct = tile_cyc > 0 ? 100.0 * per_ki / tile_cyc : 0.0;
+            printf("  %2d   %6.0f   %4.1f%%   %7.0f\n", k, per_ki, pct, cum);
+        }
+        double tot_per_tile = (double)grand_total / denom;
+        double tot_pct = tile_cyc > 0 ? 100.0 * tot_per_tile / tile_cyc : 0.0;
+        printf("  --- sum across K_ITERS=%d ------\n", K_ITERS);
+        printf("       %6.0f   %4.1f%%  (should ≈ PROFILE W%d MMA P0 cyc/tile)\n",
+               tot_per_tile, tot_pct, WARP_MMA);
+        free(h_prof_ki);
     }
 #endif
 
@@ -968,6 +1079,9 @@ int main(int argc, char** argv) {
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_bias); cudaFree(d_C);
 #ifdef PROFILE_CYCLES
     if (d_dbg_prof) cudaFree(d_dbg_prof);
+#endif
+#ifdef PROFILE_KI
+    if (d_dbg_prof_ki) cudaFree(d_dbg_prof_ki);
 #endif
     return errors == 0 ? 0 : 1;
 }
