@@ -9,7 +9,7 @@ CUTLASS_DIR = third_party/cutlass
 CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUTLASS_FLAGS = -std=c++17 --expt-relaxed-constexpr
 
-.PHONY: all clean timing fc2-w3-bias fc1-gelu fc1-w3 fc1-w3-gemm fc1-w3-strip fc1-w3-sched fc1-w3-lean fc1-w3-dgswizzle fc1-w3-dgphase fc1-w3-dgnrot fc1-w3-zorder fc1-w3-hilbert fc1-w3-zigzag fc1-w3-rowmajor fc1-w3-ncycle fc1-w3-ncyrot fc1-w3-nflat fc1-w3-nsnake fc1-w3-packed fc1-w3-packed-sched fc1-w3-packed-lean fc1-w3-packed-dgswizzle fc1-w3-packed-zorder fc1-w3-packed-hilbert fc1-w3-packed-zigzag fc1-w3-packed-rowmajor fc1-w3-packed-ncycle fc1-w3-packed-ncyrot fc1-w3-packed-nflat fc1-w3-packed-nsnake fc1-w3-nlock fc1-w3-checkered fc1-w3-dgsnake fc1-w3-kstagger fc1-w3-dg4 fc1-w3-dg6 fc1-w3-dg10 fc1-w3-dg12 fc1-w3-dg16 fc1-w3-dg24 fc1-w3-dg32 fc2 fc2-timing fc2-w3 fc2-w3-c4 fc2-w3-c4-gemm fc2-w3-c4-strip fc2-w3-clock fc2-w3-sched-clock fc2-w3-collock fc2-w3-collock-clock fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-w3-self fc2-w3-atomic fc2-w3-spin fc2-w3-grid fc2-w3-inline fc2-w3-inline7 fc2-w3-inline7-clock fc2-w3-noprefill fc2-w3-ns7 fc2-w3-clc fc2-w3-rowsteal fc2-w3-tail fc2-w3-tail-lean fc2-w3-nlock fc2-w3-ncyrot fc2-w3-dgphase fc2-w3-dgnrot fc2-w3-checkered fc2-w3-dgsnake fc2-w3-kstagger fc2-w3-kstagger2 fc2-w3-kstagger3 fc2-w3-dg2 fc2-w3-dg3 fc2-w3-dg10 fc2-w3-dg20 fc2-w3-dg32 fc2-ldg fc2-ldg-strip fc2-ldg-gemm fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-warp calib-all tma-bench mma-bench stmatrix-bench fc2-w3x fc2-w3x-ns4 fc2-w3x-sw fc2-w3x-sw-ns4 tma-swizzle-probe tma-swizzle-probe-sw tma-swizzle-probe-sw-x2 tma-swizzle-probe-sw-x3 tma-swizzle-probe-sw-x4
+.PHONY: all clean timing fc2-w3-bias fc1-gelu fc1-w3 fc1-w3-gemm fc1-w3-strip fc1-w3-sched fc1-w3-lean fc1-w3-dgswizzle fc1-w3-dgphase fc1-w3-dgnrot fc1-w3-zorder fc1-w3-hilbert fc1-w3-zigzag fc1-w3-rowmajor fc1-w3-ncycle fc1-w3-ncyrot fc1-w3-nflat fc1-w3-nsnake fc1-w3-packed fc1-w3-packed-sched fc1-w3-packed-lean fc1-w3-packed-dgswizzle fc1-w3-packed-zorder fc1-w3-packed-hilbert fc1-w3-packed-zigzag fc1-w3-packed-rowmajor fc1-w3-packed-ncycle fc1-w3-packed-ncyrot fc1-w3-packed-nflat fc1-w3-packed-nsnake fc1-w3-nlock fc1-w3-checkered fc1-w3-dgsnake fc1-w3-kstagger fc1-w3-dg4 fc1-w3-dg6 fc1-w3-dg10 fc1-w3-dg12 fc1-w3-dg16 fc1-w3-dg24 fc1-w3-dg32 fc2 fc2-timing fc2-w3 fc2-w3-c4 fc2-w3-c4-gemm fc2-w3-c4-strip fc2-w3-clock fc2-w3-sched-clock fc2-w3-collock fc2-w3-collock-clock fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-w3-self fc2-w3-atomic fc2-w3-spin fc2-w3-grid fc2-w3-inline fc2-w3-inline7 fc2-w3-inline7-clock fc2-w3-noprefill fc2-w3-ns7 fc2-w3-clc fc2-w3-rowsteal fc2-w3-tail fc2-w3-tail-lean fc2-w3-nlock fc2-w3-ncyrot fc2-w3-dgphase fc2-w3-dgnrot fc2-w3-checkered fc2-w3-dgsnake fc2-w3-kstagger fc2-w3-kstagger2 fc2-w3-kstagger3 fc2-w3-dg2 fc2-w3-dg3 fc2-w3-dg10 fc2-w3-dg20 fc2-w3-dg32 fc2-ldg fc2-ldg-strip fc2-ldg-gemm fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-warp calib-all tma-bench mma-bench stmatrix-bench fc2-w3x tma-swizzle-probe tma-swizzle-probe-sw tma-swizzle-probe-sw-x2 tma-swizzle-probe-sw-x3 tma-swizzle-probe-sw-x4
 
 all: $(TARGET)
 
@@ -140,17 +140,6 @@ fc2-w3x-strip: fc2_w3x.cu
 
 fc2-w3x-gemm: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY $< -o $@ $(LDFLAGS)
-
-# Epilogue 4-combo sweep: NS_EPI ∈ {2, 4} × {swizzle off, on}.
-# Baseline fc2-w3x covers (ns2, sw_off). Targets below cover the other three.
-fc2-w3x-ns4: fc2_w3x.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DNUM_EPI_STAGES=4 $< -o $@ $(LDFLAGS)
-
-fc2-w3x-sw: fc2_w3x.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SWIZZLE_64B $< -o $@ $(LDFLAGS)
-
-fc2-w3x-sw-ns4: fc2_w3x.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SWIZZLE_64B -DNUM_EPI_STAGES=4 $< -o $@ $(LDFLAGS)
 
 # Warpgroup-asymmetric regs: default LO=48 in fc2_w3x.cu, HI set via target name.
 # Pattern rule: fc2-w3x-r<HI> sweeps epilogue-warpgroup reg target (8-aligned,
