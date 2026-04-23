@@ -615,6 +615,133 @@ static __device__ __forceinline__ int static_swizzle(int block_idx) {
         if (tn >= TILES_N) tn = TILES_N - 1;
         return tm * TILES_N + tn;
     }
+#elif TILE_DISPATCH == 30
+    /*
+    HYB_CHET (cluster-heterogeneous): partition cluster space and tile space
+    by M-halves. First NC/2 clusters run dgswizzle on M-blocks [0, TM/2);
+    last NC/2 clusters run rowmajor on M-blocks [TM/2, TM).
+
+    At any given tt, half the wavefront has dgswizzle's 8-cluster cooperative
+    A-loading pattern; the other half has rowmajor's tighter per-M-block
+    coverage.  Each half's tile space is fully-covered by its rule alone,
+    so bijection is trivial.
+
+    Constraints: TILES_M must be even, NC must be even.
+    */
+    {
+#ifndef DG_GROUP_SIZE
+#define DG_GROUP_SIZE 8
+#endif
+        const int NC      = SM_COUNT / 2;
+        const int NC_HALF = NC / 2;
+        const int TM_HALF = TILES_M / 2;
+        const int c       = block_idx - (block_idx / NC) * NC;
+        const int tt      = block_idx / NC;
+        int tm, tn;
+        if (c < NC_HALF) {
+            const int sub_lin     = c + tt * NC_HALF;
+            const int G           = DG_GROUP_SIZE;
+            const int group_tiles = TILES_N * G;
+            const int group_idx   = sub_lin / group_tiles;
+            const int first_m     = group_idx * G;
+            const int in_group    = sub_lin - group_idx * group_tiles;
+            const int nig         = (first_m + G <= TM_HALF) ? G : TM_HALF - first_m;
+            const int tm_local    = in_group - (in_group / nig) * nig;
+            tn                    = in_group / nig;
+            tm                    = first_m + tm_local;
+        } else {
+            const int sub_lin     = (c - NC_HALF) + tt * NC_HALF;
+            const int tm_local    = sub_lin / TILES_N;
+            tn                    = sub_lin - tm_local * TILES_N;
+            tm                    = TM_HALF + tm_local;
+        }
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        if (tn >= TILES_N) tn = TILES_N - 1;
+        return tm * TILES_N + tn;
+    }
+
+#elif TILE_DISPATCH == 31
+    /*
+    HYB_PMIX (phase-mixed): every cluster runs dgswizzle on tn in [0, TILES_N-1)
+    for its first (TILES_N-1)*TILES_M/NC tt's, then rowmajor on tn=TILES_N-1
+    for its remaining TILES_M/NC tt's.  Tile partition is by N-column, NOT
+    by M-range.
+
+    At FC2 (TILES_N=3, TILES_M=3626, NC=74): phase 1 = 98 tt × 74 clusters =
+    7252 tiles (covering tn=0,1); phase 2 = 49 tt × 74 clusters = 3626 tiles
+    (covering tn=2).  Within phase 1, dgswizzle groups are of size 8*2=16
+    (restricted to tn=0,1).
+
+    Constraints: TILES_M*(TILES_N-1) % NC == 0 and TILES_M % NC == 0
+    (both hold at FC2: 3626*2 % 74 = 0 and 3626 % 74 = 0).
+    */
+    {
+#ifndef DG_GROUP_SIZE
+#define DG_GROUP_SIZE 8
+#endif
+        const int NC             = SM_COUNT / 2;
+        const int PHASE1_TILES   = TILES_M * (TILES_N - 1);
+        int tm, tn;
+        if (block_idx < PHASE1_TILES) {
+            const int G           = DG_GROUP_SIZE;
+            const int TN_PHASE1   = TILES_N - 1;
+            const int group_tiles = TN_PHASE1 * G;
+            const int group_idx   = block_idx / group_tiles;
+            const int first_m     = group_idx * G;
+            const int in_group    = block_idx - group_idx * group_tiles;
+            const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+            const int tm_local    = in_group - (in_group / nig) * nig;
+            tn                    = in_group / nig;
+            tm                    = first_m + tm_local;
+        } else {
+            const int sub_lin     = block_idx - PHASE1_TILES;
+            tm                    = sub_lin;
+            tn                    = TILES_N - 1;
+        }
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        if (tn >= TILES_N) tn = TILES_N - 1;
+        return tm * TILES_N + tn;
+    }
+
+#elif TILE_DISPATCH == 32
+    /*
+    HYB_INGH (within-group hybrid): same group structure as dgswizzle, but
+    alternate the in-group traversal per group.  Even group_idx uses
+    M-major (tm_local = in_group % nig, tn = in_group / nig — dgswizzle's
+    default).  Odd group_idx uses N-major (tm_local = in_group / TILES_N,
+    tn = in_group % TILES_N — DG_INNER_T's default).
+
+    Preserves dgswizzle's cross-cluster A-sharing at group level (same 8
+    M-blocks in play across 24 cluster slots per group), but alternates the
+    cluster → (tm, tn) mapping within the group to break synchronous
+    arrival patterns. Each group independently bijective; disjoint groups
+    compose to full bijection.
+    */
+    {
+#ifndef DG_GROUP_SIZE
+#define DG_GROUP_SIZE 8
+#endif
+        const int G           = DG_GROUP_SIZE;
+        const int group_tiles = TILES_N * G;
+        const int group_idx   = block_idx / group_tiles;
+        const int first_m     = group_idx * G;
+        const int in_group    = block_idx - group_idx * group_tiles;
+        const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+        int tm_local, tn;
+        if ((group_idx & 1) == 0) {
+            tm_local = in_group - (in_group / nig) * nig;
+            tn       = in_group / nig;
+        } else {
+            tm_local = in_group / TILES_N;
+            tn       = in_group - tm_local * TILES_N;
+            if (tm_local >= nig) tm_local = nig - 1;
+        }
+        int tm = first_m + tm_local;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        if (tn >= TILES_N) tn = TILES_N - 1;
+        return tm * TILES_N + tn;
+    }
+
 #endif
 }
 

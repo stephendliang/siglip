@@ -201,12 +201,19 @@ fc2-w3x-tile-dgsnake:   fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=19 $< -o $@ $(LDFLAGS)
 fc2-w3x-tile-ncyrot:    fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=21 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-chet:      fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=30 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-pmix:      fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=31 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-ingh:      fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=32 $< -o $@ $(LDFLAGS)
 
 fc2-w3x-tile-sweep: fc2-w3x \
     fc2-w3x-tile-zorder fc2-w3x-tile-hilbert fc2-w3x-tile-zigzag \
     fc2-w3x-tile-rowmajor fc2-w3x-tile-ncycle fc2-w3x-tile-nflat \
     fc2-w3x-tile-nsnake fc2-w3x-tile-nlock fc2-w3x-tile-checkered \
-    fc2-w3x-tile-dgsnake fc2-w3x-tile-ncyrot
+    fc2-w3x-tile-dgsnake fc2-w3x-tile-ncyrot \
+    fc2-w3x-tile-chet fc2-w3x-tile-pmix fc2-w3x-tile-ingh
 
 # Sync/fence experiments (DROP_TRAIL_BARSYNC × WAIT_GROUP_READ).  Driver:
 # tools/sweep_sync_experiments.sh.  Each binary is the baseline dgswizzle
