@@ -164,6 +164,41 @@ fc2-w3x-stagger: fc2_w3x.cu
 
 fc2-w3x-dg-sweep: fc2-w3x fc2-w3x-dg4 fc2-w3x-dg16 fc2-w3x-dg32 fc2-w3x-innerT fc2-w3x-stagger
 
+# ── fc2_w3x structurally-different tile swizzles (tile_dispatch.cuh TD=9..21) ──
+# Not dgswizzle variants — genuinely different traversal structures.  TILES_N=3
+# makes most 2D space-filling curves collapse or degrade; included for empirical
+# measurement.  nlock (TD=17) exposes column-locked dispatch (cluster bound to
+# one tn, sweeps M).  checkered (TD=18) is a 2D M×N block.  dg-snake (TD=19) is
+# zigzag-within-dgswizzle-band.
+fc2-w3x-tile-zorder:    fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=9  $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-hilbert:   fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=10 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-zigzag:    fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=11 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-rowmajor:  fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=13 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-ncycle:    fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=14 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-nflat:     fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=15 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-nsnake:    fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=16 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-nlock:     fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=17 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-checkered: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=18 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-dgsnake:   fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=19 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-ncyrot:    fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=21 $< -o $@ $(LDFLAGS)
+
+fc2-w3x-tile-sweep: fc2-w3x \
+    fc2-w3x-tile-zorder fc2-w3x-tile-hilbert fc2-w3x-tile-zigzag \
+    fc2-w3x-tile-rowmajor fc2-w3x-tile-ncycle fc2-w3x-tile-nflat \
+    fc2-w3x-tile-nsnake fc2-w3x-tile-nlock fc2-w3x-tile-checkered \
+    fc2-w3x-tile-dgsnake fc2-w3x-tile-ncyrot
+
 # Warpgroup-asymmetric regs: default LO=48 in fc2_w3x.cu, HI set via target name.
 # Pattern rule: fc2-w3x-r<HI> sweeps epilogue-warpgroup reg target (8-aligned,
 # valid range 24..256).  LO override via DFLAGS='-DSETMAXNREG_LO=N'.

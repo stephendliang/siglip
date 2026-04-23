@@ -246,6 +246,39 @@ int dgswizzle_in_group(int lin) {
 #endif
 }
 
+/*
+  Non-dgswizzle dispatch variants from tile_dispatch.cuh.  Set -DTILE_DISPATCH=N
+  where N chooses a static_swizzle (see tile_dispatch.cuh):
+     9 zorder, 10 hilbert, 11 zigzag, 13 rowmajor,
+    14 ncycle, 15 nflat, 16 nsnake, 17 nlock, 18 checkered,
+    19 dg-snake (zigzag within dgswizzle band), 21 ncyrot.
+  Unset (default) → dgswizzle as currently shipping.  tile_swizzle() is the
+  single entry point; PROFILE_{W4,TILE}'s in_g field is only meaningful under
+  dgswizzle (returns 0 otherwise).
+*/
+#ifdef TILE_DISPATCH
+#include "tile_dispatch.cuh"
+#endif
+
+static __device__ __forceinline__
+int tile_swizzle(int lin) {
+#if defined(TILE_DISPATCH) && TILE_DISPATCH >= 8
+    return static_swizzle(lin);
+#else
+    return dgswizzle(lin);
+#endif
+}
+
+static __device__ __forceinline__
+int tile_in_group(int lin) {
+#if defined(TILE_DISPATCH) && TILE_DISPATCH >= 8
+    (void)lin;
+    return 0;
+#else
+    return dgswizzle_in_group(lin);
+#endif
+}
+
 static __device__ __forceinline__
 void mbar_init(uint32_t addr, uint32_t count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
@@ -523,7 +556,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
             if (lin_tile >= TOTAL_TILES) break;
-            const int swizzled = dgswizzle(lin_tile);
+            const int swizzled = tile_swizzle(lin_tile);
             const int tm = swizzled / TILES_N;
             const int tn = swizzled % TILES_N;
             const int prev_m = tm * TM * 2;
@@ -688,7 +721,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
             if (lin_tile >= TOTAL_TILES) break;
-            const int swizzled = dgswizzle(lin_tile);
+            const int swizzled = tile_swizzle(lin_tile);
             const int tm = swizzled / TILES_N;
             const int tn = swizzled % TILES_N;
             const int a_m_tile = tm * 2 + cta_rank;
@@ -745,7 +778,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             }
 #ifdef PROFILE_W4
             if (elect && d_dbg_prof_w4 != nullptr) {
-                const int _ig = dgswizzle_in_group(lin_tile);
+                const int _ig = tile_in_group(lin_tile);
                 uint64_t _e = _w4_empty_sum;  if (_e > 0xFFFFFULL) _e = 0xFFFFFULL;
                 uint64_t _i = _w4_issue_sum;  if (_i > 0x3FFFFULL) _i = 0x3FFFFULL;
                 const uint64_t _pack =
@@ -803,7 +836,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             if (lin_tile >= TOTAL_TILES) break;
             const int buf = tt & 1;
 #if defined(PROFILE_KI_TN) || defined(PROFILE_TILE)
-            const int _sw_tn = dgswizzle(lin_tile) % TILES_N;
+            const int _sw_tn = tile_swizzle(lin_tile) % TILES_N;
 #endif
 
 #ifdef NO_PREFILL
@@ -899,10 +932,10 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 
 #ifdef PROFILE_TILE
             if (lane == 0 && d_dbg_prof_tile != nullptr) {
-                const int _sw = dgswizzle(lin_tile);
+                const int _sw = tile_swizzle(lin_tile);
                 const int _tm = _sw / TILES_N;
                 const int _tn = _sw % TILES_N;
-                const int _ig = dgswizzle_in_group(lin_tile);
+                const int _ig = tile_in_group(lin_tile);
                 const uint64_t _pack =
                       ((uint64_t)(_tm & 0xFFFF) << 48)
                     | ((uint64_t)(_tn & 0xFF)   << 40)
