@@ -60,8 +60,20 @@
 #define K_ITERS     (K_DIM / TK)
 
 #define N_STAGES       6
+#ifndef NUM_EPI_STAGES
 #define NUM_EPI_STAGES 2
+#endif
 #define NUM_SUBPASSES  (TN / 32)
+
+/*
+  USE_SWIZZLE_64B: opt-in SWIZZLE_64B for tma_c + matching XOR on epilogue STS.
+  Bank-conflict lever. Row stride in the staging is already 64B, so the TMA
+  tensor map gets CU_TENSOR_MAP_SWIZZLE_64B; STS addresses XOR the chunk
+  offset ({0,16,32,48}) by ((row & 3) << 4) to match TMA's chunk permutation.
+  Baseline STS has even-lane + odd-lane pairs colliding on bank groups [0..3]
+  and [16..19] => 16-way conflict; (row & 3) spreads starts across 4 unique
+  row-mod-4 groups => 8-way conflict (half-fix, orthogonal to NUM_EPI_STAGES).
+*/
 
 #define SUBPASS_COLS   32
 #define ROWS_PER_CTA   TM
@@ -405,15 +417,21 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                         : "=r"(p[i]) : "f"(o[2*i]), "f"(o[2*i + 1]));
                 }
 
-                const uint32_t out_base = out_smem_arr[es] + (row_group * 32 + lane) * (SUBPASS_COLS * 2);
+                const uint32_t row_idx  = row_group * 32 + lane;
+                const uint32_t out_base = out_smem_arr[es] + row_idx * (SUBPASS_COLS * 2);
+#ifdef USE_SWIZZLE_64B
+                const uint32_t xor_m = (row_idx & 3) << 4;
+#else
+                const uint32_t xor_m = 0;
+#endif
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-                    :: "r"(out_base +  0), "r"(p[0]), "r"(p[1]), "r"(p[2]), "r"(p[3]));
+                    :: "r"(out_base + ( 0 ^ xor_m)), "r"(p[0]), "r"(p[1]), "r"(p[2]), "r"(p[3]));
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-                    :: "r"(out_base + 16), "r"(p[4]), "r"(p[5]), "r"(p[6]), "r"(p[7]));
+                    :: "r"(out_base + (16 ^ xor_m)), "r"(p[4]), "r"(p[5]), "r"(p[6]), "r"(p[7]));
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-                    :: "r"(out_base + 32), "r"(p[8]), "r"(p[9]), "r"(p[10]), "r"(p[11]));
+                    :: "r"(out_base + (32 ^ xor_m)), "r"(p[8]), "r"(p[9]), "r"(p[10]), "r"(p[11]));
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-                    :: "r"(out_base + 48), "r"(p[12]), "r"(p[13]), "r"(p[14]), "r"(p[15]));
+                    :: "r"(out_base + (48 ^ xor_m)), "r"(p[12]), "r"(p[13]), "r"(p[14]), "r"(p[15]));
 
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("bar.sync 0, 128;" ::: "memory");
@@ -681,7 +699,11 @@ int main(int argc, char** argv) {
             CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_C,
             dims, strides, box, estrides,
             CU_TENSOR_MAP_INTERLEAVE_NONE,
+#ifdef USE_SWIZZLE_64B
+            CU_TENSOR_MAP_SWIZZLE_64B,
+#else
             CU_TENSOR_MAP_SWIZZLE_NONE,
+#endif
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }
