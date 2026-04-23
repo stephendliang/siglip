@@ -91,12 +91,19 @@ void probe_kernel(const __grid_constant__ CUtensorMap tma_c,
     const int lane    = tid & 31;
     const int row     = warp_id * 32 + lane;
 
-    __nv_bfloat16 vals[32];
+    /*
+      Markers are raw uint16 bit patterns (NOT floats).  BF16 only represents
+      every integer exactly up to 256; above 256 it quantizes (can't tell apart
+      257 and 258).  Encoding row*32+c as a float fails correctness for rows
+      >= 8 even when TMA is correct.  TMA itself is byte-transparent, so raw
+      uint16 markers survive round-trip without FP precision loss.
+    */
+    uint16_t marks[32];
     #pragma unroll
     for (int c = 0; c < 32; c++) {
-        vals[c] = __float2bfloat16((float)(row * 32 + c));
+        marks[c] = (uint16_t)(row * 32 + c);
     }
-    const uint32_t* p = reinterpret_cast<const uint32_t*>(vals);
+    const uint32_t* p = reinterpret_cast<const uint32_t*>(marks);
 
     const uint32_t row_base = smem_to_uint(smem) + row * ROW_BYTES;
     const uint32_t xor_m    = xor_mask_for(row);
@@ -172,17 +179,20 @@ int main(int, char**) {
     __nv_bfloat16* h_C = (__nv_bfloat16*)malloc(sC * sizeof(__nv_bfloat16));
     CUDA_CHECK(cudaMemcpy(h_C, d_C, sC * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
 
+    const uint16_t* h_bits = reinterpret_cast<const uint16_t*>(h_C);
     int errors = 0;
     int shown = 0;
     for (int r = 0; r < ROWS; r++) {
         for (int c = 0; c < COLS; c++) {
-            float expected = (float)(r * 32 + c);
-            float got      = __bfloat162float(h_C[r * COLS + c]);
+            uint16_t expected = (uint16_t)(r * 32 + c);
+            uint16_t got      = h_bits[r * COLS + c];
             if (expected != got) {
                 errors++;
                 if (shown < 8) {
-                    printf("  MISMATCH [r=%3d, c=%2d]  expected=%.1f  got=%.1f\n",
-                           r, c, expected, got);
+                    int src_row = got >> 5;
+                    int src_col = got & 31;
+                    printf("  MISMATCH [r=%3d, c=%2d]  expected=0x%04x (r=%d,c=%d)  got=0x%04x (r=%d,c=%d)\n",
+                           r, c, expected, r, c, got, src_row, src_col);
                     shown++;
                 }
             }
@@ -197,10 +207,9 @@ int main(int, char**) {
             int sample_row = rmod;
             int out_chunk_src[4] = {-1, -1, -1, -1};
             for (int c = 0; c < COLS; c++) {
-                float got_f = __bfloat162float(h_C[sample_row * COLS + c]);
-                int val = (int)got_f;
-                int src_row   = val / 32;
-                int src_col   = val - src_row * 32;
+                uint16_t val = h_bits[sample_row * COLS + c];
+                int src_row    = val >> 5;
+                int src_col    = val & 31;
                 int phys_chunk = c >> 3;
                 int logi_chunk = src_col >> 3;
                 if (src_row == sample_row && out_chunk_src[phys_chunk] == -1) {
