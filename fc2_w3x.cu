@@ -305,9 +305,30 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc, int32_t c0, int32
 
   Independent of PROFILE_CYCLES: can be enabled alone or together.
 */
-#if defined(PROFILE_KI) || defined(PROFILE_TILE)
+#if defined(PROFILE_KI) || defined(PROFILE_TILE) || defined(PROFILE_W4)
 #define PROF_KI_READ(v) asm volatile("mov.u64 %0, %%clock64;" : "=l"(v))
 #endif
+
+/*
+  PROFILE_W4 — per-tile W4 TMA-loader diagnostic. Captures two counters:
+    empty_wait_cyc: sum of clock64 deltas around mbar_wait(tma_empty) calls
+                    across K_ITERS=24. W4 blocks here when W5/MMA hasn't
+                    consumed the slot yet. If ≈0 → W4 never blocks → TMA
+                    issue-rate is the bottleneck (mainloop squeezed).
+                    If large → W5/MMA is the bottleneck and W4 is waiting.
+    issue_cyc:      sum of clock64 deltas around the cp.async.bulk.tensor
+                    asm block across K_ITERS. Per-issue cost ≈ issue_cyc/24.
+                    Back-to-back TMA issues → baseline ~419 cyc (L2-warm).
+                    Larger → TMA engine queue backpressure.
+  Pack (one u64 per tile):
+    [63:48] tm         (16 bits)
+    [47:44] tn         (4 bits,  holds 0..TILES_N-1)
+    [43:38] in_g       (6 bits,  holds 0..23 for DG_GROUP_SIZE=8 × TILES_N=3)
+    [37:20] issue_cyc  (18 bits, cap 262K cyc)
+    [19:0]  empty_wait (20 bits, cap 1M cyc)
+  Output: d_dbg_prof_w4[cluster_id * tiles_per_cluster + tt].
+  Independent of PROFILE_TILE (which targets W5), can be combined.
+*/
 
 /*
   PROFILE_TILE — per-tile total of W5 MMA full-slot wait, dumped to global so
@@ -332,12 +353,14 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                __nv_bfloat16* __restrict__ d_C,
                uint64_t* __restrict__ d_dbg_prof,
                uint64_t* __restrict__ d_dbg_prof_ki,
-               uint64_t* __restrict__ d_dbg_prof_tile)
+               uint64_t* __restrict__ d_dbg_prof_tile,
+               uint64_t* __restrict__ d_dbg_prof_w4)
 {
     (void)d_C;
     (void)d_dbg_prof;
     (void)d_dbg_prof_ki;
     (void)d_dbg_prof_tile;
+    (void)d_dbg_prof_w4;
 
     extern __shared__ __align__(128) uint8_t smem[];
 
@@ -619,11 +642,22 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             const int a_m_tile = tm * 2 + cta_rank;
             const int b_n_half = tn * 2 + cta_rank;
 
+#ifdef PROFILE_W4
+            uint64_t _w4_empty_sum = 0;
+            uint64_t _w4_issue_sum = 0;
+#endif
+
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
                 if (ki >= N_STAGES || tt > 0) {
                     PROF_BEGIN(t0);
+#ifdef PROFILE_W4
+                    uint64_t _ew0; PROF_KI_READ(_ew0);
+#endif
                     mbar_wait(tma_empty_arr[s], tma_empty_phase[s]);
+#ifdef PROFILE_W4
+                    { uint64_t _ew1; PROF_KI_READ(_ew1); _w4_empty_sum += _ew1 - _ew0; }
+#endif
                     PROF_END(t0, 0);
                     tma_empty_phase[s] ^= 1;
                 }
@@ -635,6 +669,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     const int tma_a_c1  = (a_m_tile * K_ITERS + ki) * TM;
                     const int tma_b_c1  = (b_n_half * K_ITERS + ki) * (TN / 2);
                     PROF_BEGIN(t1);
+#ifdef PROFILE_W4
+                    uint64_t _is0; PROF_KI_READ(_is0);
+#endif
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
                         ".mbarrier::complete_tx::bytes.cta_group::2"
@@ -648,9 +685,26 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                            "r"(b_dst), "l"(&tma_b), "r"(tma_b_c1),
                            "r"(TMA_BYTES)
                         : "memory");
+#ifdef PROFILE_W4
+                    { uint64_t _is1; PROF_KI_READ(_is1); _w4_issue_sum += _is1 - _is0; }
+#endif
                     PROF_END(t1, 1);
                 }
             }
+#ifdef PROFILE_W4
+            if (elect && d_dbg_prof_w4 != nullptr) {
+                const int _ig = dgswizzle_in_group(lin_tile);
+                uint64_t _e = _w4_empty_sum;  if (_e > 0xFFFFFULL) _e = 0xFFFFFULL;
+                uint64_t _i = _w4_issue_sum;  if (_i > 0x3FFFFULL) _i = 0x3FFFFULL;
+                const uint64_t _pack =
+                      ((uint64_t)(tm & 0xFFFF) << 48)
+                    | ((uint64_t)(tn & 0xF)    << 44)
+                    | ((uint64_t)(_ig & 0x3F)  << 38)
+                    | ((_i & 0x3FFFFULL)       << 20)
+                    |  (_e & 0xFFFFFULL);
+                d_dbg_prof_w4[cluster_id * tiles_per_cluster + tt] = _pack;
+            }
+#endif
         }
         PROF_WRITEOUT();
     }
@@ -947,7 +1001,8 @@ int main(int argc, char** argv) {
     uint64_t* d_dbg_prof = nullptr;
     uint64_t* d_dbg_prof_ki = nullptr;
     uint64_t* d_dbg_prof_tile = nullptr;
-#if defined(PROFILE_CYCLES) || defined(PROFILE_KI) || defined(PROFILE_TILE)
+    uint64_t* d_dbg_prof_w4 = nullptr;
+#if defined(PROFILE_CYCLES) || defined(PROFILE_KI) || defined(PROFILE_TILE) || defined(PROFILE_W4)
     const int num_clusters_host = SM_COUNT / CLUSTER_CTAS;
     const int tiles_per_cluster_host = (TOTAL_TILES + num_clusters_host - 1) / num_clusters_host;
 #endif
@@ -967,11 +1022,16 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_dbg_prof_tile, prof_tile_bytes));
     CUDA_CHECK(cudaMemset(d_dbg_prof_tile, 0, prof_tile_bytes));
 #endif
+#ifdef PROFILE_W4
+    const size_t prof_w4_bytes = (size_t)num_clusters_host * tiles_per_cluster_host * sizeof(uint64_t);
+    CUDA_CHECK(cudaMalloc(&d_dbg_prof_w4, prof_w4_bytes));
+    CUDA_CHECK(cudaMemset(d_dbg_prof_w4, 0, prof_w4_bytes));
+#endif
 
     dim3 grid(SM_COUNT, 1, 1);
 #define LAUNCH_KERNEL() \
     fc2_w3x_kernel<<<grid, THREADS, SMEM_BYTES>>>( \
-        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_dbg_prof, d_dbg_prof_ki, d_dbg_prof_tile)
+        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_dbg_prof, d_dbg_prof_ki, d_dbg_prof_tile, d_dbg_prof_w4)
 
     printf("Warmup (2 iters)...\n");
     for (int i = 0; i < 2; i++) LAUNCH_KERNEL();
@@ -986,6 +1046,9 @@ int main(int argc, char** argv) {
 #ifdef PROFILE_TILE
     CUDA_CHECK(cudaMemset(d_dbg_prof_tile, 0, prof_tile_bytes));
 #endif
+#ifdef PROFILE_W4
+    CUDA_CHECK(cudaMemset(d_dbg_prof_w4, 0, prof_w4_bytes));
+#endif
     printf("Timing 10 iters...\n");
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0); cudaEventCreate(&t1);
@@ -999,7 +1062,7 @@ int main(int argc, char** argv) {
     printf("FC2-W3X kernel: %.3f ms  %.2f TFLOPS\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9);
 
-#if defined(PROFILE_CYCLES) || defined(PROFILE_KI) || defined(PROFILE_TILE)
+#if defined(PROFILE_CYCLES) || defined(PROFILE_KI) || defined(PROFILE_TILE) || defined(PROFILE_W4)
     const double tile_cyc = (double)ms * 1e-3 * 1.813e9 / tiles_per_cluster_host;
 #endif
 
@@ -1307,6 +1370,94 @@ int main(int argc, char** argv) {
     }
 #endif
 
+#ifdef PROFILE_W4
+    {
+        uint64_t* h_prof_w4 = (uint64_t*)malloc(prof_w4_bytes);
+        CUDA_CHECK(cudaMemcpy(h_prof_w4, d_dbg_prof_w4, prof_w4_bytes, cudaMemcpyDeviceToHost));
+        /*
+          Per-tile W4 TMA-loader diagnostic.
+          Pack: [tm:16][tn:4][in_g:6][issue:18][empty:20].
+          empty_wait: cyc W4 spent blocked on tma_empty_mbar across K_ITERS=24.
+                      near-zero → W4 never blocks → TMA-issue-rate limited.
+                      large     → W5/MMA slow to consume → MMA is the bottleneck.
+          issue_cyc:  cyc inside the cp.async.bulk.tensor asm block across K_ITERS.
+                      per-issue ≈ issue_cyc / K_ITERS. Baseline ~419 cyc/issue
+                      (L2-warm). Larger → TMA engine queue backpressure.
+          Buckets shown: overall, by tn, by in_g. (Note: tile 0 has ki<NS early-skip
+          so first tile is apples-vs-oranges — aggregate still informative.)
+        */
+        const int tiles_m_host = M_TOTAL / TM / 2;
+        const int tiles_n_host = N_DIM / TN;
+        const int IG_SLOTS = tiles_n_host * DG_GROUP_SIZE;
+        (void)tiles_m_host;
+
+        uint64_t tn_e[8] = {0}, tn_i[8] = {0};
+        uint32_t tn_cnt[8] = {0};
+        uint64_t ig_e[32] = {0}, ig_i[32] = {0};
+        uint32_t ig_cnt[32] = {0};
+        uint64_t grand_e = 0, grand_i = 0;
+        uint32_t grand_cnt = 0;
+        uint32_t e_min = 0xFFFFFFFFu, e_max = 0;
+        uint32_t i_min = 0xFFFFFFFFu, i_max = 0;
+
+        for (int c = 0; c < num_clusters_host; c++) {
+            for (int t = 0; t < tiles_per_cluster_host; t++) {
+                uint64_t p = h_prof_w4[c * tiles_per_cluster_host + t];
+                if (p == 0) continue;
+                int      tn  = (int)((p >> 44) & 0xFu);
+                int      ig  = (int)((p >> 38) & 0x3Fu);
+                uint32_t ic  = (uint32_t)((p >> 20) & 0x3FFFFu);
+                uint32_t ec  = (uint32_t)( p        & 0xFFFFFu);
+                if (tn < 8) {
+                    tn_e[tn] += ec; tn_i[tn] += ic; tn_cnt[tn]++;
+                }
+                if (ig < 32) {
+                    ig_e[ig] += ec; ig_i[ig] += ic; ig_cnt[ig]++;
+                }
+                grand_e += ec; grand_i += ic; grand_cnt++;
+                if (ec < e_min) e_min = ec; if (ec > e_max) e_max = ec;
+                if (ic < i_min) i_min = ic; if (ic > i_max) i_max = ic;
+            }
+        }
+
+        double mean_e = grand_cnt ? (double)grand_e / grand_cnt : 0.0;
+        double mean_i = grand_cnt ? (double)grand_i / grand_cnt : 0.0;
+        printf("\n[PROFILE_W4] W4 TMA-loader per-tile diagnostic  (entries=%u)\n", grand_cnt);
+        printf("  wall cyc/tile @ 1.813 GHz = %.0f  (K_ITERS=%d issues/tile)\n",
+               tile_cyc, K_ITERS);
+        printf("  overall: empty_wait mean=%.0f (%.1f%% wall)  min=%u  max=%u\n",
+               mean_e, tile_cyc > 0 ? 100.0 * mean_e / tile_cyc : 0.0,
+               e_min == 0xFFFFFFFFu ? 0 : e_min, e_max);
+        printf("           issue_cyc  mean=%.0f (%.1f%% wall)  min=%u  max=%u  per-issue≈%.0f\n",
+               mean_i, tile_cyc > 0 ? 100.0 * mean_i / tile_cyc : 0.0,
+               i_min == 0xFFFFFFFFu ? 0 : i_min, i_max, mean_i / K_ITERS);
+        printf("\n  diagnosis: empty_wait ≈ 0 → TMA-issue-rate limited (W4 saturated, mainloop squeezed)\n");
+        printf("             empty_wait large → W5/MMA is the bottleneck (W4 blocked waiting for consume)\n");
+
+        printf("\n  by N-col (aggregated over all tm)\n");
+        printf("  tn    empty/tile   issue/tile   per-issue   count\n");
+        for (int n = 0; n < tiles_n_host && n < 8; n++) {
+            if (tn_cnt[n] == 0) continue;
+            double me = (double)tn_e[n] / tn_cnt[n];
+            double mi = (double)tn_i[n] / tn_cnt[n];
+            printf("  %2d    %8.0f     %8.0f   %7.0f   %u\n",
+                   n, me, mi, mi / K_ITERS, tn_cnt[n]);
+        }
+
+        printf("\n  by in_g (position within dgswizzle group)\n");
+        printf("  in_g  raw_tn  empty/tile  issue/tile  per-issue  count\n");
+        for (int ig = 0; ig < IG_SLOTS && ig < 32; ig++) {
+            if (ig_cnt[ig] == 0) continue;
+            double me = (double)ig_e[ig] / ig_cnt[ig];
+            double mi = (double)ig_i[ig] / ig_cnt[ig];
+            int raw_tn = ig / DG_GROUP_SIZE;
+            printf("   %3d    %3d   %8.0f    %8.0f    %7.0f    %u\n",
+                   ig, raw_tn, me, mi, mi / K_ITERS, ig_cnt[ig]);
+        }
+        free(h_prof_w4);
+    }
+#endif
+
 #if defined(STRIP_EPILOGUE)
     int errors = 0;
     int valid = 0;
@@ -1358,6 +1509,9 @@ int main(int argc, char** argv) {
 #endif
 #ifdef PROFILE_TILE
     if (d_dbg_prof_tile) cudaFree(d_dbg_prof_tile);
+#endif
+#ifdef PROFILE_W4
+    if (d_dbg_prof_w4) cudaFree(d_dbg_prof_w4);
 #endif
     return errors == 0 ? 0 : 1;
 }
