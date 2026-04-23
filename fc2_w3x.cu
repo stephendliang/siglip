@@ -107,7 +107,12 @@
 
 #define OFF_TMEM       ((MBARS_END + 15) & ~15)
 #ifdef PROFILE_KI
-#define PROF_KI_BYTES  (K_ITERS * 8)
+#ifdef PROFILE_KI_TN
+#define PROF_KI_SLOTS  (K_ITERS * ((N_DIM + TN - 1) / TN))
+#else
+#define PROF_KI_SLOTS  K_ITERS
+#endif
+#define PROF_KI_BYTES  (PROF_KI_SLOTS * 8)
 #define OFF_PROF_KI    ((OFF_TMEM + 8 + 15) & ~15)
 #define SMEM_BYTES     ((OFF_PROF_KI + PROF_KI_BYTES + 127) & ~127)
 #else
@@ -156,18 +161,37 @@ uint64_t make_smem_desc(uint32_t addr) {
     return d;
 }
 
+/*
+  P2 probe — DG_ROT: rotate within-group tn order by (group_idx % TILES_N).
+  Vanilla dgswizzle visits tn=0 first in every group, so every M-block
+  boundary lands on tn=0. DG_ROT spreads group boundaries across all tn:
+  group gi visits tn order (gi%3, (gi+1)%3, (gi+2)%3) × G tiles each.
+  If the tn=0 slowness is a dispatch-order artifact, DG_ROT should
+  equalize mean cyc across tn. If tn=0 is still slow, it's intrinsic.
+*/
 static __device__ __forceinline__
 int dgswizzle(int lin) {
     const int group_tiles = TILES_N * DG_GROUP_SIZE;
     const int group_idx = lin / group_tiles;
     const int first_m = group_idx * DG_GROUP_SIZE;
     const int in_group = lin % group_tiles;
-    if (first_m + DG_GROUP_SIZE <= TILES_M) {
-        return (first_m + in_group % DG_GROUP_SIZE) * TILES_N
-             + in_group / DG_GROUP_SIZE;
-    }
-    const int tail = TILES_M - first_m;
-    return (first_m + in_group % tail) * TILES_N + in_group / tail;
+    const int nig = (first_m + DG_GROUP_SIZE <= TILES_M)
+                  ? DG_GROUP_SIZE
+                  : TILES_M - first_m;
+    int tm_local = in_group % nig;
+    int tn_raw   = in_group / nig;
+#ifdef DG_ROT
+    const int tn = (tn_raw + group_idx) % TILES_N;
+#else
+    const int tn = tn_raw;
+#endif
+    return (first_m + tm_local) * TILES_N + tn;
+}
+
+static __device__ __forceinline__
+int dgswizzle_in_group(int lin) {
+    const int group_tiles = TILES_N * DG_GROUP_SIZE;
+    return lin % group_tiles;
 }
 
 static __device__ __forceinline__
@@ -645,7 +669,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         const uint32_t prof_ki_smem = smem_to_uint(smem + OFF_PROF_KI);
         if (lane == 0) {
             #pragma unroll
-            for (int k = 0; k < K_ITERS; k++) {
+            for (int k = 0; k < PROF_KI_SLOTS; k++) {
                 asm volatile("st.shared.b64 [%0], %1;"
                     :: "r"(prof_ki_smem + k * 8), "l"(0ULL));
             }
@@ -672,6 +696,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             const int lin_tile = cluster_id + tt * num_clusters;
             if (lin_tile >= TOTAL_TILES) break;
             const int buf = tt & 1;
+#if defined(PROFILE_KI_TN) || defined(PROFILE_TILE)
+            const int _sw_tn = dgswizzle(lin_tile) % TILES_N;
+#endif
 
 #ifdef NO_PREFILL
             PROF_BEGIN(m3);
@@ -698,11 +725,16 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     uint64_t _delta = _ki_end - _ki_start;
 #ifdef PROFILE_KI
                     if (lane == 0) {
+#ifdef PROFILE_KI_TN
+                        const uint32_t _slot = (ki * TILES_N + _sw_tn) * 8;
+#else
+                        const uint32_t _slot = ki * 8;
+#endif
                         uint64_t _old;
                         asm volatile("ld.shared.b64 %0, [%1];"
-                            : "=l"(_old) : "r"(prof_ki_smem + ki * 8));
+                            : "=l"(_old) : "r"(prof_ki_smem + _slot));
                         asm volatile("st.shared.b64 [%0], %1;"
-                            :: "r"(prof_ki_smem + ki * 8), "l"(_old + _delta));
+                            :: "r"(prof_ki_smem + _slot), "l"(_old + _delta));
                     }
 #endif
 #ifdef PROFILE_TILE
@@ -764,9 +796,11 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 const int _sw = dgswizzle(lin_tile);
                 const int _tm = _sw / TILES_N;
                 const int _tn = _sw % TILES_N;
+                const int _ig = dgswizzle_in_group(lin_tile);
                 const uint64_t _pack =
                       ((uint64_t)(_tm & 0xFFFF) << 48)
                     | ((uint64_t)(_tn & 0xFF)   << 40)
+                    | ((uint64_t)(_ig & 0xFF)   << 32)
                     | ((uint64_t)_tile_wait_sum & 0xFFFFFFFFu);
                 d_dbg_prof_tile[cluster_id * tiles_per_cluster + tt] = _pack;
             }
@@ -776,11 +810,11 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #ifdef PROFILE_KI
         if (lane == 0 && d_dbg_prof_ki != nullptr) {
             #pragma unroll
-            for (int k = 0; k < K_ITERS; k++) {
+            for (int k = 0; k < PROF_KI_SLOTS; k++) {
                 uint64_t _v;
                 asm volatile("ld.shared.b64 %0, [%1];"
                     : "=l"(_v) : "r"(prof_ki_smem + k * 8));
-                d_dbg_prof_ki[cluster_id * K_ITERS + k] = _v;
+                d_dbg_prof_ki[cluster_id * PROF_KI_SLOTS + k] = _v;
             }
         }
 #endif
@@ -924,7 +958,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemset(d_dbg_prof, 0, prof_bytes));
 #endif
 #ifdef PROFILE_KI
-    const size_t prof_ki_bytes = (size_t)num_clusters_host * K_ITERS * sizeof(uint64_t);
+    const size_t prof_ki_bytes = (size_t)num_clusters_host * PROF_KI_SLOTS * sizeof(uint64_t);
     CUDA_CHECK(cudaMalloc(&d_dbg_prof_ki, prof_ki_bytes));
     CUDA_CHECK(cudaMemset(d_dbg_prof_ki, 0, prof_ki_bytes));
 #endif
@@ -1052,15 +1086,75 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(h_prof_ki, d_dbg_prof_ki, prof_ki_bytes, cudaMemcpyDeviceToHost));
 
         /*
-          W5 MMA per-ki full-slot wait. Aggregate across 74 clusters; each
-          cluster's slot = sum over tiles_per_cluster tiles of clock64 delta
-          around mbar_wait(tma_full). Divide by (clusters × tiles) for mean
-          cyc per ki per tile. Last-launch-only semantics (same as PROFILE_CYCLES).
+          W5 MMA per-ki full-slot wait. With PROFILE_KI_TN, slots are
+          per-(ki, tn) with TILES_N tn buckets (= PROF_KI_SLOTS = K_ITERS*TILES_N);
+          without it, slots are per-ki only. Aggregate across 74 clusters; each
+          cluster's slot = sum over tiles_per_cluster tiles of clock64 delta.
+          Divide by per-tile-count (total or per-tn) for mean cyc per ki per tile.
+          Last-launch-only semantics (same as PROFILE_CYCLES).
+
+          NOTE on per-tn denominators: each cluster covers
+          tiles_per_cluster tiles, and under dgswizzle each tn is visited
+          tiles_per_cluster/TILES_N times per cluster (exact for FC2 shape:
+          147 tiles, 49 per tn). So the per-(ki,tn) mean uses
+          (num_clusters * tiles_per_cluster / TILES_N).
         */
+        const int tn_host = (N_DIM + TN - 1) / TN;
         printf("\n[PROFILE_KI] W5 MMA per-ki full-slot wait  (clusters=%d, tiles/cluster=%d)\n",
                num_clusters_host, tiles_per_cluster_host);
-        printf("  ki  cyc/ki   wall%%   cum-cyc/tile\n");
 
+#ifdef PROFILE_KI_TN
+        printf("  ki        tn=0          tn=1          tn=2         all_tn  wall%%\n");
+        printf("        cyc/vis      cyc/vis      cyc/vis      cyc/tile\n");
+        const double denom_tn  = (double)num_clusters_host * tiles_per_cluster_host / tn_host;
+        const double denom_all = (double)num_clusters_host * tiles_per_cluster_host;
+        uint64_t grand_total = 0;
+        double cum_all = 0.0;
+        for (int k = 0; k < K_ITERS; k++) {
+            uint64_t s_tn[4] = {0,0,0,0};
+            for (int c = 0; c < num_clusters_host; c++) {
+                for (int n = 0; n < tn_host && n < 4; n++) {
+                    s_tn[n] += h_prof_ki[c * PROF_KI_SLOTS + k * tn_host + n];
+                }
+            }
+            uint64_t s_all = 0;
+            for (int n = 0; n < tn_host && n < 4; n++) s_all += s_tn[n];
+            grand_total += s_all;
+            double per_ki_all = (double)s_all / denom_all;
+            cum_all += per_ki_all;
+            double pct = tile_cyc > 0 ? 100.0 * per_ki_all / tile_cyc : 0.0;
+            printf("  %2d", k);
+            for (int n = 0; n < 3; n++) {
+                if (n < tn_host) {
+                    printf("   %7.0f  ", (double)s_tn[n] / denom_tn);
+                } else {
+                    printf("   %7s  ", "---");
+                }
+            }
+            printf("    %7.0f  %4.1f%%\n", per_ki_all, pct);
+        }
+        double tot_per_tile = (double)grand_total / denom_all;
+        double tot_pct = tile_cyc > 0 ? 100.0 * tot_per_tile / tile_cyc : 0.0;
+        printf("  --- sum across K_ITERS=%d (all_tn) ------\n", K_ITERS);
+        printf("                                            %7.0f  %4.1f%%  (should ≈ W%d MMA P0)\n",
+               tot_per_tile, tot_pct, WARP_MMA);
+
+        printf("\n  per-tn totals (across all ki):\n");
+        uint64_t s_tn_tot[4] = {0,0,0,0};
+        for (int k = 0; k < K_ITERS; k++) {
+            for (int c = 0; c < num_clusters_host; c++) {
+                for (int n = 0; n < tn_host && n < 4; n++) {
+                    s_tn_tot[n] += h_prof_ki[c * PROF_KI_SLOTS + k * tn_host + n];
+                }
+            }
+        }
+        for (int n = 0; n < tn_host && n < 3; n++) {
+            double per_vis = (double)s_tn_tot[n] / denom_tn;
+            printf("    tn=%d: %7.0f cyc/visit  (sum across %d ki = cyc spent waiting on tn=%d B per tile)\n",
+                   n, per_vis, K_ITERS, n);
+        }
+#else
+        printf("  ki  cyc/ki   wall%%   cum-cyc/tile\n");
         double denom = (double)num_clusters_host * tiles_per_cluster_host;
         double cum = 0.0;
         uint64_t grand_total = 0;
@@ -1078,6 +1172,8 @@ int main(int argc, char** argv) {
         printf("  --- sum across K_ITERS=%d ------\n", K_ITERS);
         printf("       %6.0f   %4.1f%%  (should ≈ PROFILE W%d MMA P0 cyc/tile)\n",
                tot_per_tile, tot_pct, WARP_MMA);
+        (void)tn_host;
+#endif
         free(h_prof_ki);
     }
 #endif
@@ -1089,17 +1185,20 @@ int main(int argc, char** argv) {
 
         /*
           Per-tile W5 MMA full-slot wait, last-launch-only (same as PROFILE_KI).
-          Packed u64 = [tm:16][tn:8][reserved:8][cyc:32]. Aggregate across all
-          (cluster, tt) entries, bucketed three ways:
+          Packed u64 = [tm:16][tn:8][in_g:8][cyc:32]. Aggregate across all
+          (cluster, tt) entries, bucketed four ways:
             (1) by tm_bin × tn                 — spatial histogram
             (2) by tt   (sequence index)       — L2-warmup trajectory
             (3) by tn   (aggregated over tm)   — N-column effect
+            (4) by in_g (0..23, dgswizzle position-in-group)
+                                               — group-boundary effect
         */
         const int TOTAL_ENTRIES = num_clusters_host * tiles_per_cluster_host;
         const int TM_BINS = 16;
         const int tiles_m_host = M_TOTAL / TM / 2;
         const int tiles_n_host = N_DIM / TN;
         const int bin_width = (tiles_m_host + TM_BINS - 1) / TM_BINS;
+        const int IG_SLOTS = tiles_n_host * DG_GROUP_SIZE;
 
         uint64_t bin_cyc[TM_BINS][3]   = {{0}};
         uint32_t bin_cnt[TM_BINS][3]   = {{0}};
@@ -1108,6 +1207,9 @@ int main(int argc, char** argv) {
         uint32_t tt_cnt[256]           = {0};
         uint64_t tn_cyc[8]             = {0};
         uint32_t tn_cnt[8]             = {0};
+        uint64_t ig_cyc[32]            = {0};
+        uint32_t ig_cnt[32]            = {0};
+        uint64_t ig_max[32]            = {0};
         uint64_t grand_cyc_sum = 0;
         uint32_t grand_cnt     = 0;
         uint32_t cyc_min = 0xFFFFFFFFu, cyc_max = 0;
@@ -1118,6 +1220,7 @@ int main(int argc, char** argv) {
                 if (p == 0) continue;
                 int      tm  = (int)((p >> 48) & 0xFFFFu);
                 int      tn  = (int)((p >> 40) & 0xFFu);
+                int      ig  = (int)((p >> 32) & 0xFFu);
                 uint32_t cyc = (uint32_t)(p & 0xFFFFFFFFu);
 
                 int mb = tm / bin_width; if (mb >= TM_BINS) mb = TM_BINS - 1;
@@ -1133,6 +1236,11 @@ int main(int argc, char** argv) {
                 if (t < 256) {
                     tt_cyc[t] += cyc;
                     tt_cnt[t] += 1;
+                }
+                if (ig < 32) {
+                    ig_cyc[ig] += cyc;
+                    ig_cnt[ig] += 1;
+                    if (cyc > ig_max[ig]) ig_max[ig] = cyc;
                 }
                 grand_cyc_sum += cyc;
                 grand_cnt     += 1;
@@ -1184,6 +1292,16 @@ int main(int argc, char** argv) {
             if (tt_cnt[t] == 0) continue;
             double m = (double)tt_cyc[t] / tt_cnt[t];
             printf("   %3d   %7.0f\n", t, m);
+        }
+
+        printf("\n  by in_g (position within dgswizzle group; 0=group boundary)\n");
+        printf("  in_g  raw_tn  cyc/tile    max    count\n");
+        for (int ig = 0; ig < IG_SLOTS && ig < 32; ig++) {
+            if (ig_cnt[ig] == 0) continue;
+            double m = (double)ig_cyc[ig] / ig_cnt[ig];
+            int raw_tn = ig / DG_GROUP_SIZE;
+            printf("   %3d    %3d   %7.0f  %5lu    %u\n",
+                   ig, raw_tn, m, (unsigned long)ig_max[ig], ig_cnt[ig]);
         }
         free(h_prof_tile);
     }
