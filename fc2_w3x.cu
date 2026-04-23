@@ -359,23 +359,44 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc, int32_t c0, int32
 */
 #ifdef PROFILE_CYCLES
 #define PROF_N_PHASES 8
+#define PROF_WALL_SLOT 7
 #define PROF_READ(v) asm volatile("mov.u64 %0, %%clock64;" : "=l"(v))
 #define PROF_BEGIN(tag) uint64_t _pstart_##tag; PROF_READ(_pstart_##tag)
 #define PROF_END(tag, ph) do { \
     uint64_t _pend; PROF_READ(_pend); \
     if (lane == 0) prof[ph] += _pend - _pstart_##tag; \
 } while(0)
+/*
+  PROF_WALL_BEGIN/END: bracket the whole per-warp persistent loop with
+  clock64 so host can compute a measured wall cyc/tile per warp — no
+  hard-coded 1.813 GHz assumption.  Max across warps = critical path.
+*/
+#define PROF_WALL_BEGIN() uint64_t _wall_t0 = 0; if (lane == 0) PROF_READ(_wall_t0)
+#define PROF_WALL_END() do { \
+    if (lane == 0) { uint64_t _wall_t1; PROF_READ(_wall_t1); \
+                     prof[PROF_WALL_SLOT] += _wall_t1 - _wall_t0; } \
+} while(0)
+/*
+  Accumulate across all timed launches via atomicAdd (one atomic per
+  warp per phase per launch — zero hot-path cost; writeout is at kernel
+  exit).  Host divides by N_TIMED_LAUNCHES × tiles_per_cluster to get
+  per-tile means with 10× more samples than the old last-launch-only
+  readback.
+*/
 #define PROF_WRITEOUT() do { \
     if (lane == 0 && d_dbg_prof != nullptr) { \
         const int _flat = (cluster_id * CLUSTER_CTAS + (int)cta_rank) * TOTAL_WARPS + warp_id; \
         for (int _ph = 0; _ph < PROF_N_PHASES; _ph++) { \
-            d_dbg_prof[_flat * PROF_N_PHASES + _ph] = prof[_ph]; \
+            atomicAdd((unsigned long long*)&d_dbg_prof[_flat * PROF_N_PHASES + _ph], \
+                      (unsigned long long)prof[_ph]); \
         } \
     } \
 } while(0)
 #else
 #define PROF_BEGIN(tag)
 #define PROF_END(tag, ph)
+#define PROF_WALL_BEGIN()
+#define PROF_WALL_END()
 #define PROF_WRITEOUT()
 #endif
 
@@ -552,6 +573,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #ifdef PROFILE_CYCLES
         uint64_t prof[PROF_N_PHASES] = {0};
 #endif
+        PROF_WALL_BEGIN();
 
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
@@ -707,6 +729,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         if (tid == 0) {
             asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
         }
+        PROF_WALL_END();
         PROF_WRITEOUT();
     }
     else if (warp_id == WARP_TMA) {
@@ -717,6 +740,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #ifdef PROFILE_CYCLES
         uint64_t prof[PROF_N_PHASES] = {0};
 #endif
+        PROF_WALL_BEGIN();
 
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
@@ -791,6 +815,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             }
 #endif
         }
+        PROF_WALL_END();
         PROF_WRITEOUT();
     }
     else /* warp_id == WARP_MMA, cta_rank == 0 */ {
@@ -830,6 +855,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             mbar_arrive(mbar_tmem_consumed_base + 8);
         }
 #endif
+        PROF_WALL_BEGIN();
 
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
@@ -945,6 +971,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             }
 #endif
         }
+        PROF_WALL_END();
         PROF_WRITEOUT();
 #ifdef PROFILE_KI
         if (lane == 0 && d_dbg_prof_ki != nullptr) {
@@ -1134,21 +1161,23 @@ int main(int argc, char** argv) {
 #ifdef PROFILE_W4
     CUDA_CHECK(cudaMemset(d_dbg_prof_w4, 0, prof_w4_bytes));
 #endif
-    printf("Timing 10 iters...\n");
+    const int N_TIMED_LAUNCHES = 10;
+    printf("Timing %d iters...\n", N_TIMED_LAUNCHES);
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0);
-    for (int i = 0; i < 10; i++) LAUNCH_KERNEL();
+    for (int i = 0; i < N_TIMED_LAUNCHES; i++) LAUNCH_KERNEL();
     cudaEventRecord(t1);
     cudaEventSynchronize(t1);
     float ms;
     cudaEventElapsedTime(&ms, t0, t1);
-    ms /= 10.0f;
+    ms /= (float)N_TIMED_LAUNCHES;
     printf("FC2-W3X kernel: %.3f ms  %.2f TFLOPS\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9);
 
 #if defined(PROFILE_CYCLES) || defined(PROFILE_KI) || defined(PROFILE_TILE) || defined(PROFILE_W4)
     const double tile_cyc = (double)ms * 1e-3 * 1.813e9 / tiles_per_cluster_host;
+    (void)tile_cyc; /* Kept for PROFILE_KI/_TILE/_W4 host-side scaling. */
 #endif
 
 #ifdef PROFILE_CYCLES
@@ -1159,9 +1188,9 @@ int main(int argc, char** argv) {
         /*
           Aggregate per warp_id across all (cluster, cta) instances where the
           warp actually ran (skip all-zero rows — W_MMA on CTA 1 early-exits).
-          Each launch overwrites d_dbg_prof (no atomic accumulate), so the
-          readback contains ONLY the last launch's prof[], summed over
-          tiles_per_cluster tiles × N_phase_brackets. Divide by tiles only.
+          PROF_WRITEOUT uses atomicAdd, so readback sums all N_TIMED_LAUNCHES.
+          Divide by warp_count × tiles_per_cluster × N_TIMED_LAUNCHES for per-
+          tile means with 10× more samples than last-launch-only readback.
         */
         uint64_t warp_sum[TOTAL_WARPS][PROF_N_PHASES] = {{0}};
         int warp_count[TOTAL_WARPS] = {0};
@@ -1181,9 +1210,31 @@ int main(int argc, char** argv) {
             }
         }
 
-        printf("\n[PROFILE] mean cyc/tile per (warp, phase), averaged across %d clusters\n", num_clusters_host);
-        printf("  tiles/cluster=%d, wall cyc/tile @ 1.813 GHz = %.0f\n",
-               tiles_per_cluster_host, tile_cyc);
+        /*
+          Wall cyc/tile: take max across warps of the PROF_WALL_SLOT accumulator
+          (loop-enter → loop-exit clock64 bracket).  That's the true critical-
+          path length in cycles, independent of clock frequency.  Effective
+          clock = wall_cyc / (ms / 1000 / tiles_per_cluster) tells us whether
+          the GPU ran at base (1.813 GHz) or boost (1.965 GHz).
+        */
+        double wall_cyc = 0;
+        int wall_src_warp = -1;
+        for (int w = 0; w < TOTAL_WARPS; w++) {
+            if (warp_count[w] == 0) continue;
+            double v = (double)warp_sum[w][PROF_WALL_SLOT]
+                     / ((double)warp_count[w] * tiles_per_cluster_host * N_TIMED_LAUNCHES);
+            if (v > wall_cyc) { wall_cyc = v; wall_src_warp = w; }
+        }
+        const double eff_clock_ghz = (ms > 0 && tiles_per_cluster_host > 0)
+            ? (wall_cyc * tiles_per_cluster_host * 1e-3 / ms) : 0.0;
+
+        printf("\n[PROFILE] mean cyc/tile per (warp, phase), across %d clusters × %d timed launches\n",
+               num_clusters_host, N_TIMED_LAUNCHES);
+        printf("  tiles/cluster=%d  wall cyc/tile (measured, W%d) = %.0f  effective clock = %.3f GHz\n",
+               tiles_per_cluster_host, wall_src_warp, wall_cyc, eff_clock_ghz);
+        printf("  (hard-coded 1.813 GHz would give wall cyc/tile = %.0f — delta %.1f%% indicates actual clock)\n",
+               (double)ms * 1e-3 * 1.813e9 / tiles_per_cluster_host,
+               wall_cyc > 0 ? 100.0 * (wall_cyc / ((double)ms * 1e-3 * 1.813e9 / tiles_per_cluster_host) - 1.0) : 0.0);
 
         const char* epi_labels[5] = {
             "tmem_ready wait",
@@ -1207,22 +1258,32 @@ int main(int argc, char** argv) {
             if (warp_count[w] == 0) { printf("  [W%d %s] no data\n", w, tag); return; }
             uint64_t total = 0;
             for (int p = 0; p < nph; p++) total += warp_sum[w][p];
-            double denom = (double)warp_count[w] * tiles_per_cluster_host;
+            double denom = (double)warp_count[w] * tiles_per_cluster_host * N_TIMED_LAUNCHES;
             double total_per_tile = (double)total / denom;
+            double wall_w = (double)warp_sum[w][PROF_WALL_SLOT] / denom;
             printf("  [W%d %-4s  instances=%3d]   cyc/tile  wall%%\n",
                    w, tag, warp_count[w]);
             for (int p = 0; p < nph; p++) {
                 double v = (double)warp_sum[w][p] / denom;
-                double pct = tile_cyc > 0 ? 100.0 * v / tile_cyc : 0.0;
+                double pct = wall_cyc > 0 ? 100.0 * v / wall_cyc : 0.0;
                 printf("    P%d %s  %8.0f  %5.1f%%\n", p, labels[p], v, pct);
+                printf("@@PROF warp=%d tag=%s phase=%d label=%s cyc_per_tile=%.2f wall_pct=%.3f\n",
+                       w, tag, p, labels[p], v, pct);
             }
-            double tot_pct = tile_cyc > 0 ? 100.0 * total_per_tile / tile_cyc : 0.0;
+            double tot_pct = wall_cyc > 0 ? 100.0 * total_per_tile / wall_cyc : 0.0;
             printf("    %-19s  %8.0f  %5.1f%%\n", "SUM (instrumented)", total_per_tile, tot_pct);
+            printf("@@PROF warp=%d tag=%s phase=SUM label=instrumented cyc_per_tile=%.2f wall_pct=%.3f\n",
+                   w, tag, total_per_tile, tot_pct);
+            printf("@@PROF warp=%d tag=%s phase=WALL label=wall_bracket cyc_per_tile=%.2f wall_pct=100.000\n",
+                   w, tag, wall_w);
         };
 
         for (int w = 0; w < N_EPI_WARPS; w++) dump_warp(w, "epi",  epi_labels, 5);
         dump_warp(WARP_TMA, "TMA", tma_labels, 2);
         dump_warp(WARP_MMA, "MMA", mma_labels, 4);
+
+        printf("@@PROFMETA wall_cyc_per_tile=%.2f eff_clock_ghz=%.4f tiles_per_cluster=%d launches=%d\n",
+               wall_cyc, eff_clock_ghz, tiles_per_cluster_host, N_TIMED_LAUNCHES);
 
         free(h_prof);
     }
