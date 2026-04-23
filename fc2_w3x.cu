@@ -69,10 +69,13 @@
   USE_SWIZZLE_64B: opt-in SWIZZLE_64B for tma_c + matching XOR on epilogue STS.
   Bank-conflict lever. Row stride in the staging is already 64B, so the TMA
   tensor map gets CU_TENSOR_MAP_SWIZZLE_64B; STS addresses XOR the chunk
-  offset ({0,16,32,48}) by ((row & 3) << 4) to match TMA's chunk permutation.
+  offset ({0,16,32,48}) by (((row >> 1) & 3) << 4) to match TMA's chunk
+  permutation. (Empirically determined via bench/tma_swizzle_probe.cu on
+  B200 / sm_100a — SWIZZLE_64B pairs consecutive rows per XOR bucket so
+  rows 0-1 share XOR=0, 2-3 XOR=16, 4-5 XOR=32, 6-7 XOR=48.)
   Baseline STS has even-lane + odd-lane pairs colliding on bank groups [0..3]
-  and [16..19] => 16-way conflict; (row & 3) spreads starts across 4 unique
-  row-mod-4 groups => 8-way conflict (half-fix, orthogonal to NUM_EPI_STAGES).
+  and [16..19] => 16-way conflict. (row >> 1) & 3 spreads starts across 8
+  unique banks => 4-way conflict (orthogonal to NUM_EPI_STAGES).
 */
 
 #define SUBPASS_COLS   32
@@ -420,7 +423,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 const uint32_t row_idx  = row_group * 32 + lane;
                 const uint32_t out_base = out_smem_arr[es] + row_idx * (SUBPASS_COLS * 2);
 #ifdef USE_SWIZZLE_64B
-                const uint32_t xor_m = (row_idx & 3) << 4;
+                const uint32_t xor_m = ((row_idx >> 1) & 3) << 4;
 #else
                 const uint32_t xor_m = 0;
 #endif

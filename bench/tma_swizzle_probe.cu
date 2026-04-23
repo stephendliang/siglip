@@ -69,9 +69,12 @@ static __device__ __forceinline__ uint32_t xor_mask_for(uint32_t row) {
 #if XOR_MODE == 0
     (void)row; return 0;
 #elif XOR_MODE == 1
-    return (row & 3) << 4;
-#elif XOR_MODE == 2
+    /* WINNER on B200 / sm_100a (verified 2026-04-23): SWIZZLE_64B pairs
+       consecutive rows per XOR bucket — rows 0-1 XOR=0, 2-3 =16, 4-5 =32,
+       6-7 =48, repeat every 8. */
     return ((row >> 1) & 3) << 4;
+#elif XOR_MODE == 2
+    return (row & 3) << 4;
 #elif XOR_MODE == 3
     return (row & 7) << 4;
 #elif XOR_MODE == 4
