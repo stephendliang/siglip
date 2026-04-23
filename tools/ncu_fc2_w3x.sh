@@ -13,12 +13,27 @@
 # Non-docker requirement: ncu needs CAP_SYS_ADMIN or sudo for perf
 # counter access; if you get "ERR_NVGPUCTRPERM" run with sudo.
 #
-# Budget: ~25-35 min total (well under the 1-hour window).
+# Budget: ~25-35 min default, ~40-55 min with --max.
+#
+# Flags:
+#   (none)              Phase 1 + Phase 2 (w3x + rank1 only).  ~25-35 min.
+#   --focused-only      Phase 1 only (4 variants, 25 metrics each).
+#   --full-only         Phase 2 only (--set full, w3x + rank1).
+#   --all-full          Phase 2 runs --set full on ALL 4 variants, not just 2.
+#   --with-source       Embed source-line attribution in the ncu-rep
+#                       exports (requires -lineinfo in CFLAGS, already on).
+#                       Unlocks per-SASS-line stall attribution inside
+#                       Nsight GUI or  ncu --import ... --page source.
+#   --reps N            Run Phase 1 N times for variance confirmation.
+#                       Each rep is saved as <name>_r<N>.csv.
+#   --max               Shortcut: --all-full --with-source --reps 3.
+#                       This is the maximum comprehensive option.
+#                       Budget ~40-55 min.
 #
 # Output: data/ncu_w3x_<timestamp>/
-#   {w3x,w3x-strip,w3x-gemm,rank1}.csv           focused metrics
-#   full_{w3x,rank1}.ncu-rep                     exhaustive reports
-#   summary.txt                                  decoded diff table
+#   {w3x,w3x-strip,w3x-gemm,rank1}[_r<N>].csv    focused metrics
+#   full_{w3x,[w3x-strip,w3x-gemm,]rank1}.ncu-rep  exhaustive reports
+#   summary.txt                                    decoded diff table
 #
 set -u
 cd "$(dirname "$0")/.."
@@ -30,13 +45,36 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 
 DO_FULL=1
 DO_FOCUSED=1
+MAX_MODE=0
+FULL_ALL_VARIANTS=0
+WITH_SOURCE=0
+REPS=1
 while [ $# -gt 0 ]; do
     case "$1" in
-        --focused-only) DO_FULL=0;    shift ;;
-        --full-only)    DO_FOCUSED=0; shift ;;
+        --focused-only)       DO_FULL=0;            shift ;;
+        --full-only)          DO_FOCUSED=0;         shift ;;
+        --all-full)           FULL_ALL_VARIANTS=1;  shift ;;
+        --with-source)        WITH_SOURCE=1;        shift ;;
+        --reps)               REPS="$2";            shift 2 ;;
+        --max)
+            MAX_MODE=1
+            DO_FOCUSED=1
+            DO_FULL=1
+            FULL_ALL_VARIANTS=1
+            WITH_SOURCE=1
+            REPS=3
+            shift ;;
+        -h|--help)
+            sed -n '1,30p' "$0"
+            exit 0 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
+
+SOURCE_FLAGS=""
+if [ "$WITH_SOURCE" = 1 ]; then
+    SOURCE_FLAGS="--import-source yes"
+fi
 
 command -v ncu >/dev/null || { echo "ncu not in PATH" >&2; exit 1; }
 
@@ -85,29 +123,42 @@ EOF
 
 if [ "$DO_FOCUSED" = 1 ]; then
     log ""
-    log "--- phase 1: focused metric pack ---"
-    for entry in "${TARGETS[@]}"; do
-        read -r name bin filt <<<"$entry"
-        if [ ! -x "$bin" ]; then
-            log "  SKIP $name: $bin missing"
-            continue
-        fi
-        log "  ncu $name"
-        ncu --target-processes all \
-            -k "regex:$filt" \
-            --launch-skip 2 --launch-count 1 \
-            --metrics "$METRICS" \
-            --csv \
-            "$bin" > "$OUT/$name.csv" 2> "$OUT/$name.stderr" \
-            || log "    WARN ncu returned nonzero for $name (see $OUT/$name.stderr)"
+    log "--- phase 1: focused metric pack (reps=$REPS) ---"
+    for rep in $(seq 1 "$REPS"); do
+        [ "$REPS" -gt 1 ] && log "  -- rep $rep/$REPS --"
+        for entry in "${TARGETS[@]}"; do
+            read -r name bin filt <<<"$entry"
+            if [ ! -x "$bin" ]; then
+                log "  SKIP $name: $bin missing"
+                continue
+            fi
+            suffix=""
+            [ "$REPS" -gt 1 ] && suffix="_r$rep"
+            log "  ncu $name$suffix"
+            ncu --target-processes all \
+                -k "regex:$filt" \
+                --launch-skip 2 --launch-count 1 \
+                --metrics "$METRICS" \
+                --csv \
+                "$bin" > "$OUT/$name$suffix.csv" 2> "$OUT/$name$suffix.stderr" \
+                || log "    WARN ncu returned nonzero for $name$suffix (see $OUT/$name$suffix.stderr)"
+        done
     done
 fi
 
 if [ "$DO_FULL" = 1 ]; then
     log ""
-    log "--- phase 2: --set full (w3x + rank1 only) ---"
-    for entry in "w3x ./fc2-w3x fc2_w3x_kernel" \
-                 "rank1 ./cublaslt-fc2 nvjet_sm100_qqtst"; do
+    if [ "$FULL_ALL_VARIANTS" = 1 ]; then
+        log "--- phase 2: --set full on ALL variants ($SOURCE_FLAGS) ---"
+        FULL_TARGETS=("${TARGETS[@]}")
+    else
+        log "--- phase 2: --set full (w3x + rank1 only) ($SOURCE_FLAGS) ---"
+        FULL_TARGETS=(
+            "w3x ./fc2-w3x fc2_w3x_kernel"
+            "rank1 ./cublaslt-fc2 nvjet_sm100_qqtst"
+        )
+    fi
+    for entry in "${FULL_TARGETS[@]}"; do
         read -r name bin filt <<<"$entry"
         if [ ! -x "$bin" ]; then
             log "  SKIP full/$name: $bin missing"
@@ -118,6 +169,7 @@ if [ "$DO_FULL" = 1 ]; then
             -k "regex:$filt" \
             --launch-skip 2 --launch-count 1 \
             --set full \
+            $SOURCE_FLAGS \
             --export "$OUT/full_$name" \
             --force-overwrite \
             "$bin" > "$OUT/full_$name.stdout" 2> "$OUT/full_$name.stderr" \
