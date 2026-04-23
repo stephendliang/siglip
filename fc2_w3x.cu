@@ -4,11 +4,15 @@
   Target: beat cuBLASLt rank-1 `nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_bias_TNT`
           (1.046 ms on B200 at K=3072, FC2 shape).
 
-  Architecture (per CTA, tid 0..191 = 6 warps × 32 threads):
+  Architecture (per CTA, default 6 warps × 32 threads = 192 thr):
     tid   0..127 (W0-W3)  Epilogue warpgroup   setmaxnreg.inc 232
     tid 128..159 (W4)     TMA A+B + bias LDG   setmaxnreg.dec  24
     tid 160..191 (W5)     MMA issuer (CTA 0)   setmaxnreg.dec  24
                           CTA 1: W5 exits early after init barrier
+
+  With -DEPI_2WARP: 4 warps × 32 thr = 128 thr; roles renumbered via
+  N_EPI_WARPS/WARP_TMA/WARP_MMA. Each epi warp covers 64 rows (2× rows,
+  via an inner ROW_HALVES loop) so output coverage is unchanged.
 
   Cluster: 2x1, cta_group::2, per-CTA tile 128x256 → cluster output 256x256.
   Total 384 threads / 2-CTA cluster, warps_act=6 on CTA 0, warps_act=5 on CTA 1.
@@ -52,7 +56,7 @@
 #define TK          128
 #define SM_COUNT    148
 #define CLUSTER_CTAS 2
-#define THREADS     192
+#define THREADS     (TOTAL_WARPS * 32)
 
 #define TILES_M     ((M_TOTAL + TM * 2 - 1) / (TM * 2))
 #define TILES_N     ((N_DIM  + TN - 1) / TN)
@@ -62,6 +66,23 @@
 #define N_STAGES       6
 #define NUM_EPI_STAGES 2
 #define NUM_SUBPASSES  (TN / 32)
+
+#ifdef EPI_2WARP
+#define N_EPI_WARPS      2
+#define ROWS_PER_WARP    64
+#define EPI_BARSYNC_ASM  "bar.sync 0, 64;"
+#define WARP_TMA         2
+#define WARP_MMA         3
+#define TOTAL_WARPS      4
+#else
+#define N_EPI_WARPS      4
+#define ROWS_PER_WARP    32
+#define EPI_BARSYNC_ASM  "bar.sync 0, 128;"
+#define WARP_TMA         4
+#define WARP_MMA         5
+#define TOTAL_WARPS      6
+#endif
+#define ROW_HALVES       (ROWS_PER_WARP / 32)
 
 #define SUBPASS_COLS   32
 #define ROWS_PER_CTA   TM
@@ -229,7 +250,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #ifndef SETMAXNREG_LO
 #define SETMAXNREG_LO 48
 #endif
-    if (warp_id < 4) {
+    if (warp_id < N_EPI_WARPS) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" :: "n"(SETMAXNREG_HI));
     } else {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" :: "n"(SETMAXNREG_LO));
@@ -254,8 +275,8 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             :: "r"(smem_to_uint(smem + OFF_TMEM)), "n"(TMEM_COLS));
     }
 
-    /* W4: bias LDG+STS, all 32 lanes cooperate, pre-cluster-barrier. */
-    if (warp_id == 4) {
+    /* WARP_TMA: bias LDG+STS, all 32 lanes cooperate, pre-cluster-barrier. */
+    if (warp_id == WARP_TMA) {
         for (int i = lane; i < N_DIM; i += 32) {
             __nv_bfloat16 v = d_bias[i];
             uint16_t bits = *reinterpret_cast<uint16_t*>(&v);
@@ -267,8 +288,8 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
-    /* W5 on CTA 1 is dead — only W5 on CTA 0 issues MMA. */
-    if (warp_id == 5 && cta_rank != 0) return;
+    /* WARP_MMA on CTA 1 is dead — only CTA 0 issues MMA. */
+    if (warp_id == WARP_MMA && cta_rank != 0) return;
 
     const uint32_t taddr_base = *reinterpret_cast<uint32_t*>(smem + OFF_TMEM);
 
@@ -302,8 +323,8 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     const int cluster_id   = blockIdx.x / CLUSTER_CTAS;
     const int tiles_per_cluster = (TOTAL_TILES + num_clusters - 1) / num_clusters;
 
-    if (warp_id < 4) {
-        /* =============== Epilogue warpgroup (W0-W3, tid 0..127) =============== */
+    if (warp_id < N_EPI_WARPS) {
+        /* =============== Epilogue warpgroup (W0..W_{N_EPI_WARPS-1}) =============== */
         const int row_group = warp_id;
 
         uint32_t mma_phase[2] = {0, 0};
@@ -322,11 +343,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             mma_phase[buf] ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-            const uint32_t taddr_tile = taddr_base + buf * TN
-                + ((cta_rank * TM + row_group * 32) << 16);
-
 #ifdef STRIP_EPILOGUE
-            (void)prev_m; (void)prev_n; (void)taddr_tile;
+            (void)prev_m; (void)prev_n;
+            (void)taddr_base; (void)buf; (void)cta_rank; (void)row_group;
 #ifdef NO_PREFILL
             if (tid == 0) mbar_arrive(mbar_tmem_cons_peer_base + buf * 8);
 #endif
@@ -336,13 +355,10 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 const int es = sp & (NUM_EPI_STAGES - 1);
                 const int nc = sp * SUBPASS_COLS;
 
-                float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
-                float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
-                TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-                              a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                              taddr_tile + nc);
-                TMEM_WAIT();
-
+                /*
+                  Bias is column-only (nc-dependent, row-invariant), so we
+                  LDS once per subpass and reuse across ROW_HALVES.
+                */
                 uint4 bv0, bv1, bv2, bv3;
                 asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(bv0.x), "=r"(bv0.y), "=r"(bv0.z), "=r"(bv0.w)
@@ -364,59 +380,73 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 bptr[8]=bv2.x;  bptr[9]=bv2.y;  bptr[10]=bv2.z; bptr[11]=bv2.w;
                 bptr[12]=bv3.x; bptr[13]=bv3.y; bptr[14]=bv3.z; bptr[15]=bv3.w;
 
-                float o[32];
-                o[0]  = a0  + __bfloat162float(b[0].x);
-                o[1]  = a1  + __bfloat162float(b[0].y);
-                o[2]  = a2  + __bfloat162float(b[1].x);
-                o[3]  = a3  + __bfloat162float(b[1].y);
-                o[4]  = a4  + __bfloat162float(b[2].x);
-                o[5]  = a5  + __bfloat162float(b[2].y);
-                o[6]  = a6  + __bfloat162float(b[3].x);
-                o[7]  = a7  + __bfloat162float(b[3].y);
-                o[8]  = a8  + __bfloat162float(b[4].x);
-                o[9]  = a9  + __bfloat162float(b[4].y);
-                o[10] = a10 + __bfloat162float(b[5].x);
-                o[11] = a11 + __bfloat162float(b[5].y);
-                o[12] = a12 + __bfloat162float(b[6].x);
-                o[13] = a13 + __bfloat162float(b[6].y);
-                o[14] = a14 + __bfloat162float(b[7].x);
-                o[15] = a15 + __bfloat162float(b[7].y);
-                o[16] = a16 + __bfloat162float(b[8].x);
-                o[17] = a17 + __bfloat162float(b[8].y);
-                o[18] = a18 + __bfloat162float(b[9].x);
-                o[19] = a19 + __bfloat162float(b[9].y);
-                o[20] = a20 + __bfloat162float(b[10].x);
-                o[21] = a21 + __bfloat162float(b[10].y);
-                o[22] = a22 + __bfloat162float(b[11].x);
-                o[23] = a23 + __bfloat162float(b[11].y);
-                o[24] = a24 + __bfloat162float(b[12].x);
-                o[25] = a25 + __bfloat162float(b[12].y);
-                o[26] = a26 + __bfloat162float(b[13].x);
-                o[27] = a27 + __bfloat162float(b[13].y);
-                o[28] = a28 + __bfloat162float(b[14].x);
-                o[29] = a29 + __bfloat162float(b[14].y);
-                o[30] = a30 + __bfloat162float(b[15].x);
-                o[31] = a31 + __bfloat162float(b[15].y);
-
-                uint32_t p[16];
                 #pragma unroll
-                for (int i = 0; i < 16; i++) {
-                    asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;"
-                        : "=r"(p[i]) : "f"(o[2*i]), "f"(o[2*i + 1]));
+                for (int rh = 0; rh < ROW_HALVES; rh++) {
+                    const int row_local_32 = row_group * ROWS_PER_WARP + rh * 32;
+                    const uint32_t taddr_tile = taddr_base + buf * TN
+                        + ((cta_rank * TM + row_local_32) << 16);
+
+                    float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
+                    float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
+                    TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
+                                  taddr_tile + nc);
+                    TMEM_WAIT();
+
+                    float o[32];
+                    o[0]  = a0  + __bfloat162float(b[0].x);
+                    o[1]  = a1  + __bfloat162float(b[0].y);
+                    o[2]  = a2  + __bfloat162float(b[1].x);
+                    o[3]  = a3  + __bfloat162float(b[1].y);
+                    o[4]  = a4  + __bfloat162float(b[2].x);
+                    o[5]  = a5  + __bfloat162float(b[2].y);
+                    o[6]  = a6  + __bfloat162float(b[3].x);
+                    o[7]  = a7  + __bfloat162float(b[3].y);
+                    o[8]  = a8  + __bfloat162float(b[4].x);
+                    o[9]  = a9  + __bfloat162float(b[4].y);
+                    o[10] = a10 + __bfloat162float(b[5].x);
+                    o[11] = a11 + __bfloat162float(b[5].y);
+                    o[12] = a12 + __bfloat162float(b[6].x);
+                    o[13] = a13 + __bfloat162float(b[6].y);
+                    o[14] = a14 + __bfloat162float(b[7].x);
+                    o[15] = a15 + __bfloat162float(b[7].y);
+                    o[16] = a16 + __bfloat162float(b[8].x);
+                    o[17] = a17 + __bfloat162float(b[8].y);
+                    o[18] = a18 + __bfloat162float(b[9].x);
+                    o[19] = a19 + __bfloat162float(b[9].y);
+                    o[20] = a20 + __bfloat162float(b[10].x);
+                    o[21] = a21 + __bfloat162float(b[10].y);
+                    o[22] = a22 + __bfloat162float(b[11].x);
+                    o[23] = a23 + __bfloat162float(b[11].y);
+                    o[24] = a24 + __bfloat162float(b[12].x);
+                    o[25] = a25 + __bfloat162float(b[12].y);
+                    o[26] = a26 + __bfloat162float(b[13].x);
+                    o[27] = a27 + __bfloat162float(b[13].y);
+                    o[28] = a28 + __bfloat162float(b[14].x);
+                    o[29] = a29 + __bfloat162float(b[14].y);
+                    o[30] = a30 + __bfloat162float(b[15].x);
+                    o[31] = a31 + __bfloat162float(b[15].y);
+
+                    uint32_t p[16];
+                    #pragma unroll
+                    for (int i = 0; i < 16; i++) {
+                        asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;"
+                            : "=r"(p[i]) : "f"(o[2*i]), "f"(o[2*i + 1]));
+                    }
+
+                    const uint32_t out_base = out_smem_arr[es] + (row_local_32 + lane) * (SUBPASS_COLS * 2);
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                        :: "r"(out_base +  0), "r"(p[0]), "r"(p[1]), "r"(p[2]), "r"(p[3]));
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                        :: "r"(out_base + 16), "r"(p[4]), "r"(p[5]), "r"(p[6]), "r"(p[7]));
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                        :: "r"(out_base + 32), "r"(p[8]), "r"(p[9]), "r"(p[10]), "r"(p[11]));
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                        :: "r"(out_base + 48), "r"(p[12]), "r"(p[13]), "r"(p[14]), "r"(p[15]));
                 }
 
-                const uint32_t out_base = out_smem_arr[es] + (row_group * 32 + lane) * (SUBPASS_COLS * 2);
-                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-                    :: "r"(out_base +  0), "r"(p[0]), "r"(p[1]), "r"(p[2]), "r"(p[3]));
-                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-                    :: "r"(out_base + 16), "r"(p[4]), "r"(p[5]), "r"(p[6]), "r"(p[7]));
-                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-                    :: "r"(out_base + 32), "r"(p[8]), "r"(p[9]), "r"(p[10]), "r"(p[11]));
-                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-                    :: "r"(out_base + 48), "r"(p[12]), "r"(p[13]), "r"(p[14]), "r"(p[15]));
-
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                asm volatile("bar.sync 0, 128;" ::: "memory");
+                asm volatile(EPI_BARSYNC_ASM ::: "memory");
 
                 if (tid == 0) {
                     if (tt > 0 || sp >= NUM_EPI_STAGES) {
@@ -428,7 +458,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 }
 
 #ifndef DROP_TRAIL_BARSYNC
-                asm volatile("bar.sync 0, 128;" ::: "memory");
+                asm volatile(EPI_BARSYNC_ASM ::: "memory");
 #endif
             }
 
@@ -443,8 +473,8 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
         }
     }
-    else if (warp_id == 4) {
-        /* =============== W4: TMA A+B loader (tid 128..159) =============== */
+    else if (warp_id == WARP_TMA) {
+        /* =============== WARP_TMA: TMA A+B loader =============== */
         uint32_t tma_empty_phase[N_STAGES] = {0};
         const bool elect = (lane == 0);
 
@@ -487,8 +517,8 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             }
         }
     }
-    else /* warp_id == 5, cta_rank == 0 */ {
-        /* =============== W5: MMA issuer (tid 160..191, CTA 0 only) =============== */
+    else /* warp_id == WARP_MMA, cta_rank == 0 */ {
+        /* =============== WARP_MMA: MMA issuer (CTA 0 only) =============== */
         uint32_t tma_full_phase[N_STAGES] = {0};
 #ifdef NO_PREFILL
         uint32_t tmem_cons_phase[2] = {0, 0};
