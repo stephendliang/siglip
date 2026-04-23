@@ -162,26 +162,69 @@ uint64_t make_smem_desc(uint32_t addr) {
 }
 
 /*
-  P2 probe — DG_ROT: rotate within-group tn order by (group_idx % TILES_N).
-  Vanilla dgswizzle visits tn=0 first in every group, so every M-block
-  boundary lands on tn=0. DG_ROT spreads group boundaries across all tn:
-  group gi visits tn order (gi%3, (gi+1)%3, (gi+2)%3) × G tiles each.
-  If the tn=0 slowness is a dispatch-order artifact, DG_ROT should
-  equalize mean cyc across tn. If tn=0 is still slow, it's intrinsic.
+  Dispatch variants for fc2_w3x (all strided layout: lin = c + tt*NC).
+
+  Base: dgswizzle(DG_GROUP_SIZE=G). Within each group of G*TILES_N tiles,
+  iterate tm fastest then tn (tn-run length = G).
+
+  Flags (mutually exclusive except where noted):
+    DG_ROT (existing P2 probe, 0-delta perf): rotate tn by group_idx —
+      spreads group-boundary position across all tn values.
+    DG_INNER_T (NEW): transpose within-group decomposition — iterate tn
+      fastest then tm (tn-run length = 1). Breaks per-tn sub-run
+      coherence; each tile cycles through all TILES_N columns. Bijective:
+      same (tm, tn) set within a group, different traversal order.
+    DG_STAGGER (NEW): shift lin by c*group_tiles per cluster so cluster c
+      starts at group_idx=c instead of group_idx=c/gt. The 74 clusters
+      span 74 distinct group_idx values at tt=0 instead of 4.
+      Bijectivity proof: lin' = 25c + 74tt (mod 10878) for FC2
+      (gt=24, NC=74, TPC=147, TOTAL=10878=NC*TPC). gcd(25, 10878)=1
+      and gcd(74, 10878)=74, so the coset {25c + 74t mod 10878 : t} has
+      10878/74=147 elements = TPC, and c → (25c mod 74) is a bijection
+      on [0, 74), so different c land in different cosets. Bijective.
+    DG_GROUP_SIZE=N (build-time): override G ∈ {4, 8, 16, 32}. Trades
+      tn-run length vs group count. Affects all variants.
+
+  Sweep suggestion (one binary per config):
+    baseline (G=8):                make -B fc2-w3x
+    G=4:                           make -B fc2-w3x DFLAGS='-DDG_GROUP_SIZE=4'
+    G=16:                          make -B fc2-w3x DFLAGS='-DDG_GROUP_SIZE=16'
+    G=32:                          make -B fc2-w3x DFLAGS='-DDG_GROUP_SIZE=32'
+    inner-transpose:               make -B fc2-w3x DFLAGS='-DDG_INNER_T'
+    cluster-group-stagger:         make -B fc2-w3x DFLAGS='-DDG_STAGGER'
 */
 static __device__ __forceinline__
 int dgswizzle(int lin) {
     const int group_tiles = TILES_N * DG_GROUP_SIZE;
+
+#ifdef DG_STAGGER
+    const int _NC = SM_COUNT / CLUSTER_CTAS;
+    const int _TOTAL = TILES_M * TILES_N;
+    const int _c = lin - (lin / _NC) * _NC;
+    lin = lin + _c * group_tiles;
+    if (lin >= _TOTAL) lin -= _TOTAL;
+#endif
+
     const int group_idx = lin / group_tiles;
     const int first_m = group_idx * DG_GROUP_SIZE;
-    const int in_group = lin % group_tiles;
+    const int in_group = lin - group_idx * group_tiles;
     const int nig = (first_m + DG_GROUP_SIZE <= TILES_M)
                   ? DG_GROUP_SIZE
                   : TILES_M - first_m;
-    int tm_local = in_group % nig;
-    int tn_raw   = in_group / nig;
+
+    int tm_local, tn_raw;
+#ifdef DG_INNER_T
+    tm_local = in_group / TILES_N;
+    tn_raw   = in_group - tm_local * TILES_N;
+    if (tm_local >= nig) tm_local = nig - 1;
+#else
+    tm_local = in_group % nig;
+    tn_raw   = in_group / nig;
+#endif
+
 #ifdef DG_ROT
-    const int tn = (tn_raw + group_idx) % TILES_N;
+    int tn = tn_raw + group_idx;
+    while (tn >= TILES_N) tn -= TILES_N;
 #else
     const int tn = tn_raw;
 #endif
@@ -191,7 +234,16 @@ int dgswizzle(int lin) {
 static __device__ __forceinline__
 int dgswizzle_in_group(int lin) {
     const int group_tiles = TILES_N * DG_GROUP_SIZE;
-    return lin % group_tiles;
+#ifdef DG_STAGGER
+    const int _NC = SM_COUNT / CLUSTER_CTAS;
+    const int _TOTAL = TILES_M * TILES_N;
+    const int _c = lin - (lin / _NC) * _NC;
+    int lin_s = lin + _c * group_tiles;
+    if (lin_s >= _TOTAL) lin_s -= _TOTAL;
+    return lin_s - (lin_s / group_tiles) * group_tiles;
+#else
+    return lin - (lin / group_tiles) * group_tiles;
+#endif
 }
 
 static __device__ __forceinline__
