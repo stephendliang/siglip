@@ -217,15 +217,63 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc, int32_t c0, int32
 #define TMEM_WAIT() \
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory")
 
+/*
+  PROFILE_CYCLES — per-warp clock64 phase accumulators.
+  Each warp's lane 0 sums cycles per phase; at kernel exit, lane 0 dumps
+  prof[] to d_dbg_prof[cluster*2*TOTAL_WARPS + cta_rank*TOTAL_WARPS + warp_id].
+  Host aggregates and prints mean cyc/tile per (warp_role, phase).
+  Clock64 overhead is ~1-2 cyc per read → ~6 cyc per bracketed phase.
+  Use the breakdown for *relative* stall diagnosis, not exact timing.
+
+  Phase semantics per warp role:
+    Epi (W0..W_{N_EPI_WARPS-1}):
+      0: TMEM ready mbar_wait (per tile)
+      1: subpass body — bias LDS + TMEM_LOAD + HFMA2 + CVT + STS + fence
+      2: first bar.sync wait (cross-warp STS sync)
+      3: tid==0 TMA store (wait_group + cp.async.bulk.tensor + commit)
+      4: trailing bar.sync wait (elided under DROP_TRAIL_BARSYNC)
+    WARP_TMA:
+      0: empty-slot mbar_wait
+      1: cp.async.bulk.tensor A+B chain (lane 0)
+    WARP_MMA (CTA 0 only):
+      0: full-slot mbar_wait
+      1: 4× UTCQMMA + commit_mcast(empty)
+      2: commit_mcast(tmem_ready) per tile
+      3: tmem_consumed wait (NO_PREFILL only)
+*/
+#ifdef PROFILE_CYCLES
+#define PROF_N_PHASES 8
+#define PROF_READ(v) asm volatile("mov.u64 %0, %%clock64;" : "=l"(v))
+#define PROF_BEGIN(tag) uint64_t _pstart_##tag; PROF_READ(_pstart_##tag)
+#define PROF_END(tag, ph) do { \
+    uint64_t _pend; PROF_READ(_pend); \
+    if (lane == 0) prof[ph] += _pend - _pstart_##tag; \
+} while(0)
+#define PROF_WRITEOUT() do { \
+    if (lane == 0 && d_dbg_prof != nullptr) { \
+        const int _flat = (cluster_id * CLUSTER_CTAS + (int)cta_rank) * TOTAL_WARPS + warp_id; \
+        for (int _ph = 0; _ph < PROF_N_PHASES; _ph++) { \
+            d_dbg_prof[_flat * PROF_N_PHASES + _ph] = prof[_ph]; \
+        } \
+    } \
+} while(0)
+#else
+#define PROF_BEGIN(tag)
+#define PROF_END(tag, ph)
+#define PROF_WRITEOUT()
+#endif
+
 __global__ void __launch_bounds__(THREADS, 1)
 __cluster_dims__(2, 1, 1)
 fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                const __grid_constant__ CUtensorMap tma_b,
                const __grid_constant__ CUtensorMap tma_c,
                const __nv_bfloat16* __restrict__ d_bias,
-               __nv_bfloat16* __restrict__ d_C)
+               __nv_bfloat16* __restrict__ d_C,
+               uint64_t* __restrict__ d_dbg_prof)
 {
     (void)d_C;
+    (void)d_dbg_prof;
 
     extern __shared__ __align__(128) uint8_t smem[];
 
@@ -329,6 +377,10 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 
         uint32_t mma_phase[2] = {0, 0};
 
+#ifdef PROFILE_CYCLES
+        uint64_t prof[PROF_N_PHASES] = {0};
+#endif
+
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
             if (lin_tile >= TOTAL_TILES) break;
@@ -339,7 +391,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             const int prev_n = tn * TN;
             const int buf = tt & 1;
 
+            PROF_BEGIN(e0);
             mbar_wait(mbar_tmem_ready_base + buf * 8, mma_phase[buf]);
+            PROF_END(e0, 0);
             mma_phase[buf] ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
@@ -355,6 +409,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 const int es = sp & (NUM_EPI_STAGES - 1);
                 const int nc = sp * SUBPASS_COLS;
 
+                PROF_BEGIN(e1);
                 /*
                   Bias is column-only (nc-dependent, row-invariant), so we
                   LDS once per subpass and reuse across ROW_HALVES.
@@ -446,19 +501,27 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 }
 
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                PROF_END(e1, 1);
+
+                PROF_BEGIN(e2);
                 asm volatile(EPI_BARSYNC_ASM ::: "memory");
+                PROF_END(e2, 2);
 
                 if (tid == 0) {
+                    PROF_BEGIN(e3);
                     if (tt > 0 || sp >= NUM_EPI_STAGES) {
                         asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
                     }
                     tma_store(out_smem_arr[es], &tma_c,
                               prev_n + nc, prev_m + cta_rank * ROWS_PER_CTA);
                     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+                    PROF_END(e3, 3);
                 }
 
 #ifndef DROP_TRAIL_BARSYNC
+                PROF_BEGIN(e4);
                 asm volatile(EPI_BARSYNC_ASM ::: "memory");
+                PROF_END(e4, 4);
 #endif
             }
 
@@ -472,11 +535,16 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         if (tid == 0) {
             asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
         }
+        PROF_WRITEOUT();
     }
     else if (warp_id == WARP_TMA) {
         /* =============== WARP_TMA: TMA A+B loader =============== */
         uint32_t tma_empty_phase[N_STAGES] = {0};
         const bool elect = (lane == 0);
+
+#ifdef PROFILE_CYCLES
+        uint64_t prof[PROF_N_PHASES] = {0};
+#endif
 
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
@@ -490,7 +558,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
                 if (ki >= N_STAGES || tt > 0) {
+                    PROF_BEGIN(t0);
                     mbar_wait(tma_empty_arr[s], tma_empty_phase[s]);
+                    PROF_END(t0, 0);
                     tma_empty_phase[s] ^= 1;
                 }
 
@@ -500,6 +570,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     const int tma_c0    = 0;
                     const int tma_a_c1  = (a_m_tile * K_ITERS + ki) * TM;
                     const int tma_b_c1  = (b_n_half * K_ITERS + ki) * (TN / 2);
+                    PROF_BEGIN(t1);
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
                         ".mbarrier::complete_tx::bytes.cta_group::2"
@@ -513,15 +584,21 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                            "r"(b_dst), "l"(&tma_b), "r"(tma_b_c1),
                            "r"(TMA_BYTES)
                         : "memory");
+                    PROF_END(t1, 1);
                 }
             }
         }
+        PROF_WRITEOUT();
     }
     else /* warp_id == WARP_MMA, cta_rank == 0 */ {
         /* =============== WARP_MMA: MMA issuer (CTA 0 only) =============== */
         uint32_t tma_full_phase[N_STAGES] = {0};
 #ifdef NO_PREFILL
         uint32_t tmem_cons_phase[2] = {0, 0};
+#endif
+
+#ifdef PROFILE_CYCLES
+        uint64_t prof[PROF_N_PHASES] = {0};
 #endif
 
         uint64_t desc_a_base[N_STAGES], desc_b_base[N_STAGES];
@@ -546,13 +623,17 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             const int buf = tt & 1;
 
 #ifdef NO_PREFILL
+            PROF_BEGIN(m3);
             mbar_wait(mbar_tmem_consumed_base + buf * 8, tmem_cons_phase[buf]);
+            PROF_END(m3, 3);
             tmem_cons_phase[buf] ^= 1;
 #endif
 
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
+                PROF_BEGIN(m0);
                 mbar_wait(tma_full_arr[s], tma_full_phase[s]);
+                PROF_END(m0, 0);
                 tma_full_phase[s] ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
@@ -560,6 +641,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     uint64_t desc_a = desc_a_base[s];
                     uint64_t desc_b = desc_b_base[s];
                     const int accum_flag = (ki == 0) ? 0 : 1;
+                    PROF_BEGIN(m1);
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p_init, p_acc;\n\t"
@@ -591,11 +673,17 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                           "r"(0),"r"(0),"r"(0),"r"(0),
                           "r"(accum_flag));
                     tcgen05_commit_mcast(tma_empty_arr[s], pair_mask);
+                    PROF_END(m1, 1);
                 }
             }
 
-            if (lane == 0) tcgen05_commit_mcast(mbar_tmem_ready_base + buf * 8, pair_mask);
+            if (lane == 0) {
+                PROF_BEGIN(m2);
+                tcgen05_commit_mcast(mbar_tmem_ready_base + buf * 8, pair_mask);
+                PROF_END(m2, 2);
+            }
         }
+        PROF_WRITEOUT();
     }
 
     if (warp_id == 0) {
@@ -722,15 +810,27 @@ int main(int argc, char** argv) {
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     printf("  TMA descriptors + func attr done (SMEM=%d B)\n", SMEM_BYTES);
 
+    uint64_t* d_dbg_prof = nullptr;
+#ifdef PROFILE_CYCLES
+    const int num_clusters_host = SM_COUNT / CLUSTER_CTAS;
+    const size_t prof_slots = (size_t)num_clusters_host * CLUSTER_CTAS * TOTAL_WARPS * PROF_N_PHASES;
+    const size_t prof_bytes = prof_slots * sizeof(uint64_t);
+    CUDA_CHECK(cudaMalloc(&d_dbg_prof, prof_bytes));
+    CUDA_CHECK(cudaMemset(d_dbg_prof, 0, prof_bytes));
+#endif
+
     dim3 grid(SM_COUNT, 1, 1);
 #define LAUNCH_KERNEL() \
     fc2_w3x_kernel<<<grid, THREADS, SMEM_BYTES>>>( \
-        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C)
+        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_dbg_prof)
 
     printf("Warmup (2 iters)...\n");
     for (int i = 0; i < 2; i++) LAUNCH_KERNEL();
     CUDA_CHECK(cudaDeviceSynchronize());
 
+#ifdef PROFILE_CYCLES
+    CUDA_CHECK(cudaMemset(d_dbg_prof, 0, prof_bytes));
+#endif
     printf("Timing 10 iters...\n");
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0); cudaEventCreate(&t1);
@@ -743,6 +843,85 @@ int main(int argc, char** argv) {
     ms /= 10.0f;
     printf("FC2-W3X kernel: %.3f ms  %.2f TFLOPS\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9);
+
+#ifdef PROFILE_CYCLES
+    {
+        const int tiles_per_cluster_host = (TOTAL_TILES + num_clusters_host - 1) / num_clusters_host;
+        const int iters = 10;
+        uint64_t* h_prof = (uint64_t*)malloc(prof_bytes);
+        CUDA_CHECK(cudaMemcpy(h_prof, d_dbg_prof, prof_bytes, cudaMemcpyDeviceToHost));
+
+        /*
+          Aggregate per warp_id across all (cluster, cta) instances where the
+          warp actually ran (skip all-zero rows — W_MMA on CTA 1 early-exits).
+          Values are sums over `iters` kernel launches × `tiles_per_cluster`
+          tiles/cluster. Divide by (iters * tiles) to get mean cyc/tile.
+        */
+        uint64_t warp_sum[TOTAL_WARPS][PROF_N_PHASES] = {{0}};
+        int warp_count[TOTAL_WARPS] = {0};
+        for (int c = 0; c < num_clusters_host; c++) {
+            for (int r = 0; r < CLUSTER_CTAS; r++) {
+                for (int w = 0; w < TOTAL_WARPS; w++) {
+                    uint64_t row_sum = 0;
+                    for (int p = 0; p < PROF_N_PHASES; p++) {
+                        row_sum += h_prof[((c * CLUSTER_CTAS + r) * TOTAL_WARPS + w) * PROF_N_PHASES + p];
+                    }
+                    if (row_sum == 0) continue;
+                    warp_count[w]++;
+                    for (int p = 0; p < PROF_N_PHASES; p++) {
+                        warp_sum[w][p] += h_prof[((c * CLUSTER_CTAS + r) * TOTAL_WARPS + w) * PROF_N_PHASES + p];
+                    }
+                }
+            }
+        }
+
+        const double tile_cyc = (double)ms * 1e-3 * 1.813e9 / tiles_per_cluster_host;
+        printf("\n[PROFILE] mean cyc/tile per (warp, phase), averaged across %d clusters\n", num_clusters_host);
+        printf("  tiles/cluster=%d, iters=%d, wall cyc/tile @ 1.813 GHz = %.0f\n",
+               tiles_per_cluster_host, iters, tile_cyc);
+
+        const char* epi_labels[5] = {
+            "tmem_ready wait",
+            "subpass body  ",
+            "bar.sync 1    ",
+            "TMA store (t0)",
+            "bar.sync 2    "
+        };
+        const char* tma_labels[2] = {
+            "empty-slot wait",
+            "cp.async.tensor"
+        };
+        const char* mma_labels[4] = {
+            "full-slot wait ",
+            "4x UTCQMMA     ",
+            "tmem_ready cmt ",
+            "tmem_cons wait "
+        };
+
+        auto dump_warp = [&](int w, const char* tag, const char** labels, int nph) {
+            if (warp_count[w] == 0) { printf("  [W%d %s] no data\n", w, tag); return; }
+            uint64_t total = 0;
+            for (int p = 0; p < nph; p++) total += warp_sum[w][p];
+            double denom = (double)warp_count[w] * iters * tiles_per_cluster_host;
+            double total_per_tile = (double)total / denom;
+            printf("  [W%d %-4s  instances=%3d]   cyc/tile  wall%%\n",
+                   w, tag, warp_count[w]);
+            for (int p = 0; p < nph; p++) {
+                double v = (double)warp_sum[w][p] / denom;
+                double pct = tile_cyc > 0 ? 100.0 * v / tile_cyc : 0.0;
+                printf("    P%d %s  %8.0f  %5.1f%%\n", p, labels[p], v, pct);
+            }
+            double tot_pct = tile_cyc > 0 ? 100.0 * total_per_tile / tile_cyc : 0.0;
+            printf("    %-19s  %8.0f  %5.1f%%\n", "SUM (instrumented)", total_per_tile, tot_pct);
+        };
+
+        for (int w = 0; w < N_EPI_WARPS; w++) dump_warp(w, "epi",  epi_labels, 5);
+        dump_warp(WARP_TMA, "TMA", tma_labels, 2);
+        dump_warp(WARP_MMA, "MMA", mma_labels, 4);
+
+        free(h_prof);
+    }
+#endif
 
 #if defined(STRIP_EPILOGUE)
     int errors = 0;
@@ -787,5 +966,8 @@ int main(int argc, char** argv) {
     free(h_C);
 #endif
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_bias); cudaFree(d_C);
+#ifdef PROFILE_CYCLES
+    if (d_dbg_prof) cudaFree(d_dbg_prof);
+#endif
     return errors == 0 ? 0 : 1;
 }
