@@ -105,7 +105,22 @@
 #define MBAR_TMEM_CONSUMED  (MBAR_TMEM_READY + 2 * 8)
 #define MBARS_END           (MBAR_TMEM_CONSUMED + 2 * 8)
 
-#define OFF_TMEM       ((MBARS_END + 15) & ~15)
+#ifdef XPF_A
+/*
+  Cross-group A-prefetch (Option A): SMEM-landing TMA for next group's A.
+  W4 issues at end of tn=2 tiles into a dedicated 16KB scratch SMEM slot
+  with its own mbarrier, cycling parity. Data is never consumed; the issue
+  populates L2 as side effect.
+*/
+#define PF_A_BYTES       16384
+#define OFF_PF_A_DATA    ((MBARS_END + 127) & ~127)
+#define OFF_PF_A_MBAR    ((OFF_PF_A_DATA + PF_A_BYTES + 127) & ~127)
+#define PF_A_END         (OFF_PF_A_MBAR + 8)
+#else
+#define PF_A_END         MBARS_END
+#endif
+
+#define OFF_TMEM       ((PF_A_END + 15) & ~15)
 #ifdef PROFILE_KI
 #ifdef PROFILE_KI_TN
 #define PROF_KI_SLOTS  (K_ITERS * ((N_DIM + TN - 1) / TN))
@@ -550,6 +565,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             mbar_init(smem_to_uint(smem + MBAR_TMEM_CONSUMED + b * 8), 2);
 #endif
         }
+#ifdef XPF_A
+        mbar_init(smem_to_uint(smem + OFF_PF_A_MBAR), 1);
+#endif
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp_id == 0) {
@@ -780,6 +798,13 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         uint32_t tma_empty_phase[N_STAGES] = {0};
         const bool elect = (lane == 0);
 
+#ifdef XPF_A
+        const uint32_t pf_a_data_smem = smem_to_uint(smem + OFF_PF_A_DATA);
+        const uint32_t pf_a_mbar      = smem_to_uint(smem + OFF_PF_A_MBAR);
+        uint32_t       pf_a_phase     = 0;
+        bool           pf_a_pending   = false;
+#endif
+
 #ifdef PROFILE_CYCLES
         uint64_t prof[PROF_N_PHASES] = {0};
 #endif
@@ -826,7 +851,55 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     PROF_END(t1, 1);
                 }
             }
+
+#if defined(XPF_A) || defined(XPF_B)
+            /*
+              Cross-group A-prefetch: at end of tn=2 tiles, issue speculative
+              load for the corresponding tm in next group's A. Each cluster's
+              tm-in-group position covers a different tm of the next group, so
+              all 8 next-group A-tiles get prefetched cooperatively.
+            */
+            if (tn == TILES_N - 1 && elect) {
+                const int g_size_pf  = DG_GROUP_SIZE;
+                const int tm_local   = tm - (tm / g_size_pf) * g_size_pf;
+                const int first_m_nx = (tm / g_size_pf + 1) * g_size_pf;
+                const int tm_pf      = first_m_nx + tm_local;
+                if (tm_pf < TILES_M) {
+                    const int a_m_pf     = tm_pf * 2 + cta_rank;
+                    const int tma_a_c1_pf = a_m_pf * K_ITERS * TM;
+#ifdef XPF_A
+                    if (pf_a_pending) {
+                        mbar_wait(pf_a_mbar, pf_a_phase);
+                        pf_a_phase ^= 1;
+                    }
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                        ".mbarrier::complete_tx::bytes"
+                        " [%0], [%1, {%2, %3}], [%4];\n\t"
+                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %5;"
+                        :: "r"(pf_a_data_smem), "l"(&tma_a),
+                           "r"(0), "r"(tma_a_c1_pf),
+                           "r"(pf_a_mbar),
+                           "r"(PF_A_BYTES)
+                        : "memory");
+                    pf_a_pending = true;
+#endif
+#ifdef XPF_B
+                    asm volatile(
+                        "cp.async.bulk.prefetch.tensor.2d.L2.global.tile"
+                        " [%0, {%1, %2}];"
+                        :: "l"(&tma_a), "r"(0), "r"(tma_a_c1_pf)
+                        : "memory");
+#endif
+                }
+            }
+#endif
         }
+#ifdef XPF_A
+        if (elect && pf_a_pending) {
+            mbar_wait(pf_a_mbar, pf_a_phase);
+        }
+#endif
         PROF_WALL_END();
         PROF_WRITEOUT();
     }
