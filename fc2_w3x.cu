@@ -817,6 +817,16 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             const int a_m_tile = tm * 2 + cta_rank;
             const int b_n_half = tn * 2 + cta_rank;
 
+            /*
+              Rolled K-loop: force ptxas to keep one physical copy of the TMA
+              asm body. Default would partially unroll (K_ITERS=24 compile-time
+              constant, observed 2×). Rolled costs ~1 BRA per iter but collapses
+              UTMALDG count 48→2 in static SASS, plus the ELECT/BSSY/BSYNC/
+              R2UR scaffolds that attach to each unrolled copy. See
+              docs/W3X_GRIEVANCES_VS_RANK1.md Grievance 6. i-cache footprint
+              win only — runtime inst count is unchanged.
+            */
+            #pragma unroll 1
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
                 if (ki >= N_STAGES || tt > 0) {
@@ -966,6 +976,14 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             uint64_t _tile_wait_sum = 0;
 #endif
 
+            /*
+              W5 K-loop rolled: mirror the W4 rationale. 192 UTCQMMA → 4 in
+              static SASS (one per MMA × the 4× fold inside the asm body, not
+              per unrolled ki). Each UTCQMMA still emits its own ELECT +
+              BRA.U.ANY loop at runtime — that scaffold lives with the
+              instruction semantic, not with asm-block structure.
+            */
+            #pragma unroll 1
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
 #if defined(PROFILE_KI) || defined(PROFILE_TILE)
@@ -1008,6 +1026,16 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     uint64_t _w5_m0; PROF_KI_READ(_w5_m0);
 #endif
                     PROF_BEGIN(m1);
+                    /*
+                      Monolithic MMA + empty-slot commit: 4× tcgen05.mma +
+                      tcgen05.commit::mbarrier::arrive (ptx-level multicast)
+                      under a single asm volatile. Zero SASS opcode delta vs
+                      the old split (ptxas already coalesces adjacent
+                      predicated asm volatiles, and ELECT/BSSY/R2UR scaffold
+                      attaches per-SASS-instruction not per-asm-block), but
+                      reads cleaner and keeps the desc_a/desc_b advances
+                      inside one block scope.
+                    */
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p_init, p_acc;\n\t"
@@ -1032,13 +1060,16 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                         "add.s64 db, db, 2;\n\t"
                         "tcgen05.mma.cta_group::2.kind::f8f6f4 "
                         "[tc], da, db, %3, {%4,%5,%6,%7,%8,%9,%10,%11}, p_acc;\n\t"
+                        "tcgen05.commit.cta_group::2.mbarrier::arrive::one"
+                        ".shared::cluster.multicast::cluster.b64 [%13], %14;\n\t"
                         "}"
                         :
                         : "r"(buf * TN), "l"(desc_a), "l"(desc_b), "r"(IDESC),
                           "r"(0),"r"(0),"r"(0),"r"(0),
                           "r"(0),"r"(0),"r"(0),"r"(0),
-                          "r"(accum_flag));
-                    tcgen05_commit_mcast(tma_empty_arr[s], pair_mask);
+                          "r"(accum_flag),
+                          "r"(tma_empty_arr[s]), "h"(pair_mask)
+                        : "memory");
                     PROF_END(m1, 1);
 #ifdef PROFILE_W5
                     { uint64_t _w5_m1; PROF_KI_READ(_w5_m1); _w5_mma_sum += _w5_m1 - _w5_m0; }
