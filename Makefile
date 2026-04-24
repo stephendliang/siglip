@@ -150,6 +150,12 @@ fc2-w3x-ncu-strip: fc2_w3x.cu
 fc2-w3x-ncu-gemm: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNCU_PROFILE -DGEMM_ONLY $< -o $@ $(LDFLAGS)
 
+# Lever C — STSM (stmatrix) epilogue stores + LDTM.16dp256bit.x4 TMEM load.
+# SASS-shape match for cuBLASLt rank-1 `nvjet_..._bz_bias_TNT`.
+# Correctness not verifiable on CPU; see docs/LEVER_C_STATUS.md.
+fc2-w3x-stsm: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_STMATRIX=1 $< -o $@ $(LDFLAGS)
+
 # ── fc2_w3x PTX port — hand-authored .ptx + driver-API host harness ──
 # fc2_w3x.ptx is the hand-authored PTX deliverable (see docs/PTX_BUILD_NOTES.md
 # for design notes).  Build pipeline:

@@ -345,8 +345,65 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc, int32_t c0, int32
           "=f"(r24),"=f"(r25),"=f"(r26),"=f"(r27),"=f"(r28),"=f"(r29),"=f"(r30),"=f"(r31) \
         : "r"(TADDR))
 
+/*
+  Lever C — stmatrix-native TMEM load.
+
+  tcgen05.ld.sync.aligned.16x256b.x4.b32 loads 16 TMEM rows × (4 × 256 bits)
+  into 16 b32 regs per lane.  Register layout is stmatrix.x4 compatible:
+  lane t holds 4 chunks of 4 regs each, one chunk per 8×8 matrix, where the
+  chunk for matrix c on lane t=8c+r contains the 8 bf16 values packed as
+  4 bf16x2 regs that stmatrix.x4.trans.m8n8 expects (8 rows of col r).
+
+  2 such LDTMs (at TMEM row offsets 0 and +16 via +0x100000 in bits 20..) cover
+  our 32-row rh.  This replaces 1 LDTM.32x32b.x32 (which gives lane t all cols
+  of row t — wrong layout for stmatrix).
+
+  SASS: LDTM.16dp256bit.x4  (matches rank-1 `..._bz_bias_TNT`).
+*/
+#define TMEM_LOAD_16X256_X4(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15, TADDR) \
+    asm volatile( \
+        "tcgen05.ld.sync.aligned.16x256b.x4.b32 " \
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];" \
+        : "=f"(r0),"=f"(r1),"=f"(r2),"=f"(r3),"=f"(r4),"=f"(r5),"=f"(r6),"=f"(r7), \
+          "=f"(r8),"=f"(r9),"=f"(r10),"=f"(r11),"=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15) \
+        : "r"(TADDR))
+
 #define TMEM_WAIT() \
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory")
+
+/*
+  Lever C — STSM (stmatrix) SMEM store.
+
+  stmatrix.sync.aligned.x4.trans.m8n8.shared.b16 stores 4 8×8 bf16 matrices
+  per call, one per lane-octet.  Per lane t=8c+r, the 4 b32 source regs are
+  interpreted as 8 bf16 values = column r (rows 0..7) of matrix c.  With the
+  `.trans` variant, the matrix is transposed on write so SMEM sees the data
+  row-major.
+
+  Lane addresses:  each lane supplies an address; stmatrix uses addresses
+  from lane (8c + r), r∈[0,7] as the row-r offset within matrix c's 128B
+  tile.  We place matrix c (covering output cols 8c..8c+7) at SMEM offset
+  `out_base + row_start*64 + c*16`, with lane t=8c+r providing
+  `out_base + (row_start + r)*64 + c*16` → produces linear row-major SMEM
+  (row stride 64B = 32 bf16 cols), identical to the layout the current STS
+  path writes and the TMA-C store expects (SWIZZLE_NONE).
+
+  NOTE: rank-1's SMEM layout differs — it uses SMEM bit-20 XOR swizzling
+  with SWIZZLE_32B-shaped TMA.  Our variant preserves the existing
+  SWIZZLE_NONE TMA store descriptor.  This is a valid alternative layout
+  for stmatrix; the register routing is what the `.trans` instruction
+  demands, the SMEM destination math is ours.
+
+  SASS: STSM.16.MT88.4 (matches rank-1's `bz_bias_TNT`).
+*/
+#ifndef USE_STMATRIX
+#define USE_STMATRIX 0
+#endif
+
+#define STSM_X4_TRANS(SADDR, r0, r1, r2, r3) \
+    asm volatile( \
+        "stmatrix.sync.aligned.x4.trans.m8n8.shared.b16 [%0], {%1,%2,%3,%4};" \
+        :: "r"(SADDR), "r"(r0), "r"(r1), "r"(r2), "r"(r3))
 
 /*
   CVT_ADD_BF16X2 — native bf16 epilogue math.
@@ -685,9 +742,12 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 const int nc = sp * SUBPASS_COLS;
 
                 PROF_BEGIN(e1);
+#if !USE_STMATRIX
                 /*
                   Bias is column-only (nc-dependent, row-invariant), so we
                   LDS once per subpass and reuse across ROW_HALVES.
+                  Under USE_STMATRIX the bias is re-loaded per-lane inside
+                  the rh body (see below) to avoid bp[] stack-spill.
                 */
                 uint4 bv0, bv1, bv2, bv3;
                 asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
@@ -708,6 +768,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 bp[ 4]=bv1.x;  bp[ 5]=bv1.y;  bp[ 6]=bv1.z;  bp[ 7]=bv1.w;
                 bp[ 8]=bv2.x;  bp[ 9]=bv2.y;  bp[10]=bv2.z;  bp[11]=bv2.w;
                 bp[12]=bv3.x;  bp[13]=bv3.y;  bp[14]=bv3.z;  bp[15]=bv3.w;
+#endif
 
                 #pragma unroll
                 for (int rh = 0; rh < ROW_HALVES; rh++) {
@@ -715,6 +776,110 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     const uint32_t taddr_tile = taddr_base + buf * TN
                         + ((cta_rank * TM + row_local_32) << 16);
 
+#if USE_STMATRIX
+                    /*
+                      Lever C path — LDTM.16dp256bit.x4 + STSM.16.MT88.4
+                      shape match for cuBLASLt rank-1.
+
+                      2 × LDTM.16dp256bit.x4 load 32 fp32 per lane covering
+                      16+16 rows of the 32×32 subpass-rh block.  4 × STSM
+                      .x4.trans.m8n8 write the resulting 8 bf16x2 bands per
+                      LDTM (4 bf16x2 per STSM × 32 lanes × 2B = 256B... wait
+                      = 512B per STSM; 4 STSM = 2048B = rh block).
+
+                      CORRECTNESS — UNVERIFIED on B200.
+                        The per-lane register layout produced by
+                        LDTM.16x256b.x4 in this configuration is not
+                        independently documented here; we trust the memory
+                        note (project_lever_c_bugs_confirmed.md) that this
+                        variant is stmatrix-native.  Bias lookup and STSM
+                        destination addresses below are computed assuming
+                        lane t=8c+r holds, in fp32 order, 8 cols of rows r
+                        and r+8 (for LDTM #1; +16 rows for LDTM #2).
+                        Actual TMEM routing may differ — TRUST B200 FIRST
+                        RUN to confirm, and fix routing if row_t_bias or
+                        STSM address math is wrong.
+                    */
+                    float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
+                    TMEM_LOAD_16X256_X4(a0,a1,a2,a3,a4,a5,a6,a7,
+                                        a8,a9,a10,a11,a12,a13,a14,a15,
+                                        taddr_tile + nc);
+
+                    float b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15;
+                    TMEM_LOAD_16X256_X4(b0,b1,b2,b3,b4,b5,b6,b7,
+                                        b8,b9,b10,b11,b12,b13,b14,b15,
+                                        taddr_tile + nc + (16u << 16));
+                    TMEM_WAIT();
+
+                    /*
+                      F2FP.PACK_AB pairs adjacent fp32 → 1 bf16x2, matching
+                      rank-1's packing shape.  We fold the bias add into the
+                      pack via a 3-operand inline sequence (cvt + add).  For
+                      a rank-1-shape SASS we could switch to FFMA2/FADD on
+                      fp32 first, then F2FP.PACK — functionally identical
+                      modulo rounding order, but closer to rank-1's insn
+                      mix (Grievance 1, for future if fused-residual).
+
+                      Per-lane bias load.  For LDTM.16x256b.x4, lane t=8c+r
+                      is assumed to own 8 contiguous cols
+                      (nc + 8c .. nc + 8c + 7).  4 bf16x2 bias values cover
+                      those 8 cols; same 4 reused across the two 8-row
+                      bands of the rh (rows within a band share col
+                      assignment).  Load with per-lane divergent
+                      LDS.v4.u32 directly from SMEM bias — avoids the
+                      stack spill a bp_lane[] array-index would otherwise
+                      trigger on ptxas.  Lane->col mapping is unverified;
+                      B200 first run will reveal any permutation.
+                    */
+                    const int lane_c = lane >> 3;
+                    const int lane_r = lane & 7;
+                    uint32_t bl0, bl1, bl2, bl3;
+                    asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(bl0), "=r"(bl1), "=r"(bl2), "=r"(bl3)
+                        : "r"(smem_bias + (prev_n + nc + lane_c * 8) * 2));
+
+                    uint32_t p[16];
+                    CVT_ADD_BF16X2(p[ 0], a0,  a1,  bl0);
+                    CVT_ADD_BF16X2(p[ 1], a2,  a3,  bl1);
+                    CVT_ADD_BF16X2(p[ 2], a4,  a5,  bl2);
+                    CVT_ADD_BF16X2(p[ 3], a6,  a7,  bl3);
+                    CVT_ADD_BF16X2(p[ 4], a8,  a9,  bl0);
+                    CVT_ADD_BF16X2(p[ 5], a10, a11, bl1);
+                    CVT_ADD_BF16X2(p[ 6], a12, a13, bl2);
+                    CVT_ADD_BF16X2(p[ 7], a14, a15, bl3);
+                    CVT_ADD_BF16X2(p[ 8], b0,  b1,  bl0);
+                    CVT_ADD_BF16X2(p[ 9], b2,  b3,  bl1);
+                    CVT_ADD_BF16X2(p[10], b4,  b5,  bl2);
+                    CVT_ADD_BF16X2(p[11], b6,  b7,  bl3);
+                    CVT_ADD_BF16X2(p[12], b8,  b9,  bl0);
+                    CVT_ADD_BF16X2(p[13], b10, b11, bl1);
+                    CVT_ADD_BF16X2(p[14], b12, b13, bl2);
+                    CVT_ADD_BF16X2(p[15], b14, b15, bl3);
+
+                    /*
+                      STSM per-lane address: lane t=8c+r supplies the 16B
+                      row-of-matrix-c slot in a 512B stmatrix tile.  To
+                      produce a linear row-major SMEM layout with row
+                      stride 64B (= 32 bf16 cols) and matrix c occupying
+                      cols (8c..8c+7), we pass:
+                        addr_lane = base + (row_start + r) * 64 + c * 16.
+                      Each STSM covers 8 rows; 4 STSMs cover 32 rows.
+
+                      addr uses row_local_32 + {0,8,16,24} for the 8-row
+                      starting offset of each STSM.
+                    */
+                    const uint32_t out_base = out_smem_arr[es];
+                    const uint32_t lane_off = lane_r * (SUBPASS_COLS * 2)
+                                            + lane_c * 16;
+                    STSM_X4_TRANS(out_base + (row_local_32 +  0) * (SUBPASS_COLS * 2) + lane_off,
+                                  p[0], p[1], p[2], p[3]);
+                    STSM_X4_TRANS(out_base + (row_local_32 +  8) * (SUBPASS_COLS * 2) + lane_off,
+                                  p[4], p[5], p[6], p[7]);
+                    STSM_X4_TRANS(out_base + (row_local_32 + 16) * (SUBPASS_COLS * 2) + lane_off,
+                                  p[8], p[9], p[10], p[11]);
+                    STSM_X4_TRANS(out_base + (row_local_32 + 24) * (SUBPASS_COLS * 2) + lane_off,
+                                  p[12], p[13], p[14], p[15]);
+#else
                     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
                     float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
                     TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
@@ -749,6 +914,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                         :: "r"(out_base + 32), "r"(p[8]), "r"(p[9]), "r"(p[10]), "r"(p[11]));
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
                         :: "r"(out_base + 48), "r"(p[12]), "r"(p[13]), "r"(p[14]), "r"(p[15]));
+#endif /* USE_STMATRIX */
                 }
 
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
