@@ -983,16 +983,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             const int a_m_tile = tm * 2 + cta_rank;
             const int b_n_half = tn * 2 + cta_rank;
 
-            /*
-              Rolled K-loop: force ptxas to keep one physical copy of the TMA
-              asm body. Default would partially unroll (K_ITERS=24 compile-time
-              constant, observed 2×). Rolled costs ~1 BRA per iter but collapses
-              UTMALDG count 48→2 in static SASS, plus the ELECT/BSSY/BSYNC/
-              R2UR scaffolds that attach to each unrolled copy. See
-              docs/W3X_GRIEVANCES_VS_RANK1.md Grievance 6. i-cache footprint
-              win only — runtime inst count is unchanged.
-            */
-            #pragma unroll 1
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
                 if (ki >= N_STAGES || tt > 0) {
@@ -1142,14 +1132,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             uint64_t _tile_wait_sum = 0;
 #endif
 
-            /*
-              W5 K-loop rolled: mirror the W4 rationale. 192 UTCQMMA → 4 in
-              static SASS (one per MMA × the 4× fold inside the asm body, not
-              per unrolled ki). Each UTCQMMA still emits its own ELECT +
-              BRA.U.ANY loop at runtime — that scaffold lives with the
-              instruction semantic, not with asm-block structure.
-            */
-            #pragma unroll 1
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
 #if defined(PROFILE_KI) || defined(PROFILE_TILE)
