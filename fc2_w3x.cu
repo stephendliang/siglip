@@ -349,6 +349,28 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc, int32_t c0, int32
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory")
 
 /*
+  CVT_ADD_BF16X2 — native bf16 epilogue math.
+  Pack the two fp32 accumulator lanes into one bf16x2 register (F2FP.PACK),
+  then add the packed bf16x2 bias in one HADD2. Output is bf16x2 ready
+  for the STS.
+
+  Collapses { 2× FADD fp32 + 1× cvt.bf16x2.f32 } per pair into
+  { 1× F2FP.PACK + 1× HADD2 }. The acc rounds to bf16 before the add,
+  so precision differs from rank-1's fp32-add-then-convert pattern.
+  Output-valid to 2% rel for sensible acc scales; SigLIP2 FC2 accs
+  stay well within bf16's representable add range.
+*/
+#define CVT_ADD_BF16X2(p_out, a_lo, a_hi, b_in) \
+    asm volatile( \
+        "{\n\t" \
+        ".reg .b32 ap;\n\t" \
+        "cvt.rn.bf16x2.f32 ap, %2, %1;\n\t" \
+        "add.rn.bf16x2 %0, ap, %3;\n\t" \
+        "}" \
+        : "=r"(p_out) \
+        : "f"(a_lo), "f"(a_hi), "r"(b_in))
+
+/*
   Async bulk completion fences.  TMA-store only uses the SMEM-read side of
   the bulk path (we never bulk-load here, so there's no global-side state
   to reconcile), but ptxas emits CCTL.IVALL (L1 invalidate) after every
@@ -681,12 +703,11 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     : "=r"(bv3.x), "=r"(bv3.y), "=r"(bv3.z), "=r"(bv3.w)
                     : "r"(smem_bias + (prev_n + nc + 24) * 2));
 
-                __nv_bfloat162 b[16];
-                uint32_t* bptr = reinterpret_cast<uint32_t*>(b);
-                bptr[0]=bv0.x;  bptr[1]=bv0.y;  bptr[2]=bv0.z;  bptr[3]=bv0.w;
-                bptr[4]=bv1.x;  bptr[5]=bv1.y;  bptr[6]=bv1.z;  bptr[7]=bv1.w;
-                bptr[8]=bv2.x;  bptr[9]=bv2.y;  bptr[10]=bv2.z; bptr[11]=bv2.w;
-                bptr[12]=bv3.x; bptr[13]=bv3.y; bptr[14]=bv3.z; bptr[15]=bv3.w;
+                uint32_t bp[16];
+                bp[ 0]=bv0.x;  bp[ 1]=bv0.y;  bp[ 2]=bv0.z;  bp[ 3]=bv0.w;
+                bp[ 4]=bv1.x;  bp[ 5]=bv1.y;  bp[ 6]=bv1.z;  bp[ 7]=bv1.w;
+                bp[ 8]=bv2.x;  bp[ 9]=bv2.y;  bp[10]=bv2.z;  bp[11]=bv2.w;
+                bp[12]=bv3.x;  bp[13]=bv3.y;  bp[14]=bv3.z;  bp[15]=bv3.w;
 
                 #pragma unroll
                 for (int rh = 0; rh < ROW_HALVES; rh++) {
@@ -701,46 +722,23 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                                   taddr_tile + nc);
                     TMEM_WAIT();
 
-                    float o[32];
-                    o[0]  = a0  + __bfloat162float(b[0].x);
-                    o[1]  = a1  + __bfloat162float(b[0].y);
-                    o[2]  = a2  + __bfloat162float(b[1].x);
-                    o[3]  = a3  + __bfloat162float(b[1].y);
-                    o[4]  = a4  + __bfloat162float(b[2].x);
-                    o[5]  = a5  + __bfloat162float(b[2].y);
-                    o[6]  = a6  + __bfloat162float(b[3].x);
-                    o[7]  = a7  + __bfloat162float(b[3].y);
-                    o[8]  = a8  + __bfloat162float(b[4].x);
-                    o[9]  = a9  + __bfloat162float(b[4].y);
-                    o[10] = a10 + __bfloat162float(b[5].x);
-                    o[11] = a11 + __bfloat162float(b[5].y);
-                    o[12] = a12 + __bfloat162float(b[6].x);
-                    o[13] = a13 + __bfloat162float(b[6].y);
-                    o[14] = a14 + __bfloat162float(b[7].x);
-                    o[15] = a15 + __bfloat162float(b[7].y);
-                    o[16] = a16 + __bfloat162float(b[8].x);
-                    o[17] = a17 + __bfloat162float(b[8].y);
-                    o[18] = a18 + __bfloat162float(b[9].x);
-                    o[19] = a19 + __bfloat162float(b[9].y);
-                    o[20] = a20 + __bfloat162float(b[10].x);
-                    o[21] = a21 + __bfloat162float(b[10].y);
-                    o[22] = a22 + __bfloat162float(b[11].x);
-                    o[23] = a23 + __bfloat162float(b[11].y);
-                    o[24] = a24 + __bfloat162float(b[12].x);
-                    o[25] = a25 + __bfloat162float(b[12].y);
-                    o[26] = a26 + __bfloat162float(b[13].x);
-                    o[27] = a27 + __bfloat162float(b[13].y);
-                    o[28] = a28 + __bfloat162float(b[14].x);
-                    o[29] = a29 + __bfloat162float(b[14].y);
-                    o[30] = a30 + __bfloat162float(b[15].x);
-                    o[31] = a31 + __bfloat162float(b[15].y);
-
                     uint32_t p[16];
-                    #pragma unroll
-                    for (int i = 0; i < 16; i++) {
-                        asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;"
-                            : "=r"(p[i]) : "f"(o[2*i]), "f"(o[2*i + 1]));
-                    }
+                    CVT_ADD_BF16X2(p[ 0], a0,  a1,  bp[ 0]);
+                    CVT_ADD_BF16X2(p[ 1], a2,  a3,  bp[ 1]);
+                    CVT_ADD_BF16X2(p[ 2], a4,  a5,  bp[ 2]);
+                    CVT_ADD_BF16X2(p[ 3], a6,  a7,  bp[ 3]);
+                    CVT_ADD_BF16X2(p[ 4], a8,  a9,  bp[ 4]);
+                    CVT_ADD_BF16X2(p[ 5], a10, a11, bp[ 5]);
+                    CVT_ADD_BF16X2(p[ 6], a12, a13, bp[ 6]);
+                    CVT_ADD_BF16X2(p[ 7], a14, a15, bp[ 7]);
+                    CVT_ADD_BF16X2(p[ 8], a16, a17, bp[ 8]);
+                    CVT_ADD_BF16X2(p[ 9], a18, a19, bp[ 9]);
+                    CVT_ADD_BF16X2(p[10], a20, a21, bp[10]);
+                    CVT_ADD_BF16X2(p[11], a22, a23, bp[11]);
+                    CVT_ADD_BF16X2(p[12], a24, a25, bp[12]);
+                    CVT_ADD_BF16X2(p[13], a26, a27, bp[13]);
+                    CVT_ADD_BF16X2(p[14], a28, a29, bp[14]);
+                    CVT_ADD_BF16X2(p[15], a30, a31, bp[15]);
 
                     const uint32_t out_base = out_smem_arr[es] + (row_local_32 + lane) * (SUBPASS_COLS * 2);
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
