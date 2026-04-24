@@ -32,7 +32,10 @@ cutlass-256x256x64
 *.cubin
 *.fatbin
 *.fatbin.c
+# hand-authored PTX source is a deliverable, not a build artifact
+!fc2_w3x.ptx
 *.ptx
+!fc2_w3x.ptx
 *.ii
 *.module_id
 *.reg.c

@@ -150,6 +150,24 @@ fc2-w3x-ncu-strip: fc2_w3x.cu
 fc2-w3x-ncu-gemm: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNCU_PROFILE -DGEMM_ONLY $< -o $@ $(LDFLAGS)
 
+# ── fc2_w3x PTX port — hand-authored .ptx + driver-API host harness ──
+# fc2_w3x.ptx is the hand-authored PTX deliverable (see docs/PTX_BUILD_NOTES.md
+# for design notes).  Build pipeline:
+#   1. nvcc compiles .ptx → .cubin
+#   2. ld -r -b binary embeds .cubin bytes into a .o (symbols _binary_*_start/end/size)
+#   3. nvcc links .cc host + embedded-cubin .o + CUDA driver lib
+fc2_w3x.cubin: fc2_w3x.ptx
+	$(NVCC) -arch=compute_100a -code=sm_100a -cubin $< -o $@
+
+fc2_w3x_cubin.o: fc2_w3x.cubin
+	ld -r -b binary $< -o $@
+
+fc2_w3x_host.o: fc2_w3x_host.cc
+	$(NVCC) $(CFLAGS) $(DFLAGS) -x c++ -c $< -o $@
+
+fc2-w3x-ptx: fc2_w3x_host.o fc2_w3x_cubin.o
+	$(NVCC) $(CFLAGS) $(DFLAGS) fc2_w3x_host.o fc2_w3x_cubin.o -o $@ $(LDFLAGS)
+
 # ── fc2_w3x dispatch-variant sweep (CPU-design, B200-measured) ────────────
 # All bijective on FC2 shape (TM=3626, TN=3, NC=74); verified via
 # /tmp/dg_variants_check.py.  Hypothesis-motivated by in_g-structural
