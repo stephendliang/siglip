@@ -372,37 +372,33 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc, int32_t c0, int32
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory")
 
 /*
-  Lever C — STSM (stmatrix) SMEM store.
+  Lever C — STSM (stmatrix) SMEM store, NON-transposed variant.
 
-  stmatrix.sync.aligned.x4.trans.m8n8.shared.b16 stores 4 8×8 bf16 matrices
-  per call, one per lane-octet.  Per lane t=8c+r, the 4 b32 source regs are
-  interpreted as 8 bf16 values = column r (rows 0..7) of matrix c.  With the
-  `.trans` variant, the matrix is transposed on write so SMEM sees the data
-  row-major.
+  stmatrix.sync.aligned.x4.m8n8.shared.b16 stores 4 8x8 bf16 matrices per
+  call.  Per PTX ISA, lane t's reg #m (m in 0..3) contributes 2 bf16 values
+  to matrix m at (row t/4, cols 2(t%4), 2(t%4)+1).  Lane t=8m+r supplies
+  the address for matrix m row r.
 
-  Lane addresses:  each lane supplies an address; stmatrix uses addresses
-  from lane (8c + r), r∈[0,7] as the row-r offset within matrix c's 128B
-  tile.  We place matrix c (covering output cols 8c..8c+7) at SMEM offset
-  `out_base + row_start*64 + c*16`, with lane t=8c+r providing
-  `out_base + (row_start + r)*64 + c*16` → produces linear row-major SMEM
-  (row stride 64B = 32 bf16 cols), identical to the layout the current STS
-  path writes and the TMA-C store expects (SWIZZLE_NONE).
+  With matrix m placed at SMEM cols (8m..8m+7) of a 32-col bf16 tile and
+  row stride 64B, lane t=8m+r supplies addr = base + r*64 + m*16.  The
+  natural LDTM.16dp256bit.x4 register layout places lane t=4j+i's data at
+  (row j, col 2i+8m, 2i+8m+1) in reg k = 4m + 0/1 (for r_hi=0 rows).  That
+  matches STSM_N's "row t/4 cols 2(t%4), 2(t%4)+1" requirement exactly:
+  SMEM (row j, col 8m+2i, 8m+2i+1) = lane t reg #m = LDTM (row j, col
+  2i+8m, 2i+8m+1).  IDENTITY.
 
-  NOTE: rank-1's SMEM layout differs — it uses SMEM bit-20 XOR swizzling
-  with SWIZZLE_32B-shaped TMA.  Our variant preserves the existing
-  SWIZZLE_NONE TMA store descriptor.  This is a valid alternative layout
-  for stmatrix; the register routing is what the `.trans` instruction
-  demands, the SMEM destination math is ours.
+  Using `.trans` here breaks identity: it writes SMEM (matrix m, row 2i)
+  col j instead of (matrix m, row j, cols 2i, 2i+1) — rows and cols swap.
 
-  SASS: STSM.16.MT88.4 (matches rank-1's `bz_bias_TNT`).
+  SASS: STSM.16.MT88.4 (non-trans also emits .MT88 mnemonic on sm_100a).
 */
 #ifndef USE_STMATRIX
 #define USE_STMATRIX 0
 #endif
 
-#define STSM_X4_TRANS(SADDR, r0, r1, r2, r3) \
+#define STSM_X4(SADDR, r0, r1, r2, r3) \
     asm volatile( \
-        "stmatrix.sync.aligned.x4.trans.m8n8.shared.b16 [%0], {%1,%2,%3,%4};" \
+        "stmatrix.sync.aligned.x4.m8n8.shared.b16 [%0], {%1,%2,%3,%4};" \
         :: "r"(SADDR), "r"(r0), "r"(r1), "r"(r2), "r"(r3))
 
 /*
@@ -779,26 +775,33 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #if USE_STMATRIX
                     /*
                       Lever C path — LDTM.16dp256bit.x4 + STSM.16.MT88.4
-                      shape match for cuBLASLt rank-1.
+                      (non-trans) to match cuBLASLt rank-1's shape.
 
-                      2 × LDTM.16dp256bit.x4 load 32 fp32 per lane covering
-                      16+16 rows of the 32×32 subpass-rh block.  4 × STSM
-                      .x4.trans.m8n8 write the resulting 8 bf16x2 bands per
-                      LDTM (4 bf16x2 per STSM × 32 lanes × 2B = 256B... wait
-                      = 512B per STSM; 4 STSM = 2048B = rh block).
+                      LDTM layout (derived from CUTLASS Copy_Traits
+                      SM100_TMEM_LOAD_16dp256b4x DstLayout, verified against
+                      PTX ISA bit-strides).  Lane t=4j+i (i = t%4, j = t/4)
+                      holds 16 fp32 regs a[0..15] at:
+                        a[k]: row = j + 8 * ((k>>1)&1),
+                              col = 2i + (k&1) + 8 * ((k>>2)&3)
+                      Reg-index bits: k bit 0 = col parity, k bit 1 = row
+                      half (j vs j+8), k bits 2-3 = col-group (0,8,16,24).
 
-                      CORRECTNESS — UNVERIFIED on B200.
-                        The per-lane register layout produced by
-                        LDTM.16x256b.x4 in this configuration is not
-                        independently documented here; we trust the memory
-                        note (project_lever_c_bugs_confirmed.md) that this
-                        variant is stmatrix-native.  Bias lookup and STSM
-                        destination addresses below are computed assuming
-                        lane t=8c+r holds, in fp32 order, 8 cols of rows r
-                        and r+8 (for LDTM #1; +16 rows for LDTM #2).
-                        Actual TMEM routing may differ — TRUST B200 FIRST
-                        RUN to confirm, and fix routing if row_t_bias or
-                        STSM address math is wrong.
+                      LDTM #1 covers rows [0..15] of the 32-row rh block;
+                      LDTM #2 (tmem addr offset +16<<16) covers rows 16..31
+                      with the same layout shape.
+
+                      STSM.x4.m8n8 (non-trans) semantics:
+                        Lane t=8m+r provides address for matrix m row r.
+                        Lane t's reg #m (m in 0..3) contributes 2 bf16 at
+                        matrix m row t/4 cols 2(t%4), 2(t%4)+1.
+                      For lane t=4j+i: reg #m goes to matrix m row j cols
+                      2i, 2i+1.  Placing matrix m at SMEM cols 8m..8m+7
+                      yields SMEM(row j, col 8m+2i, col 8m+2i+1) = reg #m's
+                      two bf16 values = LDTM(row j, col 2i+8m, col 2i+8m+1).
+                      IDENTITY.  Therefore reg #m per lane must be
+                      pack(a[4m], a[4m+1]) for r_hi=0 (STSM writing rows
+                      j = 0..7) and pack(a[4m+2], a[4m+3]) for r_hi=1 (STSM
+                      writing rows j+8 = 8..15).
                     */
                     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
                     TMEM_LOAD_16X256_X4(a0,a1,a2,a3,a4,a5,a6,a7,
@@ -812,73 +815,81 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     TMEM_WAIT();
 
                     /*
-                      F2FP.PACK_AB pairs adjacent fp32 → 1 bf16x2, matching
-                      rank-1's packing shape.  We fold the bias add into the
-                      pack via a 3-operand inline sequence (cvt + add).  For
-                      a rank-1-shape SASS we could switch to FFMA2/FADD on
-                      fp32 first, then F2FP.PACK — functionally identical
-                      modulo rounding order, but closer to rank-1's insn
-                      mix (Grievance 1, for future if fused-residual).
-
-                      Per-lane bias load.  For LDTM.16x256b.x4, lane t=8c+r
-                      is assumed to own 8 contiguous cols
-                      (nc + 8c .. nc + 8c + 7).  4 bf16x2 bias values cover
-                      those 8 cols; same 4 reused across the two 8-row
-                      bands of the rh (rows within a band share col
-                      assignment).  Load with per-lane divergent
-                      LDS.v4.u32 directly from SMEM bias — avoids the
-                      stack spill a bp_lane[] array-index would otherwise
-                      trigger on ptxas.  Lane->col mapping is unverified;
-                      B200 first run will reveal any permutation.
+                      Per-lane bias load.  Lane t=4j+i owns cols {2i, 2i+1,
+                      2i+8, 2i+9, 2i+16, 2i+17, 2i+24, 2i+25} — packed into
+                      4 bf16x2 (bl0..bl3) at col pairs (2i, 2i+1), (2i+8,
+                      2i+9), (2i+16, 2i+17), (2i+24, 2i+25).  Base offset
+                      = (prev_n + nc + 2i) * 2 bytes; four loads at stride
+                      16 bytes (8 bf16).  Four LDS.U32 instead of one
+                      LDS.128 because the 4 target bf16x2 are not
+                      contiguous in SMEM (16-byte stride, not 4-byte).
                     */
+                    const int lane_i = lane & 3;
                     const int lane_c = lane >> 3;
                     const int lane_r = lane & 7;
                     uint32_t bl0, bl1, bl2, bl3;
-                    asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(bl0), "=r"(bl1), "=r"(bl2), "=r"(bl3)
-                        : "r"(smem_bias + (prev_n + nc + lane_c * 8) * 2));
+                    asm volatile("ld.shared.u32 %0, [%1];"
+                        : "=r"(bl0)
+                        : "r"(smem_bias + (prev_n + nc + 2 * lane_i +  0) * 2));
+                    asm volatile("ld.shared.u32 %0, [%1];"
+                        : "=r"(bl1)
+                        : "r"(smem_bias + (prev_n + nc + 2 * lane_i +  8) * 2));
+                    asm volatile("ld.shared.u32 %0, [%1];"
+                        : "=r"(bl2)
+                        : "r"(smem_bias + (prev_n + nc + 2 * lane_i + 16) * 2));
+                    asm volatile("ld.shared.u32 %0, [%1];"
+                        : "=r"(bl3)
+                        : "r"(smem_bias + (prev_n + nc + 2 * lane_i + 24) * 2));
 
+                    /*
+                      Pack+bias-add into STSM.x4 reg groups.  Each group
+                      of 4 regs (p[k..k+3]) holds the 4 matrices' per-
+                      lane bf16x2 slots for one 8-row STSM call.  Bias
+                      is row-invariant, so same bl[m] applies to all 4
+                      row bands within a rh.
+                    */
                     uint32_t p[16];
+                    /* STSM #1: rows row_local_32+0..7  (LDTM#1, r_hi=0, j) */
                     CVT_ADD_BF16X2(p[ 0], a0,  a1,  bl0);
-                    CVT_ADD_BF16X2(p[ 1], a2,  a3,  bl1);
-                    CVT_ADD_BF16X2(p[ 2], a4,  a5,  bl2);
-                    CVT_ADD_BF16X2(p[ 3], a6,  a7,  bl3);
-                    CVT_ADD_BF16X2(p[ 4], a8,  a9,  bl0);
-                    CVT_ADD_BF16X2(p[ 5], a10, a11, bl1);
-                    CVT_ADD_BF16X2(p[ 6], a12, a13, bl2);
+                    CVT_ADD_BF16X2(p[ 1], a4,  a5,  bl1);
+                    CVT_ADD_BF16X2(p[ 2], a8,  a9,  bl2);
+                    CVT_ADD_BF16X2(p[ 3], a12, a13, bl3);
+                    /* STSM #2: rows +8..15  (LDTM#1, r_hi=1, j+8) */
+                    CVT_ADD_BF16X2(p[ 4], a2,  a3,  bl0);
+                    CVT_ADD_BF16X2(p[ 5], a6,  a7,  bl1);
+                    CVT_ADD_BF16X2(p[ 6], a10, a11, bl2);
                     CVT_ADD_BF16X2(p[ 7], a14, a15, bl3);
+                    /* STSM #3: rows +16..23  (LDTM#2, r_hi=0, 16+j) */
                     CVT_ADD_BF16X2(p[ 8], b0,  b1,  bl0);
-                    CVT_ADD_BF16X2(p[ 9], b2,  b3,  bl1);
-                    CVT_ADD_BF16X2(p[10], b4,  b5,  bl2);
-                    CVT_ADD_BF16X2(p[11], b6,  b7,  bl3);
-                    CVT_ADD_BF16X2(p[12], b8,  b9,  bl0);
-                    CVT_ADD_BF16X2(p[13], b10, b11, bl1);
-                    CVT_ADD_BF16X2(p[14], b12, b13, bl2);
+                    CVT_ADD_BF16X2(p[ 9], b4,  b5,  bl1);
+                    CVT_ADD_BF16X2(p[10], b8,  b9,  bl2);
+                    CVT_ADD_BF16X2(p[11], b12, b13, bl3);
+                    /* STSM #4: rows +24..31  (LDTM#2, r_hi=1, 24+j) */
+                    CVT_ADD_BF16X2(p[12], b2,  b3,  bl0);
+                    CVT_ADD_BF16X2(p[13], b6,  b7,  bl1);
+                    CVT_ADD_BF16X2(p[14], b10, b11, bl2);
                     CVT_ADD_BF16X2(p[15], b14, b15, bl3);
 
                     /*
-                      STSM per-lane address: lane t=8c+r supplies the 16B
-                      row-of-matrix-c slot in a 512B stmatrix tile.  To
-                      produce a linear row-major SMEM layout with row
-                      stride 64B (= 32 bf16 cols) and matrix c occupying
-                      cols (8c..8c+7), we pass:
-                        addr_lane = base + (row_start + r) * 64 + c * 16.
-                      Each STSM covers 8 rows; 4 STSMs cover 32 rows.
-
-                      addr uses row_local_32 + {0,8,16,24} for the 8-row
-                      starting offset of each STSM.
+                      STSM address per-lane: lane t=8m+r supplies addr for
+                      matrix m row r.  Row-major 32-col output with row
+                      stride 64 bytes (= 32 bf16) and matrix m at byte
+                      offset 16m within a row →
+                        addr = out_base + (row_start + r) * 64 + m * 16
+                      Row_start = row_local_32 + 8*stsm_idx for stsm_idx
+                      in 0..3.
                     */
                     const uint32_t out_base = out_smem_arr[es];
                     const uint32_t lane_off = lane_r * (SUBPASS_COLS * 2)
                                             + lane_c * 16;
-                    STSM_X4_TRANS(out_base + (row_local_32 +  0) * (SUBPASS_COLS * 2) + lane_off,
-                                  p[0], p[1], p[2], p[3]);
-                    STSM_X4_TRANS(out_base + (row_local_32 +  8) * (SUBPASS_COLS * 2) + lane_off,
-                                  p[4], p[5], p[6], p[7]);
-                    STSM_X4_TRANS(out_base + (row_local_32 + 16) * (SUBPASS_COLS * 2) + lane_off,
-                                  p[8], p[9], p[10], p[11]);
-                    STSM_X4_TRANS(out_base + (row_local_32 + 24) * (SUBPASS_COLS * 2) + lane_off,
-                                  p[12], p[13], p[14], p[15]);
+                    STSM_X4(out_base + (row_local_32 +  0) * (SUBPASS_COLS * 2) + lane_off,
+                            p[0], p[1], p[2], p[3]);
+                    STSM_X4(out_base + (row_local_32 +  8) * (SUBPASS_COLS * 2) + lane_off,
+                            p[4], p[5], p[6], p[7]);
+                    STSM_X4(out_base + (row_local_32 + 16) * (SUBPASS_COLS * 2) + lane_off,
+                            p[8], p[9], p[10], p[11]);
+                    STSM_X4(out_base + (row_local_32 + 24) * (SUBPASS_COLS * 2) + lane_off,
+                            p[12], p[13], p[14], p[15]);
 #else
                     float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
                     float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
