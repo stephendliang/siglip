@@ -210,9 +210,12 @@ cyc/iter, per `PROFILE_W5`). Tensor pipe 95.84% active. Every store-side / epilo
 dispatch lever tried since lands ±3 µs noise. See `docs/W3X_GRIEVANCES_VS_RANK1.md`
 for 9 remaining SASS deltas (15-25 µs total upside).
 
-**Active:** Lever C (USE_STMATRIX=1) — `bcce329` layout fix matches rank-1 SASS opcode
-mix (STS.128 4→0, STSM.16.M88.4 0→4, regs 64→54). UNVERIFIED on B200; pure
-diagnostic value if it passes (no perf upside expected).
+**Lever C** (USE_STMATRIX=1) — `bcce329` layout fix matches rank-1 SASS opcode mix
+(STS.128 4→0, STSM.16.M88.4 0→4, regs 64→53). B200 n=10 (2026-04-25): PASS,
+mean 1.0039 ± 0.0004 ms vs base 1.0043 ± 0.0002 ms. Δ = −0.4 µs (Welch t≈2.8
+on within-batch σ; under project ±3 µs noise threshold and likely inside
+session-correlated jitter). Treat as at-baseline; SASS-shape match is the
+real win, perf is a noise-floor coin-flip.
 
 **Next:** port `fc2_w3x` from bias-only to fused-residual (production target).
 
@@ -228,8 +231,12 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
 - **Hand-written PTX `fc2_w3x.ptx`:** byte-identical SASS to nvcc emission. PTX ISA
   has no uniform-register type; ptxas owns R-vs-UR placement. PTX escape hatch does
   not exist. Frozen at `fc2-w3x-ptx`.
-- **K-loop `#pragma unroll 1`:** 6× SASS shrink (9805→1645 lines) but +200 µs wall.
-  Full-unroll gives ptxas cross-ki scheduling freedom. Reverted in `31ad6cb`. Don't re-roll.
+- **K_UNROLL partial-unroll** (Apr 25, B200 n=3 sweep): u1/u2/u3/u4/u8 all regress
+  87–197 µs (UIADD3=7, regs=66 — UR datapath collapses on non-N_STAGES-multiples).
+  u6/u12/u24 tie default within 0.4 µs (UR on, regs=64). Explicit `K_UNROLL=24`
+  shrinks SASS 39% (10029→6077 lines) at parity wall — free cleanup. Default
+  variance anomalously wide (max−min=7.9 µs on n=3) — n=10 re-test open.
+  See `memory/project_k_unroll_sweep.md`.
 - **fc2_w3x post-WIN levers (all ±3 µs or regression):** subpass 8→4, cross-tile TMA
   carry, SWIZZLE_64B, NS_EPI sweep, EPI_2WARP, DROP_TRAIL_BARSYNC, WAIT_GROUP_READ,
   DROP_LEAD_BARSYNC, XPF_A/B prefetch, CHET/PMIX/INGH hybrid dispatches, 11 non-dgsw
@@ -245,7 +252,7 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
 ```bash
 # FC2 BIAS_ONLY (BEST — beats cuBLASLt rank-1)
 make fc2-w3x && ./fc2-w3x                        # 1.007 ms
-make fc2-w3x-stsm && ./fc2-w3x-stsm              # Lever C USE_STMATRIX — UNVERIFIED
+make fc2-w3x-stsm && ./fc2-w3x-stsm              # Lever C USE_STMATRIX — at-baseline (n=10)
 make fc2-w3x-ptx                                 # hand-written PTX, byte-identical SASS
 
 # fc2_w3x sweeps + diagnostics
