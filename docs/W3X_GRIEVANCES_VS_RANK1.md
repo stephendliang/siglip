@@ -14,9 +14,11 @@ have been investigated since; section 1 below summarizes status. The
 forward-looking content is sections 2-4: Tier 1-3 untested strategies
 ranked by upside/effort.
 
-Reference SASS: `rank1.sass` is a `cuda-gdb` dump of the rank-2 listing
-(`128x256 NS=6 2x1 2cta`, the architectural twin) captured 2026-04-19.
-Header decodes:
+Reference SASS: `rank1.sass` is a `cuda-gdb` dump of cuBLASLt listing 2
+(`128x256 NS=6 2x1 2cta`, the architectural twin of fc2_w3x) captured
+2026-04-19. Used as a *data point* on alternative design choices, not
+as a target — fc2_w3x at 1.007 ms beats both rank-1 listings (listing 1
+at 1.0454, listing 2 at 1.0457). Header decodes:
 ```
 nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_bias_TNT
   <<<(21756,1,1),(256,1,1)>>>   cluster dim (2,1,1)
@@ -27,10 +29,14 @@ nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_bias_TNT
 - 21756 CTAs = 10878 clusters = `TOTAL_TILES` exactly: rank-1 launches
   **one cluster per tile, non-persistent** (~74 waves to drain). We
   use 73 persistent clusters that loop over tiles. Different scheduling
-  model — see Tier 3 #4.
+  model — see Tier 3 #4. Note: this scheduling alone doesn't make
+  rank-1 faster; it loses 39 µs to us anyway. The relevant question is
+  whether non-persistent + our hand-tuned per-tile work would be faster
+  than our current persistent kernel.
 
-Top heuristic listing 1 (`176x128 NS=8 1x2 2cta`) is a different tile
-shape — see Tier 1 #1.
+Listing 1 (`176x128 NS=8 1x2 2cta`) is a different tile shape — see
+Tier 1 #1. Reference target is the **hardware MMA-retirement floor**
+(0.896 ms base, 0.827 ms boost), not rank-1.
 
 ## 1. SASS-level grievances — exhausted
 
@@ -59,11 +65,13 @@ shape, cluster topology, register budget, dispatch model, or MMA shape.
 
 ### Strategy 1.1 — Tile shape sweep with deeper NS
 
-Rank-1's listing 1 (the actual top cuBLASLt heuristic, 0.3 µs faster than
-listing 2) is **`176x128 NS=8 1x2 2cta`**. We've only matched listing 2
-(`128x256 NS=6 2x1 2cta`, our exact geom). Listing 1 uses a deeper
-pipeline (NS=8) at a smaller tile (176x128), which trades total-tiles for
-TMA-latency hiding.
+We've only ever benched fc2_w3x at one shape: `128x256 NS=6 2x1 2cta`
+(per-CTA 128x256, cluster output 256x256). cuBLASLt listing 1
+(`176x128 NS=8 1x2 2cta`) is a different point in the design space —
+smaller per-CTA tile, deeper pipeline, N-axis cluster split. cuBLASLt
+itself runs slower than fc2_w3x at both shapes, so this isn't about
+mimicking — it's about whether deeper NS at a smaller tile would let
+*our* hand-tuned per-tile work hide more TMA latency.
 
 **Why it's a lever:** at 256x256 NS=6, each pipeline stage holds 256x128 A
 + 256x128 B in FP8 = ~64 KB per stage × 6 stages ≈ 227 KB of 228 KB SMEM
@@ -229,33 +237,42 @@ metadata staging.
 
 ### Strategy 3.4 — Non-persistent dispatch (one cluster per tile)
 
-Confirmed via `rank1.sass`: cuBLASLt launches **one cluster per tile,
-non-persistent** — grid (21756,1,1) = 10878 clusters across ~74 waves.
-We use 73 persistent clusters that loop over `tiles_per_cluster=149`
-tiles each. Same total work; different scheduling model.
+We chose persistent dispatch (73 clusters × 149 tiles each) early in
+fc2_w3x's life and never sweeped the alternative. Non-persistent =
+launch one cluster per tile, ~74 waves drain via HW scheduler.
+Different scheduling model in the design space, untested for fc2_w3x.
+
+cuBLASLt and CUTLASS both happen to use non-persistent — and both
+land slower than us (rank-1 +39 µs, CUTLASS-static +185 µs) — so the
+*model itself* clearly isn't a free win; epilogue/MMA throughput
+dominate. The question is whether non-persistent + our hand-tuned
+per-tile work would beat our current persistent.
 
 **Why it might be a lever:**
 - Hardware scheduler picks cluster→SM placement per launch. Non-
   persistent gets fresh L2-aware placement each wave; persistent
-  locks in placement at kernel launch and never rebalances.
+  locks in placement at kernel launch and never rebalances. At
+  10878 clusters / 74 waves = 147 cluster placements per wave,
+  driver may stagger L2 sets better than our static tile-dispatch
+  scheme can.
 - Tile-boundary state (mbarrier rotates, register reset, TMEM dealloc)
   is amortized differently. Persistent stages 6 K-iters of next tile
   inside current epilogue (PREFILL); non-persistent has cleaner tile
   starts but pays full launch overhead per cluster.
-- 95.84% tensor active in our kernel says staging is the gap — and
-  staging is exactly where these two models differ.
+- 95.84% tensor active says staging is the gap — and staging is
+  exactly where these two models differ.
 
 **Why it might not be:**
-- We have a CUTLASS reference at 1.244 ms (185 µs *slower* than us)
-  which uses non-persistent + tile-bijection + cluster cooperative
-  load. Tells us non-persistent isn't free; epilogue throughput
-  matters more.
 - Persistent kernel's main win is PREFILL (10 µs at K=3072 per
   CLAUDE.md). Going non-persistent loses that, has to be made up
   by better placement or cleaner pipeline drain.
 - 10878 cluster launches × per-launch overhead (~few hundred ns?)
-  is a real tax. cuBLASLt absorbs this because their per-tile work
-  is heavier; ours is leaner.
+  is a real tax. cuBLASLt and CUTLASS absorb this because their
+  per-tile work is heavier; ours is leaner, so the launch tax bites
+  proportionally harder.
+- Our static dispatch (dgswizzle TD=8) already hits 67.65% L2 hit
+  rate with 1.043× DRAM amp. Driver-managed placement would have to
+  beat that to recover the launch overhead.
 
 **Cost:**
 - Strip the persistent loop: `for (int tt = 0; tt < tiles_per_cluster;
@@ -264,8 +281,7 @@ tiles each. Same total work; different scheduling model.
   `cluster_id + tt * num_clusters` formula).
 - Disable PREFILL (`#undef PREFILL` or auto-guard tightens since
   `tiles_per_cluster=1` triggers the K_ITERS<20 short-circuit anyway).
-- Grid becomes `(2 * TOTAL_TILES, 1, 1) = (21756, 1, 1)` to match
-  rank-1.
+- Grid becomes `(2 * TOTAL_TILES, 1, 1) = (21756, 1, 1)`.
 
 **Realistic upside:** plausibly 10-30 µs if HW scheduler placement is
 materially better non-persistent; plausibly negative if launch
@@ -283,13 +299,17 @@ or full geometry shift), not an additive cleanup.
 
 The honest cap on incremental work: ~30 µs from current 1.007 ms.
 
-## What rank-1 does that we shouldn't necessarily copy
+## Structural differences from rank-1
 
-- 557 more BRA when fully unrolled — wanted only if i-cache pressure
+Listed for awareness, not as targets to chase. fc2_w3x beats rank-1
+by 39 µs at our shape — these differences haven't held us back. They
+matter only as data points on alternative design choices.
+
+- 557 more BRA when fully unrolled — only relevant if i-cache pressure
   becomes load-bearing.
-- 32 STSM ops — only wanted via Lever C, which is at-baseline.
-- Tight looped K-body — possibly bad for persistent-kernel tail
-  overlap (irrelevant if we adopt Tier 3 #4 non-persistent).
-- Non-persistent dispatch — TBD; see Tier 3 #4. Could be a win or
-  a wash; CUTLASS-static (also non-persistent) loses 185 µs to us
-  on the same shape, suggesting non-persistent alone isn't the lever.
+- 32 STSM ops — Lever C lands the same shape and is at-baseline.
+- Tight looped K-body — explored via K_UNROLL sweep; tied default at
+  multiples-of-NS, regressed at non-multiples.
+- Non-persistent dispatch — see Tier 3 #4. Both rank-1 and CUTLASS
+  use it; both lose to us. So it's not a free win. Whether it pairs
+  with our hand-tuned per-tile work for a net gain is open.
