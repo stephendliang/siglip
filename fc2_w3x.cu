@@ -63,41 +63,6 @@
 #define TOTAL_TILES (TILES_M * TILES_N)
 #define K_ITERS     (K_DIM / TK)
 
-#ifndef CLUSTER_AXIS
-#define CLUSTER_AXIS 0
-#endif
-#if CLUSTER_AXIS == 0
-#define CLUSTER_DIMS_DECL __cluster_dims__(CLUSTER_CTAS, 1, 1)
-#define CLUSTER_GRID      dim3(SM_COUNT, 1, 1)
-#define CLUSTER_DIM_X     CLUSTER_CTAS
-#define CLUSTER_DIM_Y     1
-#define CLUSTER_DIM_Z     1
-#define CLUSTER_BLOCK_LIN (blockIdx.x)
-#elif CLUSTER_AXIS == 1
-#define CLUSTER_DIMS_DECL __cluster_dims__(1, CLUSTER_CTAS, 1)
-#define CLUSTER_GRID      dim3(1, SM_COUNT, 1)
-#define CLUSTER_DIM_X     1
-#define CLUSTER_DIM_Y     CLUSTER_CTAS
-#define CLUSTER_DIM_Z     1
-#define CLUSTER_BLOCK_LIN (blockIdx.y)
-#elif CLUSTER_AXIS == 2
-#define CLUSTER_DIMS_DECL __cluster_dims__(1, 1, CLUSTER_CTAS)
-#define CLUSTER_GRID      dim3(1, 1, SM_COUNT)
-#define CLUSTER_DIM_X     1
-#define CLUSTER_DIM_Y     1
-#define CLUSTER_DIM_Z     CLUSTER_CTAS
-#define CLUSTER_BLOCK_LIN (blockIdx.z)
-#else
-#error "CLUSTER_AXIS must be 0, 1, or 2"
-#endif
-
-__device__ __forceinline__ uint32_t mapa_to_cta0(uint32_t local_smem) {
-    uint32_t peer;
-    asm("mapa.shared::cluster.u32 %0, %1, %2;"
-        : "=r"(peer) : "r"(local_smem), "r"(0u));
-    return peer;
-}
-
 #ifdef K_UNROLL
 #define _DO_PRAGMA1(x) _Pragma(#x)
 #define _DO_PRAGMA(x)  _DO_PRAGMA1(x)
@@ -623,7 +588,7 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc, int32_t c0, int32
 */
 
 __global__ void __launch_bounds__(THREADS, 1)
-CLUSTER_DIMS_DECL
+__cluster_dims__(2, 1, 1)
 fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                const __grid_constant__ CUtensorMap tma_b,
                const __grid_constant__ CUtensorMap tma_c,
@@ -718,7 +683,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         smem_b_arr[s]      = smem_to_uint(smem + s * STAGE_BYTES + 16384);
         uint32_t tf_local  = smem_to_uint(smem + MBAR_TMA_FULL + s * 8);
         tma_full_arr[s]    = tf_local;
-        tma_full_peer_arr[s] = mapa_to_cta0(tf_local);
+        tma_full_peer_arr[s] = tf_local & 0xFEFFFFFFu;
         tma_empty_arr[s]   = smem_to_uint(smem + MBAR_TMA_EMPTY + s * 8);
     }
 
@@ -732,11 +697,11 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 
 #ifdef NO_PREFILL
     const uint32_t mbar_tmem_consumed_base = smem_to_uint(smem + MBAR_TMEM_CONSUMED);
-    const uint32_t mbar_tmem_cons_peer_base = mapa_to_cta0(mbar_tmem_consumed_base);
+    const uint32_t mbar_tmem_cons_peer_base = mbar_tmem_consumed_base & 0xFEFFFFFFu;
 #endif
 
     const int num_clusters = SM_COUNT / CLUSTER_CTAS;
-    const int cluster_id   = CLUSTER_BLOCK_LIN / CLUSTER_CTAS;
+    const int cluster_id   = blockIdx.x / CLUSTER_CTAS;
     const int tiles_per_cluster = (TOTAL_TILES + num_clusters - 1) / num_clusters;
 
     if (warp_id < N_EPI_WARPS) {
@@ -1519,25 +1484,10 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemset(d_dbg_prof_w5, 0, prof_w5_bytes));
 #endif
 
-    dim3 grid = CLUSTER_GRID;
-
-    cudaLaunchAttribute cluster_attrs[1];
-    cluster_attrs[0].id = cudaLaunchAttributeClusterDimension;
-    cluster_attrs[0].val.clusterDim.x = CLUSTER_DIM_X;
-    cluster_attrs[0].val.clusterDim.y = CLUSTER_DIM_Y;
-    cluster_attrs[0].val.clusterDim.z = CLUSTER_DIM_Z;
-
-    cudaLaunchConfig_t launch_cfg = {};
-    launch_cfg.gridDim          = grid;
-    launch_cfg.blockDim         = dim3(THREADS, 1, 1);
-    launch_cfg.dynamicSmemBytes = SMEM_BYTES;
-    launch_cfg.stream           = 0;
-    launch_cfg.attrs            = cluster_attrs;
-    launch_cfg.numAttrs         = 1;
-
+    dim3 grid(SM_COUNT, 1, 1);
 #define LAUNCH_KERNEL() \
-    CUDA_CHECK(cudaLaunchKernelEx(&launch_cfg, fc2_w3x_kernel, \
-        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_dbg_prof, d_dbg_prof_ki, d_dbg_prof_tile, d_dbg_prof_w5))
+    fc2_w3x_kernel<<<grid, THREADS, SMEM_BYTES>>>( \
+        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_dbg_prof, d_dbg_prof_ki, d_dbg_prof_tile, d_dbg_prof_w5)
 
 #ifdef NCU_PROFILE
     const int N_WARMUP = 1;
