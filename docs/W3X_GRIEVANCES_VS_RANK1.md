@@ -1,244 +1,232 @@
-# fc2_w3x grievances vs cuBLASLt rank-1
+# fc2_w3x — what's left to try
 
-Status: fc2_w3x beats rank-1 by 39 µs (1.007 ms vs 1.046 ms) on FC2 K=3072
-BIAS_ONLY. Tensor pipe 95.84% active, so absolute non-tensor idle ceiling is
-~43 µs. Most grievances below are code-quality issues with small-to-zero
-perf upside in this regime, because the pipes they run on already have slack.
-Listed anyway so future-us knows what to try first if the critical path
-shifts (e.g., after a fused-residual port that adds epilogue work).
+Status (2026-04-25): fc2_w3x bias-only at 1.007 ms, beats cuBLASLt rank-1
+(1.046 ms) by 39 µs on FC2 K=3072. W5 MMA-ceiling-bound at ~12482 cyc/tile
+≈ 24 × 520 cyc/iter. Tensor pipe 95.84% active → 43 µs absolute non-tensor
+slack. Hardware MMA-retirement floor 0.896 ms (base) / 0.827 ms (boost).
+Gap to floor: ~100 µs (base), 180 µs (boost). Per ncu, that's "staging +
+pipeline bubbles, not compute-bound" — the regime where structural topology
+changes pay off and SASS cleanups don't.
 
-Opcode counts are from `cuobjdump --dump-sass fc2-w3x` vs local
-`rank1.sass` (128x256 NS=6 2x1 2cta variant, the architectural twin).
+This doc was originally a list of 9 SASS-level deltas vs rank-1's
+`128x256 NS=6 2x1 2cta` listing (architectural twin of our kernel). All 9
+have been investigated since; section 1 below summarizes status. The
+forward-looking content is sections 2-4: Tier 1-3 untested strategies
+ranked by upside/effort.
 
-## Grievance 1 — no packed BF16/FP32 epilogue ops
+Reference SASS: `rank1.sass` (cuBLASLt rank-2 listing, the architectural
+twin). Top heuristic listing 1 (`176x128 NS=8 1x2 2cta`) is structurally
+different — see Tier 1 #1.
 
-| opcode | rank1 | w3x |
-|---|---|---|
-| FFMA2  | 256   | 0   |
-| FADD   | 256   | 32  |
-| F2FP   | 128   | 16  |
+## 1. SASS-level grievances — exhausted
 
-Rank-1's epilogue computes `acc[0:1] + bias[0:1]` with one `FFMA2` and
-converts 2 fp32 lanes to bf16x2 with one `F2FP.PACK`. We emit scalar
-`FADD` + scalar `F2FP`, one column at a time. ~8× more epilogue math
-insts than rank-1.
+| # | Grievance | Status | Verdict |
+|---|---|---|---|
+| G1 | No packed BF16 epilogue (FFMA2/F2FP.PACK) | Implemented (`native BF16 epilogue`) | DEAD as wall lever (±0 µs, cleaner) |
+| G2 | No stmatrix (STSM) | Lever C `bcce329` lands SASS shape match | At-baseline n=10 (Δ −0.4 µs ≈ noise floor) |
+| G3 | Per-thread IMAD addressing | Bundled with G4 | DEAD |
+| G4 | 495 R2UR round-trips | `dead_r2ur_elect_smem_fix.md` | DEAD — ptxas won't ULDS-promote inside `if(lane==0)`; UIADD3=706 already uses UR via constant prop |
+| G5 | Per-asm ELECT/BSSY/BSYNC scaffold | K-loop single-asm DEAD; **multi-block consolidation untested** | See Tier 2 #2 |
+| G6 | Fully-unrolled K-loop vs tight loop | K_UNROLL sweep B200 n=3 (Apr 25) | DEAD as wall lever; multiples-of-N_STAGES tie default, non-multiples regress 87–197 µs. Explicit `K_UNROLL=24` = 39% SASS shrink at parity wall |
+| G7 | NANOSLEEP count | Never tested as perf | Not a lever (fires on miss only) |
+| G8 | No ACQBULK fence | Never tested as perf | Code-cleanliness only |
+| G9 | TMA batch granularity | Never tested as perf | Revisit during fused-residual port |
 
-**Why it's probably not a perf lever**: FMA/FP32 and XU pipes have 43 µs
-of slack under the tensor-pipe ceiling. Cutting 320 scalar insts →
-~128 packed insts frees cycles on pipes that are already idle.
+**What this means:** the static-SASS-cleanup ceiling is now ~5-10 µs of
+remaining upside (G5 multi-block, possibly G7/G8/G9 if a future regime
+shift makes them load-bearing). The original 15-25 µs estimate baked in
+G2 (since proven noise-floor) and G4 (since proven structural).
 
-**When it would become one**: fused-residual port. Fused adds another
-bias+add per column. If we keep scalar ops, epilogue doubles. Packed
-keeps it at parity with current cycle count. Move here when porting
-to fused.
+To go materially below 1.007 ms, structural changes are needed: tile
+shape, cluster topology, register budget, dispatch model, or MMA shape.
 
-**Fix**: rewrite epilogue arith as `__hfma2` / `__hadd2` on bf16x2, or
-emit inline PTX `fma.rn.bf16x2` / `cvt.pack.bf16x2.sat.f32x2`.
+## 2. Tier 1 — structural changes, 5-15 µs upside, moderate effort
 
-## Grievance 2 — no stmatrix (STSM), plain STS instead
+### Strategy 1.1 — Tile shape sweep with deeper NS
 
-| opcode | rank1 | w3x |
-|---|---|---|
-| STSM | 32 | 0  |
-| STS  | 1  | 24 |
+Rank-1's listing 1 (the actual top cuBLASLt heuristic, 0.3 µs faster than
+listing 2) is **`176x128 NS=8 1x2 2cta`**. We've only matched listing 2
+(`128x256 NS=6 2x1 2cta`, our exact geom). Listing 1 uses a deeper
+pipeline (NS=8) at a smaller tile (176x128), which trades total-tiles for
+TMA-latency hiding.
 
-Rank-1 uses `stmatrix` to write TMEM→SMEM in a warp-cooperative pattern
-that matches TMA store box layout. We use plain STS after manual pack.
+**Why it's a lever:** at 256x256 NS=6, each pipeline stage holds 256x128 A
++ 256x128 B in FP8 = ~64 KB per stage × 6 stages ≈ 227 KB of 228 KB SMEM
+(NS=7 doesn't fit). At 128x256 (half the per-stage A bytes), NS=7-8
+should fit. Deeper NS = more in-flight TMA loads = better latency hide
+when MMA is faster than fill.
 
-Known blocker (see `project_lever_c_bugs_confirmed.md`): Lever C
-(`USE_STMATRIX=1`) fails because our `LDTM.32x32b.x32` reg layout
-doesn't line up with stmatrix's expected layout + address-swizzle
-collisions. Fix = swap to `LDTM.16dp256bit.x4` variant. Not attempted.
+**Why it might not be:** smaller tiles → more total tiles → more tile-
+launch overhead (BSSY/BSYNC, mbarrier rotates, scheduler atomicAdd).
+Persistent kernel amortizes some of this, but not all. Also, our 256x256
+choice was made because larger tiles minimize cluster-sync frequency on
+B operand multicast.
 
-**Perf upside**: uncertain. Our STS count is 24 per iter, not 192, so
-this is already reasonably consolidated. stmatrix would collapse
-24→~8–12 shared stores and may reduce barrier stalls on the SMEM port.
-Realistic: 5–10 µs if it works.
+**Sweep matrix:** (TM, TN, NS) ∈ {128, 256} × {128, 256} × {6, 7, 8},
+filter for SMEM ≤ 228 KB. ~9 valid configs. Each requires `make -B
+fc2-w3x DFLAGS='-DTM=... -DTN=... -DN_STAGES=...'` and a wall test.
 
-## Grievance 3 — per-thread addressing arithmetic
+**Constraint to verify per config:** kernel asserts `TOTAL_TILES %
+num_clusters == 0` (CLAUDE.md). Compute TOTAL_TILES = ceil(M_TOTAL /
+(TM × 2)) × ceil(N_DIM / TN) and confirm it's a multiple of 74 before
+queueing each build. Some shape combinations will fall out of the sweep
+on this constraint alone.
 
-| opcode | rank1 | w3x |
-|---|---|---|
-| IMAD  | 5   | 421 |
-| UIMAD | 58  | 0   |
-| UPRMT | 31  | 0   |
-| UISETP| 51  | 1   |
+**Realistic upside:** 5-15 µs if NS=7-8 fits and meaningfully deepens
+TMA-latency hide. Could be 0 if the smaller-tile launch overhead
+cancels the pipeline gain.
 
-Rank-1 does descriptor advance, tile offsets, and loop predicates on
-the uniform datapath (UR regs, UIMAD/UIADD3/UPRMT/UISETP). We compute
-the same math per-thread in R regs, duplicating work 32× across lanes
-of a warp.
+### Strategy 1.2 — Register-budget tuning via `__launch_bounds__` / `.maxnreg`
 
-**Why we got here**: most of our scalar math lives in C++ between
-`asm volatile` blocks. ptxas can lift it to UR only when it sees it's
-warp-uniform — which it does, mostly (`UIADD3 706`), but the R-side
-remains populated because several round-trips through R exist
-(see Grievance 4).
+The K_UNROLL sweep showed regs=64 vs 66 toggles wall by 100+ µs (the UR
+datapath gate). That's a side-effect observation, not a swept lever.
+Forcing ptxas to a different reg target via `__launch_bounds__(threads,
+min_blocks)` or PTX-level `.maxnreg N` could push it onto a different
+scheduling regime.
 
-**Perf upside**: ~0 cycles in this kernel. FMA pipe has slack; per-thread
-IMAD retires in the shadow. But it DOES eat R registers — 32 lanes ×
-N scalar regs. Fewer R regs would let ptxas schedule the real work
-better. Probably 1–2 µs if it helps at all.
+**Why it's a lever:** regs=64 at threads=192 already leaves slack — B200
+SM has 64K registers, 192 threads × 64 regs = 12K regs per CTA, well
+under the 64K cap. Forcing regs=48 or regs=80 changes ptxas's spill/fill
+calculus and can unlock different instruction schedules.
 
-## Grievance 4 — 495 R2UR round-trips
+**Sweep:** `__launch_bounds__(192, N)` for N ∈ {1, 2, 4, 8, 16}, then
+also raw `.maxnreg` values via PTX. ~10 builds, single-file change.
 
-| opcode | rank1 | w3x |
-|---|---|---|
-| R2UR | 3 | 495 |
+**Risk:** spill (regs too low) is a hard wall regression; relaxed regs
+(regs too high) eats SM occupancy. Only the sweet spot pays.
 
-We compute values in R and then broadcast to UR. Rank-1 keeps scalars
-uniform from the start. Each R2UR is a real cycle on the regular
-datapath.
+**Realistic upside:** 3-10 µs if there's a reg-budget the K_UNROLL
+sweep didn't accidentally hit. Highly uncertain — could be 0.
 
-**Why**: our inline PTX blocks take arguments as `"r"` (register)
-constraints. ptxas can't pass a `u` (uniform) value into an `r` slot,
-so it emits R2UR before every asm block that needs a uniform value.
+## 3. Tier 2 — validated paths, small wins
 
-**Fix**: change PTX operand constraints from `"r"` to `"u"` where the
-value is warp-uniform (tile index, descriptor base, SMEM offset
-constants). Touches every asm block in `fc2_w3x.cu`.
+### Strategy 2.1 — Explicit `K_UNROLL=24` as default
 
-**Perf upside**: small but real — 495 cycles × 147 tiles = ~73K
-cycles ≈ 37 µs *if* any of it is on the critical path. Probably only
-5–10% is on the critical path, so 2–4 µs realistic.
+The K_UNROLL sweep (Apr 25) flagged anomalous variance on the default
+build: max−min = 7.9 µs on n=3 vs ≤0.5 µs for u6/u12/u24. If the n=10
+re-test confirms the spread is real, switching the default build to
+explicit `K_UNROLL=24` saves 5-8 µs on outlier runs and 2-3 µs on
+means, plus delivers a 39% SASS shrink (10029→6077 lines) for free.
 
-## Grievance 5 — per-`asm volatile` ELECT/BSSY/BSYNC scaffolds
+**Test:** interleaved n=10 of `./fc2-w3x` (default) vs `./fc2-w3x` with
+`-DK_UNROLL=24` baked in. Split @@RESULTs by line parity to kill
+sequential drift.
 
-| opcode | rank1 | w3x |
-|---|---|---|
-| ELECT | 0 | 292 |
-| BSSY  | 0 | 79  |
-| BSYNC | 0 | 79  |
+**Decision:**
+- If variance gap is real → make `K_UNROLL=24` the Makefile default.
+- If gap collapses → keep default, treat the SASS shrink as cosmetic.
 
-Every `asm volatile` block in our source that's wrapped in a `@P0`
-predicate gets ptxas scaffolding: `BSSY` to set up a branch-sync
-region, `ELECT` to pick one lane, the PTX body, `BSYNC` to rejoin.
-~450 insts of pure scaffold.
+**Realistic upside:** 2-8 µs depending on what n=10 says.
 
-Rank-1 gets single-lane dispatch via `UGETNEXTWORKID` into a UR
-predicate (`UP0`) — one uniform check, no BSSY/BSYNC.
+### Strategy 2.2 — ASM block consolidation (Grievance 5 expanded)
 
-**Fix**: merge adjacent `asm volatile` blocks into fewer, larger PTX
-bodies so the scaffold amortizes. Currently we have ~10 separate asm
-blocks per tile in W4 and W5; merging to 3–4 would cut scaffold
-~3×.
+Each `asm volatile` block wrapped in a `@P0` predicate gets ptxas
+scaffolding: BSSY (start branch-sync region), ELECT (pick lane),
+PTX body, BSYNC (rejoin). w3x has 292 ELECT, 79 BSSY, 79 BSYNC →
+~450 insts of pure scaffold per kernel.
 
-**Perf upside**: scaffold is on the uniform/branch pipe. Limited
-critical-path overlap. Realistic: 3–5 µs if ALL of it is removed,
-proportionally less for partial merges.
+Memory says single-block merge in the K-loop has been done (DEAD, 0 µs).
+But fc2_w3x.cu has ~10 separate asm blocks per tile in W4+W5 outside the
+K-loop (descriptor advance, mbarrier ops, scheduler increment, epilogue
+TMEM loads, STS issues, fence emits). Consolidating to 3-4 larger PTX
+bodies would cut scaffold ~3×.
 
-## Grievance 6 — fully-unrolled K-loop vs tight-loop
+**Why it's a lever:** scaffold runs on the uniform / branch pipe, not
+tensor. Critical-path overlap is limited but nonzero — at 95.84% tensor
+active, 4.16% slack ≈ 43 µs. Some scaffold cycles fall into that slack;
+some fall on critical path during transitions (tile boundaries, store
+barriers).
 
-| opcode | rank1 | w3x |
-|---|---|---|
-| UTCQMMA | 8   | 192 |
-| BRA     | 87  | 557 |
+**Why it might not be:** the doc's original estimate was 3-5 µs, "pipe
+already has slack." That estimate stands.
 
-Rank-1 runs a tight 24-iter K-loop through a backward BRA with 8
-UTCQMMAs per pass. We fully unroll, emitting 192 UTCQMMAs static.
-That's 4.96K static inst count vs 1.63K for rank-1 — 3× bigger
-binary.
+**Cost:** invasive. Each merge needs careful PTX rewriting to preserve
+correctness across now-grouped operations (memory ordering, barrier
+semantics, register allocation across the larger asm body).
 
-**Not a runtime grievance** — the dynamic instruction stream is
-similar. But static bytes matter for i-cache footprint. 9.9K lines
-of SASS vs 1.65K for rank-1 means w3x might be hitting more i-cache
-misses on the first tile of the persistent loop.
+**Realistic upside:** 3-5 µs if all consolidation lands cleanly.
 
-**Fix**: add `#pragma unroll 4` (or 1 for no unroll) on the K-loop in
-W5. Would need to benchmark carefully — we rolled it up intentionally
-at some point to avoid an unrelated issue, check commit history
-before reverting.
+## 4. Tier 3 — high-effort structural rewrites
 
-**Perf upside**: ~0 after steady state (i-cache warm). Possibly 0.5–1 µs
-on the first few tiles of each launch, invisible at steady-state.
+### Strategy 3.1 — Stream-K dispatch with our hand-tuned per-tile body
 
-## Grievance 7 — NANOSLEEP count
+Persistent dispatch hits scheduling ceilings: cluster wavefront timing,
+tile-bijection L2 staggering, store-barrier overlap. Stream-K decomposes
+the K-axis across SMs and reduces partial accumulators, fundamentally
+different load-balancing model.
 
-| opcode | rank1 | w3x |
-|---|---|---|
-| NANOSLEEP | 17 | 76 |
+**Why it might be a lever:** at 1.007 ms / 1.046 ms (us / rank-1), both
+kernels are persistent. Stream-K is a different point in the design
+space — could expose pipeline parallelism that persistent doesn't.
 
-Our mbarrier `try_wait` loops spin with `nanosleep 0xc350` (50 µs)
-on failure. Rank-1 has fewer nanosleeps (17 vs 76), likely because
-its mbarrier phase predictions succeed more often on the fast path.
+**Why it might not be:** we have a CUTLASS-static reference that runs at
+1.244 ms (185 µs slower than us at parity tile shape). That suggests
+CUTLASS's epilogue is the bottleneck in their kernel, not their
+dispatch. Grafting our epilogue onto CUTLASS's dispatch would test
+whether stream-K's load balancing helps — but most CUTLASS infrastructure
+is incompatible with our hand-rolled tcgen05 pipeline.
 
-**Fix**: review each `try_wait` site. Some could be replaced with
-`mbarrier.wait` (hardware sleep, no polling) or have the nanosleep
-duration reduced.
+**Cost:** weeks of refactoring. Probably untestable without a partial
+CUTLASS dependency.
 
-**Perf upside**: nanosleep only fires on miss. Under warm-cluster
-steady-state, miss rate should be <1% per site. Not a lever.
+**Realistic upside:** highly uncertain. Could be 20+ µs if stream-K
+fundamentally outruns persistent at this M; could be a regression.
 
-## Grievance 8 — no ACQBULK fence after cluster barrier wait
+### Strategy 3.2 — Different MMA K-shape (K=64 or K=256 per iter)
 
-| opcode | rank1 | w3x |
-|---|---|---|
-| ACQBULK | 2 | 0 |
+Currently `tcgen05.mma.sync` with K=128 per iter, K_ITERS=24. The
+hardware MMA-retirement floor (460 cyc/iter at K=128) scales with K.
 
-Rank-1 emits `ACQBULK` (bulk-async acquire fence) after cluster
-barrier waits. We do not. ACQBULK serializes the bulk async proxy
-with subsequent ops. Our tile boundaries do a generic `fence.proxy.async`
-instead, which is broader and may be stricter than needed.
+**K=64** doubles iter count to 48, halves per-iter retirement (~230
+cyc), shortens the pipeline-bubble length. Could let NS effectively
+deepen for free (more iters, same staging). Risk: more iter-boundary
+overhead (descriptor advance, mbarrier toggle).
 
-Task #24 claims this was added, but the current kernel emits 0 ACQBULK.
-Either the task was reverted or the macro guarding it is off by default.
-Check `fc2_w3x.cu` for `#ifdef ACQBULK` or similar.
+**K=256** halves iter count to 12, doubles per-iter retirement (~920
+cyc). Risk: iter is now longer than TMA load, MMA blocks waiting for
+fill regardless of NS depth.
 
-**Perf upside**: unclear. Fence strength is usually secondary to fence
-placement. If we're already correct with the broader fence, switching
-to ACQBULK is a code-cleanliness change.
+**Why it might be a lever:** the 460→520 cyc/iter staging gap is
+bubbles between MMA dispatches. Shorter iters → shorter bubbles
+proportionally.
 
-## Grievance 9 — batched TMA ops with worse granularity
+**Cost:** every PTX MMA emission, descriptor sizing, and TMA box dim
+needs rewriting. Plus correctness re-validation.
 
-| opcode | rank1 | w3x |
-|---|---|---|
-| UTMALDG       | 5 | 48 |
-| UTMACMDFLUSH  | 8 | 1  |
-| UTMASTG       | 8 | 1  |
-| LDTM          | 16 | 1 |
+**Realistic upside:** unknown. Plausibly 5-20 µs; plausibly negative if
+the iter-overhead shift goes the wrong way.
 
-These look like grievances but some may be advantages. We batch TMA
-store into 1 large UTMASTG + 1 UTMACMDFLUSH; rank-1 issues 8 smaller
-ones. Same for LDTM (1 big vs 16 small). Both patterns are valid —
-batch reduces issue overhead, smaller chunks give finer arrival
-ordering to the epilogue.
+### Strategy 3.3 — W4 slack-time recovery via geometry change
 
-Only UTMALDG is clearly higher for us (48 vs 5). That's because we
-fully unroll TMA loads (K=24 iters × 2 ops ≈ 48) vs rank-1's looped
-body.
+PROFILE_W4 shows W4 53% idle (`empty_wait` 6558 cyc/tile, 53% of wall).
+Memory frames this as structural ("W5 backpressure, not W4 underused")
+in current geometry. But that finding is at 256x256 NS=6 2x1. New tile
+shape (Tier 1 #1) or cluster topology (Tier 1 #2) could shift the
+backpressure point — if W5 bound moves, W4 might gain real work.
 
-**Perf relevance**: if the fused-residual port adds a residual TMA
-load per tile, revisit batching to keep it at 1 op.
+**Why it depends on Tier 1:** can't unlock W4 slack while keeping the
+geometry that creates the W5 backpressure. Tier 1 #1 / #2 are
+prerequisites.
 
-## Priority ranking
-
-If a future change lands us in a regime where these matter (fused
-port, dispatch shift, K-scaling), attack in this order:
-
-1. **Grievance 1 (packed epilogue math)** — free win during fused
-   port, required if epilogue work doubles.
-2. **Grievance 4 (R2UR round-trips)** — most mechanical fix, just
-   change `"r"` to `"u"` operand constraints. 2–4 µs realistic.
-3. **Grievance 2 (stmatrix / Lever C)** — known work, known fix path,
-   5–10 µs if it works.
-4. **Grievance 5 (ELECT/BSSY scaffold)** — invasive (merge asm blocks)
-   but 3–5 µs on offer.
-5. **Grievance 3 (UR addressing)** — bundles with Grievance 4.
-6. Rest — cosmetic.
-
-## What rank-1 does that we shouldn't copy
-
-Not every delta is a grievance. Rank-1 has:
-
-- 557 more BRA instructions when fully unrolled — not wanted.
-- 32 STSM ops — only wanted if LDTM reg-layout fix lands.
-- Tight looped K-body — possibly bad for persistent-kernel tail overlap.
+**Realistic upside:** 5-15 µs if Tier 1 lands a geometry where W5 isn't
+the bottleneck, and W4 cycles can be re-pipelined for prefetch /
+metadata staging.
 
 ## Hard ceiling
 
-Don't forget: ncu reports tensor pipe 95.84% active. ~43 µs of
-absolute non-tensor idle. Adding all grievance fixes together
-(~15–25 µs realistic total) lands somewhere in the 0.985–0.995 ms
-range, not sub-950 µs. Closing to the hardware floor (~0.83 ms at
-boost, 0.90 ms at base) requires structural changes (wider tile,
-split-K, different epilogue topology), not SASS cleanups.
+Tensor pipe 95.84% active = absolute non-tensor idle ceiling 43 µs.
+Adding all Tier 1+2 fixes (~15-30 µs realistic total) lands somewhere in
+the **0.978-0.992 ms range**, not sub-950 µs. Closing further to the
+hardware floor (0.896 ms base / 0.827 ms boost) requires Tier 3 — a
+structural rewrite (stream-K, K-shape change, or full geometry shift),
+not an additive cleanup.
+
+The honest cap on incremental work: ~30 µs from current 1.007 ms.
+
+## What rank-1 does that we shouldn't copy
+
+- 557 more BRA when fully unrolled — wanted only if i-cache pressure
+  becomes load-bearing.
+- 32 STSM ops — only wanted via Lever C, which is at-baseline.
+- Tight looped K-body — possibly bad for persistent-kernel tail
+  overlap.
