@@ -63,6 +63,12 @@
 #define TOTAL_TILES (TILES_M * TILES_N)
 #define K_ITERS     (K_DIM / TK)
 
+#ifdef K_UNROLL
+#define _DO_PRAGMA1(x) _Pragma(#x)
+#define _DO_PRAGMA(x)  _DO_PRAGMA1(x)
+#define K_UNROLL_PRAGMA _DO_PRAGMA(unroll K_UNROLL)
+#endif
+
 #define N_STAGES       6
 #define NUM_EPI_STAGES 2
 #define NUM_SUBPASSES  (TN / 32)
@@ -994,6 +1000,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             const int a_m_tile = tm * 2 + cta_rank;
             const int b_n_half = tn * 2 + cta_rank;
 
+#ifdef K_UNROLL
+            K_UNROLL_PRAGMA
+#endif
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
                 if (ki >= N_STAGES || tt > 0) {
@@ -1143,6 +1152,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             uint64_t _tile_wait_sum = 0;
 #endif
 
+#ifdef K_UNROLL
+            K_UNROLL_PRAGMA
+#endif
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
 #if defined(PROFILE_KI) || defined(PROFILE_TILE)
