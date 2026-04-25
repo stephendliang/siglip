@@ -14,9 +14,23 @@ have been investigated since; section 1 below summarizes status. The
 forward-looking content is sections 2-4: Tier 1-3 untested strategies
 ranked by upside/effort.
 
-Reference SASS: `rank1.sass` (cuBLASLt rank-2 listing, the architectural
-twin). Top heuristic listing 1 (`176x128 NS=8 1x2 2cta`) is structurally
-different — see Tier 1 #1.
+Reference SASS: `rank1.sass` is a `cuda-gdb` dump of the rank-2 listing
+(`128x256 NS=6 2x1 2cta`, the architectural twin) captured 2026-04-19.
+Header decodes:
+```
+nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_bias_TNT
+  <<<(21756,1,1),(256,1,1)>>>   cluster dim (2,1,1)
+```
+- Grid `(21756, 1, 1)` = X-axis only. The `2x1` and `1x2` labels in
+  cuBLASLt kernel names are *logical* cluster shape; the actual grid
+  axis is always X. Confirmed empirically — see DEAD list below.
+- 21756 CTAs = 10878 clusters = `TOTAL_TILES` exactly: rank-1 launches
+  **one cluster per tile, non-persistent** (~74 waves to drain). We
+  use 73 persistent clusters that loop over tiles. Different scheduling
+  model — see Tier 3 #4.
+
+Top heuristic listing 1 (`176x128 NS=8 1x2 2cta`) is a different tile
+shape — see Tier 1 #1.
 
 ## 1. SASS-level grievances — exhausted
 
@@ -31,6 +45,7 @@ different — see Tier 1 #1.
 | G7 | NANOSLEEP count | Never tested as perf | Not a lever (fires on miss only) |
 | G8 | No ACQBULK fence | Never tested as perf | Code-cleanliness only |
 | G9 | TMA batch granularity | Never tested as perf | Revisit during fused-residual port |
+| — | Cluster-axis swap (Y/Z) | 2 attempts: bit-mask v1, mapa+cudaLaunchKernelEx v2 | DEAD — B200 runtime rejects (1,2,1)/(1,1,2) with "cluster misconfiguration". Hardware/driver constraint. rank-1 also uses X-axis (verified in `rank1.sass`) |
 
 **What this means:** the static-SASS-cleanup ceiling is now ~5-10 µs of
 remaining upside (G5 multi-block, possibly G7/G8/G9 if a future regime
@@ -200,17 +215,62 @@ the iter-overhead shift goes the wrong way.
 
 PROFILE_W4 shows W4 53% idle (`empty_wait` 6558 cyc/tile, 53% of wall).
 Memory frames this as structural ("W5 backpressure, not W4 underused")
-in current geometry. But that finding is at 256x256 NS=6 2x1. New tile
-shape (Tier 1 #1) or cluster topology (Tier 1 #2) could shift the
-backpressure point — if W5 bound moves, W4 might gain real work.
+in current geometry. But that finding is at 256x256 NS=6 2x1. A new
+tile shape (Tier 1 #1) could shift the backpressure point — if W5
+bound moves, W4 might gain real work.
 
-**Why it depends on Tier 1:** can't unlock W4 slack while keeping the
-geometry that creates the W5 backpressure. Tier 1 #1 / #2 are
-prerequisites.
+**Why it depends on Tier 1 #1:** can't unlock W4 slack while keeping
+the geometry that creates the W5 backpressure. Tile-shape sweep is a
+prerequisite.
 
 **Realistic upside:** 5-15 µs if Tier 1 lands a geometry where W5 isn't
 the bottleneck, and W4 cycles can be re-pipelined for prefetch /
 metadata staging.
+
+### Strategy 3.4 — Non-persistent dispatch (one cluster per tile)
+
+Confirmed via `rank1.sass`: cuBLASLt launches **one cluster per tile,
+non-persistent** — grid (21756,1,1) = 10878 clusters across ~74 waves.
+We use 73 persistent clusters that loop over `tiles_per_cluster=149`
+tiles each. Same total work; different scheduling model.
+
+**Why it might be a lever:**
+- Hardware scheduler picks cluster→SM placement per launch. Non-
+  persistent gets fresh L2-aware placement each wave; persistent
+  locks in placement at kernel launch and never rebalances.
+- Tile-boundary state (mbarrier rotates, register reset, TMEM dealloc)
+  is amortized differently. Persistent stages 6 K-iters of next tile
+  inside current epilogue (PREFILL); non-persistent has cleaner tile
+  starts but pays full launch overhead per cluster.
+- 95.84% tensor active in our kernel says staging is the gap — and
+  staging is exactly where these two models differ.
+
+**Why it might not be:**
+- We have a CUTLASS reference at 1.244 ms (185 µs *slower* than us)
+  which uses non-persistent + tile-bijection + cluster cooperative
+  load. Tells us non-persistent isn't free; epilogue throughput
+  matters more.
+- Persistent kernel's main win is PREFILL (10 µs at K=3072 per
+  CLAUDE.md). Going non-persistent loses that, has to be made up
+  by better placement or cleaner pipeline drain.
+- 10878 cluster launches × per-launch overhead (~few hundred ns?)
+  is a real tax. cuBLASLt absorbs this because their per-tile work
+  is heavier; ours is leaner.
+
+**Cost:**
+- Strip the persistent loop: `for (int tt = 0; tt < tiles_per_cluster;
+  tt++)` collapses to `tt = 0` execution.
+- Compute `cluster_id` from blockIdx.x directly (no
+  `cluster_id + tt * num_clusters` formula).
+- Disable PREFILL (`#undef PREFILL` or auto-guard tightens since
+  `tiles_per_cluster=1` triggers the K_ITERS<20 short-circuit anyway).
+- Grid becomes `(2 * TOTAL_TILES, 1, 1) = (21756, 1, 1)` to match
+  rank-1.
+
+**Realistic upside:** plausibly 10-30 µs if HW scheduler placement is
+materially better non-persistent; plausibly negative if launch
+overhead dominates. A clean-room rewrite path; ~half a day of work
+to get a working non-persistent variant.
 
 ## Hard ceiling
 
@@ -218,15 +278,18 @@ Tensor pipe 95.84% active = absolute non-tensor idle ceiling 43 µs.
 Adding all Tier 1+2 fixes (~15-30 µs realistic total) lands somewhere in
 the **0.978-0.992 ms range**, not sub-950 µs. Closing further to the
 hardware floor (0.896 ms base / 0.827 ms boost) requires Tier 3 — a
-structural rewrite (stream-K, K-shape change, or full geometry shift),
-not an additive cleanup.
+structural rewrite (stream-K, K-shape change, non-persistent dispatch,
+or full geometry shift), not an additive cleanup.
 
 The honest cap on incremental work: ~30 µs from current 1.007 ms.
 
-## What rank-1 does that we shouldn't copy
+## What rank-1 does that we shouldn't necessarily copy
 
 - 557 more BRA when fully unrolled — wanted only if i-cache pressure
   becomes load-bearing.
 - 32 STSM ops — only wanted via Lever C, which is at-baseline.
 - Tight looped K-body — possibly bad for persistent-kernel tail
-  overlap.
+  overlap (irrelevant if we adopt Tier 3 #4 non-persistent).
+- Non-persistent dispatch — TBD; see Tier 3 #4. Could be a win or
+  a wash; CUTLASS-static (also non-persistent) loses 185 µs to us
+  on the same shape, suggesting non-persistent alone isn't the lever.

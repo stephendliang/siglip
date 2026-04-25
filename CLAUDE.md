@@ -237,6 +237,13 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
   shrinks SASS 39% (10029→6077 lines) at parity wall — free cleanup. Default
   variance anomalously wide (max−min=7.9 µs on n=3) — n=10 re-test open.
   See `memory/project_k_unroll_sweep.md`.
+- **Cluster-axis swap** (Apr 25, 2 attempts): B200 runtime hard-rejects
+  `__cluster_dims__(1,2,1)` and `(1,1,2)` with "cluster misconfiguration",
+  even with `cudaLaunchKernelEx` + explicit `cudaLaunchAttributeClusterDimension`
+  + `mapa.shared::cluster` peer-addressing. cuBLASLt rank-1's `2x1`/`1x2`
+  notation is logical-shape labeling inside an X-axis grid (verified via
+  `rank1.sass`: grid (21756,1,1), cluster (2,1,1)). 2-CTA clusters are
+  X-axis-only on B200. See `memory/dead_cluster_axis_swap.md`.
 - **fc2_w3x post-WIN levers (all ±3 µs or regression):** subpass 8→4, cross-tile TMA
   carry, SWIZZLE_64B, NS_EPI sweep, EPI_2WARP, DROP_TRAIL_BARSYNC, WAIT_GROUP_READ,
   DROP_LEAD_BARSYNC, XPF_A/B prefetch, CHET/PMIX/INGH hybrid dispatches, 11 non-dgsw
