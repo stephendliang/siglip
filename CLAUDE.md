@@ -244,6 +244,14 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
   notation is logical-shape labeling inside an X-axis grid (verified via
   `rank1.sass`: grid (21756,1,1), cluster (2,1,1)). 2-CTA clusters are
   X-axis-only on B200. See `memory/dead_cluster_axis_swap.md`.
+- **KERN_3WARP merge** (Apr 25): merging W4 TMA-issuer into W5 MMA-issuer
+  (single combined warp on CTA0, software-pipelined offset N_STAGES−1)
+  regresses 1.006→1.172 ms (+166 µs, +16.5%) on B200, valid=1. Per-tile
+  ~12482→~14700 cyc (+90 cyc/iter on top of 525 cyc/iter MMA-throughput
+  floor). W4's measured `empty_wait` slack is mbar_wait sleep, not free
+  issue cycles — TMA-issue + wait_tma_empty serialize onto W5's instruction
+  stream. Structural warp-count floor is 4 (2 epi + W4 + W5). Commit
+  `e292107` kept as referenced dead-end. See `memory/dead_kern_3warp.md`.
 - **fc2_w3x post-WIN levers (all ±3 µs or regression):** subpass 8→4, cross-tile TMA
   carry, SWIZZLE_64B, NS_EPI sweep, EPI_2WARP, DROP_TRAIL_BARSYNC, WAIT_GROUP_READ,
   DROP_LEAD_BARSYNC, XPF_A/B prefetch, CHET/PMIX/INGH hybrid dispatches, 11 non-dgsw
