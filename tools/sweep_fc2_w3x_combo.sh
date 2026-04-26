@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# Three-cell head-to-head: the two fc2_w3x lever combos we still care
-# about after the n=5 + n=10 sweeps, *plus* baseline (no flags) measured
-# in the same interleaved run so clock / thermal / queue state is shared.
+# Four-cell head-to-head: baseline + the two cells from the prior
+# n=64 sweep + a no-EPI_2WARP variant to test whether the 2-warp
+# epilogue restructure is essential to the v10011 win (it isn't
+# portable to FC1's 7-warp epi layout).
 #
 #   base   = v00000 = (no flags)
 #   A      = v10011 = NO_BULK_MEMCLBR + DROP_LEAD_BARSYNC + EPI_2WARP
 #   B      = v01101 = WAIT_GROUP_READ + DROP_TRAIL_BARSYNC + EPI_2WARP
+#   C      = v10110 = NO_BULK_MEMCLBR + DROP_TRAIL + DROP_LEAD (no EPI_2WARP)
 #
-# A and B were the strongest cells across the prior runs (top-2 in the
-# n=5 follow-up: v10011 −1.00 µs, v01101 −0.80 µs vs baseline). Both
-# share EPI_2WARP. Including baseline as a third cell is the only way
-# to compare them against "no flags" without cross-run drift.
+# All four measured in pass-major interleave so they share clock /
+# thermal / queue state — no cross-session baseline drift.
 #
 # Each binary is built with -DCOMBO_QUICK (fast cudaMemset init,
 # N_WARMUP=1, N_TIMED_LAUNCHES=3, skip verify).
@@ -51,6 +51,7 @@ VARIANTS=(
     "vbase:0:"
     "v10011:19:-DNO_BULK_MEMCLBR -DDROP_LEAD_BARSYNC -DEPI_2WARP"
     "v01101:13:-DWAIT_GROUP_READ -DDROP_TRAIL_BARSYNC -DEPI_2WARP"
+    "v10110:22:-DNO_BULK_MEMCLBR -DDROP_TRAIL_BARSYNC -DDROP_LEAD_BARSYNC"
 )
 
 # ── Phase 1: build the two variants ─────────────────────────────────────
