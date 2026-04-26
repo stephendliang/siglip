@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 #
-# 1-way A/B sweep on fc2_w3x epilogue lane-mapping:
+# 1-way 3-cell sweep on fc2_w3x epilogue lane-mapping:
 #
 #   stsm     — default: 2× tcgen05.ld.16x256b.x4 + 4× STSM (rank-1 shape)
 #   ldtmx32  — wide:    1× tcgen05.ld.32x32b.x32 + 4× st.shared.v4.b32
+#   ldtmx64  — widest:  1× tcgen05.ld.32x32b.x64 + 8× st.shared.v4.b32
+#                       (NUM_EPI_STAGES=1 forced — SUBPASS_BYTES doubles)
 #
 # Same MMA, same TMA load, same dispatch, same bias-preload — only the
-# epilogue's TMEM-load width and SMEM-store opcode differ.  ldtmx32
-# replaces 2 LDTMs/rh with 1 wider LDTM (lane t = row t cols 0..31)
-# and broadcasts 16 bias bf16x2 packs via shfl (vs 4 in STSM path).
+# epilogue's TMEM-load width, SMEM-store opcode, and subpass-loop count
+# differ.  ldtmx32 replaces 2 LDTMs/rh with 1 wider LDTM (lane t = row t
+# cols 0..31) and broadcasts 16 bias packs via shfl (vs 4 in STSM).
+# ldtmx64 halves NUM_SUBPASSES from 8 → 4 by drawing 64 cols/lane per
+# LDTM; bias broadcast widens to 32 shfls/subpass.
 #
 # 2 cells × REPS reps, pass-major interleaved so both share clock/thermal/
 # queue state.  Cross-session B200 baseline drift is ~4 µs, larger than
@@ -44,6 +48,7 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUT/run.log"; }
 VARIANTS=(
     "stsm:"
     "ldtmx32:-DLDTM_X32"
+    "ldtmx64:-DLDTM_X64"
 )
 
 log "=== Phase 1: building ${#VARIANTS[@]} variants with -DCOMBO_QUICK ==="
