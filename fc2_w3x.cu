@@ -120,8 +120,6 @@ static_assert(N_DIM  %  TN       == 0,
    At TM=128 TN=256 TK=128 → 16384 + 16384 = 32768. At TM=128 TN=128 → 24576.
    The 16384 hard-coded as B's offset elsewhere assumes TM=128 (A bytes). */
 #define STAGE_BYTES    ((TM + TN/2) * TK)
-#define A_TMA_BYTES    (TM * TK)
-#define B_TMA_BYTES    ((TN/2) * TK)
 #define TMA_BYTES      STAGE_BYTES
 #define MAIN_SMEM      (N_STAGES * STAGE_BYTES)
 #define OUT_STAGING    (NUM_EPI_STAGES * SUBPASS_BYTES)
@@ -132,25 +130,11 @@ static_assert(N_DIM  %  TN       == 0,
 #define OFF_BIAS       ((OFF_OUT + OUT_STAGING + 127) & ~127)
 #define OFF_MBARS      ((OFF_BIAS + BIAS_BYTES + 127) & ~127)
 
-/*
-  A_PRIVATE_TMA splits the single MBAR_TMA_FULL into:
-    - MBAR_TMA_FULL[s] : cluster-shared mbar for B (peer-routed to CTA0,
-      .cta_group::2 cp.bulk, arrive_count=2, expect_tx=2*B_BYTES).
-    - MBAR_A_FULL_LOCAL[s] : per-CTA-local mbar for A (no .cta_group::2,
-      cp.bulk targets local mbar, arrive_count=1, expect_tx=A_BYTES).
-  W5 on CTA0 then waits on local CTA0 A-mbar + peer CTA1 A-mbar + B-mbar
-  (3 waits/K-iter). Matches rank-1's UTMALDG.2D + UTMALDG.3D.2CTA pattern.
-*/
 #define MBAR_TMA_FULL       (OFF_MBARS + 0)
 #define MBAR_TMA_EMPTY      (MBAR_TMA_FULL + N_STAGES * 8)
 #define MBAR_TMEM_READY     (MBAR_TMA_EMPTY + N_STAGES * 8)
 #define MBAR_TMEM_CONSUMED  (MBAR_TMEM_READY + 2 * 8)
-#ifdef A_PRIVATE_TMA
-#define MBAR_A_FULL_LOCAL   (MBAR_TMEM_CONSUMED + 2 * 8)
-#define MBARS_END           (MBAR_A_FULL_LOCAL + N_STAGES * 8)
-#else
 #define MBARS_END           (MBAR_TMEM_CONSUMED + 2 * 8)
-#endif
 
 #define OFF_TMEM       ((MBARS_END + 15) & ~15)
 #ifdef PROFILE_KI
@@ -698,14 +682,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         for (int s = 0; s < N_STAGES; s++) {
             mbar_init(smem_to_uint(smem + MBAR_TMA_FULL + s * 8), 2);
             mbar_init(smem_to_uint(smem + MBAR_TMA_EMPTY + s * 8), 1);
-#ifdef A_PRIVATE_TMA
-            /*
-              Per-CTA-local A-mbar — only the issuing CTA's W4 arrives,
-              and only its own UTMALDG.2D contributes complete_tx.
-              Both CTAs run this init, each writing to its own SMEM slot.
-            */
-            mbar_init(smem_to_uint(smem + MBAR_A_FULL_LOCAL + s * 8), 1);
-#endif
         }
         for (int b = 0; b < 2; b++) {
             mbar_init(smem_to_uint(smem + MBAR_TMEM_READY + b * 8), 1);
@@ -742,18 +718,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     uint32_t tma_full_arr[N_STAGES];
     uint32_t tma_full_peer_arr[N_STAGES];
     uint32_t tma_empty_arr[N_STAGES];
-#ifdef A_PRIVATE_TMA
-    /*
-      a_full_local_arr   : own CTA's A-mbar (bit 24 = own rank). W4 uses
-                           this for cp.bulk and arrive.expect_tx.
-      a_full_cta0_arr    : A-mbar with bit 24 = 0 (CTA0). W5 (CTA0) waits.
-      a_full_cta1_arr    : A-mbar with bit 24 = 1 (CTA1). W5 (CTA0) waits
-                           via peer routing.
-    */
-    uint32_t a_full_local_arr[N_STAGES];
-    uint32_t a_full_cta0_arr[N_STAGES];
-    uint32_t a_full_cta1_arr[N_STAGES];
-#endif
     for (int s = 0; s < N_STAGES; s++) {
         smem_a_arr[s]      = smem_to_uint(smem + s * STAGE_BYTES);
         smem_b_arr[s]      = smem_to_uint(smem + s * STAGE_BYTES + TM * TK);
@@ -761,12 +725,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         tma_full_arr[s]    = tf_local;
         tma_full_peer_arr[s] = tf_local & 0xFEFFFFFFu;
         tma_empty_arr[s]   = smem_to_uint(smem + MBAR_TMA_EMPTY + s * 8);
-#ifdef A_PRIVATE_TMA
-        uint32_t af_local      = smem_to_uint(smem + MBAR_A_FULL_LOCAL + s * 8);
-        a_full_local_arr[s]    = af_local;
-        a_full_cta0_arr[s]     = af_local & 0xFEFFFFFFu;
-        a_full_cta1_arr[s]     = af_local | 0x01000000u;
-#endif
     }
 
     uint32_t out_smem_arr[NUM_EPI_STAGES];
@@ -1068,33 +1026,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     const int tma_a_c1  = (a_m_tile * K_ITERS + ki) * TM;
                     const int tma_b_c1  = (b_n_half * K_ITERS + ki) * (TN / 2);
                     PROF_BEGIN(t1);
-#ifdef A_PRIVATE_TMA
-                    /*
-                      A: cp.bulk WITHOUT .cta_group::2 → mbar must be local
-                      to issuing CTA. Each CTA's W4 targets its own
-                      MBAR_A_FULL_LOCAL[s] slot.
-                      B: cp.bulk WITH .cta_group::2 → cluster-routed mbar
-                      (peer-cleared to CTA0's slot, both CTAs land
-                      complete_tx there, arrive_count=2 phases on 2nd
-                      arrive).
-                    */
-                    asm volatile(
-                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                        ".mbarrier::complete_tx::bytes"
-                        " [%0], [%1, {%2, %3}], [%9];\n\t"
-                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                        ".mbarrier::complete_tx::bytes.cta_group::2"
-                        " [%5], [%6, {%2, %7}], [%4];\n\t"
-                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%9], %10;\n\t"
-                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %8;"
-                        :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(tma_a_c1),
-                           "r"(tma_full_peer_arr[s]),
-                           "r"(b_dst), "l"(&tma_b), "r"(tma_b_c1),
-                           "r"(B_TMA_BYTES),
-                           "r"(a_full_local_arr[s]),
-                           "r"(A_TMA_BYTES)
-                        : "memory");
-#else
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
                         ".mbarrier::complete_tx::bytes.cta_group::2"
@@ -1108,7 +1039,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                            "r"(b_dst), "l"(&tma_b), "r"(tma_b_c1),
                            "r"(TMA_BYTES)
                         : "memory");
-#endif
                     PROF_END(t1, 1);
                 }
             }
@@ -1119,10 +1049,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     else /* warp_id == WARP_MMA, cta_rank == 0 */ {
         /* =============== WARP_MMA: MMA issuer (CTA 0 only) =============== */
         uint32_t tma_full_phase[N_STAGES] = {0};
-#ifdef A_PRIVATE_TMA
-        uint32_t a_full_cta0_phase[N_STAGES] = {0};
-        uint32_t a_full_cta1_phase[N_STAGES] = {0};
-#endif
 #ifdef NO_PREFILL
         uint32_t tmem_cons_phase[2] = {0, 0};
 #endif
@@ -1194,18 +1120,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 uint64_t _ki_start; PROF_KI_READ(_ki_start);
 #endif
                 PROF_BEGIN(m0);
-#ifdef A_PRIVATE_TMA
-                /*
-                  A's TMA is per-CTA-private, so W5 must wait on BOTH CTAs'
-                  local A-mbars before issuing the cluster MMA. Phase XOR
-                  per stage on each. Empirically the second wait costs ~0
-                  cycles when the peer mbar already phased.
-                */
-                mbar_wait(a_full_cta0_arr[s], a_full_cta0_phase[s]);
-                a_full_cta0_phase[s] ^= 1;
-                mbar_wait(a_full_cta1_arr[s], a_full_cta1_phase[s]);
-                a_full_cta1_phase[s] ^= 1;
-#endif
                 mbar_wait(tma_full_arr[s], tma_full_phase[s]);
                 PROF_END(m0, 0);
 #if defined(PROFILE_KI) || defined(PROFILE_TILE)
