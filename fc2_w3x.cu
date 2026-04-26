@@ -51,12 +51,8 @@
 #define K_DIM   3072
 #endif
 
-#ifndef TM
 #define TM          128
-#endif
-#ifndef TN
 #define TN          256
-#endif
 #define TK          128
 #define SM_COUNT    148
 #define CLUSTER_CTAS 2
@@ -89,9 +85,7 @@ static_assert(N_DIM  %  TN       == 0,
 #define K_UNROLL_PRAGMA _DO_PRAGMA(unroll K_UNROLL)
 #endif
 
-#ifndef N_STAGES
 #define N_STAGES       6
-#endif
 #define NUM_EPI_STAGES 2
 #define NUM_SUBPASSES  (TN / 32)
 
@@ -117,10 +111,23 @@ static_assert(N_DIM  %  TN       == 0,
 #define SUBPASS_BYTES  (ROWS_PER_CTA * SUBPASS_COLS * 2)
 
 /* Stage holds A (TM × TK FP8) followed by B (TN/2 × TK FP8) per CTA.
-   At TM=128 TN=256 TK=128 → 16384 + 16384 = 32768. At TM=128 TN=128 → 24576.
-   The 16384 hard-coded as B's offset elsewhere assumes TM=128 (A bytes). */
+   TM=128 TN=256 TK=128 → 16384 + 16384 = 32768 bytes per stage. */
 #define STAGE_BYTES    ((TM + TN/2) * TK)
 #define TMA_BYTES      STAGE_BYTES
+
+/* B_BOX_N: how many N-rows fit in one B TMA op. Default loads B as a single
+   (TK × TN/2) op per stage; smaller values fragment the load into B_OPS_N
+   collective ops while preserving total bytes and SMEM layout (the TMA
+   descriptor's box[1] is set to B_BOX_N host-side, each op points at a
+   stride'd N-offset). Sweep cells: {128, 64, 32, 16, 8} → {1, 2, 4, 8, 16}
+   ops/stage. */
+#ifndef B_BOX_N
+#define B_BOX_N        (TN / 2)
+#endif
+#define B_OPS_N        ((TN / 2) / B_BOX_N)
+#define B_OP_BYTES     (TK * B_BOX_N)
+static_assert((TN / 2) % B_BOX_N == 0,
+              "B_BOX_N must divide TN/2 evenly");
 #define MAIN_SMEM      (N_STAGES * STAGE_BYTES)
 #define OUT_STAGING    (NUM_EPI_STAGES * SUBPASS_BYTES)
 #define BIAS_BYTES     (N_DIM * 2)
@@ -152,19 +159,10 @@ static_assert(N_DIM  %  TN       == 0,
 /* PROFILE_TILE uses only a register + one global write per tile — no SMEM. */
 
 #define TMEM_COLS    512
-/*
-  Instruction descriptor (CUTLASS UMMA::InstrDescriptor layout, see
-  cute/arch/mma_sm100_desc.hpp). cta_group::2 → m_dim_ holds CLUSTER M,
-  n_dim_ holds CLUSTER N (which equals per-CTA TN here since the 2 CTAs
-  split M, not N). c_format_=1 (F32 accum). f8f6f4 a/b format encoded
-  via the .kind::f8f6f4 modifier in the asm; format bits stay 0.
-    bit  4   : c_format_ bit 0 (F32)
-    bits 17..22: n_dim_ = N >> 3
-    bits 24..28: m_dim_ = M >> 4
-*/
-#define IDESC        ((uint32_t)0x10U \
-                      | ((uint32_t)((TN) >> 3) << 17) \
-                      | ((uint32_t)(((TM) * 2) >> 4) << 24))
+/* CUTLASS UMMA::InstrDescriptor: c_format_=F32 (bit 4), n_dim_=TN>>3=32
+   (bits 17..22), m_dim_=(TM*2)>>4=16 (bits 24..28). f8f6f4 kind via the
+   .kind::f8f6f4 asm modifier — format bits stay 0. */
+#define IDESC        0x10400010U
 #define SBO          1024
 
 #ifndef DG_GROUP_SIZE
@@ -1025,19 +1023,31 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     const int tma_c0    = 0;
                     const int tma_a_c1  = (a_m_tile * K_ITERS + ki) * TM;
                     const int tma_b_c1  = (b_n_half * K_ITERS + ki) * (TN / 2);
+                    const uint32_t mbar = tma_full_peer_arr[s];
                     PROF_BEGIN(t1);
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
                         ".mbarrier::complete_tx::bytes.cta_group::2"
-                        " [%0], [%1, {%2, %3}], [%4];\n\t"
-                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                        ".mbarrier::complete_tx::bytes.cta_group::2"
-                        " [%5], [%6, {%2, %7}], [%4];\n\t"
-                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %8;"
+                        " [%0], [%1, {%2, %3}], [%4];"
                         :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(tma_a_c1),
-                           "r"(tma_full_peer_arr[s]),
-                           "r"(b_dst), "l"(&tma_b), "r"(tma_b_c1),
-                           "r"(TMA_BYTES)
+                           "r"(mbar)
+                        : "memory");
+                    #pragma unroll
+                    for (int op = 0; op < B_OPS_N; op++) {
+                        const uint32_t b_dst_op = b_dst + op * B_OP_BYTES;
+                        const int b_c1_op       = tma_b_c1 + op * B_BOX_N;
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                            ".mbarrier::complete_tx::bytes.cta_group::2"
+                            " [%0], [%1, {%2, %3}], [%4];"
+                            :: "r"(b_dst_op), "l"(&tma_b), "r"(tma_c0),
+                               "r"(b_c1_op), "r"(mbar)
+                            : "memory");
+                    }
+                    asm volatile(
+                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64"
+                        " _, [%0], %1;"
+                        :: "r"(mbar), "r"(TMA_BYTES)
                         : "memory");
                     PROF_END(t1, 1);
                 }
@@ -1404,7 +1414,7 @@ int main(int argc, char** argv) {
         uint64_t b_total_rows = (uint64_t)(N_DIM / (TN/2)) * (uint64_t)K_ITERS * (uint64_t)(TN/2);
         uint64_t dims[2]    = {(uint64_t)TK, b_total_rows};
         uint64_t strides[1] = {(uint64_t)TK};
-        uint32_t box[2]     = {TK, TN / 2};
+        uint32_t box[2]     = {TK, B_BOX_N};
         uint32_t estrides[2]= {1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_b,
             CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (void*)d_B,
