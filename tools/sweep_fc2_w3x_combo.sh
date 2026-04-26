@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
 #
-# Two-cell head-to-head: the only two fc2_w3x lever combos we still care
-# about after the n=5 + n=10 sweeps showed nothing else is reproducibly
-# different from baseline.
+# Three-cell head-to-head: the two fc2_w3x lever combos we still care
+# about after the n=5 + n=10 sweeps, *plus* baseline (no flags) measured
+# in the same interleaved run so clock / thermal / queue state is shared.
 #
-#   A = v10011 = NO_BULK_MEMCLBR + DROP_LEAD_BARSYNC + EPI_2WARP
-#   B = v01101 = WAIT_GROUP_READ + DROP_TRAIL_BARSYNC + EPI_2WARP
+#   base   = v00000 = (no flags)
+#   A      = v10011 = NO_BULK_MEMCLBR + DROP_LEAD_BARSYNC + EPI_2WARP
+#   B      = v01101 = WAIT_GROUP_READ + DROP_TRAIL_BARSYNC + EPI_2WARP
 #
-# These were the strongest cells across the prior runs (top-2 in the
+# A and B were the strongest cells across the prior runs (top-2 in the
 # n=5 follow-up: v10011 −1.00 µs, v01101 −0.80 µs vs baseline). Both
-# share EPI_2WARP, so the head-to-head isolates which DROP / WAIT / BULK
-# triplet wins under the 2-warp epi structure.
-#
-# No baseline cell here — the previous n=10 sweep already pinned baseline
-# to within ±0.4 µs. This script answers a single question: A vs B.
+# share EPI_2WARP. Including baseline as a third cell is the only way
+# to compare them against "no flags" without cross-run drift.
 #
 # Each binary is built with -DCOMBO_QUICK (fast cudaMemset init,
 # N_WARMUP=1, N_TIMED_LAUNCHES=3, skip verify).
@@ -50,6 +48,7 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUT/run.log"; }
 #
 # Format: "<name>:<bits>:<-D flag list>"
 VARIANTS=(
+    "vbase:0:"
     "v10011:19:-DNO_BULK_MEMCLBR -DDROP_LEAD_BARSYNC -DEPI_2WARP"
     "v01101:13:-DWAIT_GROUP_READ -DDROP_TRAIL_BARSYNC -DEPI_2WARP"
 )
@@ -71,8 +70,8 @@ for entry in "${VARIANTS[@]}"; do
 done
 log "build summary: ${#BUILD_OK[@]} / ${#VARIANTS[@]} succeeded"
 
-if [[ ${#BUILD_OK[@]} -lt 2 ]]; then
-    log "ERROR: need both variants to compare; aborting"
+if [[ ${#BUILD_OK[@]} -lt ${#VARIANTS[@]} ]]; then
+    log "ERROR: need all ${#VARIANTS[@]} variants to compare; aborting"
     exit 1
 fi
 

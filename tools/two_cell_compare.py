@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Head-to-head comparison of exactly two variants from a wall_data.csv.
+Pairwise comparison of N variants from a wall_data.csv.
 
-Reads the CSV produced by sweep_fc2_w3x_combo.sh (when configured for
-the 2-cell mode), computes per-variant mean / SE / σ, runs a Welch's
-t-test between the two, and prints a single recommendation line.
+Reads the CSV produced by sweep_fc2_w3x_combo.sh, computes per-variant
+mean / SE / σ, and runs Welch's t-tests:
 
-No regression model — with only 2 cells the OLS design is rank-deficient
-on most predictors, so we drop it and answer the only question that's
-identifiable: A vs B, mean Δ at what z.
+  - if a variant named "vbase" is present, it's used as the reference
+    and every other cell is compared against it
+  - otherwise the slowest-mean cell is used as reference
+
+Verdict bands per |t|: TIE (<1.96), WEAK (<2.58), MODERATE (<3.29),
+STRONG (>=3.29).
 
 stdlib only.
 """
@@ -51,6 +53,16 @@ def load(path):
     return cells
 
 
+def verdict(absz):
+    if absz < 1.96:
+        return "TIE"
+    if absz < 2.58:
+        return "WEAK"
+    if absz < 3.29:
+        return "MODERATE"
+    return "STRONG"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csv")
@@ -58,60 +70,69 @@ def main():
     args = ap.parse_args()
 
     cells = load(args.csv)
-    if len(cells) != 2:
-        print(f"ERROR: expected exactly 2 variants, got {len(cells)}: "
-              f"{sorted(cells)}", file=sys.stderr)
+    if len(cells) < 2:
+        print(f"ERROR: need >=2 variants, got {len(cells)}: {sorted(cells)}",
+              file=sys.stderr)
         sys.exit(1)
 
-    names = sorted(cells, key=lambda k: -sum(cells[k]) / len(cells[k]))
-    a, b = names[0], names[1]
-    xs, ys = cells[a], cells[b]
+    if "vbase" in cells:
+        ref = "vbase"
+    else:
+        ref = max(cells, key=lambda k: sum(cells[k]) / len(cells[k]))
+
+    others = sorted(k for k in cells if k != ref)
 
     lines = []
-    lines.append(f"two-cell comparison: {a} vs {b}")
+    lines.append(f"variant comparison: ref = {ref}")
     lines.append(f"reading {args.csv}")
     lines.append("")
 
-    for name, xs_ in [(a, xs), (b, ys)]:
-        n = len(xs_)
-        m = sum(xs_) / n
-        v = sum((x - m) ** 2 for x in xs_) / (n - 1) if n > 1 else 0.0
+    for name in [ref] + others:
+        xs = cells[name]
+        n = len(xs)
+        m = sum(xs) / n
+        v = sum((x - m) ** 2 for x in xs) / (n - 1) if n > 1 else 0.0
         s = math.sqrt(v)
         se = s / math.sqrt(n) if n > 0 else 0.0
-        lines.append(f"  {name}  n={n:3d}  "
+        lines.append(f"  {name:8s}  n={n:3d}  "
                      f"mean = {fmt_ms_to_us(m):8.2f} µs   "
                      f"σ = {fmt_ms_to_us(s):5.3f} µs   "
                      f"SE = {fmt_ms_to_us(se):5.3f} µs")
 
-    res = welch_t(xs, ys)
     lines.append("")
-    if res is None:
-        lines.append("  ERROR: insufficient data for Welch t.")
-    else:
+    lines.append(f"pairwise Welch t (each vs {ref}):")
+    for name in others:
+        res = welch_t(cells[name], cells[ref])
+        if res is None:
+            lines.append(f"  {name:8s} vs {ref}: insufficient data")
+            continue
         delta_us = fmt_ms_to_us(res["mx"] - res["my"])
         se_us    = fmt_ms_to_us(res["se"])
-        lines.append(f"  Δ ({a} − {b}) = {delta_us:+.3f} µs"
-                     f"   SE = {se_us:.3f} µs"
-                     f"   t = {res['t']:+.3f}   df ≈ {res['df']:.1f}")
+        v = verdict(abs(res["t"]))
+        sign = "faster" if res["t"] < 0 else "slower"
+        if abs(res["t"]) < 1.96:
+            sign = "indistinguishable"
+        lines.append(f"  {name:8s}  Δ = {delta_us:+7.3f} µs   "
+                     f"SE = {se_us:5.3f}   "
+                     f"t = {res['t']:+6.3f}   "
+                     f"df ≈ {res['df']:5.1f}   "
+                     f"{v:9s} ({sign})")
 
-        absz = abs(res["t"])
-        if absz < 1.96:
-            verdict = "TIE — within ±1.96σ; can't distinguish."
-        elif absz < 2.58:
-            verdict = "WEAK — significant at α=0.05 but not α=0.01."
-        elif absz < 3.29:
-            verdict = "MODERATE — significant at α=0.01."
-        else:
-            verdict = "STRONG — |t| ≥ 3.29 (α≈0.001)."
-
-        if res["t"] > 0:
-            faster = b
-        else:
-            faster = a
-        lines.append(f"  verdict: {verdict}")
-        if absz >= 1.96:
-            lines.append(f"  fastest: {faster}  (mean lower by "
-                         f"{abs(delta_us):.2f} µs)")
+    if len(others) >= 2:
+        lines.append("")
+        lines.append("pairwise among non-ref cells:")
+        for i, a in enumerate(others):
+            for b in others[i + 1:]:
+                res = welch_t(cells[a], cells[b])
+                if res is None:
+                    continue
+                delta_us = fmt_ms_to_us(res["mx"] - res["my"])
+                se_us    = fmt_ms_to_us(res["se"])
+                v = verdict(abs(res["t"]))
+                lines.append(f"  {a} vs {b}:  Δ = {delta_us:+7.3f} µs   "
+                             f"SE = {se_us:5.3f}   "
+                             f"t = {res['t']:+6.3f}   "
+                             f"df ≈ {res['df']:5.1f}   {v}")
 
     text = "\n".join(lines) + "\n"
     sys.stdout.write(text)
