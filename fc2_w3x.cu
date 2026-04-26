@@ -1373,12 +1373,16 @@ int main(int argc, char** argv) {
     __nv_fp8_e4m3 *hB = nullptr;
     __nv_bfloat16 *hbias = nullptr;
 
-#ifdef NCU_PROFILE
+#if defined(NCU_PROFILE) || defined(COMBO_QUICK)
     /*
-      NCU fast path: skip host fills + H2D copies. cudaMemset to a non-NaN
-      FP8/BF16 byte pattern gives the kernel valid-looking inputs with
-      identical access pattern. Hardware counters are unchanged; only
-      numerical output differs (verification block is skipped too).
+      Fast init: skip the 2.85 GB host fill + H2D copy that otherwise
+      dominates startup. cudaMemset to a non-NaN FP8/BF16 byte pattern
+      gives the kernel valid-looking inputs with identical access
+      pattern — hardware counters and wall time are unchanged, only
+      numerical output differs (verification skipped too).
+
+      Used under NCU_PROFILE (counter capture) and COMBO_QUICK (combo
+      sweep, where 128 × N invocations × 1.5s host-fill = unbearable).
     */
     CUDA_CHECK(cudaMemset(d_A, 0x3c, sA));
     CUDA_CHECK(cudaMemset(d_B, 0x3c, sB));
@@ -1510,7 +1514,7 @@ int main(int argc, char** argv) {
     fc2_w3x_kernel<<<grid, THREADS, SMEM_BYTES>>>( \
         h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_dbg_prof, d_dbg_prof_ki, d_dbg_prof_tile, d_dbg_prof_w5)
 
-#ifdef NCU_PROFILE
+#if defined(NCU_PROFILE) || defined(COMBO_QUICK)
     const int N_WARMUP = 1;
 #else
     const int N_WARMUP = 2;
@@ -1533,6 +1537,8 @@ int main(int argc, char** argv) {
 #endif
 #ifdef NCU_PROFILE
     const int N_TIMED_LAUNCHES = 1;
+#elif defined(COMBO_QUICK)
+    const int N_TIMED_LAUNCHES = 3;
 #else
     const int N_TIMED_LAUNCHES = 10;
 #endif
@@ -1987,7 +1993,7 @@ int main(int argc, char** argv) {
     }
 #endif
 
-#if defined(STRIP_EPILOGUE) || defined(NCU_PROFILE)
+#if defined(STRIP_EPILOGUE) || defined(NCU_PROFILE) || defined(COMBO_QUICK)
     int errors = 0;
     int valid = 0;
     float c0 = 0.0f;
@@ -2026,7 +2032,7 @@ int main(int argc, char** argv) {
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9, valid, c0);
 
     free(hA); free(hB); free(hbias);
-#if !defined(STRIP_EPILOGUE) && !defined(NCU_PROFILE)
+#if !defined(STRIP_EPILOGUE) && !defined(NCU_PROFILE) && !defined(COMBO_QUICK)
     free(h_C);
 #endif
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_bias); cudaFree(d_C);
