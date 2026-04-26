@@ -188,6 +188,10 @@ def main():
     ap.add_argument("csv", type=Path)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--alpha", type=float, default=0.01)
+    ap.add_argument("--no-3way", action="store_true",
+                    help="Skip 3-way interaction terms (set this for "
+                         "fractional designs where 3-ways alias with "
+                         "lower-order effects).")
     args = ap.parse_args()
 
     header, rows = parse_csv(args.csv)
@@ -195,7 +199,7 @@ def main():
         print("no rows in csv", file=sys.stderr)
         sys.exit(1)
 
-    X, y, names = build_design(rows, include_3way=True)
+    X, y, names = build_design(rows, include_3way=not args.no_3way)
     beta, se, sigma2, resid = fit_ols(X, y)
 
     n_obs = len(y)

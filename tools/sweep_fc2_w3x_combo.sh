@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 #
-# Full 2^7 factorial sweep of fc2_w3x "wash" levers.
+# Fractional factorial sweep of fc2_w3x "wash" levers.
 #
-# Each of the 7 binary levers is solo-tested at ±3 µs noise. This sweep tests
-# every combination (128 variants) at default dispatch (dgswizzle), n=REPS,
-# PROFILE_CYCLES enabled — so per-warp brackets land in run logs alongside
-# wall ms.
+# Each binary invocation costs ~1.5s (CUDA init + tensor map setup) regardless
+# of kernel work. So variant count, not kernel time, dominates wall time.
+# Default MODE=res7 (Resolution-VII half-fraction, generator I=ABCDEFG):
+#   - 64 variants instead of 128
+#   - all 7 main effects clean (alias only with 6-way, negligible)
+#   - all 21 two-way interactions clean (alias only with 5-way, negligible)
+#   - 3-way and higher are aliased; analyzer is told to skip them via --no-3way
 #
 # Lever bit assignment (variant name = "v" + 7-bit binary, MSB=bit6):
 #   bit 0:  XPF_A
@@ -23,7 +26,9 @@
 #   anova.txt          (OLS report on main effects + 2-way interactions)
 #
 # Usage:
-#   tools/sweep_fc2_w3x_combo.sh           # REPS=6, default outdir
+#   tools/sweep_fc2_w3x_combo.sh           # MODE=res7, REPS=3 (≈5 min B200)
+#   MODE=full tools/sweep_fc2_w3x_combo.sh # 128 variants (≈30 min)
+#   MODE=res4 tools/sweep_fc2_w3x_combo.sh # 32 variants (≈2.5 min)
 #   REPS=10 tools/sweep_fc2_w3x_combo.sh
 #   tools/sweep_fc2_w3x_combo.sh my_outdir
 #
@@ -32,7 +37,8 @@ set -u
 cd "$(dirname "$0")/.."
 
 OUT=${1:-"data/fc2_w3x_combo_$(date +%Y%m%d_%H%M%S)"}
-REPS=${REPS:-6}
+REPS=${REPS:-3}
+MODE=${MODE:-res7}
 NVCC=${NVCC:-nvcc}
 CFLAGS='-gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static'
 LDFLAGS='-lcurand_static -lculibos -lcuda'
@@ -62,12 +68,53 @@ bits_to_name() {
     echo "$name"
 }
 
-# ── Phase 1: build 128 variants ─────────────────────────────────────────
-log "=== Phase 1: building 128 variants with -DPROFILE_CYCLES ==="
+popcount() {
+    local n=$1 c=0
+    while (( n )); do c=$((c + (n & 1))); n=$((n >> 1)); done
+    echo $c
+}
+
+case "$MODE" in
+    full)
+        SELECTED=($(seq 0 127))
+        ANOVA_FLAGS=""
+        ;;
+    res7|half)
+        # Generator I = ABCDEFG: keep variants with even popcount.
+        # Mains alias with 6-ways, 2-ways alias with 5-ways — both clean.
+        # 3-ways alias with 4-ways → analyzer must skip 3-way terms.
+        SELECTED=()
+        for b in $(seq 0 127); do
+            (( $(popcount "$b") % 2 == 0 )) && SELECTED+=("$b")
+        done
+        ANOVA_FLAGS="--no-3way"
+        ;;
+    res4|quarter)
+        # 2^(7-2) quarter-fraction. Generators I = ABCD, I = CDEFG.
+        # Keep variants where (b0^b1^b2^b3)==0 AND (b2^b3^b4^b5^b6)==0.
+        # All 7 mains clean; some 2-ways aliased — analyzer drops 3+way.
+        SELECTED=()
+        for b in $(seq 0 127); do
+            local0=$(( ((b>>0)&1) ^ ((b>>1)&1) ^ ((b>>2)&1) ^ ((b>>3)&1) ))
+            local1=$(( ((b>>2)&1) ^ ((b>>3)&1) ^ ((b>>4)&1) ^ ((b>>5)&1) ^ ((b>>6)&1) ))
+            (( local0 == 0 && local1 == 0 )) && SELECTED+=("$b")
+        done
+        ANOVA_FLAGS="--no-3way"
+        ;;
+    *)
+        echo "MODE must be one of: full, res7 (default), res4" >&2
+        exit 1
+        ;;
+esac
+
+N_VARIANTS=${#SELECTED[@]}
+
+# ── Phase 1: build $N_VARIANTS variants ─────────────────────────────────
+log "=== Phase 1: building $N_VARIANTS variants (MODE=$MODE) with -DPROFILE_CYCLES ==="
 log "lever bits (MSB→LSB): ${LEVERS[6]} ${LEVERS[5]} ${LEVERS[4]} ${LEVERS[3]} ${LEVERS[2]} ${LEVERS[1]} ${LEVERS[0]}"
 
 BUILD_OK=()
-for bits in $(seq 0 127); do
+for bits in "${SELECTED[@]}"; do
     name=$(bits_to_name "$bits")
     flags=$(bits_to_flags "$bits")
     bin="$OUT/fc2-w3x-combo-$name"
@@ -78,7 +125,7 @@ for bits in $(seq 0 127); do
         log "  build FAIL $name  flags='$flags'"
     fi
 done
-log "build summary: ${#BUILD_OK[@]} / 128 succeeded"
+log "build summary: ${#BUILD_OK[@]} / $N_VARIANTS succeeded"
 
 # ── Phase 2: interleaved reps across surviving variants ─────────────────
 log ""
@@ -125,7 +172,7 @@ log "extracted $n_rows wall measurements"
 # ── Phase 4: regression ─────────────────────────────────────────────────
 log ""
 log "=== Phase 4: OLS regression → $OUT/anova.txt ==="
-python3 tools/combo_anova.py "$OUT/wall_data.csv" --out "$OUT/anova.txt"
+python3 tools/combo_anova.py "$OUT/wall_data.csv" --out "$OUT/anova.txt" $ANOVA_FLAGS
 
 log ""
 log "report:           $OUT/anova.txt"
