@@ -73,14 +73,7 @@
 #define NUM_EPI_STAGES 2
 #define NUM_SUBPASSES  (TN / 32)
 
-#ifdef KERN_3WARP
-#define N_EPI_WARPS      2
-#define ROWS_PER_WARP    64
-#define EPI_BARSYNC_ASM  "bar.sync 0, 64;"
-#define WARP_TMA         2
-#define WARP_MMA         2
-#define TOTAL_WARPS      3
-#elif defined(EPI_2WARP)
+#ifdef EPI_2WARP
 #define N_EPI_WARPS      2
 #define ROWS_PER_WARP    64
 #define EPI_BARSYNC_ASM  "bar.sync 0, 64;"
@@ -195,43 +188,17 @@ uint64_t make_smem_desc(uint32_t addr) {
   Base: dgswizzle(DG_GROUP_SIZE=G). Within each group of G*TILES_N tiles,
   iterate tm fastest then tn (tn-run length = G).
 
-  Flags (mutually exclusive except where noted):
-    DG_ROT (existing P2 probe, 0-delta perf): rotate tn by group_idx —
-      spreads group-boundary position across all tn values.
-    DG_INNER_T (NEW): transpose within-group decomposition — iterate tn
-      fastest then tm (tn-run length = 1). Breaks per-tn sub-run
-      coherence; each tile cycles through all TILES_N columns. Bijective:
-      same (tm, tn) set within a group, different traversal order.
-    DG_STAGGER (NEW): shift lin by c*group_tiles per cluster so cluster c
-      starts at group_idx=c instead of group_idx=c/gt. The 74 clusters
-      span 74 distinct group_idx values at tt=0 instead of 4.
-      Bijectivity proof: lin' = 25c + 74tt (mod 10878) for FC2
-      (gt=24, NC=74, TPC=147, TOTAL=10878=NC*TPC). gcd(25, 10878)=1
-      and gcd(74, 10878)=74, so the coset {25c + 74t mod 10878 : t} has
-      10878/74=147 elements = TPC, and c → (25c mod 74) is a bijection
-      on [0, 74), so different c land in different cosets. Bijective.
-    DG_GROUP_SIZE=N (build-time): override G ∈ {4, 8, 16, 32}. Trades
-      tn-run length vs group count. Affects all variants.
+  DG_ROT (probe, 0-delta perf): rotate tn by group_idx — spreads
+  group-boundary position across all tn values. Kept as the structural
+  probe that proved tn=0 surplus is in_g-position-structural, not
+  tn-intrinsic (see memory/project_w3x_tn0_in_g_structural.md).
 
-  Sweep suggestion (one binary per config):
-    baseline (G=8):                make -B fc2-w3x
-    G=4:                           make -B fc2-w3x DFLAGS='-DDG_GROUP_SIZE=4'
-    G=16:                          make -B fc2-w3x DFLAGS='-DDG_GROUP_SIZE=16'
-    G=32:                          make -B fc2-w3x DFLAGS='-DDG_GROUP_SIZE=32'
-    inner-transpose:               make -B fc2-w3x DFLAGS='-DDG_INNER_T'
-    cluster-group-stagger:         make -B fc2-w3x DFLAGS='-DDG_STAGGER'
+  DG_GROUP_SIZE=N (build-time): override G ∈ {4, 8, 16, 32}. Trades
+  tn-run length vs group count.
 */
 static __device__ __forceinline__
 int dgswizzle(int lin) {
     const int group_tiles = TILES_N * DG_GROUP_SIZE;
-
-#ifdef DG_STAGGER
-    const int _NC = SM_COUNT / CLUSTER_CTAS;
-    const int _TOTAL = TILES_M * TILES_N;
-    const int _c = lin - (lin / _NC) * _NC;
-    lin = lin + _c * group_tiles;
-    if (lin >= _TOTAL) lin -= _TOTAL;
-#endif
 
     const int group_idx = lin / group_tiles;
     const int first_m = group_idx * DG_GROUP_SIZE;
@@ -240,15 +207,8 @@ int dgswizzle(int lin) {
                   ? DG_GROUP_SIZE
                   : TILES_M - first_m;
 
-    int tm_local, tn_raw;
-#ifdef DG_INNER_T
-    tm_local = in_group / TILES_N;
-    tn_raw   = in_group - tm_local * TILES_N;
-    if (tm_local >= nig) tm_local = nig - 1;
-#else
-    tm_local = in_group % nig;
-    tn_raw   = in_group / nig;
-#endif
+    const int tm_local = in_group % nig;
+    const int tn_raw   = in_group / nig;
 
 #ifdef DG_ROT
     int tn = tn_raw + group_idx;
@@ -262,16 +222,7 @@ int dgswizzle(int lin) {
 static __device__ __forceinline__
 int dgswizzle_in_group(int lin) {
     const int group_tiles = TILES_N * DG_GROUP_SIZE;
-#ifdef DG_STAGGER
-    const int _NC = SM_COUNT / CLUSTER_CTAS;
-    const int _TOTAL = TILES_M * TILES_N;
-    const int _c = lin - (lin / _NC) * _NC;
-    int lin_s = lin + _c * group_tiles;
-    if (lin_s >= _TOTAL) lin_s -= _TOTAL;
-    return lin_s - (lin_s / group_tiles) * group_tiles;
-#else
     return lin - (lin / group_tiles) * group_tiles;
-#endif
 }
 
 /*
@@ -279,18 +230,77 @@ int dgswizzle_in_group(int lin) {
   where N chooses a static_swizzle (see tile_dispatch.cuh):
      9 zorder, 10 hilbert, 11 zigzag, 13 rowmajor,
     14 ncycle, 15 nflat, 16 nsnake, 17 nlock, 18 checkered,
-    19 dg-snake (zigzag within dgswizzle band), 21 ncyrot.
+    19 dg-snake (zigzag within dgswizzle band), 21 ncyrot,
+    30 hyb-chet, 31 hyb-pmix, 32 hyb-ingh.
+  Two fc2_w3x-local probes are inlined below (not shared with fc1/fc2_w3):
+    33 gflip — dgsw within-group + pair-flip group_idx (checkered on group axis).
+    34 tn2br — dgsw within-group; bit-reverse the tm-order on tn=TILES_N-1.
   Unset (default) → dgswizzle as currently shipping.  tile_swizzle() is the
-  single entry point; PROFILE_{W4,TILE}'s in_g field is only meaningful under
-  dgswizzle (returns 0 otherwise).
+  single entry point; tile_in_group() preserves the in_g signal under dgsw,
+  gflip, and tn2br (so PROFILE_{W4,TILE}'s in_g field stays meaningful);
+  static_swizzle variants return 0 from tile_in_group().
 */
 #ifdef TILE_DISPATCH
 #include "tile_dispatch.cuh"
 #endif
 
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 33
+static __device__ __forceinline__
+int gflip_swizzle(int lin) {
+    const int G           = DG_GROUP_SIZE;
+    const int group_tiles = TILES_N * G;
+    const int num_groups  = (TILES_M + G - 1) / G;
+    int group_idx         = lin / group_tiles;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int paired      = group_idx ^ 1;
+    if (paired < num_groups) group_idx = paired;
+    const int first_m  = group_idx * G;
+    const int nig      = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int tm_local = in_group - (in_group / nig) * nig;
+    const int tn       = in_group / nig;
+    int tm = first_m + tm_local;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+static __device__ __forceinline__
+int gflip_in_group(int lin) {
+    const int G = DG_GROUP_SIZE;
+    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
+}
+#endif
+
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 34
+static __device__ __forceinline__
+int tn2br_swizzle(int lin) {
+    const int G           = DG_GROUP_SIZE;
+    const int group_tiles = TILES_N * G;
+    const int group_idx   = lin / group_tiles;
+    const int first_m     = group_idx * G;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int tn          = in_group / nig;
+    int tm_local          = in_group - tn * nig;
+    if (tn == TILES_N - 1 && nig == 8) {
+        tm_local = ((tm_local & 1) << 2) | (tm_local & 2) | ((tm_local >> 2) & 1);
+    }
+    int tm = first_m + tm_local;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+static __device__ __forceinline__
+int tn2br_in_group(int lin) {
+    const int G = DG_GROUP_SIZE;
+    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
+}
+#endif
+
 static __device__ __forceinline__
 int tile_swizzle(int lin) {
-#if defined(TILE_DISPATCH) && TILE_DISPATCH >= 8
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 33
+    return gflip_swizzle(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 34
+    return tn2br_swizzle(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH >= 8
     return static_swizzle(lin);
 #else
     return dgswizzle(lin);
@@ -299,7 +309,11 @@ int tile_swizzle(int lin) {
 
 static __device__ __forceinline__
 int tile_in_group(int lin) {
-#if defined(TILE_DISPATCH) && TILE_DISPATCH >= 8
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 33
+    return gflip_in_group(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 34
+    return tn2br_in_group(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH >= 8
     (void)lin;
     return 0;
 #else
@@ -676,11 +690,8 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
-    /* WARP_MMA on CTA 1 is dead — only CTA 0 issues MMA.
-       Under KERN_3WARP, WARP_MMA == WARP_TMA: CTA 1 still runs the TMA loop. */
-#ifndef KERN_3WARP
+    /* WARP_MMA on CTA 1 is dead — only CTA 0 issues MMA. */
     if (warp_id == WARP_MMA && cta_rank != 0) return;
-#endif
 
     const uint32_t taddr_base = *reinterpret_cast<uint32_t*>(smem + OFF_TMEM);
 
@@ -985,226 +996,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         PROF_WRITEOUT();
     }
     else if (warp_id == WARP_TMA) {
-#ifdef KERN_3WARP
-      if (cta_rank == 0) {
-        /* =============== KERN_3WARP combined TMA + MMA on CTA 0 ===============
-           Software-pipelined: TMA-issue runs (N_STAGES - 1) KIs ahead of MMA-issue.
-           Slot s_t = (ki_m + N_STAGES - 1) % N_STAGES is always different from
-           s_m = ki_m % N_STAGES, so wait_tma_empty[s_t] inside the merged warp
-           does not block on the MMA we just issued. Per-iter throughput is
-           bounded by the MMA HW pipeline (~525 cyc/iter, same as W5 alone). */
-
-        uint32_t tma_full_phase[N_STAGES]  = {0};
-        uint32_t tma_empty_phase[N_STAGES] = {0};
-#ifdef NO_PREFILL
-        uint32_t tmem_cons_phase[2] = {0, 0};
-#endif
-        const bool elect = (lane == 0);
-
-        uint64_t desc_a_base[N_STAGES], desc_b_base[N_STAGES];
-        for (int s = 0; s < N_STAGES; s++) {
-            desc_a_base[s] = make_smem_desc(smem_a_arr[s]);
-            desc_b_base[s] = make_smem_desc(smem_b_arr[s]);
-        }
-
-#ifdef NO_PREFILL
-        if (elect) {
-            mbar_arrive(mbar_tmem_consumed_base + 0);
-            mbar_arrive(mbar_tmem_consumed_base + 0);
-            mbar_arrive(mbar_tmem_consumed_base + 8);
-            mbar_arrive(mbar_tmem_consumed_base + 8);
-        }
-#endif
-        PROF_WALL_BEGIN();
-
-        for (int tt = 0; tt < tiles_per_cluster; tt++) {
-            const int lin_tile = cluster_id + tt * num_clusters;
-            if (lin_tile >= TOTAL_TILES) break;
-            const int swizzled = tile_swizzle(lin_tile);
-            const int tm = swizzled / TILES_N;
-            const int tn = swizzled % TILES_N;
-            const int a_m_tile = tm * 2 + cta_rank;
-            const int b_n_half = tn * 2 + cta_rank;
-            const int buf = tt & 1;
-
-#ifdef NO_PREFILL
-            mbar_wait(mbar_tmem_consumed_base + buf * 8, tmem_cons_phase[buf]);
-            tmem_cons_phase[buf] ^= 1;
-#endif
-
-            /* Prologue: issue TMA for ki_t = 0..N_STAGES-2 (slots 0..N_STAGES-2). */
-            for (int j = 0; j < N_STAGES - 1; j++) {
-                if (tt > 0) {
-                    mbar_wait(tma_empty_arr[j], tma_empty_phase[j]);
-                    tma_empty_phase[j] ^= 1;
-                }
-                if (elect) {
-                    const int tma_a_c1 = (a_m_tile * K_ITERS + j) * TM;
-                    const int tma_b_c1 = (b_n_half * K_ITERS + j) * (TN / 2);
-                    asm volatile(
-                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                        ".mbarrier::complete_tx::bytes.cta_group::2"
-                        " [%0], [%1, {%2, %3}], [%4];\n\t"
-                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                        ".mbarrier::complete_tx::bytes.cta_group::2"
-                        " [%5], [%6, {%2, %7}], [%4];\n\t"
-                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %8;"
-                        :: "r"(smem_a_arr[j]), "l"(&tma_a), "r"(0), "r"(tma_a_c1),
-                           "r"(tma_full_peer_arr[j]),
-                           "r"(smem_b_arr[j]), "l"(&tma_b), "r"(tma_b_c1),
-                           "r"(TMA_BYTES)
-                        : "memory");
-                }
-            }
-
-#ifdef PROFILE_W5
-            /* Under KERN_3WARP+PROFILE_W5, word1 packing is overridden:
-                 word1 high 32 = mma_asm_sum (same as default W5)
-                 word1 low  32 = wait_empty_sum (REPLACES commit_sum)
-               commit is single-shot per tile and well-known small; the
-               wait_empty cumulative is the suspected per-iter blocker. */
-            uint64_t _w5_tile_t0 = 0;
-            uint64_t _w5_mma_sum = 0;
-            uint64_t _w5_wait_empty_sum = 0;
-            if (lane == 0) PROF_KI_READ(_w5_tile_t0);
-#endif
-
-            /* Steady + drain: per ki_m, do MMA(ki_m, slot ki_m%N_STAGES); if
-               ki_t = ki_m + N_STAGES - 1 < K_ITERS, also issue TMA(ki_t). */
-#ifdef K_UNROLL
-            K_UNROLL_PRAGMA
-#endif
-            for (int ki_m = 0; ki_m < K_ITERS; ki_m++) {
-                const int s_m = ki_m % N_STAGES;
-
-                /* MMA on slot s_m */
-                mbar_wait(tma_full_arr[s_m], tma_full_phase[s_m]);
-                tma_full_phase[s_m] ^= 1;
-                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-
-                if (elect) {
-                    const uint64_t desc_a = desc_a_base[s_m];
-                    const uint64_t desc_b = desc_b_base[s_m];
-                    const int accum_flag = (ki_m == 0) ? 0 : 1;
-#ifdef PROFILE_W5
-                    uint64_t _w5_m0; PROF_KI_READ(_w5_m0);
-#endif
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .pred p_init, p_acc;\n\t"
-                        ".reg .b64 da, db;\n\t"
-                        ".reg .b32 tc;\n\t"
-                        "setp.ne.b32 p_init, %12, 0;\n\t"
-                        "setp.ne.b32 p_acc,  1, 0;\n\t"
-                        "mov.b32 tc, %0;\n\t"
-                        "mov.b64 da, %1;\n\t"
-                        "mov.b64 db, %2;\n\t"
-                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
-                        "[tc], da, db, %3, {%4,%5,%6,%7,%8,%9,%10,%11}, p_init;\n\t"
-                        "add.s64 da, da, 2;\n\t"
-                        "add.s64 db, db, 2;\n\t"
-                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
-                        "[tc], da, db, %3, {%4,%5,%6,%7,%8,%9,%10,%11}, p_acc;\n\t"
-                        "add.s64 da, da, 2;\n\t"
-                        "add.s64 db, db, 2;\n\t"
-                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
-                        "[tc], da, db, %3, {%4,%5,%6,%7,%8,%9,%10,%11}, p_acc;\n\t"
-                        "add.s64 da, da, 2;\n\t"
-                        "add.s64 db, db, 2;\n\t"
-                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
-                        "[tc], da, db, %3, {%4,%5,%6,%7,%8,%9,%10,%11}, p_acc;\n\t"
-                        "tcgen05.commit.cta_group::2.mbarrier::arrive::one"
-                        ".shared::cluster.multicast::cluster.b64 [%13], %14;\n\t"
-                        "}"
-                        :
-                        : "r"(buf * TN), "l"(desc_a), "l"(desc_b), "r"(IDESC),
-                          "r"(0),"r"(0),"r"(0),"r"(0),
-                          "r"(0),"r"(0),"r"(0),"r"(0),
-                          "r"(accum_flag),
-                          "r"(tma_empty_arr[s_m]), "h"(pair_mask)
-                        : "memory");
-#ifdef PROFILE_W5
-                    { uint64_t _w5_m1; PROF_KI_READ(_w5_m1); _w5_mma_sum += _w5_m1 - _w5_m0; }
-#endif
-                }
-
-                /* TMA-issue for ki_t = ki_m + N_STAGES - 1 (different slot,
-                   so wait_tma_empty drains a MMA from a previous iter, not
-                   the one we just issued). */
-                const int ki_t = ki_m + N_STAGES - 1;
-                if (ki_t < K_ITERS) {
-                    const int s_t = ki_t % N_STAGES;
-                    /* tt==0, ki_m==0 introduces slot N_STAGES-1 for the first
-                       time: skip the wait (mbar still in initial state). */
-                    if (!(tt == 0 && ki_m == 0)) {
-#ifdef PROFILE_W5
-                        uint64_t _w5_e0;
-                        if (lane == 0) PROF_KI_READ(_w5_e0);
-#endif
-                        mbar_wait(tma_empty_arr[s_t], tma_empty_phase[s_t]);
-                        tma_empty_phase[s_t] ^= 1;
-#ifdef PROFILE_W5
-                        if (lane == 0) {
-                            uint64_t _w5_e1; PROF_KI_READ(_w5_e1);
-                            _w5_wait_empty_sum += _w5_e1 - _w5_e0;
-                        }
-#endif
-                    }
-                    if (elect) {
-                        const int tma_a_c1 = (a_m_tile * K_ITERS + ki_t) * TM;
-                        const int tma_b_c1 = (b_n_half * K_ITERS + ki_t) * (TN / 2);
-                        asm volatile(
-                            "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                            ".mbarrier::complete_tx::bytes.cta_group::2"
-                            " [%0], [%1, {%2, %3}], [%4];\n\t"
-                            "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                            ".mbarrier::complete_tx::bytes.cta_group::2"
-                            " [%5], [%6, {%2, %7}], [%4];\n\t"
-                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %8;"
-                            :: "r"(smem_a_arr[s_t]), "l"(&tma_a), "r"(0), "r"(tma_a_c1),
-                               "r"(tma_full_peer_arr[s_t]),
-                               "r"(smem_b_arr[s_t]), "l"(&tma_b), "r"(tma_b_c1),
-                               "r"(TMA_BYTES)
-                            : "memory");
-                    }
-                }
-            }
-
-            /* Per-tile MMA→epi handoff. */
-            if (elect) {
-                tcgen05_commit_mcast(mbar_tmem_ready_base + buf * 8, pair_mask);
-            }
-
-#ifdef PROFILE_W5
-            if (lane == 0 && d_dbg_prof_w5 != nullptr) {
-                uint64_t _w5_tile_t1; PROF_KI_READ(_w5_tile_t1);
-                uint64_t _tile_total = _w5_tile_t1 - _w5_tile_t0;
-                const int _sw = tile_swizzle(lin_tile);
-                const int _tm = _sw / TILES_N;
-                const int _tn = _sw % TILES_N;
-                const int _ig = tile_in_group(lin_tile);
-                uint64_t _tt_cap = _tile_total;
-                if (_tt_cap > 0x3FFFFFFFFFULL) _tt_cap = 0x3FFFFFFFFFULL;
-                uint64_t _mma_cap   = _w5_mma_sum;        if (_mma_cap   > 0xFFFFFFFFULL) _mma_cap   = 0xFFFFFFFFULL;
-                uint64_t _empty_cap = _w5_wait_empty_sum; if (_empty_cap > 0xFFFFFFFFULL) _empty_cap = 0xFFFFFFFFULL;
-                uint64_t _w0 =
-                      ((uint64_t)(_tm & 0xFFFF) << 48)
-                    | ((uint64_t)(_tn & 0xF)    << 44)
-                    | ((uint64_t)(_ig & 0x3F)   << 38)
-                    | (_tt_cap & 0x3FFFFFFFFFULL);
-                uint64_t _w1 = (_mma_cap << 32) | _empty_cap;
-                const size_t _slot = (size_t)(cluster_id * tiles_per_cluster + tt) * 2;
-                d_dbg_prof_w5[_slot + 0] = _w0;
-                d_dbg_prof_w5[_slot + 1] = _w1;
-            }
-#endif
-        }
-        PROF_WALL_END();
-        PROF_WRITEOUT();
-      } else
-#endif /* KERN_3WARP CTA0 */
-      {
-        /* =============== WARP_TMA: TMA A+B loader (or KERN_3WARP CTA1) ============= */
+        /* =============== WARP_TMA: TMA A+B loader ============= */
         uint32_t tma_empty_phase[N_STAGES] = {0};
         const bool elect = (lane == 0);
 
@@ -1315,9 +1107,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #endif
         PROF_WALL_END();
         PROF_WRITEOUT();
-      }
     }
-#ifndef KERN_3WARP
     else /* warp_id == WARP_MMA, cta_rank == 0 */ {
         /* =============== WARP_MMA: MMA issuer (CTA 0 only) =============== */
         uint32_t tma_full_phase[N_STAGES] = {0};
@@ -1544,7 +1334,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         }
 #endif
     }
-#endif /* !KERN_3WARP */
 
     if (warp_id == 0) {
         asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
@@ -2153,11 +1942,6 @@ int main(int argc, char** argv) {
         double mean_m = grand_cnt ? (double)grand_m / grand_cnt : 0.0;
         double mean_c = grand_cnt ? (double)grand_c / grand_cnt : 0.0;
 
-#ifdef KERN_3WARP
-        const char* _w5_field2_label = "wait_empty";
-#else
-        const char* _w5_field2_label = "commit";
-#endif
         printf("\n[PROFILE_W5] W5 MMA-issuer per-tile diagnostic  (entries=%u)\n", grand_cnt);
         printf("  wall cyc/tile @ 1.813 GHz = %.0f  (W5 total cyc/tile ≈ wall when MMA-bound)\n", tile_cyc);
         printf("  overall: tile_total mean=%.0f  min=%llu  max=%llu  (%.1f%% wall)\n",
@@ -2165,13 +1949,12 @@ int main(int argc, char** argv) {
                tile_cyc > 0 ? 100.0 * mean_t / tile_cyc : 0.0);
         printf("           mma_asm    mean=%.0f  (per-iter≈%.0f, %.1f%% wall)\n",
                mean_m, mean_m / K_ITERS, tile_cyc > 0 ? 100.0 * mean_m / tile_cyc : 0.0);
-        printf("           %-10s mean=%.0f  (per-iter≈%.0f, %.1f%% wall)\n",
-               _w5_field2_label, mean_c, mean_c / K_ITERS,
+        printf("           commit     mean=%.0f  (per-iter≈%.0f, %.1f%% wall)\n",
+               mean_c, mean_c / K_ITERS,
                tile_cyc > 0 ? 100.0 * mean_c / tile_cyc : 0.0);
-        printf("  residual (= total − mma − %s): %.0f  (%.1f%% wall)%s\n",
-               _w5_field2_label, mean_t - mean_m - mean_c,
-               tile_cyc > 0 ? 100.0 * (mean_t - mean_m - mean_c) / tile_cyc : 0.0,
-               "  ← combine with PROFILE_TILE tma_wait for finer split");
+        printf("  residual (= total − mma − commit): %.0f  (%.1f%% wall)  ← combine with PROFILE_TILE tma_wait for finer split\n",
+               mean_t - mean_m - mean_c,
+               tile_cyc > 0 ? 100.0 * (mean_t - mean_m - mean_c) / tile_cyc : 0.0);
 
         printf("\n  by N-col (aggregated over all tm)\n");
         printf("  tn   tile_total   mma_asm   field2   residual   count\n");

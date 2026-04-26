@@ -40,7 +40,6 @@ VARIANTS=(
     "dg4:-DDG_GROUP_SIZE=4"
     "dg16:-DDG_GROUP_SIZE=16"
     "dg32:-DDG_GROUP_SIZE=32"
-    "innerT:-DDG_INNER_T"
     "zorder:-DTILE_DISPATCH=9"
     "hilbert:-DTILE_DISPATCH=10"
     "zigzag:-DTILE_DISPATCH=11"
@@ -52,6 +51,8 @@ VARIANTS=(
     "checkered:-DTILE_DISPATCH=18"
     "dgsnake:-DTILE_DISPATCH=19"
     "ncyrot:-DTILE_DISPATCH=21"
+    "gflip:-DTILE_DISPATCH=33"
+    "tn2br:-DTILE_DISPATCH=34"
 )
 
 # ── Phase 1: build all variants ─────────────────────────────────────────

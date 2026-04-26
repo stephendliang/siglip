@@ -37,8 +37,6 @@ VARIANTS=(
     "dg4:-DDG_GROUP_SIZE=4:1"
     "dg16:-DDG_GROUP_SIZE=16:1"
     "dg32:-DDG_GROUP_SIZE=32:0"
-    "innerT:-DDG_INNER_T:1"
-    "stagger:-DDG_STAGGER:1"
 )
 
 build_one() {
@@ -146,14 +144,7 @@ summary_file="$OUT/summary.txt"
     done
 
     printf "\nNotes:\n"
-    printf "  • PROFILE_W4 per-in_g table: the 'raw_tn = ig / G' decoder assumes\n"
-    printf "    the vanilla in_group layout. Under DG_INNER_T, the packed tn\n"
-    printf "    field is still correct but the per-in_g grouping interpretation\n"
-    printf "    changes (tn cycles every row instead of every G rows).\n"
     printf "  • DG_GROUP_SIZE=32 skipped under PROFILE_W4 (in_g overflow).\n"
-    printf "  • Bijection pre-verified: /tmp/dg_variants_check.py emits 10878/10878\n"
-    printf "    unique tiles for every (DG_INNER_T, DG_STAGGER, DG_ROT) cross-\n"
-    printf "    product and every G ∈ {4,8,16,32}.\n"
     printf "  • Raw logs: $OUT/run-<variant>-<rep>.log (Phase 1),\n"
     printf "             $OUT/run-<variant>-w4.log (Phase 2).\n"
 } | tee "$summary_file"

@@ -9,7 +9,7 @@ CUTLASS_DIR = third_party/cutlass
 CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUTLASS_FLAGS = -std=c++17 --expt-relaxed-constexpr
 
-.PHONY: all clean timing fc2-w3x-sync-sweep fc2-w3-bias fc1-gelu fc1-w3 fc1-w3-gemm fc1-w3-strip fc1-w3-sched fc1-w3-lean fc1-w3-dgswizzle fc1-w3-dgphase fc1-w3-dgnrot fc1-w3-zorder fc1-w3-hilbert fc1-w3-zigzag fc1-w3-rowmajor fc1-w3-ncycle fc1-w3-ncyrot fc1-w3-nflat fc1-w3-nsnake fc1-w3-packed fc1-w3-packed-sched fc1-w3-packed-lean fc1-w3-packed-dgswizzle fc1-w3-packed-zorder fc1-w3-packed-hilbert fc1-w3-packed-zigzag fc1-w3-packed-rowmajor fc1-w3-packed-ncycle fc1-w3-packed-ncyrot fc1-w3-packed-nflat fc1-w3-packed-nsnake fc1-w3-nlock fc1-w3-checkered fc1-w3-dgsnake fc1-w3-kstagger fc1-w3-dg4 fc1-w3-dg6 fc1-w3-dg10 fc1-w3-dg12 fc1-w3-dg16 fc1-w3-dg24 fc1-w3-dg32 fc2 fc2-timing fc2-w3 fc2-w3-c4 fc2-w3-c4-gemm fc2-w3-c4-strip fc2-w3-clock fc2-w3-sched-clock fc2-w3-collock fc2-w3-collock-clock fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-w3-self fc2-w3-atomic fc2-w3-spin fc2-w3-grid fc2-w3-inline fc2-w3-inline7 fc2-w3-inline7-clock fc2-w3-noprefill fc2-w3-ns7 fc2-w3-clc fc2-w3-rowsteal fc2-w3-tail fc2-w3-tail-lean fc2-w3-nlock fc2-w3-ncyrot fc2-w3-dgphase fc2-w3-dgnrot fc2-w3-checkered fc2-w3-dgsnake fc2-w3-kstagger fc2-w3-kstagger2 fc2-w3-kstagger3 fc2-w3-dg2 fc2-w3-dg3 fc2-w3-dg10 fc2-w3-dg20 fc2-w3-dg32 fc2-ldg fc2-ldg-strip fc2-ldg-gemm fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-warp calib-all tma-bench mma-bench stmatrix-bench fc2-w3x fc2-w3x-ncu fc2-w3x-ncu-strip fc2-w3x-ncu-gemm fc2-w3x-dg4 fc2-w3x-dg16 fc2-w3x-dg32 fc2-w3x-innerT fc2-w3x-stagger fc2-w3x-dg-sweep tma-swizzle-probe tma-swizzle-probe-sw tma-swizzle-probe-sw-x2 tma-swizzle-probe-sw-x3 tma-swizzle-probe-sw-x4
+.PHONY: all clean timing fc2-w3x-sync-sweep fc2-w3-bias fc1-gelu fc1-w3 fc1-w3-gemm fc1-w3-strip fc1-w3-sched fc1-w3-lean fc1-w3-dgswizzle fc1-w3-dgphase fc1-w3-dgnrot fc1-w3-zorder fc1-w3-hilbert fc1-w3-zigzag fc1-w3-rowmajor fc1-w3-ncycle fc1-w3-ncyrot fc1-w3-nflat fc1-w3-nsnake fc1-w3-packed fc1-w3-packed-sched fc1-w3-packed-lean fc1-w3-packed-dgswizzle fc1-w3-packed-zorder fc1-w3-packed-hilbert fc1-w3-packed-zigzag fc1-w3-packed-rowmajor fc1-w3-packed-ncycle fc1-w3-packed-ncyrot fc1-w3-packed-nflat fc1-w3-packed-nsnake fc1-w3-nlock fc1-w3-checkered fc1-w3-dgsnake fc1-w3-kstagger fc1-w3-dg4 fc1-w3-dg6 fc1-w3-dg10 fc1-w3-dg12 fc1-w3-dg16 fc1-w3-dg24 fc1-w3-dg32 fc2 fc2-timing fc2-w3 fc2-w3-c4 fc2-w3-c4-gemm fc2-w3-c4-strip fc2-w3-clock fc2-w3-sched-clock fc2-w3-collock fc2-w3-collock-clock fc2-w3-8w fc2-w3-fp32 fc2-w3-strip fc2-w3-self fc2-w3-atomic fc2-w3-spin fc2-w3-grid fc2-w3-inline fc2-w3-inline7 fc2-w3-inline7-clock fc2-w3-noprefill fc2-w3-ns7 fc2-w3-clc fc2-w3-rowsteal fc2-w3-tail fc2-w3-tail-lean fc2-w3-nlock fc2-w3-ncyrot fc2-w3-dgphase fc2-w3-dgnrot fc2-w3-checkered fc2-w3-dgsnake fc2-w3-kstagger fc2-w3-kstagger2 fc2-w3-kstagger3 fc2-w3-dg2 fc2-w3-dg3 fc2-w3-dg10 fc2-w3-dg20 fc2-w3-dg32 fc2-ldg fc2-ldg-strip fc2-ldg-gemm fc2-cutlass fc2-cutlass-strip fc2-cutlass-static fc2-cutlass-static-strip fc2-hybrid fc2-hybrid-strip fc2-hybrid-mma fc2-hybrid-phase3 cutlass-bench cutlass-bench-fc1 cutlass-bench-fc2 cutlass-bench-max cutlass-bench-fc1-max cutlass-bench-fc2-max cutlass-sass calibration cublas-bench cublas-bench-fc1 cublas-bench-fc2 sweep sweep-fast sweep-full sass-tool compare calib-tput calib-lat calib-conflict calib-warp calib-all tma-bench mma-bench stmatrix-bench fc2-w3x fc2-w3x-ncu fc2-w3x-ncu-strip fc2-w3x-ncu-gemm fc2-w3x-dg4 fc2-w3x-dg16 fc2-w3x-dg32 fc2-w3x-dg-sweep tma-swizzle-probe tma-swizzle-probe-sw tma-swizzle-probe-sw-x2 tma-swizzle-probe-sw-x3 tma-swizzle-probe-sw-x4
 
 all: $(TARGET)
 
@@ -135,28 +135,6 @@ fc2-w3x: fc2_w3x.cu
 fc2-w3x-noprefill: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PREFILL $< -o $@ $(LDFLAGS)
 
-# 3-warp experiment: 2 epi + 1 combined TMA+MMA warp.
-# CTA0 software-pipelines TMA-issue ahead of MMA by N_STAGES-1 KIs
-# (slot offset != 0 so wait_tma_empty doesn't block on the just-issued MMA).
-# CTA1 runs the existing TMA-only loop.
-fc2-w3x-3warp: fc2_w3x.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DKERN_3WARP $< -o $@ $(LDFLAGS)
-
-fc2-w3x-3warp-u24: fc2_w3x.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DKERN_3WARP -DK_UNROLL=24 $< -o $@ $(LDFLAGS)
-
-fc2-w3x-3warp-u6: fc2_w3x.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DKERN_3WARP -DK_UNROLL=6 $< -o $@ $(LDFLAGS)
-
-# 3-warp + PROFILE_W5: word1 packing repurposed (mma_sum<<32 | wait_empty_sum)
-# so the host-side "field2" column reports cumulative wait_tma_empty cyc per
-# tile — the suspected per-iter blocker. Add -DPROFILE_TILE for tma_wait_full.
-fc2-w3x-3warp-prof: fc2_w3x.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DKERN_3WARP -DPROFILE_W5 $< -o $@ $(LDFLAGS)
-
-fc2-w3x-3warp-prof-full: fc2_w3x.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DKERN_3WARP -DPROFILE_W5 -DPROFILE_TILE $< -o $@ $(LDFLAGS)
-
 fc2-w3x-strip: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
 
@@ -211,13 +189,7 @@ fc2-w3x-dg16: fc2_w3x.cu
 fc2-w3x-dg32: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DDG_GROUP_SIZE=32 $< -o $@ $(LDFLAGS)
 
-fc2-w3x-innerT: fc2_w3x.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DDG_INNER_T $< -o $@ $(LDFLAGS)
-
-fc2-w3x-stagger: fc2_w3x.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DDG_STAGGER $< -o $@ $(LDFLAGS)
-
-fc2-w3x-dg-sweep: fc2-w3x fc2-w3x-dg4 fc2-w3x-dg16 fc2-w3x-dg32 fc2-w3x-innerT fc2-w3x-stagger
+fc2-w3x-dg-sweep: fc2-w3x fc2-w3x-dg4 fc2-w3x-dg16 fc2-w3x-dg32
 
 # ── fc2_w3x structurally-different tile swizzles (tile_dispatch.cuh TD=9..21) ──
 # Not dgswizzle variants — genuinely different traversal structures.  TILES_N=3
@@ -253,13 +225,18 @@ fc2-w3x-tile-pmix:      fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=31 $< -o $@ $(LDFLAGS)
 fc2-w3x-tile-ingh:      fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=32 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-gflip:     fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=33 $< -o $@ $(LDFLAGS)
+fc2-w3x-tile-tn2br:     fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=34 $< -o $@ $(LDFLAGS)
 
 fc2-w3x-tile-sweep: fc2-w3x \
     fc2-w3x-tile-zorder fc2-w3x-tile-hilbert fc2-w3x-tile-zigzag \
     fc2-w3x-tile-rowmajor fc2-w3x-tile-ncycle fc2-w3x-tile-nflat \
     fc2-w3x-tile-nsnake fc2-w3x-tile-nlock fc2-w3x-tile-checkered \
     fc2-w3x-tile-dgsnake fc2-w3x-tile-ncyrot \
-    fc2-w3x-tile-chet fc2-w3x-tile-pmix fc2-w3x-tile-ingh
+    fc2-w3x-tile-chet fc2-w3x-tile-pmix fc2-w3x-tile-ingh \
+    fc2-w3x-tile-gflip fc2-w3x-tile-tn2br
 
 # Sync/fence experiments (DROP_TRAIL_BARSYNC × WAIT_GROUP_READ).  Driver:
 # tools/sweep_sync_experiments.sh.  Each binary is the baseline dgswizzle

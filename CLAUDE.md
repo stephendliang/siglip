@@ -124,6 +124,20 @@ sensitive than fc2_w3. dgsw stays default. PMIX is the cautionary case: a
 dgsw+rowmajor per-cluster mix that passes a tile-bijection check still
 destroys L2 staggering (51.82% hit) and doubles DRAM traffic.
 
+**gflip (TD=33) / tn2br (TD=34) probes (2026-04-26, B200 n=6, prof sweep):**
+two new dgsw-derived hybrids land marginally below baseline within the noise
+band — gflip 1.0091 ms, tn2br 1.0090 ms vs dgsw 1.0093 ms (Δ ≈ −0.3 µs each,
+σ=0.2–0.4 µs/variant; pooled t≈1.1, p5/p95 bands overlap heavily). Six
+variants now formally tie at the MMA-throughput floor: tn2br, gflip, dgsw,
+checkered, dg4, dgsnake. gflip pulls W4 `cp.async.tensor` 3469 → 2689 cyc
+(−780 cyc, joins the TMA-fast cluster), but the savings disappear into MMA
+shadow — same XPF_A/XPF_B autopsy. tn2br holds dgsw's TMA pattern (3479 cyc)
+since it only diverges at tn=TILES_N-1; bit-reversing tm-order at the
+boundary tn nets ±0 wall, which kills the in_g=16,17 fast-transition hypothesis
+(the in_g positional surplus is structurally welded in, not a tn-boundary
+artifact). W5 MMA wall_bracket pinned at 12484–12490 cyc across all 6 ties
+≈ 24 × 520 cyc/iter floor.
+
 ### Cleanest "DRAM amp ≠ bottleneck" proof (cutlass-static, 2026-04-23)
 
 Same tile shape (256x256x128), same cluster (2x1), same 2SM schedule, same
@@ -257,8 +271,10 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
   `memory/dead_kern_3warp.md`.
 - **fc2_w3x post-WIN levers (all ±3 µs or regression):** subpass 8→4, cross-tile TMA
   carry, SWIZZLE_64B, NS_EPI sweep, EPI_2WARP, DROP_TRAIL_BARSYNC, WAIT_GROUP_READ,
-  DROP_LEAD_BARSYNC, XPF_A/B prefetch, CHET/PMIX/INGH hybrid dispatches, 11 non-dgsw
-  TILE_DISPATCH variants, DG sweep, native BF16 epilogue (kept ±0 wall, cleaner).
+  DROP_LEAD_BARSYNC, XPF_A/B prefetch, CHET/PMIX/INGH hybrid dispatches, 13 non-dgsw
+  TILE_DISPATCH variants (incl. gflip TD=33 / tn2br TD=34, both −0.3 µs marginal
+  within-noise wins — 6-way tie at the MMA-throughput floor), DG sweep, native BF16
+  epilogue (kept ±0 wall, cleaner).
 - **Older dead variants:** TD=1 atomic, TD=5 CLC, TD=6/7 inline atomic, COL_LOCK,
   4-CTA TMA multicast (silent deadlock), mbar→SMEM polling, L2 cache hints,
   dgphase/dgnrot (TD=23/24), fc2_ldg (LDG/STG), fc2_hybrid (CUTLASS phases 2/3b/4),
