@@ -421,10 +421,8 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc,
   col j instead of (matrix m, row j, cols 2i, 2i+1) — rows and cols swap.
 
   SASS: STSM.16.MT88.4 (non-trans also emits .MT88 mnemonic on sm_100a).
+  STSM is mandatory — the legacy STS.128 path was retired 2026-04-26.
 */
-#ifndef USE_STMATRIX
-#define USE_STMATRIX 1
-#endif
 
 #define STSM_X4(SADDR, r0, r1, r2, r3) \
     asm volatile( \
@@ -736,7 +734,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #endif
         PROF_WALL_BEGIN();
 
-#ifdef BIAS_PRELOAD
         /*
           Hold the entire bias [N_DIM bf16] in registers across all tiles —
           one LDS per lane at kernel start instead of per-subpass-per-rh.
@@ -751,7 +748,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         */
         #define BIAS_REG_COUNT (N_DIM / 64)
         static_assert(BIAS_REG_COUNT * 64 == N_DIM,
-                      "BIAS_PRELOAD requires N_DIM % 64 == 0");
+                      "fc2_w3x bias-preload requires N_DIM % 64 == 0");
         uint32_t lane_bias[BIAS_REG_COUNT];
         #pragma unroll
         for (int k = 0; k < BIAS_REG_COUNT; k++) {
@@ -760,7 +757,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 : "=r"(lane_bias[k])
                 : "r"(smem_bias + pair_idx * 4));
         }
-#endif
 
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
@@ -790,40 +786,10 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 const int nc = sp * SUBPASS_COLS;
 
                 PROF_BEGIN(e1);
-#if !USE_STMATRIX
                 /*
-                  Bias is column-only (nc-dependent, row-invariant), so we
-                  LDS once per subpass and reuse across ROW_HALVES.
-                  Under USE_STMATRIX the bias is re-loaded per-lane inside
-                  the rh body (see below) to avoid bp[] stack-spill.
-                */
-                uint4 bv0, bv1, bv2, bv3;
-                asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(bv0.x), "=r"(bv0.y), "=r"(bv0.z), "=r"(bv0.w)
-                    : "r"(smem_bias + (prev_n + nc +  0) * 2));
-                asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(bv1.x), "=r"(bv1.y), "=r"(bv1.z), "=r"(bv1.w)
-                    : "r"(smem_bias + (prev_n + nc +  8) * 2));
-                asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(bv2.x), "=r"(bv2.y), "=r"(bv2.z), "=r"(bv2.w)
-                    : "r"(smem_bias + (prev_n + nc + 16) * 2));
-                asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(bv3.x), "=r"(bv3.y), "=r"(bv3.z), "=r"(bv3.w)
-                    : "r"(smem_bias + (prev_n + nc + 24) * 2));
-
-                uint32_t bp[16];
-                bp[ 0]=bv0.x;  bp[ 1]=bv0.y;  bp[ 2]=bv0.z;  bp[ 3]=bv0.w;
-                bp[ 4]=bv1.x;  bp[ 5]=bv1.y;  bp[ 6]=bv1.z;  bp[ 7]=bv1.w;
-                bp[ 8]=bv2.x;  bp[ 9]=bv2.y;  bp[10]=bv2.z;  bp[11]=bv2.w;
-                bp[12]=bv3.x;  bp[13]=bv3.y;  bp[14]=bv3.z;  bp[15]=bv3.w;
-#endif
-
-#if USE_STMATRIX && defined(BIAS_PRELOAD)
-                /*
-                  BIAS_PRELOAD: bias is held in lane_bias[] regs across all
-                  tiles.  Compute the 4 bls once per subpass via shfl from
-                  owner lanes; reuse across both rh halves (vs the per-rh
-                  LDS path below, which reloads from SMEM 2x per subpass).
+                  Bias is held in lane_bias[] regs across all tiles.
+                  Compute the 4 bls once per subpass via shfl from owner
+                  lanes; reuse across both rh halves.
 
                   start = prev_n + nc ≡ 0 mod 32, base_pair = start/2.
                   All 4 bls share reg_idx = base_pair >> 5; src_lane =
@@ -858,7 +824,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 uint32_t bl1 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  4);
                 uint32_t bl2 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  8);
                 uint32_t bl3 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre + 12);
-#endif
 
                 #pragma unroll
                 for (int rh = 0; rh < ROW_HALVES; rh++) {
@@ -866,10 +831,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     const uint32_t taddr_tile = taddr_base + buf * TN
                         + ((cta_rank * TM + row_local_32) << 16);
 
-#if USE_STMATRIX
                     /*
-                      Lever C path — LDTM.16dp256bit.x4 + STSM.16.MT88.4
-                      (non-trans) to match cuBLASLt rank-1's shape.
+                      LDTM.16dp256bit.x4 + STSM.16.MT88.4 (non-trans),
+                      matches cuBLASLt rank-1's epilogue shape.
 
                       LDTM layout (derived from CUTLASS Copy_Traits
                       SM100_TMEM_LOAD_16dp256b4x DstLayout, verified against
@@ -908,38 +872,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                                         taddr_tile + nc + (16u << 16));
                     TMEM_WAIT();
 
-                    /*
-                      Per-lane bias load.  Lane t=4j+i owns cols {2i, 2i+1,
-                      2i+8, 2i+9, 2i+16, 2i+17, 2i+24, 2i+25} — packed into
-                      4 bf16x2 (bl0..bl3) at col pairs (2i, 2i+1), (2i+8,
-                      2i+9), (2i+16, 2i+17), (2i+24, 2i+25).  Base offset
-                      = (prev_n + nc + 2i) * 2 bytes; four loads at stride
-                      16 bytes (8 bf16).  Four LDS.U32 instead of one
-                      LDS.128 because the 4 target bf16x2 are not
-                      contiguous in SMEM (16-byte stride, not 4-byte).
-                    */
-#ifdef BIAS_PRELOAD
                     /* bl0..bl3 already computed at subpass scope via shfl. */
                     const int lane_c = lane >> 3;
                     const int lane_r = lane & 7;
-#else
-                    const int lane_i = lane & 3;
-                    const int lane_c = lane >> 3;
-                    const int lane_r = lane & 7;
-                    uint32_t bl0, bl1, bl2, bl3;
-                    asm volatile("ld.shared.u32 %0, [%1];"
-                        : "=r"(bl0)
-                        : "r"(smem_bias + (prev_n + nc + 2 * lane_i +  0) * 2));
-                    asm volatile("ld.shared.u32 %0, [%1];"
-                        : "=r"(bl1)
-                        : "r"(smem_bias + (prev_n + nc + 2 * lane_i +  8) * 2));
-                    asm volatile("ld.shared.u32 %0, [%1];"
-                        : "=r"(bl2)
-                        : "r"(smem_bias + (prev_n + nc + 2 * lane_i + 16) * 2));
-                    asm volatile("ld.shared.u32 %0, [%1];"
-                        : "=r"(bl3)
-                        : "r"(smem_bias + (prev_n + nc + 2 * lane_i + 24) * 2));
-#endif
 
                     /*
                       Pack+bias-add into STSM.x4 reg groups.  Each group
@@ -990,42 +925,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                             p[8], p[9], p[10], p[11]);
                     STSM_X4(out_base + (row_local_32 + 24) * (SUBPASS_COLS * 2) + lane_off,
                             p[12], p[13], p[14], p[15]);
-#else
-                    float a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15;
-                    float a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31;
-                    TMEM_LOAD_X32(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-                                  a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31,
-                                  taddr_tile + nc);
-                    TMEM_WAIT();
-
-                    uint32_t p[16];
-                    CVT_ADD_BF16X2(p[ 0], a0,  a1,  bp[ 0]);
-                    CVT_ADD_BF16X2(p[ 1], a2,  a3,  bp[ 1]);
-                    CVT_ADD_BF16X2(p[ 2], a4,  a5,  bp[ 2]);
-                    CVT_ADD_BF16X2(p[ 3], a6,  a7,  bp[ 3]);
-                    CVT_ADD_BF16X2(p[ 4], a8,  a9,  bp[ 4]);
-                    CVT_ADD_BF16X2(p[ 5], a10, a11, bp[ 5]);
-                    CVT_ADD_BF16X2(p[ 6], a12, a13, bp[ 6]);
-                    CVT_ADD_BF16X2(p[ 7], a14, a15, bp[ 7]);
-                    CVT_ADD_BF16X2(p[ 8], a16, a17, bp[ 8]);
-                    CVT_ADD_BF16X2(p[ 9], a18, a19, bp[ 9]);
-                    CVT_ADD_BF16X2(p[10], a20, a21, bp[10]);
-                    CVT_ADD_BF16X2(p[11], a22, a23, bp[11]);
-                    CVT_ADD_BF16X2(p[12], a24, a25, bp[12]);
-                    CVT_ADD_BF16X2(p[13], a26, a27, bp[13]);
-                    CVT_ADD_BF16X2(p[14], a28, a29, bp[14]);
-                    CVT_ADD_BF16X2(p[15], a30, a31, bp[15]);
-
-                    const uint32_t out_base = out_smem_arr[es] + (row_local_32 + lane) * (SUBPASS_COLS * 2);
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-                        :: "r"(out_base +  0), "r"(p[0]), "r"(p[1]), "r"(p[2]), "r"(p[3]));
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-                        :: "r"(out_base + 16), "r"(p[4]), "r"(p[5]), "r"(p[6]), "r"(p[7]));
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-                        :: "r"(out_base + 32), "r"(p[8]), "r"(p[9]), "r"(p[10]), "r"(p[11]));
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-                        :: "r"(out_base + 48), "r"(p[12]), "r"(p[13]), "r"(p[14]), "r"(p[15]));
-#endif /* USE_STMATRIX */
                 }
 
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");

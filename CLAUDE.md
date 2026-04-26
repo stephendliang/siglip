@@ -8,8 +8,7 @@ Cross-compiled on CPU VPS, runs on B200 (148 SMs, 74 clusters). PE kernel is don
 
 | target | ms | kernel | dispatch | vs cuBLASLt rank-1 |
 |---|---|---|---|---|
-| FC2 K=3072 BIAS_ONLY + BIAS_PRELOAD | **~1.005** | `fc2_w3x` (opt-in) | dgswizzle PACKED | **−41 µs** (n=128 Δ=−1.73 µs vs baseline at z=−23) |
-| FC2 K=3072 BIAS_ONLY (baseline)     | 1.007 | `fc2_w3x` | dgswizzle PACKED | −39 µs (rank-1: 1.046) |
+| FC2 K=3072 BIAS_ONLY | **~1.009** | `fc2_w3x` (bias-preload default, STSM-only) | dgswizzle PACKED | **−37 µs** (rank-1: 1.046) |
 | FC2 K=3072 fused (+residual) | 1.063 | `fc2_w3` | dgswizzle TD=8 PACKED | (no apples-to-apples ref) |
 | FC1 K=768 fused (+GELU+bias) | 1.998 | `fc1_w3` | zigzag TD=11 + K_STAGGER=1 | +104 µs (rank-1: 1.894) |
 
@@ -218,27 +217,26 @@ variant at compile time.
 
 K=1024/2048 still report ERR — one heuristic IMAs on the device.
 
-### Status (2026-04-26): BIAS_PRELOAD opt-in WIN, baseline at 1.007 ms
+### Status (2026-04-26): bias-preload + STSM mandatory; baseline at ~1.009 ms
 
-`fc2_w3x` bias-only at 1.007 ms; W5 is MMA-ceiling-bound (~12482 cyc/tile ≈ 24 × 520
-cyc/iter, per `PROFILE_W5`). Tensor pipe 95.84% active. See
+`fc2_w3x` bias-only at ~1.009 ms; W5 is MMA-ceiling-bound (~12482 cyc/tile ≈
+24 × 520 cyc/iter, per `PROFILE_W5`). Tensor pipe 95.84% active. See
 `docs/W3X_GRIEVANCES_VS_RANK1.md` for 9 remaining SASS deltas (15-25 µs total upside).
 
-**BIAS_PRELOAD** (opt-in, 2026-04-26) — `ef62fed` pre-loads full bias [768 bf16]
-into per-lane registers at kernel start; subpass-level shfl×4 replaces the per-rh
-LDS×4 in the USE_STMATRIX epilogue. B200 n=128 pass-major interleaved: vbase
-1010.70 µs → vpreload 1008.97 µs, **Δ = −1.73 µs at z=−23.23 STRONG** (SE 0.075,
-df=243.5, p ≪ 0.001). 6× the EPI_2WARP marginal effect with zero race risk
-(same SMEM data, just read once vs N times). Regs 56→65 / stack 16 B / 0 spills.
-Currently opt-in via `-DBIAS_PRELOAD` / `make fc2-w3x-bias-preload`; default-flip
-candidate pending decision. See `memory/project_w3x_bias_preload_win.md`.
+**bias-preload (default, 2026-04-26)** — pre-loads full bias [768 bf16] into
+per-lane registers at kernel start; subpass-level shfl×4 replaces the per-rh
+LDS×4 in the epilogue. B200 n=128 pass-major interleaved (commit `ef62fed`):
+vbase 1010.70 µs → vpreload 1008.97 µs, **Δ = −1.73 µs at z=−23.23 STRONG**
+(SE 0.075, df=243.5, p ≪ 0.001). 6× the EPI_2WARP marginal effect with zero
+race risk (same SMEM data, just read once vs N times). Regs 56→65 / stack
+16 B / 0 spills. Promoted to default + `!BIAS_PRELOAD` path stripped from the
+tree. See `memory/project_w3x_bias_preload_win.md`.
 
-**Lever C** (USE_STMATRIX=1, **default since 2026-04-26**) — `bcce329` layout
-fix matches rank-1 SASS opcode mix (STS.128 4→0, STSM.16.M88.4 0→4, regs
-64→53). B200 n=10 (2026-04-25): PASS, mean 1.0039 ± 0.0004 ms vs legacy STS
-1.0043 ± 0.0002 ms. Δ = −0.4 µs (Welch t≈2.8 on within-batch σ; inside ±3 µs
-noise band). Default for SASS-shape match; opt out via `-DUSE_STMATRIX=0` /
-`make fc2-w3x-no-stsm` for A/B comparison.
+**STSM (Lever C, mandatory)** — `bcce329` layout fix matches rank-1 SASS
+opcode mix (STS.128 4→0, STSM.16.M88.4 0→4). B200 n=10 (2026-04-25): PASS,
+mean 1.0039 ± 0.0004 ms vs legacy STS 1.0043 ± 0.0002 ms. The legacy
+STS.128 path was retired with bias-preload (the bias-broadcast pattern only
+fits the STSM lane mapping); `USE_STMATRIX` is no longer a flag.
 
 **Output ABI (2026-04-26):** `d_C` is now stored in a 4D packed-tile layout
 `[TILES_M, TILES_N, TM*2, TN]` (each (tile_m, tile_n) is one contiguous
@@ -320,8 +318,7 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
 
 ```bash
 # FC2 BIAS_ONLY (BEST — beats cuBLASLt rank-1)
-make fc2-w3x && ./fc2-w3x                        # 1.007 ms (USE_STMATRIX=1 default)
-make fc2-w3x-no-stsm && ./fc2-w3x-no-stsm        # legacy STS.128 epilogue (A/B)
+make fc2-w3x && ./fc2-w3x                        # ~1.009 ms (bias-preload + STSM mandatory)
 make fc2-w3x-ptx                                 # hand-written PTX, byte-identical SASS
 
 # fc2_w3x sweeps + diagnostics
