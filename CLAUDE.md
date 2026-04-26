@@ -273,8 +273,10 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
   carry, SWIZZLE_64B, NS_EPI sweep, EPI_2WARP, DROP_TRAIL_BARSYNC, WAIT_GROUP_READ,
   DROP_LEAD_BARSYNC, XPF_A/B prefetch, CHET/PMIX/INGH hybrid dispatches, 13 non-dgsw
   TILE_DISPATCH variants (incl. gflip TD=33 / tn2br TD=34, both −0.3 µs marginal
-  within-noise wins — 6-way tie at the MMA-throughput floor), DG sweep, native BF16
-  epilogue (kept ±0 wall, cleaner).
+  within-noise wins — 6-way tie at the MMA-throughput floor), STAGGER=2 split-mbar
+  (uniformly +3 µs across all 11 dispatches, zero stagger×dispatch interaction —
+  +36 cyc on each of W4/W5 from extra arrive + extra mbar_wait), DG sweep, native
+  BF16 epilogue (kept ±0 wall, cleaner).
 - **Older dead variants:** TD=1 atomic, TD=5 CLC, TD=6/7 inline atomic, COL_LOCK,
   4-CTA TMA multicast (silent deadlock), mbar→SMEM polling, L2 cache hints,
   dgphase/dgnrot (TD=23/24), fc2_ldg (LDG/STG), fc2_hybrid (CUTLASS phases 2/3b/4),
