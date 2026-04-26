@@ -155,6 +155,11 @@ fc2-w3x-ncu-gemm: fc2_w3x.cu
 fc2-w3x-no-stsm: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_STMATRIX=0 $< -o $@ $(LDFLAGS)
 
+# Bias preload: hold full bias [N_DIM bf16] in per-lane registers across all
+# tiles, replace per-rh LDS with subpass-level shfl. USE_STMATRIX path only.
+fc2-w3x-bias-preload: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DBIAS_PRELOAD $< -o $@ $(LDFLAGS)
+
 # ── fc2_w3x PTX port — hand-authored .ptx + driver-API host harness ──
 # fc2_w3x.ptx is the hand-authored PTX deliverable (see docs/PTX_BUILD_NOTES.md
 # for design notes).  Build pipeline:

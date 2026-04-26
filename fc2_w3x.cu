@@ -736,6 +736,32 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #endif
         PROF_WALL_BEGIN();
 
+#ifdef BIAS_PRELOAD
+        /*
+          Hold the entire bias [N_DIM bf16] in registers across all tiles —
+          one LDS per lane at kernel start instead of per-subpass-per-rh.
+
+          Layout: pair p ∈ 0..(N_DIM/2 − 1) holds bias[2p, 2p+1] packed
+          bf16x2.  Lane L's reg k holds pair (32k + L), so the kernel-time
+          bias load fans out as 32 lanes × BIAS_REG_COUNT regs = full bias.
+
+          Per-subpass shfl pattern (start ≡ 0 mod 32, base_pair = start/2,
+          (start/2) mod 32 ∈ {0, 16}): all 4 bls share reg_idx = base_pair
+          >> 5; src_lane = (base_pair & 31) + lane_i + 4m for bl_m.
+        */
+        #define BIAS_REG_COUNT (N_DIM / 64)
+        static_assert(BIAS_REG_COUNT * 64 == N_DIM,
+                      "BIAS_PRELOAD requires N_DIM % 64 == 0");
+        uint32_t lane_bias[BIAS_REG_COUNT];
+        #pragma unroll
+        for (int k = 0; k < BIAS_REG_COUNT; k++) {
+            const int pair_idx = 32 * k + lane;
+            asm volatile("ld.shared.u32 %0, [%1];"
+                : "=r"(lane_bias[k])
+                : "r"(smem_bias + pair_idx * 4));
+        }
+#endif
+
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
             if (lin_tile >= TOTAL_TILES) break;
@@ -790,6 +816,48 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 bp[ 4]=bv1.x;  bp[ 5]=bv1.y;  bp[ 6]=bv1.z;  bp[ 7]=bv1.w;
                 bp[ 8]=bv2.x;  bp[ 9]=bv2.y;  bp[10]=bv2.z;  bp[11]=bv2.w;
                 bp[12]=bv3.x;  bp[13]=bv3.y;  bp[14]=bv3.z;  bp[15]=bv3.w;
+#endif
+
+#if USE_STMATRIX && defined(BIAS_PRELOAD)
+                /*
+                  BIAS_PRELOAD: bias is held in lane_bias[] regs across all
+                  tiles.  Compute the 4 bls once per subpass via shfl from
+                  owner lanes; reuse across both rh halves (vs the per-rh
+                  LDS path below, which reloads from SMEM 2x per subpass).
+
+                  start = prev_n + nc ≡ 0 mod 32, base_pair = start/2.
+                  All 4 bls share reg_idx = base_pair >> 5; src_lane =
+                  (base_pair & 31) + lane_i + 4m for bl_m, m=0..3.
+
+                  The switch on reg_idx_sub forces ptxas to emit a SEL
+                  chain over the 12 named registers; using
+                  lane_bias[reg_idx_sub] directly produced LDL on the
+                  hot path because runtime-indexed register arrays
+                  spill to local memory.
+                */
+                const int lane_i_pre  = lane & 3;
+                const int base_pair   = (prev_n + nc) >> 1;
+                const int reg_idx_sub = base_pair >> 5;
+                const int lane_off_b  = base_pair & 31;
+                uint32_t bias_pack;
+                switch (reg_idx_sub) {
+                    case  0: bias_pack = lane_bias[ 0]; break;
+                    case  1: bias_pack = lane_bias[ 1]; break;
+                    case  2: bias_pack = lane_bias[ 2]; break;
+                    case  3: bias_pack = lane_bias[ 3]; break;
+                    case  4: bias_pack = lane_bias[ 4]; break;
+                    case  5: bias_pack = lane_bias[ 5]; break;
+                    case  6: bias_pack = lane_bias[ 6]; break;
+                    case  7: bias_pack = lane_bias[ 7]; break;
+                    case  8: bias_pack = lane_bias[ 8]; break;
+                    case  9: bias_pack = lane_bias[ 9]; break;
+                    case 10: bias_pack = lane_bias[10]; break;
+                    default: bias_pack = lane_bias[11]; break;
+                }
+                uint32_t bl0 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  0);
+                uint32_t bl1 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  4);
+                uint32_t bl2 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  8);
+                uint32_t bl3 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre + 12);
 #endif
 
                 #pragma unroll
@@ -850,6 +918,11 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                       LDS.128 because the 4 target bf16x2 are not
                       contiguous in SMEM (16-byte stride, not 4-byte).
                     */
+#ifdef BIAS_PRELOAD
+                    /* bl0..bl3 already computed at subpass scope via shfl. */
+                    const int lane_c = lane >> 3;
+                    const int lane_r = lane & 7;
+#else
                     const int lane_i = lane & 3;
                     const int lane_c = lane >> 3;
                     const int lane_r = lane & 7;
@@ -866,6 +939,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     asm volatile("ld.shared.u32 %0, [%1];"
                         : "=r"(bl3)
                         : "r"(smem_bias + (prev_n + nc + 2 * lane_i + 24) * 2));
+#endif
 
                     /*
                       Pack+bias-add into STSM.x4 reg groups.  Each group
