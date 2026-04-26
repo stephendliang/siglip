@@ -41,8 +41,8 @@ def parse_csv(path: Path):
     return header, rows
 
 
-LEVERS = ["XPF_A", "XPF_B", "EPI_2WARP", "DROP_LEAD",
-          "DROP_TRAIL", "WAIT_GROUP", "NO_BULK_MEMCLBR"]
+LEVERS = ["EPI_2WARP", "DROP_LEAD", "DROP_TRAIL",
+          "WAIT_GROUP", "NO_BULK_MEMCLBR"]
 
 
 def build_design(rows, include_3way=True):
@@ -251,7 +251,7 @@ def main():
     lines.append("fc2_w3x combinatorial wash-lever sweep — OLS regression")
     lines.append("=" * 78)
     lines.append(f"n_obs={n_obs}  p={p}  rmse={rmse*1000:.2f} µs")
-    lines.append(f"  variants seen:    {len(set(r['variant'] for r in rows))} / 128")
+    lines.append(f"  variants seen:    {len(set(r['variant'] for r in rows))} / {1 << len(LEVERS)}")
     lines.append(f"  reps × variants:  {n_obs}")
     lines.append(f"  σ_resid:          {rmse*1000:.2f} µs (within-cell wall noise)")
     lines.append("")
@@ -261,15 +261,25 @@ def main():
 
     lines.append("DECISION:")
     if not sigs:
-        lines.append(f"  KILL ALL 7 LEVERS — no main or 2-way effect passes Bonferroni.")
+        lines.append(f"  KILL ALL {len(LEVERS)} LEVERS — no main or 2-way effect passes Bonferroni.")
         lines.append(f"  max |z| across mains+2way = {main_2way_max:.2f} (threshold {z_thresh:.2f})")
-        lines.append("  No interaction shelters a real effect under solo-wash results.")
     else:
-        lines.append(f"  KEEP — {len(sigs)} effect(s) passed Bonferroni:")
-        for kind, nm, b, s, z, sig in sigs:
-            lines.append(f"    {kind:5s}  {nm:35s}  β={b*1000:+7.2f} µs  z={z:+6.2f}")
-        lines.append("  Recommend: build the winning combination(s) and cross with the")
-        lines.append("  6 tied dispatches (dgsw/checkered/dg4/dgsnake/gflip/tn2br).")
+        helps = [r for r in sigs if r[2] < 0]
+        hurts = [r for r in sigs if r[2] > 0]
+        if helps and not hurts:
+            lines.append(f"  FLIP DEFAULTS — {len(helps)} effect(s) significantly help (β<0):")
+            for kind, nm, b, s, z, sig in helps:
+                lines.append(f"    {kind:5s}  {nm:35s}  β={b*1000:+7.2f} µs  z={z:+6.2f}")
+        elif hurts and not helps:
+            lines.append(f"  KILL THE LEVER(S) — {len(hurts)} effect(s) significantly HURT (β>0).")
+            lines.append("  Default is already off; the macro just bloats the source. Delete:")
+            for kind, nm, b, s, z, sig in hurts:
+                lines.append(f"    {kind:5s}  {nm:35s}  β={b*1000:+7.2f} µs  z={z:+6.2f}")
+        else:
+            lines.append(f"  MIXED — {len(helps)} help, {len(hurts)} hurt:")
+            for kind, nm, b, s, z, sig in sigs:
+                direction = "HELPS" if b < 0 else "HURTS"
+                lines.append(f"    {kind:5s}  {nm:35s}  β={b*1000:+7.2f} µs  z={z:+6.2f}  [{direction}]")
     lines.append("")
 
     lines.append("-" * 78)
@@ -293,8 +303,9 @@ def main():
     cell_means = [(v, sum(xs) / len(xs), len(xs)) for v, xs in cells.items()]
     cell_means.sort(key=lambda t: t[1])
 
-    lines.append(f"{'variant':10s}  {'bits':10s}  {'n':>3s}  {'mean ms':>9s}  {'µs vs v0000000':>14s}")
-    base_mean = next((m for v, m, n in cell_means if v == "v0000000"), cell_means[0][1])
+    baseline_name = "v" + "0" * len(LEVERS)
+    lines.append(f"{'variant':10s}  {'bits':10s}  {'n':>3s}  {'mean ms':>9s}  {'µs vs '+baseline_name:>14s}")
+    base_mean = next((m for v, m, n in cell_means if v == baseline_name), cell_means[0][1])
     for v, m, n in cell_means[:10]:
         lines.append(f"{v:10s}  {v[1:]:10s}  {n:>3d}  {m:>9.4f}  {(m-base_mean)*1000:>+14.2f}")
 

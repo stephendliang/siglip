@@ -271,7 +271,9 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
   `memory/dead_kern_3warp.md`.
 - **fc2_w3x post-WIN levers (all ±3 µs or regression):** subpass 8→4, cross-tile TMA
   carry, SWIZZLE_64B, NS_EPI sweep, EPI_2WARP, DROP_TRAIL_BARSYNC, WAIT_GROUP_READ,
-  DROP_LEAD_BARSYNC, XPF_A/B prefetch, CHET/PMIX/INGH hybrid dispatches, 13 non-dgsw
+  DROP_LEAD_BARSYNC, XPF_A/B prefetch (Bonferroni-confirmed regression in
+  the 2026-04-26 128-cell combo sweep: XPF_A +3.05 µs at z=+6.30, XPF_B
+  +1.27 µs at z=+2.62; **macros removed from tree**), CHET/PMIX/INGH hybrid dispatches, 13 non-dgsw
   TILE_DISPATCH variants (incl. gflip TD=33 / tn2br TD=34, both −0.3 µs marginal
   within-noise wins — 6-way tie at the MMA-throughput floor), STAGGER=2 split-mbar
   (uniformly +3 µs across all 11 dispatches, zero stagger×dispatch interaction —

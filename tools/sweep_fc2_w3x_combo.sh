@@ -1,42 +1,33 @@
 #!/usr/bin/env bash
 #
-# Fractional factorial sweep of fc2_w3x "wash" levers.
+# Combinatorial sweep of fc2_w3x's surviving "wash" levers.
 #
-# Each binary invocation costs ~1.5s (CUDA init + tensor map setup) regardless
-# of kernel work. So variant count, not kernel time, dominates wall time.
-# Default MODE=res7 (Resolution-VII half-fraction, generator I=ABCDEFG):
-#   - 64 variants instead of 128
-#   - all 7 main effects clean (alias only with 6-way, negligible)
-#   - all 21 two-way interactions clean (alias only with 5-way, negligible)
-#   - 3-way and higher are aliased; analyzer is told to skip them via --no-3way
+# Post-purge state (2026-04-26): XPF_A and XPF_B were Bonferroni-confirmed
+# regressions in the prior 128-cell sweep and have been deleted from the
+# kernel. The 5 remaining levers are:
 #
-# Lever bit assignment (variant name = "v" + 7-bit binary, MSB=bit6):
-#   bit 0:  XPF_A
-#   bit 1:  XPF_B
-#   bit 2:  EPI_2WARP
-#   bit 3:  DROP_LEAD_BARSYNC
-#   bit 4:  DROP_TRAIL_BARSYNC
-#   bit 5:  WAIT_GROUP_READ
-#   bit 6:  NO_BULK_MEMCLBR
+#   bit 0:  EPI_2WARP
+#   bit 1:  DROP_LEAD_BARSYNC
+#   bit 2:  DROP_TRAIL_BARSYNC
+#   bit 3:  WAIT_GROUP_READ
+#   bit 4:  NO_BULK_MEMCLBR
+#
+# Variant name = "v" + 5-bit binary (MSB=bit4=NO_BULK, LSB=bit0=EPI_2WARP).
+# 2^5 = 32 variants, default REPS=10 for tight cell-mean stats. Total
+# B200 wall ≈ 2 min with COMBO_QUICK fast init.
+#
+# Each binary is built with -DCOMBO_QUICK (fast cudaMemset init, N_WARMUP=1,
+# N_TIMED_LAUNCHES=3, skip verify).
 #
 # Output: data/fc2_w3x_combo_<ts>/
 #   build-v<bits>.log
 #   run-v<bits>-<rep>.log
-#   wall_data.csv      (variant,bits,rep,ms — fed to combo_anova.py)
-#   anova.txt          (OLS report on main effects + 2-way interactions)
-#
-# Each binary is built with -DCOMBO_QUICK, which:
-#   - skips the 2.85 GB host-side A-matrix fill (cudaMemset instead) — the
-#     real startup bottleneck, ~1-2s/binary becomes ~10ms
-#   - drops N_WARMUP 2→1, N_TIMED_LAUNCHES 10→3 (kernel time 12ms→4ms,
-#     not the bottleneck but matches user request for fewer iters/binary)
-#   - skips the post-kernel verify block (data is fake under cudaMemset)
+#   wall_data.csv      (variant,bits,rep,EPI_2WARP,...,ms)
+#   anova.txt          (OLS report on mains + 2-way + 3-way)
 #
 # Usage:
-#   tools/sweep_fc2_w3x_combo.sh           # MODE=full, REPS=2 (≈3-5 min B200)
-#   MODE=res7 tools/sweep_fc2_w3x_combo.sh # 64 variants (≈2 min)
-#   MODE=res4 tools/sweep_fc2_w3x_combo.sh # 32 variants (≈1 min)
-#   REPS=4 tools/sweep_fc2_w3x_combo.sh    # tighter z-stats
+#   tools/sweep_fc2_w3x_combo.sh           # MODE=full, REPS=10 (≈2 min)
+#   REPS=20 tools/sweep_fc2_w3x_combo.sh   # tighter
 #   tools/sweep_fc2_w3x_combo.sh my_outdir
 #
 
@@ -44,8 +35,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 OUT=${1:-"data/fc2_w3x_combo_$(date +%Y%m%d_%H%M%S)"}
-REPS=${REPS:-2}
-MODE=${MODE:-full}
+REPS=${REPS:-10}
 NVCC=${NVCC:-nvcc}
 CFLAGS='-gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static'
 LDFLAGS='-lcurand_static -lculibos -lcuda'
@@ -53,12 +43,14 @@ LDFLAGS='-lcurand_static -lculibos -lcuda'
 mkdir -p "$OUT"
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUT/run.log"; }
 
-LEVERS=(XPF_A XPF_B EPI_2WARP DROP_LEAD_BARSYNC DROP_TRAIL_BARSYNC WAIT_GROUP_READ NO_BULK_MEMCLBR)
+LEVERS=(EPI_2WARP DROP_LEAD_BARSYNC DROP_TRAIL_BARSYNC WAIT_GROUP_READ NO_BULK_MEMCLBR)
+N_LEVERS=${#LEVERS[@]}
+N_VARIANTS=$(( 1 << N_LEVERS ))
 
 bits_to_flags() {
     local bits=$1
     local flags=""
-    for i in 0 1 2 3 4 5 6; do
+    for i in $(seq 0 $((N_LEVERS - 1))); do
         if (( (bits >> i) & 1 )); then
             flags+=" -D${LEVERS[$i]}"
         fi
@@ -69,63 +61,22 @@ bits_to_flags() {
 bits_to_name() {
     local bits=$1
     local name="v"
-    for i in 6 5 4 3 2 1 0; do
+    for i in $(seq $((N_LEVERS - 1)) -1 0); do
         name+=$(( (bits >> i) & 1 ))
     done
     echo "$name"
 }
 
-popcount() {
-    local n=$1 c=0
-    while (( n )); do c=$((c + (n & 1))); n=$((n >> 1)); done
-    echo $c
-}
-
-case "$MODE" in
-    full)
-        SELECTED=($(seq 0 127))
-        ANOVA_FLAGS=""
-        ;;
-    res7|half)
-        # Generator I = ABCDEFG: keep variants with even popcount.
-        # Mains alias with 6-ways, 2-ways alias with 5-ways — both clean.
-        # 3-ways alias with 4-ways → analyzer must skip 3-way terms.
-        SELECTED=()
-        for b in $(seq 0 127); do
-            (( $(popcount "$b") % 2 == 0 )) && SELECTED+=("$b")
-        done
-        ANOVA_FLAGS="--no-3way"
-        ;;
-    res4|quarter)
-        # 2^(7-2) quarter-fraction. Generators I = ABCD, I = CDEFG.
-        # Keep variants where (b0^b1^b2^b3)==0 AND (b2^b3^b4^b5^b6)==0.
-        # All 7 mains clean; some 2-ways aliased — analyzer drops 3+way.
-        SELECTED=()
-        for b in $(seq 0 127); do
-            local0=$(( ((b>>0)&1) ^ ((b>>1)&1) ^ ((b>>2)&1) ^ ((b>>3)&1) ))
-            local1=$(( ((b>>2)&1) ^ ((b>>3)&1) ^ ((b>>4)&1) ^ ((b>>5)&1) ^ ((b>>6)&1) ))
-            (( local0 == 0 && local1 == 0 )) && SELECTED+=("$b")
-        done
-        ANOVA_FLAGS="--no-3way"
-        ;;
-    *)
-        echo "MODE must be one of: full, res7 (default), res4" >&2
-        exit 1
-        ;;
-esac
-
-N_VARIANTS=${#SELECTED[@]}
-
 # ── Phase 1: build $N_VARIANTS variants ─────────────────────────────────
-log "=== Phase 1: building $N_VARIANTS variants (MODE=$MODE) with -DPROFILE_CYCLES ==="
-log "lever bits (MSB→LSB): ${LEVERS[6]} ${LEVERS[5]} ${LEVERS[4]} ${LEVERS[3]} ${LEVERS[2]} ${LEVERS[1]} ${LEVERS[0]}"
+log "=== Phase 1: building $N_VARIANTS variants with -DCOMBO_QUICK ==="
+log "lever bits (MSB→LSB): ${LEVERS[4]} ${LEVERS[3]} ${LEVERS[2]} ${LEVERS[1]} ${LEVERS[0]}"
 
 BUILD_OK=()
-for bits in "${SELECTED[@]}"; do
+for bits in $(seq 0 $((N_VARIANTS - 1))); do
     name=$(bits_to_name "$bits")
     flags=$(bits_to_flags "$bits")
     bin="$OUT/fc2-w3x-combo-$name"
-    if $NVCC $CFLAGS -DPROFILE_CYCLES -DCOMBO_QUICK $flags fc2_w3x.cu -o "$bin" $LDFLAGS \
+    if $NVCC $CFLAGS -DCOMBO_QUICK $flags fc2_w3x.cu -o "$bin" $LDFLAGS \
             > "$OUT/build-$name.log" 2>&1; then
         BUILD_OK+=("$bits:$name")
     else
@@ -152,7 +103,7 @@ done
 log ""
 log "=== Phase 3: extracting wall ms → $OUT/wall_data.csv ==="
 {
-    echo "variant,bits,rep,XPF_A,XPF_B,EPI_2WARP,DROP_LEAD,DROP_TRAIL,WAIT_GROUP,NO_BULK_MEMCLBR,ms"
+    echo "variant,bits,rep,EPI_2WARP,DROP_LEAD,DROP_TRAIL,WAIT_GROUP,NO_BULK_MEMCLBR,ms"
     for entry in "${BUILD_OK[@]}"; do
         IFS=: read -r bits name <<< "$entry"
         b0=$(( bits & 1 ))
@@ -160,14 +111,12 @@ log "=== Phase 3: extracting wall ms → $OUT/wall_data.csv ==="
         b2=$(( (bits >> 2) & 1 ))
         b3=$(( (bits >> 3) & 1 ))
         b4=$(( (bits >> 4) & 1 ))
-        b5=$(( (bits >> 5) & 1 ))
-        b6=$(( (bits >> 6) & 1 ))
         for rep in $(seq 1 "$REPS"); do
             f="$OUT/run-$name-$rep.log"
             if [[ -f "$f" ]]; then
                 ms=$(grep -oE 'FC2-W3X kernel: [0-9.]+ ms' "$f" | head -1 | awk '{print $3}')
                 if [[ -n "$ms" ]]; then
-                    echo "$name,$bits,$rep,$b0,$b1,$b2,$b3,$b4,$b5,$b6,$ms"
+                    echo "$name,$bits,$rep,$b0,$b1,$b2,$b3,$b4,$ms"
                 fi
             fi
         done
@@ -179,7 +128,7 @@ log "extracted $n_rows wall measurements"
 # ── Phase 4: regression ─────────────────────────────────────────────────
 log ""
 log "=== Phase 4: OLS regression → $OUT/anova.txt ==="
-python3 tools/combo_anova.py "$OUT/wall_data.csv" --out "$OUT/anova.txt" $ANOVA_FLAGS
+python3 tools/combo_anova.py "$OUT/wall_data.csv" --out "$OUT/anova.txt"
 
 log ""
 log "report:           $OUT/anova.txt"
