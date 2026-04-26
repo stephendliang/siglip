@@ -1059,6 +1059,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 
             /* Steady + drain: per ki_m, do MMA(ki_m, slot ki_m%N_STAGES); if
                ki_t = ki_m + N_STAGES - 1 < K_ITERS, also issue TMA(ki_t). */
+#ifdef K_UNROLL
+            K_UNROLL_PRAGMA
+#endif
             for (int ki_m = 0; ki_m < K_ITERS; ki_m++) {
                 const int s_m = ki_m % N_STAGES;
 

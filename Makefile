@@ -142,6 +142,12 @@ fc2-w3x-noprefill: fc2_w3x.cu
 fc2-w3x-3warp: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DKERN_3WARP $< -o $@ $(LDFLAGS)
 
+fc2-w3x-3warp-u24: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DKERN_3WARP -DK_UNROLL=24 $< -o $@ $(LDFLAGS)
+
+fc2-w3x-3warp-u6: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DKERN_3WARP -DK_UNROLL=6 $< -o $@ $(LDFLAGS)
+
 fc2-w3x-strip: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
 
