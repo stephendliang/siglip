@@ -1,41 +1,39 @@
 #!/usr/bin/env bash
 #
-# Combinatorial sweep of fc2_w3x's surviving "wash" levers.
+# Two-cell head-to-head: the only two fc2_w3x lever combos we still care
+# about after the n=5 + n=10 sweeps showed nothing else is reproducibly
+# different from baseline.
 #
-# Post-purge state (2026-04-26): XPF_A and XPF_B were Bonferroni-confirmed
-# regressions in the prior 128-cell sweep and have been deleted from the
-# kernel. The 5 remaining levers are:
+#   A = v10011 = NO_BULK_MEMCLBR + DROP_LEAD_BARSYNC + EPI_2WARP
+#   B = v01101 = WAIT_GROUP_READ + DROP_TRAIL_BARSYNC + EPI_2WARP
 #
-#   bit 0:  EPI_2WARP
-#   bit 1:  DROP_LEAD_BARSYNC
-#   bit 2:  DROP_TRAIL_BARSYNC
-#   bit 3:  WAIT_GROUP_READ
-#   bit 4:  NO_BULK_MEMCLBR
+# These were the strongest cells across the prior runs (top-2 in the
+# n=5 follow-up: v10011 −1.00 µs, v01101 −0.80 µs vs baseline). Both
+# share EPI_2WARP, so the head-to-head isolates which DROP / WAIT / BULK
+# triplet wins under the 2-warp epi structure.
 #
-# Variant name = "v" + 5-bit binary (MSB=bit4=NO_BULK, LSB=bit0=EPI_2WARP).
-# 2^5 = 32 variants, default REPS=10 for tight cell-mean stats. Total
-# B200 wall ≈ 2 min with COMBO_QUICK fast init.
+# No baseline cell here — the previous n=10 sweep already pinned baseline
+# to within ±0.4 µs. This script answers a single question: A vs B.
 #
-# Each binary is built with -DCOMBO_QUICK (fast cudaMemset init, N_WARMUP=1,
-# N_TIMED_LAUNCHES=3, skip verify).
+# Each binary is built with -DCOMBO_QUICK (fast cudaMemset init,
+# N_WARMUP=1, N_TIMED_LAUNCHES=3, skip verify).
 #
 # Output: data/fc2_w3x_combo_<ts>/
 #   build-v<bits>.log
 #   run-v<bits>-<rep>.log
 #   wall_data.csv      (variant,bits,rep,EPI_2WARP,...,ms)
-#   anova.txt          (OLS report on mains + 2-way + 3-way)
+#   compare.txt        (mean ± SE per cell + Welch t between them)
 #
 # Usage:
-#   tools/sweep_fc2_w3x_combo.sh           # MODE=full, REPS=10 (≈2 min)
-#   REPS=20 tools/sweep_fc2_w3x_combo.sh   # tighter
-#   tools/sweep_fc2_w3x_combo.sh my_outdir
+#   tools/sweep_fc2_w3x_combo.sh           # REPS=20 (≈40 s B200)
+#   REPS=40 tools/sweep_fc2_w3x_combo.sh   # tighter
 #
 
 set -u
 cd "$(dirname "$0")/.."
 
 OUT=${1:-"data/fc2_w3x_combo_$(date +%Y%m%d_%H%M%S)"}
-REPS=${REPS:-10}
+REPS=${REPS:-20}
 NVCC=${NVCC:-nvcc}
 CFLAGS='-gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static'
 LDFLAGS='-lcurand_static -lculibos -lcuda'
@@ -43,55 +41,48 @@ LDFLAGS='-lcurand_static -lculibos -lcuda'
 mkdir -p "$OUT"
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUT/run.log"; }
 
-LEVERS=(EPI_2WARP DROP_LEAD_BARSYNC DROP_TRAIL_BARSYNC WAIT_GROUP_READ NO_BULK_MEMCLBR)
-N_LEVERS=${#LEVERS[@]}
-N_VARIANTS=$(( 1 << N_LEVERS ))
+# 5-bit MSB→LSB layout (matches prior CSVs):
+#   bit 4: NO_BULK_MEMCLBR
+#   bit 3: WAIT_GROUP_READ
+#   bit 2: DROP_TRAIL_BARSYNC
+#   bit 1: DROP_LEAD_BARSYNC
+#   bit 0: EPI_2WARP
+#
+# Format: "<name>:<bits>:<-D flag list>"
+VARIANTS=(
+    "v10011:19:-DNO_BULK_MEMCLBR -DDROP_LEAD_BARSYNC -DEPI_2WARP"
+    "v01101:13:-DWAIT_GROUP_READ -DDROP_TRAIL_BARSYNC -DEPI_2WARP"
+)
 
-bits_to_flags() {
-    local bits=$1
-    local flags=""
-    for i in $(seq 0 $((N_LEVERS - 1))); do
-        if (( (bits >> i) & 1 )); then
-            flags+=" -D${LEVERS[$i]}"
-        fi
-    done
-    echo "$flags"
-}
-
-bits_to_name() {
-    local bits=$1
-    local name="v"
-    for i in $(seq $((N_LEVERS - 1)) -1 0); do
-        name+=$(( (bits >> i) & 1 ))
-    done
-    echo "$name"
-}
-
-# ── Phase 1: build $N_VARIANTS variants ─────────────────────────────────
-log "=== Phase 1: building $N_VARIANTS variants with -DCOMBO_QUICK ==="
-log "lever bits (MSB→LSB): ${LEVERS[4]} ${LEVERS[3]} ${LEVERS[2]} ${LEVERS[1]} ${LEVERS[0]}"
+# ── Phase 1: build the two variants ─────────────────────────────────────
+log "=== Phase 1: building ${#VARIANTS[@]} variants with -DCOMBO_QUICK ==="
 
 BUILD_OK=()
-for bits in $(seq 0 $((N_VARIANTS - 1))); do
-    name=$(bits_to_name "$bits")
-    flags=$(bits_to_flags "$bits")
+for entry in "${VARIANTS[@]}"; do
+    IFS=: read -r name bits flags <<< "$entry"
     bin="$OUT/fc2-w3x-combo-$name"
     if $NVCC $CFLAGS -DCOMBO_QUICK $flags fc2_w3x.cu -o "$bin" $LDFLAGS \
             > "$OUT/build-$name.log" 2>&1; then
-        BUILD_OK+=("$bits:$name")
+        BUILD_OK+=("$entry")
+        log "  build OK   $name  flags='$flags'"
     else
         log "  build FAIL $name  flags='$flags'"
     fi
 done
-log "build summary: ${#BUILD_OK[@]} / $N_VARIANTS succeeded"
+log "build summary: ${#BUILD_OK[@]} / ${#VARIANTS[@]} succeeded"
 
-# ── Phase 2: interleaved reps across surviving variants ─────────────────
+if [[ ${#BUILD_OK[@]} -lt 2 ]]; then
+    log "ERROR: need both variants to compare; aborting"
+    exit 1
+fi
+
+# ── Phase 2: interleaved reps ───────────────────────────────────────────
 log ""
 log "=== Phase 2: $REPS reps/variant, pass-major interleaving ==="
 for rep in $(seq 1 "$REPS"); do
     log "-- pass $rep/$REPS --"
     for entry in "${BUILD_OK[@]}"; do
-        IFS=: read -r bits name <<< "$entry"
+        IFS=: read -r name bits flags <<< "$entry"
         bin="$OUT/fc2-w3x-combo-$name"
         if ! "$bin" > "$OUT/run-$name-$rep.log" 2>&1; then
             log "  pass $rep $name run-FAIL"
@@ -105,7 +96,7 @@ log "=== Phase 3: extracting wall ms → $OUT/wall_data.csv ==="
 {
     echo "variant,bits,rep,EPI_2WARP,DROP_LEAD,DROP_TRAIL,WAIT_GROUP,NO_BULK_MEMCLBR,ms"
     for entry in "${BUILD_OK[@]}"; do
-        IFS=: read -r bits name <<< "$entry"
+        IFS=: read -r name bits flags <<< "$entry"
         b0=$(( bits & 1 ))
         b1=$(( (bits >> 1) & 1 ))
         b2=$(( (bits >> 2) & 1 ))
@@ -125,12 +116,12 @@ log "=== Phase 3: extracting wall ms → $OUT/wall_data.csv ==="
 n_rows=$(( $(wc -l < "$OUT/wall_data.csv") - 1 ))
 log "extracted $n_rows wall measurements"
 
-# ── Phase 4: regression ─────────────────────────────────────────────────
+# ── Phase 4: head-to-head comparison ────────────────────────────────────
 log ""
-log "=== Phase 4: OLS regression → $OUT/anova.txt ==="
-python3 tools/combo_anova.py "$OUT/wall_data.csv" --out "$OUT/anova.txt"
+log "=== Phase 4: Welch t-test → $OUT/compare.txt ==="
+python3 tools/two_cell_compare.py "$OUT/wall_data.csv" --out "$OUT/compare.txt"
 
 log ""
-log "report:           $OUT/anova.txt"
+log "report:           $OUT/compare.txt"
 log "raw wall data:    $OUT/wall_data.csv"
 log "raw per-run logs: $OUT/run-v<bits>-<rep>.log"
