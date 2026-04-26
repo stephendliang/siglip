@@ -156,6 +156,12 @@ fc2-w3x-ncu-gemm: fc2_w3x.cu
 fc2-w3x-stsm: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_STMATRIX=1 $< -o $@ $(LDFLAGS)
 
+# Staggered prefetch probe (STAGGER=2): split A/B mbars in W4, dual mbar_wait
+# in W5. Wall-equivalent in expectation; cross-tested vs dispatch enum to
+# surface any TMA-issue / cluster-multicast / SASS scheduling interaction.
+fc2-w3x-stagger: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTAGGER=2 $< -o $@ $(LDFLAGS)
+
 # ── fc2_w3x PTX port — hand-authored .ptx + driver-API host harness ──
 # fc2_w3x.ptx is the hand-authored PTX deliverable (see docs/PTX_BUILD_NOTES.md
 # for design notes).  Build pipeline:

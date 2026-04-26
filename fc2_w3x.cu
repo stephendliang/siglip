@@ -69,6 +69,20 @@
 #define K_UNROLL_PRAGMA _DO_PRAGMA(unroll K_UNROLL)
 #endif
 
+/*
+  STAGGER — W4 TMA-issue / mbar architecture for A vs B fetches.
+    0 (default) baseline: A; B; arrive(mbar_full[s], TMA_BYTES)         single shared mbar
+    2 split-mbar same-iter: A; arrive(mbar_full_a[s], A_BYTES);
+                            B; arrive(mbar_full_b[s], B_BYTES)          two mbars per stage
+  STAGGER=2 lets W5 wait on A and B independently. Wall-equivalent to
+  baseline in theory (W5's max(A_arrival, B_arrival) is unchanged), but
+  ptxas/SASS scheduling and TMA hardware issue ordering may differ —
+  cross-tested against the dispatch enum to surface any interaction.
+*/
+#ifndef STAGGER
+#define STAGGER 0
+#endif
+
 #define N_STAGES       6
 #define NUM_EPI_STAGES 2
 #define NUM_SUBPASSES  (TN / 32)
@@ -96,6 +110,8 @@
 
 #define STAGE_BYTES    32768
 #define TMA_BYTES      32768
+#define A_BYTES        16384
+#define B_BYTES        16384
 #define MAIN_SMEM      (N_STAGES * STAGE_BYTES)
 #define OUT_STAGING    (NUM_EPI_STAGES * SUBPASS_BYTES)
 #define BIAS_BYTES     (N_DIM * 2)
@@ -106,7 +122,12 @@
 #define OFF_MBARS      ((OFF_BIAS + BIAS_BYTES + 127) & ~127)
 
 #define MBAR_TMA_FULL       (OFF_MBARS + 0)
+#if STAGGER == 2
+#define MBAR_TMA_FULL_B     (MBAR_TMA_FULL + N_STAGES * 8)
+#define MBAR_TMA_EMPTY      (MBAR_TMA_FULL_B + N_STAGES * 8)
+#else
 #define MBAR_TMA_EMPTY      (MBAR_TMA_FULL + N_STAGES * 8)
+#endif
 #define MBAR_TMEM_READY     (MBAR_TMA_EMPTY + N_STAGES * 8)
 #define MBAR_TMEM_CONSUMED  (MBAR_TMEM_READY + 2 * 8)
 #define MBARS_END           (MBAR_TMEM_CONSUMED + 2 * 8)
@@ -659,6 +680,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     if (tid == 0) {
         for (int s = 0; s < N_STAGES; s++) {
             mbar_init(smem_to_uint(smem + MBAR_TMA_FULL + s * 8), 2);
+#if STAGGER == 2
+            mbar_init(smem_to_uint(smem + MBAR_TMA_FULL_B + s * 8), 2);
+#endif
             mbar_init(smem_to_uint(smem + MBAR_TMA_EMPTY + s * 8), 1);
         }
         for (int b = 0; b < 2; b++) {
@@ -699,6 +723,10 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     uint32_t tma_full_arr[N_STAGES];
     uint32_t tma_full_peer_arr[N_STAGES];
     uint32_t tma_empty_arr[N_STAGES];
+#if STAGGER == 2
+    uint32_t tma_full_b_arr[N_STAGES];
+    uint32_t tma_full_b_peer_arr[N_STAGES];
+#endif
     for (int s = 0; s < N_STAGES; s++) {
         smem_a_arr[s]      = smem_to_uint(smem + s * STAGE_BYTES);
         smem_b_arr[s]      = smem_to_uint(smem + s * STAGE_BYTES + 16384);
@@ -706,6 +734,11 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         tma_full_arr[s]    = tf_local;
         tma_full_peer_arr[s] = tf_local & 0xFEFFFFFFu;
         tma_empty_arr[s]   = smem_to_uint(smem + MBAR_TMA_EMPTY + s * 8);
+#if STAGGER == 2
+        uint32_t tfb_local        = smem_to_uint(smem + MBAR_TMA_FULL_B + s * 8);
+        tma_full_b_arr[s]         = tfb_local;
+        tma_full_b_peer_arr[s]    = tfb_local & 0xFEFFFFFFu;
+#endif
     }
 
     uint32_t out_smem_arr[NUM_EPI_STAGES];
@@ -1040,6 +1073,29 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     const int tma_a_c1  = (a_m_tile * K_ITERS + ki) * TM;
                     const int tma_b_c1  = (b_n_half * K_ITERS + ki) * (TN / 2);
                     PROF_BEGIN(t1);
+#if STAGGER == 2
+                    /*
+                      Split-mbar: A and B issue against separate mbars,
+                      each with its own arrive.expect_tx. W5 waits on both
+                      independently. Wall-equivalent in expectation; this
+                      is a probe to surface any TMA-issue / SASS scheduling
+                      / cluster-multicast interaction with dispatch.
+                    */
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                        ".mbarrier::complete_tx::bytes.cta_group::2"
+                        " [%0], [%1, {%2, %3}], [%4];\n\t"
+                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %5;\n\t"
+                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                        ".mbarrier::complete_tx::bytes.cta_group::2"
+                        " [%6], [%7, {%2, %8}], [%9];\n\t"
+                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%9], %10;"
+                        :: "r"(a_dst), "l"(&tma_a), "r"(tma_c0), "r"(tma_a_c1),
+                           "r"(tma_full_peer_arr[s]), "n"(A_BYTES),
+                           "r"(b_dst), "l"(&tma_b), "r"(tma_b_c1),
+                           "r"(tma_full_b_peer_arr[s]), "n"(B_BYTES)
+                        : "memory");
+#else
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
                         ".mbarrier::complete_tx::bytes.cta_group::2"
@@ -1053,6 +1109,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                            "r"(b_dst), "l"(&tma_b), "r"(tma_b_c1),
                            "r"(TMA_BYTES)
                         : "memory");
+#endif
                     PROF_END(t1, 1);
                 }
             }
@@ -1183,6 +1240,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #endif
                 PROF_BEGIN(m0);
                 mbar_wait(tma_full_arr[s], tma_full_phase[s]);
+#if STAGGER == 2
+                mbar_wait(tma_full_b_arr[s], tma_full_phase[s]);
+#endif
                 PROF_END(m0, 0);
 #if defined(PROFILE_KI) || defined(PROFILE_TILE)
                 {
