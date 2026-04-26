@@ -86,11 +86,8 @@ static_assert(N_DIM  %  TN       == 0,
 #endif
 
 #define N_STAGES       6
-#ifdef LDTM_X64
-#define NUM_EPI_STAGES 1
-#else
 #define NUM_EPI_STAGES 2
-#endif
+#define NUM_SUBPASSES  (TN / 32)
 
 #ifdef EPI_2WARP
 #define N_EPI_WARPS      2
@@ -109,12 +106,7 @@ static_assert(N_DIM  %  TN       == 0,
 #endif
 #define ROW_HALVES       (ROWS_PER_WARP / 32)
 
-#ifdef LDTM_X64
-#define SUBPASS_COLS   64
-#else
 #define SUBPASS_COLS   32
-#endif
-#define NUM_SUBPASSES  (TN / SUBPASS_COLS)
 #define ROWS_PER_CTA   TM
 #define SUBPASS_BYTES  (ROWS_PER_CTA * SUBPASS_COLS * 2)
 
@@ -400,37 +392,6 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc,
           "=f"(r8),"=f"(r9),"=f"(r10),"=f"(r11),"=f"(r12),"=f"(r13),"=f"(r14),"=f"(r15), \
           "=f"(r16),"=f"(r17),"=f"(r18),"=f"(r19),"=f"(r20),"=f"(r21),"=f"(r22),"=f"(r23), \
           "=f"(r24),"=f"(r25),"=f"(r26),"=f"(r27),"=f"(r28),"=f"(r29),"=f"(r30),"=f"(r31) \
-        : "r"(TADDR))
-
-/*
-  LDTM_X64 — widest TMEM-load shape: .32x32b.x64.b32.
-  Lane t = row t cols 0..63 (64 fp32/lane).  One LDTM covers 32 rows ×
-  64 cols = TWO subpasses' worth of data under SUBPASS_COLS=64.
-  Reg pressure ~110/thread — fits sm_100a 255-reg budget without spill.
-*/
-#define TMEM_LOAD_X64(A, TADDR) \
-    asm volatile( \
-        "tcgen05.ld.sync.aligned.32x32b.x64.b32 " \
-        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15," \
-        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31," \
-        "%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47," \
-        "%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63}, [%64];" \
-        : "=f"(A[ 0]),"=f"(A[ 1]),"=f"(A[ 2]),"=f"(A[ 3]), \
-          "=f"(A[ 4]),"=f"(A[ 5]),"=f"(A[ 6]),"=f"(A[ 7]), \
-          "=f"(A[ 8]),"=f"(A[ 9]),"=f"(A[10]),"=f"(A[11]), \
-          "=f"(A[12]),"=f"(A[13]),"=f"(A[14]),"=f"(A[15]), \
-          "=f"(A[16]),"=f"(A[17]),"=f"(A[18]),"=f"(A[19]), \
-          "=f"(A[20]),"=f"(A[21]),"=f"(A[22]),"=f"(A[23]), \
-          "=f"(A[24]),"=f"(A[25]),"=f"(A[26]),"=f"(A[27]), \
-          "=f"(A[28]),"=f"(A[29]),"=f"(A[30]),"=f"(A[31]), \
-          "=f"(A[32]),"=f"(A[33]),"=f"(A[34]),"=f"(A[35]), \
-          "=f"(A[36]),"=f"(A[37]),"=f"(A[38]),"=f"(A[39]), \
-          "=f"(A[40]),"=f"(A[41]),"=f"(A[42]),"=f"(A[43]), \
-          "=f"(A[44]),"=f"(A[45]),"=f"(A[46]),"=f"(A[47]), \
-          "=f"(A[48]),"=f"(A[49]),"=f"(A[50]),"=f"(A[51]), \
-          "=f"(A[52]),"=f"(A[53]),"=f"(A[54]),"=f"(A[55]), \
-          "=f"(A[56]),"=f"(A[57]),"=f"(A[58]),"=f"(A[59]), \
-          "=f"(A[60]),"=f"(A[61]),"=f"(A[62]),"=f"(A[63]) \
         : "r"(TADDR))
 
 /*
@@ -878,22 +839,12 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     case 10: bias_pack = lane_bias[10]; break;
                     default: bias_pack = lane_bias[11]; break;
                 }
-#if defined(LDTM_X64)
-                /*
-                  LDTM_X64 path: lane t = row t holds 64 cols → needs all 32
-                  bias bf16x2 packs.  Under SUBPASS_COLS=64, start ≡ 0 mod 64,
-                  base_pair = start/2 ≡ 0 mod 32, so lane_off_b is always 0.
-                  Source lanes for the 32 packs span 0..31 (one per lane in the
-                  warp), all in the same reg_idx_sub.
-                */
-                uint32_t bk[32];
-                #pragma unroll
-                for (int k = 0; k < 32; k++) {
-                    bk[k] = __shfl_sync(0xffffffffu, bias_pack, k);
-                }
-                (void)lane_i_pre;
-                (void)lane_off_b;
-#elif defined(LDTM_X32)
+#ifndef LDTM_X32
+                uint32_t bl0 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  0);
+                uint32_t bl1 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  4);
+                uint32_t bl2 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  8);
+                uint32_t bl3 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre + 12);
+#else
                 /*
                   LDTM_X32 path: lane t = row t holds 32 cols → needs all 16
                   bias bf16x2 packs covering bias[start..start+31].  start is
@@ -907,11 +858,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     bk[k] = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + k);
                 }
                 (void)lane_i_pre;
-#else
-                uint32_t bl0 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  0);
-                uint32_t bl1 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  4);
-                uint32_t bl2 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  8);
-                uint32_t bl3 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre + 12);
 #endif
 
                 #pragma unroll
@@ -920,35 +866,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     const uint32_t taddr_tile = taddr_base + buf * TN
                         + ((cta_rank * TM + row_local_32) << 16);
 
-#if defined(LDTM_X64)
-                    /*
-                      LDTM_X64 path: 1× tcgen05.ld .32x32b.x64 covers 32 rows
-                      × 64 cols of this rh.  Lane t=row t holds 64 fp32.
-                      Pack to 32 bf16x2 packs + bias (bk[0..31] from prior
-                      32-shfl), then 8× st.shared.v4.b32 lays lane t's 64
-                      BF16 contiguous at SMEM(row_local_32 + t).
-                    */
-                    float a[64];
-                    TMEM_LOAD_X64(a, taddr_tile + nc);
-                    TMEM_WAIT();
-
-                    uint32_t p[32];
-                    #pragma unroll
-                    for (int k = 0; k < 32; k++) {
-                        CVT_ADD_BF16X2(p[k], a[2*k], a[2*k + 1], bk[k]);
-                    }
-
-                    const uint32_t out_base = out_smem_arr[es];
-                    const uint32_t base_row = out_base
-                        + (row_local_32 + lane) * (SUBPASS_COLS * 2);
-                    #pragma unroll
-                    for (int s = 0; s < 8; s++) {
-                        asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
-                            :: "r"(base_row + s * 16),
-                               "r"(p[4*s + 0]), "r"(p[4*s + 1]),
-                               "r"(p[4*s + 2]), "r"(p[4*s + 3]));
-                    }
-#elif !defined(LDTM_X32)
+#ifndef LDTM_X32
                     /*
                       LDTM.16dp256bit.x4 + STSM.16.MT88.4 (non-trans),
                       matches cuBLASLt rank-1's epilogue shape.
