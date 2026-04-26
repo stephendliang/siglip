@@ -1057,6 +1057,18 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 }
             }
 
+#ifdef PROFILE_W5
+            /* Under KERN_3WARP+PROFILE_W5, word1 packing is overridden:
+                 word1 high 32 = mma_asm_sum (same as default W5)
+                 word1 low  32 = wait_empty_sum (REPLACES commit_sum)
+               commit is single-shot per tile and well-known small; the
+               wait_empty cumulative is the suspected per-iter blocker. */
+            uint64_t _w5_tile_t0 = 0;
+            uint64_t _w5_mma_sum = 0;
+            uint64_t _w5_wait_empty_sum = 0;
+            if (lane == 0) PROF_KI_READ(_w5_tile_t0);
+#endif
+
             /* Steady + drain: per ki_m, do MMA(ki_m, slot ki_m%N_STAGES); if
                ki_t = ki_m + N_STAGES - 1 < K_ITERS, also issue TMA(ki_t). */
 #ifdef K_UNROLL
@@ -1074,6 +1086,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     const uint64_t desc_a = desc_a_base[s_m];
                     const uint64_t desc_b = desc_b_base[s_m];
                     const int accum_flag = (ki_m == 0) ? 0 : 1;
+#ifdef PROFILE_W5
+                    uint64_t _w5_m0; PROF_KI_READ(_w5_m0);
+#endif
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p_init, p_acc;\n\t"
@@ -1108,6 +1123,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                           "r"(accum_flag),
                           "r"(tma_empty_arr[s_m]), "h"(pair_mask)
                         : "memory");
+#ifdef PROFILE_W5
+                    { uint64_t _w5_m1; PROF_KI_READ(_w5_m1); _w5_mma_sum += _w5_m1 - _w5_m0; }
+#endif
                 }
 
                 /* TMA-issue for ki_t = ki_m + N_STAGES - 1 (different slot,
@@ -1119,8 +1137,18 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     /* tt==0, ki_m==0 introduces slot N_STAGES-1 for the first
                        time: skip the wait (mbar still in initial state). */
                     if (!(tt == 0 && ki_m == 0)) {
+#ifdef PROFILE_W5
+                        uint64_t _w5_e0;
+                        if (lane == 0) PROF_KI_READ(_w5_e0);
+#endif
                         mbar_wait(tma_empty_arr[s_t], tma_empty_phase[s_t]);
                         tma_empty_phase[s_t] ^= 1;
+#ifdef PROFILE_W5
+                        if (lane == 0) {
+                            uint64_t _w5_e1; PROF_KI_READ(_w5_e1);
+                            _w5_wait_empty_sum += _w5_e1 - _w5_e0;
+                        }
+#endif
                     }
                     if (elect) {
                         const int tma_a_c1 = (a_m_tile * K_ITERS + ki_t) * TM;
@@ -1146,6 +1174,30 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             if (elect) {
                 tcgen05_commit_mcast(mbar_tmem_ready_base + buf * 8, pair_mask);
             }
+
+#ifdef PROFILE_W5
+            if (lane == 0 && d_dbg_prof_w5 != nullptr) {
+                uint64_t _w5_tile_t1; PROF_KI_READ(_w5_tile_t1);
+                uint64_t _tile_total = _w5_tile_t1 - _w5_tile_t0;
+                const int _sw = tile_swizzle(lin_tile);
+                const int _tm = _sw / TILES_N;
+                const int _tn = _sw % TILES_N;
+                const int _ig = tile_in_group(lin_tile);
+                uint64_t _tt_cap = _tile_total;
+                if (_tt_cap > 0x3FFFFFFFFFULL) _tt_cap = 0x3FFFFFFFFFULL;
+                uint64_t _mma_cap   = _w5_mma_sum;        if (_mma_cap   > 0xFFFFFFFFULL) _mma_cap   = 0xFFFFFFFFULL;
+                uint64_t _empty_cap = _w5_wait_empty_sum; if (_empty_cap > 0xFFFFFFFFULL) _empty_cap = 0xFFFFFFFFULL;
+                uint64_t _w0 =
+                      ((uint64_t)(_tm & 0xFFFF) << 48)
+                    | ((uint64_t)(_tn & 0xF)    << 44)
+                    | ((uint64_t)(_ig & 0x3F)   << 38)
+                    | (_tt_cap & 0x3FFFFFFFFFULL);
+                uint64_t _w1 = (_mma_cap << 32) | _empty_cap;
+                const size_t _slot = (size_t)(cluster_id * tiles_per_cluster + tt) * 2;
+                d_dbg_prof_w5[_slot + 0] = _w0;
+                d_dbg_prof_w5[_slot + 1] = _w1;
+            }
+#endif
         }
         PROF_WALL_END();
         PROF_WRITEOUT();
@@ -2101,6 +2153,11 @@ int main(int argc, char** argv) {
         double mean_m = grand_cnt ? (double)grand_m / grand_cnt : 0.0;
         double mean_c = grand_cnt ? (double)grand_c / grand_cnt : 0.0;
 
+#ifdef KERN_3WARP
+        const char* _w5_field2_label = "wait_empty";
+#else
+        const char* _w5_field2_label = "commit";
+#endif
         printf("\n[PROFILE_W5] W5 MMA-issuer per-tile diagnostic  (entries=%u)\n", grand_cnt);
         printf("  wall cyc/tile @ 1.813 GHz = %.0f  (W5 total cyc/tile ≈ wall when MMA-bound)\n", tile_cyc);
         printf("  overall: tile_total mean=%.0f  min=%llu  max=%llu  (%.1f%% wall)\n",
@@ -2108,14 +2165,16 @@ int main(int argc, char** argv) {
                tile_cyc > 0 ? 100.0 * mean_t / tile_cyc : 0.0);
         printf("           mma_asm    mean=%.0f  (per-iter≈%.0f, %.1f%% wall)\n",
                mean_m, mean_m / K_ITERS, tile_cyc > 0 ? 100.0 * mean_m / tile_cyc : 0.0);
-        printf("           commit     mean=%.0f  (%.1f%% wall)\n",
-               mean_c, tile_cyc > 0 ? 100.0 * mean_c / tile_cyc : 0.0);
-        printf("  residual (= total − mma − commit): %.0f  (%.1f%% wall) ← combine with PROFILE_TILE tma_wait for finer split\n",
-               mean_t - mean_m - mean_c,
-               tile_cyc > 0 ? 100.0 * (mean_t - mean_m - mean_c) / tile_cyc : 0.0);
+        printf("           %-10s mean=%.0f  (per-iter≈%.0f, %.1f%% wall)\n",
+               _w5_field2_label, mean_c, mean_c / K_ITERS,
+               tile_cyc > 0 ? 100.0 * mean_c / tile_cyc : 0.0);
+        printf("  residual (= total − mma − %s): %.0f  (%.1f%% wall)%s\n",
+               _w5_field2_label, mean_t - mean_m - mean_c,
+               tile_cyc > 0 ? 100.0 * (mean_t - mean_m - mean_c) / tile_cyc : 0.0,
+               "  ← combine with PROFILE_TILE tma_wait for finer split");
 
         printf("\n  by N-col (aggregated over all tm)\n");
-        printf("  tn   tile_total   mma_asm   commit   residual   count\n");
+        printf("  tn   tile_total   mma_asm   field2   residual   count\n");
         for (int n = 0; n < tiles_n_host && n < 8; n++) {
             if (tn_cnt[n] == 0) continue;
             double mt = (double)tn_t[n] / tn_cnt[n];
@@ -2126,7 +2185,7 @@ int main(int argc, char** argv) {
         }
 
         printf("\n  by in_g (position within dgswizzle group)\n");
-        printf("  in_g  raw_tn  tile_total   mma_asm   commit   residual   count\n");
+        printf("  in_g  raw_tn  tile_total   mma_asm   field2   residual   count\n");
         for (int ig = 0; ig < IG_SLOTS && ig < 32; ig++) {
             if (ig_cnt[ig] == 0) continue;
             double mt = (double)ig_t[ig] / ig_cnt[ig];

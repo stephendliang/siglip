@@ -148,6 +148,15 @@ fc2-w3x-3warp-u24: fc2_w3x.cu
 fc2-w3x-3warp-u6: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DKERN_3WARP -DK_UNROLL=6 $< -o $@ $(LDFLAGS)
 
+# 3-warp + PROFILE_W5: word1 packing repurposed (mma_sum<<32 | wait_empty_sum)
+# so the host-side "field2" column reports cumulative wait_tma_empty cyc per
+# tile — the suspected per-iter blocker. Add -DPROFILE_TILE for tma_wait_full.
+fc2-w3x-3warp-prof: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DKERN_3WARP -DPROFILE_W5 $< -o $@ $(LDFLAGS)
+
+fc2-w3x-3warp-prof-full: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DKERN_3WARP -DPROFILE_W5 -DPROFILE_TILE $< -o $@ $(LDFLAGS)
+
 fc2-w3x-strip: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
 
