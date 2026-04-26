@@ -839,10 +839,26 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     case 10: bias_pack = lane_bias[10]; break;
                     default: bias_pack = lane_bias[11]; break;
                 }
+#ifndef LDTM_X32
                 uint32_t bl0 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  0);
                 uint32_t bl1 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  4);
                 uint32_t bl2 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre +  8);
                 uint32_t bl3 = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + lane_i_pre + 12);
+#else
+                /*
+                  LDTM_X32 path: lane t = row t holds 32 cols → needs all 16
+                  bias bf16x2 packs covering bias[start..start+31].  start is
+                  32-aligned, base_pair=start/2 is 16-aligned, so all 16 packs
+                  share reg_idx_sub and live at source lanes
+                  [lane_off_b .. lane_off_b+15] (lane_off_b ∈ {0,16}).
+                */
+                uint32_t bk[16];
+                #pragma unroll
+                for (int k = 0; k < 16; k++) {
+                    bk[k] = __shfl_sync(0xffffffffu, bias_pack, lane_off_b + k);
+                }
+                (void)lane_i_pre;
+#endif
 
                 #pragma unroll
                 for (int rh = 0; rh < ROW_HALVES; rh++) {
@@ -850,6 +866,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     const uint32_t taddr_tile = taddr_base + buf * TN
                         + ((cta_rank * TM + row_local_32) << 16);
 
+#ifndef LDTM_X32
                     /*
                       LDTM.16dp256bit.x4 + STSM.16.MT88.4 (non-trans),
                       matches cuBLASLt rank-1's epilogue shape.
@@ -944,6 +961,41 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                             p[8], p[9], p[10], p[11]);
                     STSM_X4(out_base + (row_local_32 + 24) * (SUBPASS_COLS * 2) + lane_off,
                             p[12], p[13], p[14], p[15]);
+#else
+                    /*
+                      LDTM_X32 path: 1× tcgen05.ld .32x32b.x32 covers all 32
+                      rows × 32 cols of this rh.  Lane t=row t holds 32 fp32.
+                      Pack to bf16x2 + bias, then 4× st.shared.v4.b32 lays
+                      lane t's 32 BF16 contiguous at SMEM(row_local_32 + t).
+                      No row-half offset; LDTM #1 (rh=0) and rh=1 just shift
+                      taddr_tile via row_local_32.
+                    */
+                    float a[32];
+                    TMEM_LOAD_X32(a[ 0], a[ 1], a[ 2], a[ 3], a[ 4], a[ 5], a[ 6], a[ 7],
+                                  a[ 8], a[ 9], a[10], a[11], a[12], a[13], a[14], a[15],
+                                  a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23],
+                                  a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+                                  taddr_tile + nc);
+                    TMEM_WAIT();
+
+                    uint32_t p[16];
+                    #pragma unroll
+                    for (int k = 0; k < 16; k++) {
+                        CVT_ADD_BF16X2(p[k], a[2*k], a[2*k + 1], bk[k]);
+                    }
+
+                    const uint32_t out_base = out_smem_arr[es];
+                    const uint32_t base_row = out_base
+                        + (row_local_32 + lane) * (SUBPASS_COLS * 2);
+                    asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
+                        :: "r"(base_row +  0), "r"(p[ 0]), "r"(p[ 1]), "r"(p[ 2]), "r"(p[ 3]));
+                    asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
+                        :: "r"(base_row + 16), "r"(p[ 4]), "r"(p[ 5]), "r"(p[ 6]), "r"(p[ 7]));
+                    asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
+                        :: "r"(base_row + 32), "r"(p[ 8]), "r"(p[ 9]), "r"(p[10]), "r"(p[11]));
+                    asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
+                        :: "r"(base_row + 48), "r"(p[12]), "r"(p[13]), "r"(p[14]), "r"(p[15]));
+#endif
                 }
 
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
