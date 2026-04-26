@@ -150,17 +150,10 @@ fc2-w3x-ncu-strip: fc2_w3x.cu
 fc2-w3x-ncu-gemm: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNCU_PROFILE -DGEMM_ONLY $< -o $@ $(LDFLAGS)
 
-# Lever C — STSM (stmatrix) epilogue stores + LDTM.16dp256bit.x4 TMEM load.
-# SASS-shape match for cuBLASLt rank-1 `nvjet_..._bz_bias_TNT`.
-# Correctness not verifiable on CPU; see docs/LEVER_C_STATUS.md.
-fc2-w3x-stsm: fc2_w3x.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_STMATRIX=1 $< -o $@ $(LDFLAGS)
-
-# Staggered prefetch probe (STAGGER=2): split A/B mbars in W4, dual mbar_wait
-# in W5. Wall-equivalent in expectation; cross-tested vs dispatch enum to
-# surface any TMA-issue / cluster-multicast / SASS scheduling interaction.
-fc2-w3x-stagger: fc2_w3x.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTAGGER=2 $< -o $@ $(LDFLAGS)
+# Lever C opt-out — STSM is the default since 2026-04-26; this builds the
+# legacy STS.128 epilogue path for A/B comparison.
+fc2-w3x-no-stsm: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_STMATRIX=0 $< -o $@ $(LDFLAGS)
 
 # ── fc2_w3x PTX port — hand-authored .ptx + driver-API host harness ──
 # fc2_w3x.ptx is the hand-authored PTX deliverable (see docs/PTX_BUILD_NOTES.md

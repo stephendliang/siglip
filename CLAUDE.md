@@ -224,12 +224,12 @@ cyc/iter, per `PROFILE_W5`). Tensor pipe 95.84% active. Every store-side / epilo
 dispatch lever tried since lands ±3 µs noise. See `docs/W3X_GRIEVANCES_VS_RANK1.md`
 for 9 remaining SASS deltas (15-25 µs total upside).
 
-**Lever C** (USE_STMATRIX=1) — `bcce329` layout fix matches rank-1 SASS opcode mix
-(STS.128 4→0, STSM.16.M88.4 0→4, regs 64→53). B200 n=10 (2026-04-25): PASS,
-mean 1.0039 ± 0.0004 ms vs base 1.0043 ± 0.0002 ms. Δ = −0.4 µs (Welch t≈2.8
-on within-batch σ; under project ±3 µs noise threshold and likely inside
-session-correlated jitter). Treat as at-baseline; SASS-shape match is the
-real win, perf is a noise-floor coin-flip.
+**Lever C** (USE_STMATRIX=1, **default since 2026-04-26**) — `bcce329` layout
+fix matches rank-1 SASS opcode mix (STS.128 4→0, STSM.16.M88.4 0→4, regs
+64→53). B200 n=10 (2026-04-25): PASS, mean 1.0039 ± 0.0004 ms vs legacy STS
+1.0043 ± 0.0002 ms. Δ = −0.4 µs (Welch t≈2.8 on within-batch σ; inside ±3 µs
+noise band). Default for SASS-shape match; opt out via `-DUSE_STMATRIX=0` /
+`make fc2-w3x-no-stsm` for A/B comparison.
 
 **Next:** port `fc2_w3x` from bias-only to fused-residual (production target).
 
@@ -275,8 +275,9 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
   TILE_DISPATCH variants (incl. gflip TD=33 / tn2br TD=34, both −0.3 µs marginal
   within-noise wins — 6-way tie at the MMA-throughput floor), STAGGER=2 split-mbar
   (uniformly +3 µs across all 11 dispatches, zero stagger×dispatch interaction —
-  +36 cyc on each of W4/W5 from extra arrive + extra mbar_wait), DG sweep, native
-  BF16 epilogue (kept ±0 wall, cleaner).
+  +36 cyc on each of W4/W5 from extra arrive + extra mbar_wait; **macro removed
+  from tree 2026-04-26**, postmortem in `memory/dead_fc2_w3x_stagger.md`), DG
+  sweep, native BF16 epilogue (kept ±0 wall, cleaner).
 - **Older dead variants:** TD=1 atomic, TD=5 CLC, TD=6/7 inline atomic, COL_LOCK,
   4-CTA TMA multicast (silent deadlock), mbar→SMEM polling, L2 cache hints,
   dgphase/dgnrot (TD=23/24), fc2_ldg (LDG/STG), fc2_hybrid (CUTLASS phases 2/3b/4),
@@ -287,8 +288,8 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
 
 ```bash
 # FC2 BIAS_ONLY (BEST — beats cuBLASLt rank-1)
-make fc2-w3x && ./fc2-w3x                        # 1.007 ms
-make fc2-w3x-stsm && ./fc2-w3x-stsm              # Lever C USE_STMATRIX — at-baseline (n=10)
+make fc2-w3x && ./fc2-w3x                        # 1.007 ms (USE_STMATRIX=1 default)
+make fc2-w3x-no-stsm && ./fc2-w3x-no-stsm        # legacy STS.128 epilogue (A/B)
 make fc2-w3x-ptx                                 # hand-written PTX, byte-identical SASS
 
 # fc2_w3x sweeps + diagnostics
