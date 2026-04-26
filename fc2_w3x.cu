@@ -51,8 +51,12 @@
 #define K_DIM   3072
 #endif
 
+#ifndef TM
 #define TM          128
+#endif
+#ifndef TN
 #define TN          256
+#endif
 #define TK          128
 #define SM_COUNT    148
 #define CLUSTER_CTAS 2
@@ -85,7 +89,9 @@ static_assert(N_DIM  %  TN       == 0,
 #define K_UNROLL_PRAGMA _DO_PRAGMA(unroll K_UNROLL)
 #endif
 
+#ifndef N_STAGES
 #define N_STAGES       6
+#endif
 #define NUM_EPI_STAGES 2
 #define NUM_SUBPASSES  (TN / 32)
 
@@ -110,8 +116,11 @@ static_assert(N_DIM  %  TN       == 0,
 #define ROWS_PER_CTA   TM
 #define SUBPASS_BYTES  (ROWS_PER_CTA * SUBPASS_COLS * 2)
 
-#define STAGE_BYTES    32768
-#define TMA_BYTES      32768
+/* Stage holds A (TM × TK FP8) followed by B (TN/2 × TK FP8) per CTA.
+   At TM=128 TN=256 TK=128 → 16384 + 16384 = 32768. At TM=128 TN=128 → 24576.
+   The 16384 hard-coded as B's offset elsewhere assumes TM=128 (A bytes). */
+#define STAGE_BYTES    ((TM + TN/2) * TK)
+#define TMA_BYTES      STAGE_BYTES
 #define MAIN_SMEM      (N_STAGES * STAGE_BYTES)
 #define OUT_STAGING    (NUM_EPI_STAGES * SUBPASS_BYTES)
 #define BIAS_BYTES     (N_DIM * 2)
@@ -699,7 +708,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     uint32_t tma_empty_arr[N_STAGES];
     for (int s = 0; s < N_STAGES; s++) {
         smem_a_arr[s]      = smem_to_uint(smem + s * STAGE_BYTES);
-        smem_b_arr[s]      = smem_to_uint(smem + s * STAGE_BYTES + 16384);
+        smem_b_arr[s]      = smem_to_uint(smem + s * STAGE_BYTES + TM * TK);
         uint32_t tf_local  = smem_to_uint(smem + MBAR_TMA_FULL + s * 8);
         tma_full_arr[s]    = tf_local;
         tma_full_peer_arr[s] = tf_local & 0xFEFFFFFFu;
@@ -1005,9 +1014,18 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     const int tma_a_c1  = (a_m_tile * K_ITERS + ki) * TM;
                     const int tma_b_c1  = (b_n_half * K_ITERS + ki) * (TN / 2);
                     PROF_BEGIN(t1);
+                    /* A_PRIVATE_TMA: drop .cta_group::2 from A's load so the
+                       SASS emits UTMALDG.2D instead of UTMALDG.2D.2CTA — A
+                       data is row-disjoint across the 2-CTA cluster anyway,
+                       so the cluster-group hint is redundant on it. */
+#ifdef A_PRIVATE_TMA
+#  define TMA_A_CTA_GROUP ""
+#else
+#  define TMA_A_CTA_GROUP ".cta_group::2"
+#endif
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                        ".mbarrier::complete_tx::bytes.cta_group::2"
+                        ".mbarrier::complete_tx::bytes" TMA_A_CTA_GROUP
                         " [%0], [%1, {%2, %3}], [%4];\n\t"
                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
                         ".mbarrier::complete_tx::bytes.cta_group::2"
