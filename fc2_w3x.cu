@@ -73,7 +73,14 @@
 #define NUM_EPI_STAGES 2
 #define NUM_SUBPASSES  (TN / 32)
 
-#ifdef EPI_2WARP
+#ifdef KERN_3WARP
+#define N_EPI_WARPS      2
+#define ROWS_PER_WARP    64
+#define EPI_BARSYNC_ASM  "bar.sync 0, 64;"
+#define WARP_TMA         2
+#define WARP_MMA         2
+#define TOTAL_WARPS      3
+#elif defined(EPI_2WARP)
 #define N_EPI_WARPS      2
 #define ROWS_PER_WARP    64
 #define EPI_BARSYNC_ASM  "bar.sync 0, 64;"
@@ -669,8 +676,11 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
-    /* WARP_MMA on CTA 1 is dead — only CTA 0 issues MMA. */
+    /* WARP_MMA on CTA 1 is dead — only CTA 0 issues MMA.
+       Under KERN_3WARP, WARP_MMA == WARP_TMA: CTA 1 still runs the TMA loop. */
+#ifndef KERN_3WARP
     if (warp_id == WARP_MMA && cta_rank != 0) return;
+#endif
 
     const uint32_t taddr_base = *reinterpret_cast<uint32_t*>(smem + OFF_TMEM);
 
@@ -975,7 +985,171 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         PROF_WRITEOUT();
     }
     else if (warp_id == WARP_TMA) {
-        /* =============== WARP_TMA: TMA A+B loader =============== */
+#ifdef KERN_3WARP
+      if (cta_rank == 0) {
+        /* =============== KERN_3WARP combined TMA + MMA on CTA 0 ===============
+           Software-pipelined: TMA-issue runs (N_STAGES - 1) KIs ahead of MMA-issue.
+           Slot s_t = (ki_m + N_STAGES - 1) % N_STAGES is always different from
+           s_m = ki_m % N_STAGES, so wait_tma_empty[s_t] inside the merged warp
+           does not block on the MMA we just issued. Per-iter throughput is
+           bounded by the MMA HW pipeline (~525 cyc/iter, same as W5 alone). */
+
+        uint32_t tma_full_phase[N_STAGES]  = {0};
+        uint32_t tma_empty_phase[N_STAGES] = {0};
+#ifdef NO_PREFILL
+        uint32_t tmem_cons_phase[2] = {0, 0};
+#endif
+        const bool elect = (lane == 0);
+
+        uint64_t desc_a_base[N_STAGES], desc_b_base[N_STAGES];
+        for (int s = 0; s < N_STAGES; s++) {
+            desc_a_base[s] = make_smem_desc(smem_a_arr[s]);
+            desc_b_base[s] = make_smem_desc(smem_b_arr[s]);
+        }
+
+#ifdef NO_PREFILL
+        if (elect) {
+            mbar_arrive(mbar_tmem_consumed_base + 0);
+            mbar_arrive(mbar_tmem_consumed_base + 0);
+            mbar_arrive(mbar_tmem_consumed_base + 8);
+            mbar_arrive(mbar_tmem_consumed_base + 8);
+        }
+#endif
+        PROF_WALL_BEGIN();
+
+        for (int tt = 0; tt < tiles_per_cluster; tt++) {
+            const int lin_tile = cluster_id + tt * num_clusters;
+            if (lin_tile >= TOTAL_TILES) break;
+            const int swizzled = tile_swizzle(lin_tile);
+            const int tm = swizzled / TILES_N;
+            const int tn = swizzled % TILES_N;
+            const int a_m_tile = tm * 2 + cta_rank;
+            const int b_n_half = tn * 2 + cta_rank;
+            const int buf = tt & 1;
+
+#ifdef NO_PREFILL
+            mbar_wait(mbar_tmem_consumed_base + buf * 8, tmem_cons_phase[buf]);
+            tmem_cons_phase[buf] ^= 1;
+#endif
+
+            /* Prologue: issue TMA for ki_t = 0..N_STAGES-2 (slots 0..N_STAGES-2). */
+            for (int j = 0; j < N_STAGES - 1; j++) {
+                if (tt > 0) {
+                    mbar_wait(tma_empty_arr[j], tma_empty_phase[j]);
+                    tma_empty_phase[j] ^= 1;
+                }
+                if (elect) {
+                    const int tma_a_c1 = (a_m_tile * K_ITERS + j) * TM;
+                    const int tma_b_c1 = (b_n_half * K_ITERS + j) * (TN / 2);
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                        ".mbarrier::complete_tx::bytes.cta_group::2"
+                        " [%0], [%1, {%2, %3}], [%4];\n\t"
+                        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                        ".mbarrier::complete_tx::bytes.cta_group::2"
+                        " [%5], [%6, {%2, %7}], [%4];\n\t"
+                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %8;"
+                        :: "r"(smem_a_arr[j]), "l"(&tma_a), "r"(0), "r"(tma_a_c1),
+                           "r"(tma_full_peer_arr[j]),
+                           "r"(smem_b_arr[j]), "l"(&tma_b), "r"(tma_b_c1),
+                           "r"(TMA_BYTES)
+                        : "memory");
+                }
+            }
+
+            /* Steady + drain: per ki_m, do MMA(ki_m, slot ki_m%N_STAGES); if
+               ki_t = ki_m + N_STAGES - 1 < K_ITERS, also issue TMA(ki_t). */
+            for (int ki_m = 0; ki_m < K_ITERS; ki_m++) {
+                const int s_m = ki_m % N_STAGES;
+
+                /* MMA on slot s_m */
+                mbar_wait(tma_full_arr[s_m], tma_full_phase[s_m]);
+                tma_full_phase[s_m] ^= 1;
+                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+
+                if (elect) {
+                    const uint64_t desc_a = desc_a_base[s_m];
+                    const uint64_t desc_b = desc_b_base[s_m];
+                    const int accum_flag = (ki_m == 0) ? 0 : 1;
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p_init, p_acc;\n\t"
+                        ".reg .b64 da, db;\n\t"
+                        ".reg .b32 tc;\n\t"
+                        "setp.ne.b32 p_init, %12, 0;\n\t"
+                        "setp.ne.b32 p_acc,  1, 0;\n\t"
+                        "mov.b32 tc, %0;\n\t"
+                        "mov.b64 da, %1;\n\t"
+                        "mov.b64 db, %2;\n\t"
+                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                        "[tc], da, db, %3, {%4,%5,%6,%7,%8,%9,%10,%11}, p_init;\n\t"
+                        "add.s64 da, da, 2;\n\t"
+                        "add.s64 db, db, 2;\n\t"
+                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                        "[tc], da, db, %3, {%4,%5,%6,%7,%8,%9,%10,%11}, p_acc;\n\t"
+                        "add.s64 da, da, 2;\n\t"
+                        "add.s64 db, db, 2;\n\t"
+                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                        "[tc], da, db, %3, {%4,%5,%6,%7,%8,%9,%10,%11}, p_acc;\n\t"
+                        "add.s64 da, da, 2;\n\t"
+                        "add.s64 db, db, 2;\n\t"
+                        "tcgen05.mma.cta_group::2.kind::f8f6f4 "
+                        "[tc], da, db, %3, {%4,%5,%6,%7,%8,%9,%10,%11}, p_acc;\n\t"
+                        "tcgen05.commit.cta_group::2.mbarrier::arrive::one"
+                        ".shared::cluster.multicast::cluster.b64 [%13], %14;\n\t"
+                        "}"
+                        :
+                        : "r"(buf * TN), "l"(desc_a), "l"(desc_b), "r"(IDESC),
+                          "r"(0),"r"(0),"r"(0),"r"(0),
+                          "r"(0),"r"(0),"r"(0),"r"(0),
+                          "r"(accum_flag),
+                          "r"(tma_empty_arr[s_m]), "h"(pair_mask)
+                        : "memory");
+                }
+
+                /* TMA-issue for ki_t = ki_m + N_STAGES - 1 (different slot,
+                   so wait_tma_empty drains a MMA from a previous iter, not
+                   the one we just issued). */
+                const int ki_t = ki_m + N_STAGES - 1;
+                if (ki_t < K_ITERS) {
+                    const int s_t = ki_t % N_STAGES;
+                    /* tt==0, ki_m==0 introduces slot N_STAGES-1 for the first
+                       time: skip the wait (mbar still in initial state). */
+                    if (!(tt == 0 && ki_m == 0)) {
+                        mbar_wait(tma_empty_arr[s_t], tma_empty_phase[s_t]);
+                        tma_empty_phase[s_t] ^= 1;
+                    }
+                    if (elect) {
+                        const int tma_a_c1 = (a_m_tile * K_ITERS + ki_t) * TM;
+                        const int tma_b_c1 = (b_n_half * K_ITERS + ki_t) * (TN / 2);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                            ".mbarrier::complete_tx::bytes.cta_group::2"
+                            " [%0], [%1, {%2, %3}], [%4];\n\t"
+                            "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+                            ".mbarrier::complete_tx::bytes.cta_group::2"
+                            " [%5], [%6, {%2, %7}], [%4];\n\t"
+                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%4], %8;"
+                            :: "r"(smem_a_arr[s_t]), "l"(&tma_a), "r"(0), "r"(tma_a_c1),
+                               "r"(tma_full_peer_arr[s_t]),
+                               "r"(smem_b_arr[s_t]), "l"(&tma_b), "r"(tma_b_c1),
+                               "r"(TMA_BYTES)
+                            : "memory");
+                    }
+                }
+            }
+
+            /* Per-tile MMA→epi handoff. */
+            if (elect) {
+                tcgen05_commit_mcast(mbar_tmem_ready_base + buf * 8, pair_mask);
+            }
+        }
+        PROF_WALL_END();
+        PROF_WRITEOUT();
+      } else
+#endif /* KERN_3WARP CTA0 */
+      {
+        /* =============== WARP_TMA: TMA A+B loader (or KERN_3WARP CTA1) ============= */
         uint32_t tma_empty_phase[N_STAGES] = {0};
         const bool elect = (lane == 0);
 
@@ -1086,7 +1260,9 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #endif
         PROF_WALL_END();
         PROF_WRITEOUT();
+      }
     }
+#ifndef KERN_3WARP
     else /* warp_id == WARP_MMA, cta_rank == 0 */ {
         /* =============== WARP_MMA: MMA issuer (CTA 0 only) =============== */
         uint32_t tma_full_phase[N_STAGES] = {0};
@@ -1313,6 +1489,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         }
 #endif
     }
+#endif /* !KERN_3WARP */
 
     if (warp_id == 0) {
         asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"

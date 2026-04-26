@@ -135,6 +135,13 @@ fc2-w3x: fc2_w3x.cu
 fc2-w3x-noprefill: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PREFILL $< -o $@ $(LDFLAGS)
 
+# 3-warp experiment: 2 epi + 1 combined TMA+MMA warp.
+# CTA0 software-pipelines TMA-issue ahead of MMA by N_STAGES-1 KIs
+# (slot offset != 0 so wait_tma_empty doesn't block on the just-issued MMA).
+# CTA1 runs the existing TMA-only loop.
+fc2-w3x-3warp: fc2_w3x.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DKERN_3WARP $< -o $@ $(LDFLAGS)
+
 fc2-w3x-strip: fc2_w3x.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
 
