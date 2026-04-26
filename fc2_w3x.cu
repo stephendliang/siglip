@@ -63,6 +63,22 @@
 #define TOTAL_TILES (TILES_M * TILES_N)
 #define K_ITERS     (K_DIM / TK)
 
+/*
+  Output C uses a 4D packed-tile descriptor (slowest→fastest):
+      [TILES_M, TILES_N, TM*2, TN]
+  i.e. each (tile_m, tile_n) lives in one contiguous (TM*2 × TN) bf16 block.
+  The next stage in the SigLIP pipeline reads C as A-input under the same
+  PACKED_TILES convention so the chain stays packed end-to-end.
+  Requires clean tile divisibility on both axes (no residual store path).
+*/
+static_assert(M_TOTAL % (TM * 2) == 0,
+              "packed-C: M_TOTAL must be a multiple of TM*2");
+static_assert(N_DIM  %  TN       == 0,
+              "packed-C: N_DIM must be a multiple of TN");
+
+#define TM_PACK    (TM * 2)
+#define TILE_BYTES_C (TM_PACK * TN * (int)sizeof(__nv_bfloat16))
+
 #ifdef K_UNROLL
 #define _DO_PRAGMA1(x) _Pragma(#x)
 #define _DO_PRAGMA(x)  _DO_PRAGMA1(x)
@@ -339,11 +355,13 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
 }
 
 static __device__ __forceinline__
-void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc, int32_t c0, int32_t c1) {
+void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc,
+               int32_t c0, int32_t c1, int32_t c2, int32_t c3) {
     asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group"
-        " [%0, {%1, %2}], [%3];"
-        :: "l"(tma_desc), "r"(c0), "r"(c1), "r"(smem_src) : "memory");
+        "cp.async.bulk.tensor.4d.global.shared::cta.bulk_group"
+        " [%0, {%1, %2, %3, %4}], [%5];"
+        :: "l"(tma_desc), "r"(c0), "r"(c1), "r"(c2), "r"(c3),
+           "r"(smem_src) : "memory");
 }
 
 #define TMEM_LOAD_X32(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,r20,r21,r22,r23,r24,r25,r26,r27,r28,r29,r30,r31, TADDR) \
@@ -724,7 +742,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             const int swizzled = tile_swizzle(lin_tile);
             const int tm = swizzled / TILES_N;
             const int tn = swizzled % TILES_N;
-            const int prev_m = tm * TM * 2;
             const int prev_n = tn * TN;
             const int buf = tt & 1;
 
@@ -735,7 +752,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
 #ifdef STRIP_EPILOGUE
-            (void)prev_m; (void)prev_n;
+            (void)tm; (void)prev_n;
             (void)taddr_base; (void)buf; (void)cta_rank; (void)row_group;
 #ifdef NO_PREFILL
             if (tid == 0) mbar_arrive(mbar_tmem_cons_peer_base + buf * 8);
@@ -952,7 +969,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                         BULK_ASM(BULK_WAIT_GROUP(1));
                     }
                     tma_store(out_smem_arr[es], &tma_c,
-                              prev_n + nc, prev_m + cta_rank * ROWS_PER_CTA);
+                              nc, cta_rank * ROWS_PER_CTA, tn, tm);
                     BULK_ASM("cp.async.bulk.commit_group;");
                     PROF_END(e3, 3);
                 }
@@ -1268,6 +1285,21 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     }
 }
 
+/*
+  Host-side index into the packed-tile C buffer for absolute (m, n).
+  Mirrors the 4D TMA descriptor; used by verify and any tooling that
+  reads C back to host as a flat blob.
+*/
+static inline size_t pack_idx_C(long long m, int n) {
+    long long tm_idx = m / TM_PACK;
+    int       mc     = (int)(m % TM_PACK);
+    int       tn_idx = n / TN;
+    int       nc     = n % TN;
+    return ((size_t)tm_idx * TILES_N + (size_t)tn_idx)
+         * (size_t)(TM_PACK * TN)
+         + (size_t)mc * TN + (size_t)nc;
+}
+
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
     printf("FC2 W3X kernel — 6-warp bias-only rank-1-shaped persistent\n");
@@ -1389,12 +1421,25 @@ int main(int argc, char** argv) {
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }
     {
-        uint64_t dims[2]    = {(uint64_t)N_DIM, (uint64_t)M_TOTAL};
-        uint64_t strides[1] = {(uint64_t)N_DIM * sizeof(__nv_bfloat16)};
-        uint32_t box[2]     = {SUBPASS_COLS, ROWS_PER_CTA};
-        uint32_t estrides[2]= {1, 1};
+        /*
+          4D packed-tile layout: dims (innermost → outermost) =
+            { TN (col-in-tile), TM*2 (row-in-tile), TILES_N (tile-N),
+              TILES_M (tile-M) }.
+          DRAM offset for absolute (m, n):
+            ((m / TM_PACK) * TILES_N + (n / TN)) * (TM_PACK * TN)
+              + (m % TM_PACK) * TN + (n % TN)
+          Per-store box stays (SUBPASS_COLS × ROWS_PER_CTA) within one tile.
+        */
+        uint64_t dims[4]    = {(uint64_t)TN, (uint64_t)TM_PACK,
+                               (uint64_t)TILES_N, (uint64_t)TILES_M};
+        uint64_t strides[3] = {
+            (uint64_t)TN * sizeof(__nv_bfloat16),
+            (uint64_t)TM_PACK * TN * sizeof(__nv_bfloat16),
+            (uint64_t)TILES_N * TM_PACK * TN * sizeof(__nv_bfloat16)};
+        uint32_t box[4]     = {SUBPASS_COLS, ROWS_PER_CTA, 1, 1};
+        uint32_t estrides[4]= {1, 1, 1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_c,
-            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_C,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, (void*)d_C,
             dims, strides, box, estrides,
             CU_TENSOR_MAP_INTERLEAVE_NONE,
             CU_TENSOR_MAP_SWIZZLE_NONE,
@@ -1943,7 +1988,7 @@ int main(int argc, char** argv) {
 #else
         float expected = expected_ab + __bfloat162float(hbias[col]);
 #endif
-        float got = __bfloat162float(h_C[row * N_DIM + col]);
+        float got = __bfloat162float(h_C[pack_idx_C(row, col)]);
         float rel = fabsf(got - expected) / fabsf(expected);
         if (rel > 0.02f) {
             if (errors < 8) fprintf(stderr, "  MISMATCH [%lld,%d] got=%.1f exp=%.1f\n", row, col, got, expected);
@@ -1952,7 +1997,7 @@ int main(int argc, char** argv) {
     }
     printf("%s  errors=%d/32\n", errors == 0 ? "PASS" : "FAIL", errors);
     int valid = (errors == 0) ? 1 : 0;
-    float c0 = __bfloat162float(h_C[0]);
+    float c0 = __bfloat162float(h_C[pack_idx_C(0, 0)]);
 #endif
 
     printf("@@RESULT ms=%.4f tflops=%.2f checksum=0.000000 valid=%d c0=%.1f\n",

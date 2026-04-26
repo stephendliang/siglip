@@ -231,6 +231,16 @@ fix matches rank-1 SASS opcode mix (STS.128 4→0, STSM.16.M88.4 0→4, regs
 noise band). Default for SASS-shape match; opt out via `-DUSE_STMATRIX=0` /
 `make fc2-w3x-no-stsm` for A/B comparison.
 
+**Output ABI (2026-04-26):** `d_C` is now stored in a 4D packed-tile layout
+`[TILES_M, TILES_N, TM*2, TN]` (each (tile_m, tile_n) is one contiguous
+TM*2 × TN bf16 block), matching A/B's PACKED_TILES convention so the next
+kernel in the SigLIP pipeline reads it pre-packed. Host-side index helper
+`pack_idx_C(m, n)` mirrors the 4D TMA descriptor; verify path uses it.
+Requires `M_TOTAL % (TM*2) == 0` and `N_DIM % TN == 0` (static_assert).
+Regs 53→56 default / 78→80 PROFILE_CYCLES (4D TMA op needs 2 extra
+register operands); 0 spills, 1 barrier unchanged. Wall impact in this
+kernel expected ±3 µs (TMA store is in MMA shadow); win is downstream.
+
 **Next:** port `fc2_w3x` from bias-only to fused-residual (production target).
 
 ## Dead ends — do NOT retry
