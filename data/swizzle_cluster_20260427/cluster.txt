@@ -1,0 +1,141 @@
+loaded 25 variants, 28 features
+
+wall-labeled: 13    unlabeled (kept for clustering only): 12
+
+============================================================================
+PCA on standardized features (all variants)
+============================================================================
+  PC1  var= 46.7%  cumulative= 46.7%
+  PC2  var= 18.5%  cumulative= 65.2%
+  PC3  var= 14.2%  cumulative= 79.5%
+  PC4  var= 10.4%  cumulative= 89.9%
+  PC5  var=  4.2%  cumulative= 94.1%
+  PC6  var=  2.8%  cumulative= 96.9%
+
+Top |loading| on PC1 / PC2 / PC3:
+  PC1: wf_uniq_tm_mean=+0.27, wf_tm_entropy=+0.27, wf_tm_mult_mean=-0.26, fresh_tm_max=+0.26, wf_uniq_tm_max=+0.26, intra_tm_run=+0.25
+  PC2: tm_extent_mean=+0.42, adj_tm_diff=+0.42, cluster_tm_var=-0.42, tm_density_mean=-0.40, fresh_tm_total=-0.38, intra_tn_run=+0.37
+  PC3: cluster_tn_corr=+0.43, tick_irreg_mean=+0.34, tick_irreg_p95=+0.34, cluster_tm_corr=-0.33, wf_uniq_tn_mean=+0.25, wf_tn_mult_mean=-0.24
+
+============================================================================
+PC1/PC2 coordinates (sorted by wall delta where labeled)
+============================================================================
+name                PC1      PC2      PC3    wall_us   delta  hint
+  dgsnake         -1.83    -0.86    -0.62    1002.22   +0.00  dgsw_G8 + asym
+  gflip           -1.42    -0.24    +1.02    1002.24   +0.02  dgsw_G8 + asym
+  tn2br           -1.27    -0.70    +0.15    1002.33   +0.11  dgsw_G8 + asym
+  checkered       -1.26    -0.77    +0.13    1002.39   +0.17  dgsw_G8-shape
+  dgsw_G8         -1.26    -0.77    +0.13    1002.56   +0.34  dgsw_G8 baseline
+  dg4_pingpong    -1.74    -0.92    -0.37    1003.01   +0.79  small G
+  dg4_diag        -2.31    -1.07    -1.02    1003.03   +0.81  small G
+  dgsw_G4         -1.95    -0.93    -0.62    1003.08   +0.86  small G
+  dgsw_G2         -2.13    -1.06    -1.11    1003.88   +1.66  small G
+  rowmajor        -2.60    -1.18    -1.29    1004.21   +1.99  linear
+  zigzag          -2.29    -1.11    -1.03    1004.32   +2.10  linear
+  dgsw_G16        -0.05    -0.65    +2.11    1006.85   +4.63  large G
+  dgsw_G32        +1.52    -0.33    +6.34    1008.40   +6.18  large G
+  -- unlabeled --
+  ingh            -1.75    -0.98    -0.29          —       —  asym broken
+  chet            -2.20    +4.62    +0.53          —       —  hybrid
+  pmix            +3.65    -0.15    -3.06          —       —  hybrid
+  ncycle          +9.67    +0.73    -2.58          —       —  ncycle family
+  ncyrot          +5.15    -0.12    +3.40          —       —  ncycle family
+  nflat           +5.15    -0.12    +3.40          —       —  ncycle family
+  nsnake          +9.67    +0.75    -2.58          —       —  ncycle family
+  dgsw_G3         -2.12    -0.98    -0.91          —       —  small G
+  dgsw_G6         -1.59    -0.85    -0.23          —       —  small G
+  dgsw_off1       -1.98    -0.96    -0.60          —       —  
+  dgsw_off2       -1.99    -1.01    -0.58          —       —  
+  xband_G4        -3.07    +9.65    -0.33          —       —  
+
+============================================================================
+k-means clustering on full feature space (k=4)
+============================================================================
+  cluster 0  size= 4  mean_wall=1008.400 µs
+      dgsw_G32        wall= 1008.40   large G
+      pmix            wall=       —   hybrid
+      ncyrot          wall=       —   ncycle family
+      nflat           wall=       —   ncycle family
+  cluster 1  size=18  mean_wall=1003.343 µs
+      dgsw_G2         wall= 1003.88   small G
+      dgsw_G4         wall= 1003.08   small G
+      dgsw_G8         wall= 1002.56   dgsw_G8 baseline
+      dgsw_G16        wall= 1006.85   large G
+      dgsnake         wall= 1002.22   dgsw_G8 + asym
+      checkered       wall= 1002.39   dgsw_G8-shape
+      zigzag          wall= 1004.32   linear
+      rowmajor        wall= 1004.21   linear
+      ingh            wall=       —   asym broken
+      chet            wall=       —   hybrid
+      gflip           wall= 1002.24   dgsw_G8 + asym
+      tn2br           wall= 1002.33   dgsw_G8 + asym
+      dgsw_G3         wall=       —   small G
+      dgsw_G6         wall=       —   small G
+      dgsw_off1       wall=       —   
+      dgsw_off2       wall=       —   
+      dg4_diag        wall= 1003.03   small G
+      dg4_pingpong    wall= 1003.01   small G
+  cluster 2  size= 2  (no wall data)
+      ncycle          wall=       —   ncycle family
+      nsnake          wall=       —   ncycle family
+  cluster 3  size= 1  (no wall data)
+      xband_G4        wall=       —   
+
+============================================================================
+hierarchical (Ward) cluster tree on labeled set
+============================================================================
+  k=2: {dgsnake,gflip,tn2br,checkered,dgsw_G8,dg4_pingpong,dg4_diag,dgsw_G4,dgsw_G2,rowmajor,zigzag,dgsw_G16} | {dgsw_G32}
+  k=3: {dgsnake,tn2br,checkered,dgsw_G8,dg4_pingpong,dg4_diag,dgsw_G4,dgsw_G2,rowmajor,zigzag} | {gflip,dgsw_G16} | {dgsw_G32}
+  k=4: {tn2br,checkered,dgsw_G8,dg4_pingpong,dgsw_G4,dgsw_G2,zigzag} | {gflip,dgsw_G16} | {dgsw_G32} | {dgsnake,dg4_diag,rowmajor}
+  k=5: {tn2br,checkered,dgsw_G8,dg4_pingpong,dgsw_G4,dgsw_G2,zigzag} | {dgsw_G16} | {dgsw_G32} | {dgsnake,dg4_diag,rowmajor} | {gflip}
+
+============================================================================
+Linear regression: wall_delta ~ standardized features (Lasso α=0.05)
+============================================================================
+  R² = 0.9229    intercept = +0.590
+  feature               β (std)  note
+  tick_irreg_mean        +2.009
+  wf_tm_mult_mean        +1.095
+  cluster_tn_corr        -0.661
+  cluster_tm_corr        +0.145
+  intra_tn_run           -0.119
+  adj_tn_diff            -0.022
+
+============================================================================
+Plain OLS for comparison (no shrinkage)
+============================================================================
+  R² = 0.9997    intercept = +1.125
+  feature               β (std)
+  tick_irreg_mean        +4.076
+  same_tn_mass_mean      +2.909
+  tick_irreg_p95         -2.530
+  intra_tn_run           -2.172
+  fresh_tm_max           +1.506
+  adj_tm_diff            -1.201
+  wf_tm_mult_mean        +0.997
+  same_tn_mass_max       -0.597
+  l2_warm_w24            -0.573
+  l2_warm_w8             -0.535
+
+============================================================================
+DIAGNOSIS: front-tier separation
+============================================================================
+feature-space distance between {dgsnake, gflip, tn2br} centroid
+and dgsw_G8: ‖Δ‖ = 1.318 std-units
+
+Top features by |Δ| (front centroid − dgsw_G8), in std-units:
+  feature               Δ (std)     front   dgsw_G8
+  adj_tn_diff            +0.899     0.527     0.165
+  cluster_tm_corr        -0.873     0.840     0.937
+  tm_density_mean        -0.280     0.925     1.000
+  cluster_tn_corr        -0.236     0.089     0.131
+  pc_tn_traj_dist        +0.134     0.526     0.492
+  fresh_tm_total         -0.100  3625.333  3626.000
+  adj_tm_diff            +0.058     1.949     1.493
+  wf_uniq_tn_mean        +0.035     3.020     3.000
+  same_tn_mass_mean      -0.017     0.348     0.351
+  wf_tn_entropy          +0.006     1.587     1.584
+
+VERDICT:
+  ANALYZER WEAK SIGNAL. Top feature adj_tn_diff separates by
+  0.90 std-units — small but present. The lever may be partly captured.

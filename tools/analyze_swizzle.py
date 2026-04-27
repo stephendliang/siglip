@@ -429,6 +429,37 @@ def total_intra_runs(seqs):
     return runs
 
 
+def shannon_entropy(seq):
+    cnts = Counter(seq)
+    n = len(seq)
+    ent = 0.0
+    for v in cnts.values():
+        p = v / n
+        if p > 0:
+            ent -= p * math.log2(p)
+    return ent
+
+
+def pearson_corr_abs(xs, ys):
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxy = sum((xs[i] - mx) * (ys[i] - my) for i in range(n))
+    sx2 = sum((x - mx) ** 2 for x in xs)
+    sy2 = sum((y - my) ** 2 for y in ys)
+    if sx2 == 0 or sy2 == 0:
+        return 0.0
+    return abs(sxy / math.sqrt(sx2 * sy2))
+
+
+def adjacent_diff(seq):
+    if len(seq) < 2:
+        return 0.0
+    return sum(abs(seq[i + 1] - seq[i]) for i in range(len(seq) - 1)) / (len(seq) - 1)
+
+
 def cross_cluster_l2_reuse(per_cluster_tm, window):
     """For each tick tt, how many of the 74 (cluster, tm) pairs at tt have
     their tm appear in any cluster's required-tm set across ticks
@@ -503,6 +534,43 @@ def metrics(swizzle_fn, name):
         if tick_irregularity else 0
     )
 
+    cluster_ids = list(range(NC))
+    wf_tn_entropy = [shannon_entropy(wfn[tt]) for tt in range(TICKS)]
+    wf_tm_entropy = [shannon_entropy(wfm[tt]) for tt in range(TICKS)]
+    cluster_tn_corr = [pearson_corr_abs(cluster_ids, wfn[tt]) for tt in range(TICKS)]
+    cluster_tm_corr = [pearson_corr_abs(cluster_ids, wfm[tt]) for tt in range(TICKS)]
+    adj_tn_diff = [adjacent_diff(wfn[tt]) for tt in range(TICKS)]
+    adj_tm_diff = [adjacent_diff(wfm[tt]) for tt in range(TICKS)]
+
+    pair_same_tn = []
+    for tt in range(TICKS):
+        s = wfn[tt]
+        n = len(s)
+        same = 0
+        total = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                total += 1
+                if s[i] == s[j]:
+                    same += 1
+        pair_same_tn.append(same / total if total else 0.0)
+
+    cluster_tm_var = []
+    for c in range(NC):
+        seq = pcm[c]
+        m = sum(seq) / len(seq)
+        cluster_tm_var.append(sum((x - m) ** 2 for x in seq) / len(seq))
+    cluster_tm_var_mean = statistics.mean(cluster_tm_var)
+
+    per_cluster_tn_traj_dist = []
+    for i in range(NC):
+        for j in range(i + 1, min(i + 8, NC)):
+            d = sum(1 for tt in range(TICKS) if pcn[i][tt] != pcn[j][tt]) / TICKS
+            per_cluster_tn_traj_dist.append(d)
+    pc_tn_traj_dist_mean = (
+        statistics.mean(per_cluster_tn_traj_dist) if per_cluster_tn_traj_dist else 0.0
+    )
+
     bijection_tiles = set()
     for c in range(NC):
         for tt in range(TICKS):
@@ -543,6 +611,15 @@ def metrics(swizzle_fn, name):
         "same_tn_mass_max": same_tn_mass_max,
         "tick_irreg_mean":  tick_irregularity_mean,
         "tick_irreg_p95":   tick_irregularity_p95,
+        "wf_tn_entropy":    statistics.mean(wf_tn_entropy),
+        "wf_tm_entropy":    statistics.mean(wf_tm_entropy),
+        "cluster_tn_corr":  statistics.mean(cluster_tn_corr),
+        "cluster_tm_corr":  statistics.mean(cluster_tm_corr),
+        "adj_tn_diff":      statistics.mean(adj_tn_diff),
+        "adj_tm_diff":      statistics.mean(adj_tm_diff),
+        "pair_same_tn":     statistics.mean(pair_same_tn),
+        "cluster_tm_var":   cluster_tm_var_mean,
+        "pc_tn_traj_dist":  pc_tn_traj_dist_mean,
     }
 
 
