@@ -63,6 +63,12 @@
 #define TOTAL_TILES (TILES_M * TILES_N)
 #define K_ITERS     (K_DIM / TK)
 
+#define NUM_CLUSTERS       (SM_COUNT / CLUSTER_CTAS)
+#define TILES_PER_CLUSTER  ((TOTAL_TILES + NUM_CLUSTERS - 1) / NUM_CLUSTERS)
+#define SWIZZLE_LUT_BYTES  (TILES_PER_CLUSTER * 4)
+static_assert(TILES_M < 65536, "swizzle LUT packs tm in 16 bits");
+static_assert(TILES_N < 65536, "swizzle LUT packs tn in 16 bits");
+
 /*
   Output C uses a 4D packed-tile descriptor (slowest→fastest):
       [TILES_M, TILES_N, TM*2, TN]
@@ -144,6 +150,7 @@ static_assert((TN / 2) % B_BOX_N == 0,
 #define MBARS_END           (MBAR_TMEM_CONSUMED + 2 * 8)
 
 #define OFF_TMEM       ((MBARS_END + 15) & ~15)
+#define OFF_SWIZZLE_LUT ((OFF_TMEM + 8 + 15) & ~15)
 #ifdef PROFILE_KI
 #ifdef PROFILE_KI_TN
 #define PROF_KI_SLOTS  (K_ITERS * ((N_DIM + TN - 1) / TN))
@@ -151,10 +158,10 @@ static_assert((TN / 2) % B_BOX_N == 0,
 #define PROF_KI_SLOTS  K_ITERS
 #endif
 #define PROF_KI_BYTES  (PROF_KI_SLOTS * 8)
-#define OFF_PROF_KI    ((OFF_TMEM + 8 + 15) & ~15)
+#define OFF_PROF_KI    ((OFF_SWIZZLE_LUT + SWIZZLE_LUT_BYTES + 15) & ~15)
 #define SMEM_BYTES     ((OFF_PROF_KI + PROF_KI_BYTES + 127) & ~127)
 #else
-#define SMEM_BYTES     ((OFF_TMEM + 8 + 127) & ~127)
+#define SMEM_BYTES     ((OFF_SWIZZLE_LUT + SWIZZLE_LUT_BYTES + 127) & ~127)
 #endif
 /* PROFILE_TILE uses only a register + one global write per tile — no SMEM. */
 
@@ -704,6 +711,31 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         }
     }
 
+    /* Populate per-cluster swizzle LUT: amortizes per-tile dgswizzle + divmod
+       over the kernel by running it once per cluster at startup. Stored as
+       packed (tm:lo16, tn:hi16) u32 per tt slot. W3 (epi warp, idle pre-
+       cluster-barrier on both CTAs) cooperates across 32 lanes; bias LDG
+       owns W4, mbar_init owns tid==0, tcgen05.alloc owns W0. Both CTAs
+       populate independently — SMEM is per-CTA. */
+    if (warp_id == 3) {
+        const int lut_num_clusters = NUM_CLUSTERS;
+        const int lut_cluster_id   = blockIdx.x / CLUSTER_CTAS;
+        const uint32_t lut_smem    = smem_to_uint(smem + OFF_SWIZZLE_LUT);
+        #pragma unroll 1
+        for (int tt = lane; tt < TILES_PER_CLUSTER; tt += 32) {
+            const int lin_tile = lut_cluster_id + tt * lut_num_clusters;
+            uint32_t packed = 0;
+            if (lin_tile < TOTAL_TILES) {
+                const int sw   = tile_swizzle(lin_tile);
+                const int tm_v = sw / TILES_N;
+                const int tn_v = sw % TILES_N;
+                packed = (uint32_t)tm_v | ((uint32_t)tn_v << 16);
+            }
+            asm volatile("st.shared.b32 [%0], %1;"
+                :: "r"(lut_smem + tt * 4), "r"(packed));
+        }
+    }
+
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
@@ -778,12 +810,15 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 : "r"(smem_bias + pair_idx * 4));
         }
 
+        const uint32_t lut_smem_epi = smem_to_uint(smem + OFF_SWIZZLE_LUT);
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
             if (lin_tile >= TOTAL_TILES) break;
-            const int swizzled = tile_swizzle(lin_tile);
-            const int tm = swizzled / TILES_N;
-            const int tn = swizzled % TILES_N;
+            uint32_t lut_packed;
+            asm volatile("ld.shared.b32 %0, [%1];"
+                : "=r"(lut_packed) : "r"(lut_smem_epi + tt * 4));
+            const int tm = lut_packed & 0xFFFF;
+            const int tn = lut_packed >> 16;
             const int prev_n = tn * TN;
             const int buf = tt & 1;
 
@@ -1052,12 +1087,15 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #endif
         PROF_WALL_BEGIN();
 
+        const uint32_t lut_smem_tma = smem_to_uint(smem + OFF_SWIZZLE_LUT);
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
             if (lin_tile >= TOTAL_TILES) break;
-            const int swizzled = tile_swizzle(lin_tile);
-            const int tm = swizzled / TILES_N;
-            const int tn = swizzled % TILES_N;
+            uint32_t lut_packed;
+            asm volatile("ld.shared.b32 %0, [%1];"
+                : "=r"(lut_packed) : "r"(lut_smem_tma + tt * 4));
+            const int tm = lut_packed & 0xFFFF;
+            const int tn = lut_packed >> 16;
             const int a_m_tile = tm * 2 + cta_rank;
             const int b_n_half = tn * 2 + cta_rank;
 
