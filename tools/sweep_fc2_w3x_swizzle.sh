@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 #
-# 1-way swizzle sweep on fc2_w3x: pits the 3 newest TD>30 variants
-# (INGH=32, gflip=33, tn2br=34) against the established 6-way-tie set
-# (dgsw baseline, checkered=18, dgsnake=19, dg4 via DG_GROUP_SIZE=4)
-# plus zigzag=11 / rowmajor=13 as off-tie reference outliers so the
-# ANOVA has at least one cell that is *expected* to break ties — keeps
-# the F-statistic interpretable when the new TD>30 set ends up
+# 1-way swizzle sweep on fc2_w3x: pits the 2 newest TD>30 survivors
+# (gflip=33, tn2br=34) against the established 6-way-tie set (dgsw
+# baseline, checkered=18, dgsnake=19, dg4 via DG_GROUP_SIZE=4) plus
+# zigzag=11 / rowmajor=13 as off-tie reference outliers so the ANOVA
+# has at least one cell that is *expected* to break ties — keeps the
+# F-statistic interpretable when the new TD>30 set ends up
 # indistinguishable.
+#
+# INGH=32 dropped: 2026-04-26 n=20 sweep landed it at +3.35 µs vs
+# leader (STRONG, p≪1e-9) — worse than the zigzag/rowmajor reference
+# outliers. Re-probing it costs build+run time and adds nothing.
 #
 # Pass-major interleaving (all variants in pass i, then pass i+1) shares
 # clock / thermal / queue state across cells, beating cross-session
@@ -44,7 +48,6 @@ VARIANTS=(
     "checkered:checkered:-DTILE_DISPATCH=18"
     "dgsnake:dgsnake:-DTILE_DISPATCH=19"
     "dg4:dg4:-DDG_GROUP_SIZE=4"
-    "ingh:ingh:-DTILE_DISPATCH=32"
     "gflip:gflip:-DTILE_DISPATCH=33"
     "tn2br:tn2br:-DTILE_DISPATCH=34"
     "zigzag:zigzag:-DTILE_DISPATCH=11"
