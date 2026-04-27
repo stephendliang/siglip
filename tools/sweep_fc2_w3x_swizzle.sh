@@ -3,11 +3,25 @@
 # 1-way swizzle sweep on fc2_w3x: maps the DG_GROUP_SIZE curve
 # (dg2 / dg4 / dg8(=dgsw default) / dg16 / dg32) alongside the 2 TD>30
 # survivors (gflip=33, tn2br=34), 2 structural alternatives
-# (checkered=18, dgsnake=19), and 2 analyzer-driven new probes
-# (dg4_diag=35, dg4_pingpong=36) added 2026-04-27 from
-# tools/analyze_swizzle.py predictions.  zigzag=11 / rowmajor=13 stay
-# in as off-tie reference outliers so the F-statistic stays interpretable
-# when adjacent group sizes tie.
+# (checkered=18, dgsnake=19), and 8 analyzer-driven new probes
+# (dg4_diag=35, dg4_pingpong=36 from 2026-04-27 round 1; rowmaj=37,
+# g4swap=38, lmrev=39, comboAB=40, comboAC=41, tnblk=42 from round 2,
+# 2026-04-27 from tools/cluster_swizzle.py + Kendall-τ analysis on the
+# n=200 wall sweep).  zigzag=11 / rowmajor=13 stay in as off-tie
+# reference outliers so the F-statistic stays interpretable.
+#
+# Round-2 hypothesis matrix (cluster_swizzle.py):
+#   front-tier {dgsnake, gflip, tn2br} centroid is 1.32 std-units from
+#   dgsw_G8 along three orthogonal feature axes.  TD=37..42 isolate
+#   them:
+#     37 rowmaj  — push adj_tn_diff to ~1.0 (dgsnake's lever maxed)
+#     38 g4swap  — gflip-style group XOR=3 (vs gflip's XOR=1)
+#     39 lmrev   — push adj_tm_diff via 3-bit lm reverse (tn2br lever
+#                  generalized across all (tm, tn))
+#     40 comboAB — TD=37 + TD=38 (composes A+B)
+#     41 comboAC — TD=37 + TD=39 (composes A+C)
+#     42 tnblk   — global tn-blocked, intra_tn_run = 49 (Kendall-τ
+#                  #1 signal sanity check)
 #
 # At n=100 (2026-04-26) dg4 won by ~1.85 µs STRONG vs the dg8/checkered/
 # dgsnake/gflip cluster, with tn2br alone at +0.47 µs MODERATE.
@@ -77,6 +91,15 @@ VARIANTS=(
     "dg4pp:dg4pp:-DTILE_DISPATCH=36 -DDG_GROUP_SIZE=4"
     "gflip:gflip:-DTILE_DISPATCH=33"
     "tn2br:tn2br:-DTILE_DISPATCH=34"
+    "rowmaj:rowmaj:-DTILE_DISPATCH=37"
+    "g4swap:g4swap:-DTILE_DISPATCH=38"
+    "lmrev:lmrev:-DTILE_DISPATCH=39"
+    "comboAB:comboAB:-DTILE_DISPATCH=40"
+    "comboAC:comboAC:-DTILE_DISPATCH=41"
+    "tnblk:tnblk:-DTILE_DISPATCH=42"
+    "snrot1:snrot1:-DTILE_DISPATCH=43"
+    "snrot2:snrot2:-DTILE_DISPATCH=44"
+    "lmsn:lmsn:-DTILE_DISPATCH=45"
     "zigzag:zigzag:-DTILE_DISPATCH=11"
     "rowmajor:rowmajor:-DTILE_DISPATCH=13"
 )

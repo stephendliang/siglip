@@ -259,28 +259,67 @@ int dgswizzle_in_group(int lin) {
     14 ncycle, 15 nflat, 16 nsnake, 17 nlock, 18 checkered,
     19 dg-snake (zigzag within dgswizzle band), 21 ncyrot,
     30 hyb-chet, 31 hyb-pmix, 32 hyb-ingh.
-  Four fc2_w3x-local probes are inlined below (not shared with fc1/fc2_w3):
+  Ten fc2_w3x-local probes are inlined below (not shared with fc1/fc2_w3):
     33 gflip — dgsw within-group + pair-flip group_idx (checkered on group axis).
     34 tn2br — dgsw within-group; bit-reverse the tm-order on tn=TILES_N-1.
     35 dg_diag — dgsw + within-group diagonal tn rotation: tn=(ln+lm) mod TN.
-                  At every cluster slot within a group, all TILES_N tn columns
-                  are simultaneously demanded — kills same-tn lockstep across
-                  the 4 (G=4) cluster-mates of each group while preserving the
-                  wavefront tm-shape (uTm, tmMult identical to dgsw).  Probe
-                  added 2026-04-27 from tools/analyze_swizzle.py prediction.
     36 dg_pingpong — dgsw + tn-shift on odd groups: tn=(ln+(g&1)) mod TN.
-                  Halves same-tn cluster lockstep across consecutive groups
-                  (group g and g+1 stamp different tn for the same ln) while
-                  preserving dgsw within-group reuse.  Different lever from
-                  dg_diag — varies tn run length per cluster instead of
-                  shifting it per cluster slot.
-  Both 35/36 are dgsw-shaped on the lin-to-(tm,tn) bijection — group_tiles
-  unchanged at TILES_N*G; only the (lm, ln) → tn mapping differs.  Use with
-  -DDG_GROUP_SIZE=4 (the analyzer-predicted Goldilocks G).
+
+  TD=37..42 added 2026-04-27 from cluster_swizzle.py / Kendall-τ analysis on
+  the n=200 wall sweep.  Each isolates one of three measured front-tier
+  mechanisms (dgsnake / gflip / tn2br each pull a different feature):
+    37 dg_rowmaj — dgsw with (lm,ln) fast/slow swapped: lm=in_g/TN, ln=in_g%TN.
+                  Pushes adj_tn_diff to ~1.0 within group (vs dgsw's 0.0).
+                  Tests dgsnake's lever at maximum.
+    38 dg_g4swap — gflip-lever with XOR=3 instead of XOR=1: swaps groups in
+                  4-blocks (0↔3, 1↔2, 4↔7, 5↔6, ...).  Tests whether
+                  gflip's perf comes from the group_idx swap mechanism
+                  itself (with a larger swap window) rather than from a
+                  ln-shift dressed up as a group swap.  Note: TD=36
+                  dg_pingpong is the (g&1) ln-shift variant; we don't
+                  re-probe that.
+    39 dg_lmrev — dgsw + 3-bit reverse on lm (G=8 only): lm=bitrev3(in_g%8),
+                  ln=in_g/8.  Lifts adj_tm_diff from 1.5 to ~3.5.  Tests
+                  tn2br's lever generalized across all (tm,tn) tiles.
+    40 dg_combo_AB — TD=37 within-group + TD=38 group_idx XOR=3 swap.
+                    Composes dgsnake×gflip levers; tests whether they
+                    add or are redundant.
+    41 dg_combo_AC — TD=37 + 3-bit reverse on lm.  Composes dgsnake×tn2br;
+                    tests if cluster decorrelation across BOTH axes wins.
+    42 dg_tn_blk — Global tn-blocked: tn=lin/TILES_M, tm=lin%TILES_M.
+                  Each cluster gets ~49 consecutive same-tn ticks.
+                  intra_tn_run maxed (Kendall-τ #1 signal, τ=-0.586 p=0.007).
+                  Sanity check that the τ feature isn't a hidden lever.
+
+  TD=43..45 (tnRun-preserving "max adj_tn_diff" family):
+    Cluster c's in_g advances by NC%group_tiles = 74%24 = 2 per tick.  Only
+    lm%2 is invariant across the cluster's tick sequence (mod-3/4 cycle).
+    Permutations keyed on lm%2 (or ln%2 for the lm-axis variant) preserve
+    cluster c's tnRun.  All three are dgsw bijection.
+    43 dg_sn_rot1 — even lm: tn=ln; odd lm: tn=(ln+1) mod 3.  dgsnake-style
+                  but rotation-by-+1 instead of reverse.  Different |Δtn|
+                  magnitude pattern; tests whether dgsnake's win is
+                  reverse-specific or just "any non-identity at lm%2".
+    44 dg_sn_rot2 — even lm: tn=ln; odd lm: tn=(ln+2) mod 3.  Symmetric
+                  partner to TD=43 (= rot-by-(-1)).
+    45 dg_lmsn — Snake on lm at odd ln: ln=0 → lm=lm_raw; ln=1 → lm reversed
+                  within group; ln=2 → lm=lm_raw.  Tn unchanged from dgsw,
+                  so tnRun = dgsw 3.92 by construction.  Pushes adj_tm_diff
+                  via reversal at every ln-row boundary (cross-row
+                  transitions hold lm constant).  tn2br-lever generalized
+                  but limited to ln%2 (matches dgsw's 4-tick ln stability).
+
+  TD=37..41,43..45 are dgsw-shaped on the lin-to-(tm,tn) bijection —
+  group_tiles unchanged at TILES_N*G; only the (lm, ln) → (tm, tn) mapping
+  differs.  Designed for -DDG_GROUP_SIZE=8.  TD=42 has no group concept
+  (returns 0 from tile_in_group()).
   Unset (default) → dgswizzle as currently shipping.  tile_swizzle() is the
-  single entry point; tile_in_group() preserves the in_g signal under dgsw,
-  gflip, tn2br, dg_diag, and dg_pingpong (so PROFILE_{W4,TILE}'s in_g field
-  stays meaningful); static_swizzle variants return 0 from tile_in_group().
+  single entry point; tile_in_group() preserves the in_g signal under dgsw
+  and TD=33..41,43..45 (so PROFILE_{W4,TILE}'s in_g field stays meaningful);
+  TD=42 and static_swizzle variants return 0 from tile_in_group().
+  All swizzles are amortized into the per-cluster LUT (W3 populates 147
+  packed (tm,tn) entries at startup), so swizzle compute cost is identical
+  at runtime regardless of complexity.
 */
 #ifdef TILE_DISPATCH
 #include "tile_dispatch.cuh"
@@ -384,6 +423,218 @@ int dg_pingpong_in_group(int lin) {
 }
 #endif
 
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 37
+static __device__ __forceinline__
+int dg_rowmaj_swizzle(int lin) {
+    const int G           = DG_GROUP_SIZE;
+    const int group_tiles = TILES_N * G;
+    const int group_idx   = lin / group_tiles;
+    const int first_m     = group_idx * G;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int slots       = nig * TILES_N;
+    const int ig_clamped  = (in_group < slots) ? in_group : slots - 1;
+    const int tn          = ig_clamped - (ig_clamped / TILES_N) * TILES_N;
+    const int lm          = ig_clamped / TILES_N;
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+static __device__ __forceinline__
+int dg_rowmaj_in_group(int lin) {
+    const int G = DG_GROUP_SIZE;
+    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
+}
+#endif
+
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 38
+static __device__ __forceinline__
+int dg_g4swap_swizzle(int lin) {
+    const int G           = DG_GROUP_SIZE;
+    const int group_tiles = TILES_N * G;
+    const int num_groups  = (TILES_M + G - 1) / G;
+    int group_idx         = lin / group_tiles;
+    const int in_group    = lin - (lin / group_tiles) * group_tiles;
+    const int paired      = group_idx ^ 3;
+    if (paired < num_groups) group_idx = paired;
+    const int first_m     = group_idx * G;
+    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int lm          = in_group - (in_group / nig) * nig;
+    const int ln          = in_group / nig;
+    const int tn = ln;
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+static __device__ __forceinline__
+int dg_g4swap_in_group(int lin) {
+    const int G = DG_GROUP_SIZE;
+    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
+}
+#endif
+
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 39
+static __device__ __forceinline__
+int dg_lmrev_swizzle(int lin) {
+    const int G           = DG_GROUP_SIZE;
+    const int group_tiles = TILES_N * G;
+    const int group_idx   = lin / group_tiles;
+    const int first_m     = group_idx * G;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int lm_raw      = in_group - (in_group / nig) * nig;
+    const int ln          = in_group / nig;
+    int lm = lm_raw;
+    if (nig == 8) {
+        lm = ((lm_raw & 1) << 2) | (lm_raw & 2) | ((lm_raw >> 2) & 1);
+    }
+    const int tn = ln;
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+static __device__ __forceinline__
+int dg_lmrev_in_group(int lin) {
+    const int G = DG_GROUP_SIZE;
+    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
+}
+#endif
+
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 40
+static __device__ __forceinline__
+int dg_combo_ab_swizzle(int lin) {
+    const int G           = DG_GROUP_SIZE;
+    const int group_tiles = TILES_N * G;
+    const int num_groups  = (TILES_M + G - 1) / G;
+    int group_idx         = lin / group_tiles;
+    const int in_group    = lin - (lin / group_tiles) * group_tiles;
+    const int paired      = group_idx ^ 3;
+    if (paired < num_groups) group_idx = paired;
+    const int first_m     = group_idx * G;
+    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int slots       = nig * TILES_N;
+    const int ig_clamped  = (in_group < slots) ? in_group : slots - 1;
+    const int tn          = ig_clamped - (ig_clamped / TILES_N) * TILES_N;
+    const int lm          = ig_clamped / TILES_N;
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+static __device__ __forceinline__
+int dg_combo_ab_in_group(int lin) {
+    const int G = DG_GROUP_SIZE;
+    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
+}
+#endif
+
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 41
+static __device__ __forceinline__
+int dg_combo_ac_swizzle(int lin) {
+    const int G           = DG_GROUP_SIZE;
+    const int group_tiles = TILES_N * G;
+    const int group_idx   = lin / group_tiles;
+    const int first_m     = group_idx * G;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int slots       = nig * TILES_N;
+    const int ig_clamped  = (in_group < slots) ? in_group : slots - 1;
+    const int tn          = ig_clamped - (ig_clamped / TILES_N) * TILES_N;
+    const int lm_raw      = ig_clamped / TILES_N;
+    int lm = lm_raw;
+    if (nig == 8) {
+        lm = ((lm_raw & 1) << 2) | (lm_raw & 2) | ((lm_raw >> 2) & 1);
+    }
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+static __device__ __forceinline__
+int dg_combo_ac_in_group(int lin) {
+    const int G = DG_GROUP_SIZE;
+    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
+}
+#endif
+
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 42
+static __device__ __forceinline__
+int dg_tn_blk_swizzle(int lin) {
+    const int tn = lin / TILES_M;
+    const int tm = lin - tn * TILES_M;
+    return tm * TILES_N + tn;
+}
+#endif
+
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 43
+static __device__ __forceinline__
+int dg_sn_rot1_swizzle(int lin) {
+    const int G           = DG_GROUP_SIZE;
+    const int group_tiles = TILES_N * G;
+    const int group_idx   = lin / group_tiles;
+    const int first_m     = group_idx * G;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int lm          = in_group - (in_group / nig) * nig;
+    const int ln          = in_group / nig;
+    int tn = (lm & 1) ? (ln + 1) : ln;
+    if (tn >= TILES_N) tn -= TILES_N;
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+static __device__ __forceinline__
+int dg_sn_rot1_in_group(int lin) {
+    const int G = DG_GROUP_SIZE;
+    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
+}
+#endif
+
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 44
+static __device__ __forceinline__
+int dg_sn_rot2_swizzle(int lin) {
+    const int G           = DG_GROUP_SIZE;
+    const int group_tiles = TILES_N * G;
+    const int group_idx   = lin / group_tiles;
+    const int first_m     = group_idx * G;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int lm          = in_group - (in_group / nig) * nig;
+    const int ln          = in_group / nig;
+    int tn = (lm & 1) ? (ln + 2) : ln;
+    if (tn >= TILES_N) tn -= TILES_N;
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+static __device__ __forceinline__
+int dg_sn_rot2_in_group(int lin) {
+    const int G = DG_GROUP_SIZE;
+    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
+}
+#endif
+
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 45
+static __device__ __forceinline__
+int dg_lmsn_swizzle(int lin) {
+    const int G           = DG_GROUP_SIZE;
+    const int group_tiles = TILES_N * G;
+    const int group_idx   = lin / group_tiles;
+    const int first_m     = group_idx * G;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int lm_raw      = in_group - (in_group / nig) * nig;
+    const int ln          = in_group / nig;
+    const int lm = (ln & 1) ? (nig - 1 - lm_raw) : lm_raw;
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + ln;
+}
+static __device__ __forceinline__
+int dg_lmsn_in_group(int lin) {
+    const int G = DG_GROUP_SIZE;
+    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
+}
+#endif
+
 static __device__ __forceinline__
 int tile_swizzle(int lin) {
 #if defined(TILE_DISPATCH) && TILE_DISPATCH == 33
@@ -394,6 +645,24 @@ int tile_swizzle(int lin) {
     return dg_diag_swizzle(lin);
 #elif defined(TILE_DISPATCH) && TILE_DISPATCH == 36
     return dg_pingpong_swizzle(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 37
+    return dg_rowmaj_swizzle(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 38
+    return dg_g4swap_swizzle(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 39
+    return dg_lmrev_swizzle(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 40
+    return dg_combo_ab_swizzle(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 41
+    return dg_combo_ac_swizzle(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 42
+    return dg_tn_blk_swizzle(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 43
+    return dg_sn_rot1_swizzle(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 44
+    return dg_sn_rot2_swizzle(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 45
+    return dg_lmsn_swizzle(lin);
 #elif defined(TILE_DISPATCH) && TILE_DISPATCH >= 8
     return static_swizzle(lin);
 #else
@@ -411,6 +680,25 @@ int tile_in_group(int lin) {
     return dg_diag_in_group(lin);
 #elif defined(TILE_DISPATCH) && TILE_DISPATCH == 36
     return dg_pingpong_in_group(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 37
+    return dg_rowmaj_in_group(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 38
+    return dg_g4swap_in_group(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 39
+    return dg_lmrev_in_group(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 40
+    return dg_combo_ab_in_group(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 41
+    return dg_combo_ac_in_group(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 42
+    (void)lin;
+    return 0;
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 43
+    return dg_sn_rot1_in_group(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 44
+    return dg_sn_rot2_in_group(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 45
+    return dg_lmsn_in_group(lin);
 #elif defined(TILE_DISPATCH) && TILE_DISPATCH >= 8
     (void)lin;
     return 0;

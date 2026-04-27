@@ -375,6 +375,146 @@ def sw_pingpong(lin, G=4):
     return first_m + lm, tn
 
 
+def sw_dg_rowmaj(lin, G=8):
+    """TD=37: dgsw with (lm, ln) fast/slow swapped — ln strides fast, lm slow.
+    Pushes adj_tn_diff to ~1.0 within group (vs dgsw_G8's 0.165).  Tests
+    dgsnake's lever (cluster↔tn decorrelation) at maximum."""
+    gt = TILES_N * G
+    group_idx = lin // gt
+    first_m = group_idx * G
+    in_g = lin - group_idx * gt
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    slots = nig * TILES_N
+    igc = in_g if in_g < slots else slots - 1
+    tn = igc % TILES_N
+    lm = igc // TILES_N
+    return first_m + lm, tn
+
+
+def sw_dg_g4swap(lin, G=8):
+    """TD=38: gflip-style group_idx XOR 3 (vs gflip's XOR 1).  Within-group
+    decode unchanged from dgsw.  Tests whether gflip's perf comes from the
+    group_idx swap mechanism itself with a larger swap window."""
+    gt = TILES_N * G
+    num_groups = (TILES_M + G - 1) // G
+    group_idx = lin // gt
+    in_g = lin - group_idx * gt
+    paired = group_idx ^ 3
+    if paired < num_groups:
+        group_idx = paired
+    first_m = group_idx * G
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    lm = in_g % nig
+    ln = in_g // nig
+    return first_m + lm, ln
+
+
+def sw_dg_lmrev(lin, G=8):
+    """TD=39: dgsw + 3-bit reverse on lm (G=8 only).  Lifts adj_tm_diff
+    from 1.5 to ~3.5.  Tests tn2br's lever (cluster↔tm decorrelation)
+    generalized across all (tm, tn) tiles, not just at tn=TILES_N-1."""
+    gt = TILES_N * G
+    group_idx = lin // gt
+    first_m = group_idx * G
+    in_g = lin - group_idx * gt
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    lmr = in_g % nig
+    ln = in_g // nig
+    if nig == 8:
+        lm = ((lmr & 1) << 2) | (lmr & 2) | ((lmr >> 2) & 1)
+    else:
+        lm = lmr
+    return first_m + lm, ln
+
+
+def sw_dg_combo_ab(lin, G=8):
+    """TD=40: TD=37 within-group + TD=38 group_idx XOR=3 swap.
+    Composes dgsnake×gflip levers."""
+    gt = TILES_N * G
+    num_groups = (TILES_M + G - 1) // G
+    group_idx = lin // gt
+    in_g = lin - group_idx * gt
+    paired = group_idx ^ 3
+    if paired < num_groups:
+        group_idx = paired
+    first_m = group_idx * G
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    slots = nig * TILES_N
+    igc = in_g if in_g < slots else slots - 1
+    tn = igc % TILES_N
+    lm = igc // TILES_N
+    return first_m + lm, tn
+
+
+def sw_dg_combo_ac(lin, G=8):
+    """TD=41: TD=37 within-group + TD=39 lm bit-reverse.
+    Composes dgsnake×tn2br levers."""
+    gt = TILES_N * G
+    group_idx = lin // gt
+    first_m = group_idx * G
+    in_g = lin - group_idx * gt
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    slots = nig * TILES_N
+    igc = in_g if in_g < slots else slots - 1
+    tn = igc % TILES_N
+    lmr = igc // TILES_N
+    if nig == 8:
+        lm = ((lmr & 1) << 2) | (lmr & 2) | ((lmr >> 2) & 1)
+    else:
+        lm = lmr
+    return first_m + lm, tn
+
+
+def sw_dg_tn_blk(lin):
+    """TD=42: global tn-blocked.  tn=lin/TILES_M, tm=lin%TILES_M.
+    Each cluster gets ~49 consecutive same-tn ticks → intra_tn_run maxed
+    (Kendall-τ #1 signal sanity check)."""
+    tn = lin // TILES_M
+    tm = lin - tn * TILES_M
+    return tm, tn
+
+
+def sw_dg_sn_rot1(lin, G=8):
+    """TD=43: dgsnake-style with rot+1 on odd lm (vs reverse).  tnRun
+    preserved by lm%2 invariance under cluster's +2/tick advance."""
+    gt = TILES_N * G
+    group_idx = lin // gt
+    first_m = group_idx * G
+    in_g = lin - group_idx * gt
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    lm = in_g % nig
+    ln = in_g // nig
+    tn = (ln + 1) % TILES_N if (lm & 1) else ln
+    return first_m + lm, tn
+
+
+def sw_dg_sn_rot2(lin, G=8):
+    """TD=44: dgsnake-style with rot+2 on odd lm.  Symmetric to TD=43."""
+    gt = TILES_N * G
+    group_idx = lin // gt
+    first_m = group_idx * G
+    in_g = lin - group_idx * gt
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    lm = in_g % nig
+    ln = in_g // nig
+    tn = (ln + 2) % TILES_N if (lm & 1) else ln
+    return first_m + lm, tn
+
+
+def sw_dg_lmsn(lin, G=8):
+    """TD=45: snake on lm at odd ln.  Tn unchanged, so tnRun = dgsw 3.92.
+    Pushes adj_tm_diff via lm reversal at ln%2 boundaries."""
+    gt = TILES_N * G
+    group_idx = lin // gt
+    first_m = group_idx * G
+    in_g = lin - group_idx * gt
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    lm_raw = in_g % nig
+    ln = in_g // nig
+    lm = (nig - 1 - lm_raw) if (ln & 1) else lm_raw
+    return first_m + lm, ln
+
+
 # ---------------------------------------------------------------- metrics
 
 
@@ -650,6 +790,17 @@ VARIANTS = [
     ("xband_G4",         lambda l: sw_xband(l, 4)),
     ("dg4_diag",         sw_dgsw_tnrot_g4),
     ("dg4_pingpong",     sw_pingpong),
+
+    ("dg_rowmaj",        sw_dg_rowmaj),
+    ("dg_g4swap",        sw_dg_g4swap),
+    ("dg_lmrev",         sw_dg_lmrev),
+    ("dg_combo_ab",      sw_dg_combo_ab),
+    ("dg_combo_ac",      sw_dg_combo_ac),
+    ("dg_tn_blk",        sw_dg_tn_blk),
+
+    ("dg_sn_rot1",       sw_dg_sn_rot1),
+    ("dg_sn_rot2",       sw_dg_sn_rot2),
+    ("dg_lmsn",          sw_dg_lmsn),
 ]
 
 
