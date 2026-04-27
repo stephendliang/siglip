@@ -725,10 +725,11 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         tma_empty_arr[s]   = smem_to_uint(smem + MBAR_TMA_EMPTY + s * 8);
     }
 
-    uint32_t out_smem_arr[NUM_EPI_STAGES];
-    for (int s = 0; s < NUM_EPI_STAGES; s++) {
-        out_smem_arr[s]  = smem_to_uint(smem + OFF_OUT + s * SUBPASS_BYTES);
-    }
+    static_assert(NUM_EPI_STAGES == 1 || NUM_EPI_STAGES == 2,
+        "out_smem named scalars assume NUM_EPI_STAGES in {1, 2}");
+    const uint32_t out_smem_0 = smem_to_uint(smem + OFF_OUT + 0 * SUBPASS_BYTES);
+    const uint32_t out_smem_1 = (NUM_EPI_STAGES > 1)
+        ? smem_to_uint(smem + OFF_OUT + 1 * SUBPASS_BYTES) : 0;
 
     const uint32_t mbar_tmem_ready_base   = smem_to_uint(smem + MBAR_TMEM_READY);
     const uint32_t smem_bias              = smem_to_uint(smem + OFF_BIAS);
@@ -746,7 +747,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         /* =============== Epilogue warpgroup (W0..W_{N_EPI_WARPS-1}) =============== */
         const int row_group = warp_id;
 
-        uint32_t mma_phase[2] = {0, 0};
+        uint32_t mma_phase_0 = 0, mma_phase_1 = 0;
 
 #ifdef PROFILE_CYCLES
         uint64_t prof[PROF_N_PHASES] = {0};
@@ -787,9 +788,11 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             const int buf = tt & 1;
 
             PROF_BEGIN(e0);
-            mbar_wait(mbar_tmem_ready_base + buf * 8, mma_phase[buf]);
+            const uint32_t cur_phase = (buf == 0) ? mma_phase_0 : mma_phase_1;
+            mbar_wait(mbar_tmem_ready_base + buf * 8, cur_phase);
             PROF_END(e0, 0);
-            mma_phase[buf] ^= 1;
+            if (buf == 0) mma_phase_0 ^= 1;
+            else          mma_phase_1 ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
 #ifdef STRIP_EPILOGUE
@@ -950,7 +953,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                       Row_start = row_local_32 + 8*stsm_idx for stsm_idx
                       in 0..3.
                     */
-                    const uint32_t out_base = out_smem_arr[es];
+                    const uint32_t out_base = (es == 0) ? out_smem_0 : out_smem_1;
                     const uint32_t lane_off = lane_r * (SUBPASS_COLS * 2)
                                             + lane_c * 16;
                     STSM_X4(out_base + (row_local_32 +  0) * (SUBPASS_COLS * 2) + lane_off,
@@ -984,7 +987,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                         CVT_ADD_BF16X2(p[k], a[2*k], a[2*k + 1], bk[k]);
                     }
 
-                    const uint32_t out_base = out_smem_arr[es];
+                    const uint32_t out_base = (es == 0) ? out_smem_0 : out_smem_1;
                     const uint32_t base_row = out_base
                         + (row_local_32 + lane) * (SUBPASS_COLS * 2);
                     asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
@@ -1012,7 +1015,8 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     if (tt > 0 || sp >= NUM_EPI_STAGES) {
                         BULK_ASM(BULK_WAIT_GROUP(1));
                     }
-                    tma_store(out_smem_arr[es], &tma_c,
+                    const uint32_t tma_base = (es == 0) ? out_smem_0 : out_smem_1;
+                    tma_store(tma_base, &tma_c,
                               nc, cta_rank * ROWS_PER_CTA, tn, tm);
                     BULK_ASM("cp.async.bulk.commit_group;");
                     PROF_END(e3, 3);
