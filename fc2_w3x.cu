@@ -259,13 +259,28 @@ int dgswizzle_in_group(int lin) {
     14 ncycle, 15 nflat, 16 nsnake, 17 nlock, 18 checkered,
     19 dg-snake (zigzag within dgswizzle band), 21 ncyrot,
     30 hyb-chet, 31 hyb-pmix, 32 hyb-ingh.
-  Two fc2_w3x-local probes are inlined below (not shared with fc1/fc2_w3):
+  Four fc2_w3x-local probes are inlined below (not shared with fc1/fc2_w3):
     33 gflip — dgsw within-group + pair-flip group_idx (checkered on group axis).
     34 tn2br — dgsw within-group; bit-reverse the tm-order on tn=TILES_N-1.
+    35 dg_diag — dgsw + within-group diagonal tn rotation: tn=(ln+lm) mod TN.
+                  At every cluster slot within a group, all TILES_N tn columns
+                  are simultaneously demanded — kills same-tn lockstep across
+                  the 4 (G=4) cluster-mates of each group while preserving the
+                  wavefront tm-shape (uTm, tmMult identical to dgsw).  Probe
+                  added 2026-04-27 from tools/analyze_swizzle.py prediction.
+    36 dg_pingpong — dgsw + tn-shift on odd groups: tn=(ln+(g&1)) mod TN.
+                  Halves same-tn cluster lockstep across consecutive groups
+                  (group g and g+1 stamp different tn for the same ln) while
+                  preserving dgsw within-group reuse.  Different lever from
+                  dg_diag — varies tn run length per cluster instead of
+                  shifting it per cluster slot.
+  Both 35/36 are dgsw-shaped on the lin-to-(tm,tn) bijection — group_tiles
+  unchanged at TILES_N*G; only the (lm, ln) → tn mapping differs.  Use with
+  -DDG_GROUP_SIZE=4 (the analyzer-predicted Goldilocks G).
   Unset (default) → dgswizzle as currently shipping.  tile_swizzle() is the
   single entry point; tile_in_group() preserves the in_g signal under dgsw,
-  gflip, and tn2br (so PROFILE_{W4,TILE}'s in_g field stays meaningful);
-  static_swizzle variants return 0 from tile_in_group().
+  gflip, tn2br, dg_diag, and dg_pingpong (so PROFILE_{W4,TILE}'s in_g field
+  stays meaningful); static_swizzle variants return 0 from tile_in_group().
 */
 #ifdef TILE_DISPATCH
 #include "tile_dispatch.cuh"
@@ -321,12 +336,64 @@ int tn2br_in_group(int lin) {
 }
 #endif
 
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 35
+static __device__ __forceinline__
+int dg_diag_swizzle(int lin) {
+    const int G           = DG_GROUP_SIZE;
+    const int group_tiles = TILES_N * G;
+    const int group_idx   = lin / group_tiles;
+    const int first_m     = group_idx * G;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int lm          = in_group - (in_group / nig) * nig;
+    const int ln          = in_group / nig;
+    int tn = ln + lm;
+    while (tn >= TILES_N) tn -= TILES_N;
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+static __device__ __forceinline__
+int dg_diag_in_group(int lin) {
+    const int G = DG_GROUP_SIZE;
+    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
+}
+#endif
+
+#if defined(TILE_DISPATCH) && TILE_DISPATCH == 36
+static __device__ __forceinline__
+int dg_pingpong_swizzle(int lin) {
+    const int G           = DG_GROUP_SIZE;
+    const int group_tiles = TILES_N * G;
+    const int group_idx   = lin / group_tiles;
+    const int first_m     = group_idx * G;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int lm          = in_group - (in_group / nig) * nig;
+    const int ln          = in_group / nig;
+    int tn = ln + (group_idx & 1);
+    while (tn >= TILES_N) tn -= TILES_N;
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+static __device__ __forceinline__
+int dg_pingpong_in_group(int lin) {
+    const int G = DG_GROUP_SIZE;
+    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
+}
+#endif
+
 static __device__ __forceinline__
 int tile_swizzle(int lin) {
 #if defined(TILE_DISPATCH) && TILE_DISPATCH == 33
     return gflip_swizzle(lin);
 #elif defined(TILE_DISPATCH) && TILE_DISPATCH == 34
     return tn2br_swizzle(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 35
+    return dg_diag_swizzle(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 36
+    return dg_pingpong_swizzle(lin);
 #elif defined(TILE_DISPATCH) && TILE_DISPATCH >= 8
     return static_swizzle(lin);
 #else
@@ -340,6 +407,10 @@ int tile_in_group(int lin) {
     return gflip_in_group(lin);
 #elif defined(TILE_DISPATCH) && TILE_DISPATCH == 34
     return tn2br_in_group(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 35
+    return dg_diag_in_group(lin);
+#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 36
+    return dg_pingpong_in_group(lin);
 #elif defined(TILE_DISPATCH) && TILE_DISPATCH >= 8
     (void)lin;
     return 0;

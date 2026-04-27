@@ -1,16 +1,38 @@
 #!/usr/bin/env bash
 #
-# 1-way swizzle sweep on fc2_w3x: pits the 2 newest TD>30 survivors
-# (gflip=33, tn2br=34) against the established 6-way-tie set (dgsw
-# baseline, checkered=18, dgsnake=19, dg4 via DG_GROUP_SIZE=4) plus
-# zigzag=11 / rowmajor=13 as off-tie reference outliers so the ANOVA
-# has at least one cell that is *expected* to break ties — keeps the
-# F-statistic interpretable when the new TD>30 set ends up
-# indistinguishable.
+# 1-way swizzle sweep on fc2_w3x: maps the DG_GROUP_SIZE curve
+# (dg2 / dg4 / dg8(=dgsw default) / dg16 / dg32) alongside the 2 TD>30
+# survivors (gflip=33, tn2br=34), 2 structural alternatives
+# (checkered=18, dgsnake=19), and 2 analyzer-driven new probes
+# (dg4_diag=35, dg4_pingpong=36) added 2026-04-27 from
+# tools/analyze_swizzle.py predictions.  zigzag=11 / rowmajor=13 stay
+# in as off-tie reference outliers so the F-statistic stays interpretable
+# when adjacent group sizes tie.
 #
-# INGH=32 dropped: 2026-04-26 n=20 sweep landed it at +3.35 µs vs
-# leader (STRONG, p≪1e-9) — worse than the zigzag/rowmajor reference
-# outliers. Re-probing it costs build+run time and adds nothing.
+# At n=100 (2026-04-26) dg4 won by ~1.85 µs STRONG vs the dg8/checkered/
+# dgsnake/gflip cluster, with tn2br alone at +0.47 µs MODERATE.
+# Analyzer (tools/analyze_swizzle.py) predicts:
+#   - dg2: densest within-wavefront A multicast (tmMult=2.85 vs dg4=2.71,
+#     dg8=2.49) and zero tick-to-tick irregularity (tIrM=0.0). Should tie
+#     dg4 or beat by ≤0.5 µs if multicast-density is the lever.
+#   - dg4_diag (TD=35): dg4 + within-group diagonal tn rotation.  Same
+#     wavefront tm-shape as dg4 but breaks same-tn cluster lockstep across
+#     the 4 group-mates — every cluster slot in a group stamps a different
+#     tn at any tick.  Tests whether the residual dg4 cost is
+#     within-group same-tn cluster lockstep.
+#   - dg4_pingpong (TD=36): dg4 + tn-shift on odd groups.  Different lever
+#     from dg_diag — varies tn run length per cluster (tnRun=2.38 vs
+#     dg4=1.99, dg4_diag=1.00) instead of shifting per cluster slot.
+#   - dg16 / dg32: high cross-tick L2 warmth (0.216, 0.430) but low
+#     wavefront density (uTm=35.3, 45.9).  Confirm L2-warmth is NOT the
+#     lever (i.e. dg32 still loses despite best L2w8).
+#
+# INGH=32 dropped: n=20 sweep landed it at +3.35 µs vs leader (STRONG,
+# p≪1e-9) — worse than the zigzag/rowmajor reference outliers.  Analyzer
+# diagnosis: tIrM=1.9, tIr95=4 (highest among dg-family) + frMax=30
+# vs dg4's 26 → wavefront shape oscillates between even-group dgsw layout
+# and odd-group tn-major layout, creating bursty/regular DRAM demand
+# alternation that doesn't smooth out.  Don't re-probe.
 #
 # Pass-major interleaving (all variants in pass i, then pass i+1) shares
 # clock / thermal / queue state across cells, beating cross-session
@@ -47,7 +69,12 @@ VARIANTS=(
     "dgsw:dgsw:"
     "checkered:checkered:-DTILE_DISPATCH=18"
     "dgsnake:dgsnake:-DTILE_DISPATCH=19"
+    "dg2:dg2:-DDG_GROUP_SIZE=2"
     "dg4:dg4:-DDG_GROUP_SIZE=4"
+    "dg16:dg16:-DDG_GROUP_SIZE=16"
+    "dg32:dg32:-DDG_GROUP_SIZE=32"
+    "dg4diag:dg4diag:-DTILE_DISPATCH=35 -DDG_GROUP_SIZE=4"
+    "dg4pp:dg4pp:-DTILE_DISPATCH=36 -DDG_GROUP_SIZE=4"
     "gflip:gflip:-DTILE_DISPATCH=33"
     "tn2br:tn2br:-DTILE_DISPATCH=34"
     "zigzag:zigzag:-DTILE_DISPATCH=11"
