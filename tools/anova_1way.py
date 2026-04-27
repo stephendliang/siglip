@@ -227,18 +227,16 @@ def main():
                  "TIE <1.96, WEAK <2.58, MODERATE <3.29, STRONG ≥3.29.")
     lines.append("")
 
-    sorted_cells = sorted(cell_means.items(), key=lambda kv: -kv[1])
+    sorted_cells = sorted(cell_means.items(), key=lambda kv: kv[1])
     ref_lv, ref_mean = sorted_cells[0]
-    lines.append(f"pairwise Welch t (each cell vs slowest = {ref_lv}):")
+    lines.append(f"pairwise Welch t (each cell vs fastest = {ref_lv}):")
     ref_xs = cells[ref_lv]
-    for lv in sorted(cells):
-        if lv == ref_lv:
-            continue
+    for lv, _ in sorted_cells[1:]:
         result = welch_t(cells[lv], ref_xs)
         if result is None:
             continue
         v = verdict(abs(result["t"]))
-        sign = "faster" if result["t"] < 0 else "slower"
+        sign = "slower" if result["t"] > 0 else "faster"
         if abs(result["t"]) < 1.96:
             sign = "indistinguishable"
         p_two = t_pvalue_two_sided(result["t"], result["df"])
