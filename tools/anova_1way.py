@@ -1,15 +1,31 @@
 #!/usr/bin/env python3
 """
-1-way ANOVA + per-cell stats for sweep CSVs with one factor.
+1-way effect-size analysis for sweep CSVs with one factor.
 
 Reads a CSV with columns including {factor, <metric>} and runs:
 
   - per-cell stats (mean / σ / SE)
-  - 1-way ANOVA: between-cell vs within-cell variance, F-test
-  - pairwise Welch t-test of every cell against the fastest cell
+  - 1-way ANOVA: between-cell vs within-cell variance,
+    summarized by η² (proportion of variance explained), NOT p-values
+  - pairwise effect size of every cell against the fastest cell:
+    empirical AUC (Mann-Whitney) + Cohen's d, NOT t / p
 
-F-distribution p-values via the regularized incomplete beta function
-(Numerical Recipes Lentz continued fraction). stdlib only.
+Why no p-values: with n in the thousands, the t-statistic scales with √n
+and any tiny effect becomes "STRONG" by p<<1e-9. Effect-size measures are
+sample-size-independent and answer the practical question "how much do
+these distributions actually overlap?"
+
+  AUC = P(x < y) for x drawn from cell A, y drawn from cell B.
+        0.5 = indistinguishable (full overlap).
+        1.0 = perfect separation, A always faster.
+  d   = Cohen's d, (μ_y − μ_x) / pooled_σ.  Standardized mean diff.
+
+Verdict bands by AUC (folded to [0.5, 1.0]):
+  TIE       AUC <0.55     practically indistinguishable
+  WEAK      0.55–0.65     clear shift, heavy overlap
+  MODERATE  0.65–0.75     shift visible in histograms
+  STRONG    0.75–0.85     mostly disjoint
+  DECISIVE  ≥0.85         distributions barely overlap
 
 Thermal-throttle defenses (vast.ai-grade noise):
 
@@ -33,114 +49,69 @@ Usage:
         [--metric ms|cyc] [--paired COL] [--trim FRAC] [--out compare.txt]
 """
 import argparse
+import bisect
 import csv
 import math
 import sys
 
 
-def regularized_beta(x, a, b):
-    if x <= 0.0:
+def empirical_auc(xs, ys):
+    """Mann-Whitney U / (n_x * n_y) — empirical P(x < y).
+
+    No distributional assumption.  AUC=0.5 is full overlap;
+    AUC=1.0 means every x_i < every y_j.  Ties contribute 0.5
+    (standard convention).
+    """
+    n_x, n_y = len(xs), len(ys)
+    if n_x == 0 or n_y == 0:
+        return 0.5
+    ys_sorted = sorted(ys)
+    total = 0.0
+    for x in xs:
+        lo = bisect.bisect_left(ys_sorted, x)
+        hi = bisect.bisect_right(ys_sorted, x)
+        total += (n_y - hi) + 0.5 * (hi - lo)
+    return total / (n_x * n_y)
+
+
+def cohens_d(xs, ys):
+    """Standardized mean difference: (μ_y − μ_x) / pooled_σ.
+    Positive d means ys is slower (assuming larger = slower).
+    """
+    n_x, n_y = len(xs), len(ys)
+    if n_x < 2 or n_y < 2:
         return 0.0
-    if x >= 1.0:
-        return 1.0
-    bt = math.exp(
-        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
-        + a * math.log(x) + b * math.log(1.0 - x)
-    )
-    if x < (a + 1.0) / (a + b + 2.0):
-        return bt * _betacf(x, a, b) / a
-    else:
-        return 1.0 - bt * _betacf(1.0 - x, b, a) / b
+    mx = sum(xs) / n_x
+    my = sum(ys) / n_y
+    vx = sum((x - mx) ** 2 for x in xs) / (n_x - 1)
+    vy = sum((y - my) ** 2 for y in ys) / (n_y - 1)
+    pooled_var = ((n_x - 1) * vx + (n_y - 1) * vy) / (n_x + n_y - 2)
+    if pooled_var <= 0:
+        return 0.0
+    return (my - mx) / math.sqrt(pooled_var)
 
 
-def _betacf(x, a, b):
-    EPS = 3e-7
-    FPMIN = 1e-30
-    MAXIT = 200
-    qab = a + b
-    qap = a + 1.0
-    qam = a - 1.0
-    c = 1.0
-    d = 1.0 - qab * x / qap
-    if abs(d) < FPMIN:
-        d = FPMIN
-    d = 1.0 / d
-    h = d
-    for m in range(1, MAXIT + 1):
-        m2 = 2 * m
-        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
-        d = 1.0 + aa * d
-        if abs(d) < FPMIN:
-            d = FPMIN
-        c = 1.0 + aa / c
-        if abs(c) < FPMIN:
-            c = FPMIN
-        d = 1.0 / d
-        h *= d * c
-        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
-        d = 1.0 + aa * d
-        if abs(d) < FPMIN:
-            d = FPMIN
-        c = 1.0 + aa / c
-        if abs(c) < FPMIN:
-            c = FPMIN
-        d = 1.0 / d
-        delta = d * c
-        h *= delta
-        if abs(delta - 1.0) < EPS:
-            return h
-    return h
-
-
-def f_pvalue(F, df1, df2):
-    if F <= 0.0:
-        return 1.0
-    x = df2 / (df2 + df1 * F)
-    return regularized_beta(x, df2 / 2.0, df1 / 2.0)
-
-
-def t_pvalue_two_sided(t, df):
-    if df <= 0:
-        return 1.0
-    x = df / (df + t * t)
-    return regularized_beta(x, df / 2.0, 0.5)
-
-
-def welch_t(xs, ys):
-    nx, ny = len(xs), len(ys)
-    if nx < 2 or ny < 2:
-        return None
-    mx = sum(xs) / nx
-    my = sum(ys) / ny
-    vx = sum((x - mx) ** 2 for x in xs) / (nx - 1)
-    vy = sum((y - my) ** 2 for y in ys) / (ny - 1)
-    se = math.sqrt(vx / nx + vy / ny)
-    if se == 0.0:
-        return None
-    t = (mx - my) / se
-    num = (vx / nx + vy / ny) ** 2
-    den = (vx / nx) ** 2 / (nx - 1) + (vy / ny) ** 2 / (ny - 1)
-    df = num / den if den > 0 else float("inf")
-    return {"t": t, "df": df, "delta_us": (mx - my) * 1000.0,
-            "se_us": se * 1000.0, "mx": mx, "my": my}
-
-
-def verdict(absz):
-    if absz < 1.96:
+def auc_verdict(auc):
+    a = abs(auc - 0.5) + 0.5
+    if a < 0.55:
         return "TIE"
-    if absz < 2.58:
+    if a < 0.65:
         return "WEAK"
-    if absz < 3.29:
+    if a < 0.75:
         return "MODERATE"
-    return "STRONG"
+    if a < 0.85:
+        return "STRONG"
+    return "DECISIVE"
 
 
-def fmt_p(p):
-    if p < 1e-9:
-        return "<1e-9"
-    if p < 1e-6:
-        return f"{p:.1e}"
-    return f"{p:.4f}"
+def eta_squared_verdict(eta):
+    if eta < 0.01:
+        return "negligible"
+    if eta < 0.06:
+        return "small"
+    if eta < 0.14:
+        return "medium"
+    return "large"
 
 
 def anova_1way(rows, factor, metric="ms"):
@@ -160,6 +131,7 @@ def anova_1way(rows, factor, metric="ms"):
 
     ss_between = sum(len(cells[lv]) * (cell_means[lv] - grand) ** 2 for lv in levels)
     ss_within  = sum((v - cell_means[lv]) ** 2 for lv in levels for v in cells[lv])
+    ss_total   = ss_between + ss_within
 
     df_between = k - 1
     df_within  = sum(ns) - k
@@ -167,7 +139,7 @@ def anova_1way(rows, factor, metric="ms"):
     ms_between = ss_between / df_between if df_between else 0.0
     ms_within  = ss_within  / df_within  if df_within  else 0.0
     F = ms_between / ms_within if ms_within > 0 else float("inf")
-    p = f_pvalue(F, df_between, df_within)
+    eta_sq = ss_between / ss_total if ss_total > 0 else 0.0
 
     return {
         "levels": levels,
@@ -180,7 +152,7 @@ def anova_1way(rows, factor, metric="ms"):
         "ms_between": ms_between,
         "ms_within":  ms_within,
         "F": F,
-        "p": p,
+        "eta_sq": eta_sq,
     }
 
 
@@ -229,9 +201,8 @@ def main():
     ap.add_argument("--metric", default="ms", choices=("ms", "cyc"),
                     help="response variable column (default: ms)")
     ap.add_argument("--paired", default=None,
-                    help="block-pair column (e.g. rep, pass).  ANOVA runs on "
-                         "residuals = sample − per-block mean. Restores cell "
-                         "means in the output for human-readable absolute values.")
+                    help="block-pair column (e.g. rep, pass).  Pairwise AUC/d "
+                         "runs on residuals = sample − per-block mean.")
     ap.add_argument("--trim", type=float, default=0.0,
                     help="drop first FRAC of samples per cell, sorted by "
                          "--paired if given (e.g. 0.33 drops cold-start third)")
@@ -275,9 +246,9 @@ def main():
     delta_lbl = "cyc" if is_cyc else "µs"
 
     lines = []
-    lines.append(f"1-way ANOVA: factor = {args.factor}  metric = {args.metric}")
+    lines.append(f"effect-size analysis: factor = {args.factor}  metric = {args.metric}")
     if args.paired is not None:
-        lines.append(f"paired by {args.paired} (analysis runs on residuals; "
+        lines.append(f"paired by {args.paired} (pairwise AUC/d run on residuals; "
                      f"per-cell means below are absolute pre-pairing)")
     if args.trim > 0.0:
         lines.append(f"trim = {args.trim:.2f} ({n_raw} → {len(rows)} rows after dropping "
@@ -311,41 +282,43 @@ def main():
                          f"σ = {s*scale:7.3f}  SE = {se*scale:6.3f}")
         lines.append("")
 
-    ss_unit = f"{args.metric}²"
-    lines.append(f"ANOVA table (units: {ss_unit} for SS, {ss_unit} for MS):")
-    lines.append(f"  {'source':14s}  {'SS':>14s}  {'df':>5s}  {'MS':>14s}  "
-                 f"{'F':>9s}  {'p':>10s}  verdict")
-    F_proxy = math.sqrt(res["F"]) if res["F"] != float("inf") else 999.0
-    v_overall = verdict(F_proxy)
-    lines.append(f"  {args.factor:14s}  {res['ss_between']:14.6f}  "
-                 f"{res['df_between']:5d}  {res['ms_between']:14.6f}  "
-                 f"{res['F']:9.3f}  {fmt_p(res['p']):>10s}  {v_overall}")
-    lines.append(f"  {'residual':14s}  {res['ss_within']:14.6f}  "
-                 f"{res['df_within']:5d}  {res['ms_within']:14.6f}        —          —    —")
-    lines.append("")
-    lines.append("Verdict bands by F (proxy via √F vs |z|): "
-                 "TIE <1.96, WEAK <2.58, MODERATE <3.29, STRONG ≥3.29.")
+    lines.append("ANOVA summary (η² = SS_between / SS_total — proportion of "
+                 "variance explained by factor):")
+    lines.append(f"  {'source':14s}  {'SS':>16s}  {'df':>5s}  {'MS':>16s}")
+    lines.append(f"  {args.factor:14s}  {res['ss_between']:16.3f}  "
+                 f"{res['df_between']:5d}  {res['ms_between']:16.3f}")
+    lines.append(f"  {'residual':14s}  {res['ss_within']:16.3f}  "
+                 f"{res['df_within']:5d}  {res['ms_within']:16.3f}")
+    lines.append(f"  η² = {res['eta_sq']:.4f}  ({eta_squared_verdict(res['eta_sq'])} effect)"
+                 f"   F = {res['F']:.2f}")
+    lines.append("  η² bands (Cohen): <0.01 negligible, <0.06 small, <0.14 medium, ≥0.14 large.")
     lines.append("")
 
     sorted_cells = sorted(cell_means.items(), key=lambda kv: kv[1])
     ref_lv, ref_mean = sorted_cells[0]
-    lines.append(f"pairwise Welch t (each cell vs fastest = {ref_lv}):")
+    lines.append(f"pairwise effect size vs fastest = {ref_lv}:")
+    lines.append(f"  AUC bands: <0.55 TIE, <0.65 WEAK, <0.75 MODERATE, "
+                 f"<0.85 STRONG, ≥0.85 DECISIVE")
+    lines.append(f"  {'variant':22s}  {'Δ':>14s}        {'d':>7s}    "
+                 f"{'AUC':>5s}    verdict")
     ref_xs = cells[ref_lv]
     for lv, _ in sorted_cells[1:]:
-        result = welch_t(cells[lv], ref_xs)
-        if result is None:
+        xs = cells[lv]
+        if len(xs) < 2:
             continue
-        v = verdict(abs(result["t"]))
-        sign = "slower" if result["t"] > 0 else "faster"
-        if abs(result["t"]) < 1.96:
-            sign = "indistinguishable"
-        p_two = t_pvalue_two_sided(result["t"], result["df"])
-        delta = result["delta_us"] if not is_cyc else (result["mx"] - result["my"])
-        se = result["se_us"] if not is_cyc else (result["se_us"] / 1000.0)
-        lines.append(f"  {lv:22s}  Δ = {delta:+10.3f} {delta_lbl}   "
-                     f"SE = {se:7.3f}   "
-                     f"t = {result['t']:+7.3f}   df ≈ {result['df']:5.1f}   "
-                     f"p = {fmt_p(p_two):>10s}   {v:9s} ({sign})")
+        auc = empirical_auc(ref_xs, xs)
+        d = cohens_d(ref_xs, xs)
+        v = auc_verdict(auc)
+        if abs(auc - 0.5) < 0.05:
+            sign = "practically indistinguishable"
+        elif auc > 0.5:
+            sign = "slower"
+        else:
+            sign = "faster"
+        delta_raw = sum(xs) / len(xs) - sum(ref_xs) / len(ref_xs)
+        delta_disp = delta_raw if is_cyc else delta_raw * 1000.0
+        lines.append(f"  {lv:22s}  Δ = {delta_disp:+10.3f} {delta_lbl}  "
+                     f"d = {d:+6.3f}   AUC = {auc:.3f}   {v:9s} ({sign})")
 
     text = "\n".join(lines) + "\n"
     sys.stdout.write(text)
