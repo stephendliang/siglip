@@ -6,9 +6,15 @@
 #   tn128_ns6  — TN halved, same NS
 #   tn128_ns8  — TN halved, deeper pipeline (NS=8 fits since per-stage shrinks)
 #
-# 3 cells × REPS reps, pass-major interleaved so all cells share clock/
-# thermal/queue state. Cross-session B200 baseline drift is ~4 µs, larger
-# than any single lever effect we're trying to detect.
+# Single-process per-cell timing: REPS=N env var loops the existing
+# 3-launch cudaEvent window N times inside one process and emits a
+# `@@SAMPLE rep=K ms=X` line per rep (added 2026-04-27 to fc2_w3x.cu).
+# This drops ~200 ms × (REPS-1) of per-rep process churn per cell.
+#
+# 3 cells × REPS reps. Tradeoff: cell-major rather than pass-major
+# interleaving — but the whole sweep wallclock is short enough that all
+# cells stay inside one B200 drift window (drift is ~4 µs at the
+# minute scale, far above the µs-scale lever).
 #
 # Each binary built with -DCOMBO_QUICK (fast cudaMemset init, N_WARMUP=1,
 # N_TIMED_LAUNCHES=3, skip verify). Run the FULL build once first to
@@ -16,13 +22,13 @@
 #
 # Output: data/fc2_w3x_tile_<ts>/
 #   build-<cell>.log
-#   run-<cell>-<rep>.log
+#   run-<cell>.log     (one log per cell; contains all @@SAMPLE lines)
 #   wall_data.csv      (variant,tile_shape,rep,ms)
 #   compare.txt        (per-cell stats + 1-way ANOVA + pairwise Welch)
 #
 # Usage:
-#   tools/sweep_fc2_w3x_tile.sh                # REPS=20 (~1 min B200)
-#   REPS=64 tools/sweep_fc2_w3x_tile.sh        # tighter (~3 min)
+#   tools/sweep_fc2_w3x_tile.sh                # REPS=20
+#   REPS=64 tools/sweep_fc2_w3x_tile.sh        # tighter
 
 set -u
 cd "$(dirname "$0")/.."
@@ -65,36 +71,33 @@ if [[ ${#BUILD_OK[@]} -lt ${#VARIANTS[@]} ]]; then
     exit 1
 fi
 
-# ── Phase 2: interleaved reps ──────────────────────────────────────────
+# ── Phase 2: single-process per cell (REPS env var) ────────────────────
 log ""
-log "=== Phase 2: $REPS reps/variant, pass-major interleaving ==="
-for rep in $(seq 1 "$REPS"); do
-    log "-- pass $rep/$REPS --"
-    for entry in "${BUILD_OK[@]}"; do
-        IFS=: read -r name tile_shape flags <<< "$entry"
-        bin="$OUT/fc2-w3x-tile-$name"
-        if ! "$bin" > "$OUT/run-$name-$rep.log" 2>&1; then
-            log "  pass $rep $name run-FAIL"
-        fi
-    done
+log "=== Phase 2: $REPS reps/variant, single-process per cell (REPS env) ==="
+for entry in "${BUILD_OK[@]}"; do
+    IFS=: read -r name tile_shape flags <<< "$entry"
+    bin="$OUT/fc2-w3x-tile-$name"
+    if ! REPS="$REPS" "$bin" > "$OUT/run-$name.log" 2>&1; then
+        log "  $name run-FAIL"
+        continue
+    fi
+    n_seen=$(grep -cE '^@@SAMPLE rep=' "$OUT/run-$name.log" || true)
+    log "  $name  reps=$n_seen"
 done
 
-# ── Phase 3: extract wall ms into CSV ──────────────────────────────────
+# ── Phase 3: extract @@SAMPLE lines into CSV ───────────────────────────
 log ""
-log "=== Phase 3: extracting wall ms → $OUT/wall_data.csv ==="
+log "=== Phase 3: extracting @@SAMPLE → $OUT/wall_data.csv ==="
 {
     echo "variant,tile_shape,rep,ms"
     for entry in "${BUILD_OK[@]}"; do
         IFS=: read -r name tile_shape flags <<< "$entry"
-        for rep in $(seq 1 "$REPS"); do
-            f="$OUT/run-$name-$rep.log"
-            if [[ -f "$f" ]]; then
-                ms=$(grep -oE 'FC2-W3X kernel: [0-9.]+ ms' "$f" | head -1 | awk '{print $3}')
-                if [[ -n "$ms" ]]; then
-                    echo "$name,$tile_shape,$rep,$ms"
-                fi
-            fi
-        done
+        f="$OUT/run-$name.log"
+        if [[ -f "$f" ]]; then
+            grep -E '^@@SAMPLE rep=' "$f" | \
+                sed -E 's/^@@SAMPLE rep=([0-9]+) ms=([0-9.]+).*/\1,\2/' | \
+                awk -F, -v n="$name" -v s="$tile_shape" '{print n","s","$1","$2}'
+        fi
     done
 } > "$OUT/wall_data.csv"
 n_rows=$(( $(wc -l < "$OUT/wall_data.csv") - 1 ))

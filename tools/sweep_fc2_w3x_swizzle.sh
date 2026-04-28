@@ -55,15 +55,23 @@
 # and odd-group tn-major layout, creating bursty/regular DRAM demand
 # alternation that doesn't smooth out.  Don't re-probe.
 #
-# Pass-major interleaving (all variants in pass i, then pass i+1) shares
-# clock / thermal / queue state across cells, beating cross-session
-# B200 drift (~4 µs, larger than the µs-scale lever effects we care
-# about). REPS=20 default catches ~0.5 µs cell separations at α≈0.05;
+# Single-process per-cell timing: each binary call now loops the existing
+# 3-launch cudaEvent timing window REPS times in one process via the
+# REPS=N env var (added 2026-04-27 to fc2_w3x.cu).  Each rep emits a
+# `@@SAMPLE rep=K ms=X` line; we grep those into the CSV.  This drops
+# ~200 ms of per-rep process churn × (REPS-1) per cell — REPS=64 over
+# 18 cells goes from ~4 min to ~30 s.
+#
+# Tradeoff: cell-major rather than pass-major interleaving — all REPS of
+# cell i run before any of cell i+1.  Cross-session B200 baseline drift
+# is ~4 µs, larger than the µs-scale lever effects we care about, so a
+# whole-sweep wallclock under ~1 min keeps every cell within one drift
+# window.  REPS=20 default catches ~0.5 µs cell separations at α≈0.05;
 # REPS=64 tightens to ~0.2 µs.
 #
 # Output: data/fc2_w3x_swizzle_<ts>/
 #   build-<cell>.log
-#   run-<cell>-<rep>.log
+#   run-<cell>.log     (one log per cell; contains all @@SAMPLE lines)
 #   wall_data.csv      (variant,swizzle,rep,ms)
 #   compare.txt        (per-cell stats + 1-way ANOVA + pairwise Welch)
 #
@@ -131,33 +139,30 @@ if [[ ${#BUILD_OK[@]} -lt 2 ]]; then
 fi
 
 log ""
-log "=== Phase 2: $REPS reps/variant, pass-major interleaving ==="
-for rep in $(seq 1 "$REPS"); do
-    log "-- pass $rep/$REPS --"
-    for entry in "${BUILD_OK[@]}"; do
-        IFS=: read -r name swizzle flags <<< "$entry"
-        bin="$OUT/fc2-w3x-swizzle-$name"
-        if ! "$bin" > "$OUT/run-$name-$rep.log" 2>&1; then
-            log "  pass $rep $name run-FAIL"
-        fi
-    done
+log "=== Phase 2: $REPS reps/variant, single-process per cell (REPS env) ==="
+for entry in "${BUILD_OK[@]}"; do
+    IFS=: read -r name swizzle flags <<< "$entry"
+    bin="$OUT/fc2-w3x-swizzle-$name"
+    if ! REPS="$REPS" "$bin" > "$OUT/run-$name.log" 2>&1; then
+        log "  $name run-FAIL"
+        continue
+    fi
+    n_seen=$(grep -cE '^@@SAMPLE rep=' "$OUT/run-$name.log" || true)
+    log "  $name  reps=$n_seen"
 done
 
 log ""
-log "=== Phase 3: extracting wall ms → $OUT/wall_data.csv ==="
+log "=== Phase 3: extracting @@SAMPLE → $OUT/wall_data.csv ==="
 {
     echo "variant,swizzle,rep,ms"
     for entry in "${BUILD_OK[@]}"; do
         IFS=: read -r name swizzle flags <<< "$entry"
-        for rep in $(seq 1 "$REPS"); do
-            f="$OUT/run-$name-$rep.log"
-            if [[ -f "$f" ]]; then
-                ms=$(grep -oE 'FC2-W3X kernel: [0-9.]+ ms' "$f" | head -1 | awk '{print $3}')
-                if [[ -n "$ms" ]]; then
-                    echo "$name,$swizzle,$rep,$ms"
-                fi
-            fi
-        done
+        f="$OUT/run-$name.log"
+        if [[ -f "$f" ]]; then
+            grep -E '^@@SAMPLE rep=' "$f" | \
+                sed -E 's/^@@SAMPLE rep=([0-9]+) ms=([0-9.]+).*/\1,\2/' | \
+                awk -F, -v n="$name" -v s="$swizzle" '{print n","s","$1","$2}'
+        fi
     done
 } > "$OUT/wall_data.csv"
 n_rows=$(( $(wc -l < "$OUT/wall_data.csv") - 1 ))

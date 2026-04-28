@@ -40,6 +40,8 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cmath>
+#include <vector>
+#include <algorithm>
 
 #ifndef M_TOTAL
 #define M_TOTAL 928256
@@ -1971,16 +1973,58 @@ int main(int argc, char** argv) {
 #else
     const int N_TIMED_LAUNCHES = 10;
 #endif
-    printf("Timing %d iters...\n", N_TIMED_LAUNCHES);
+    /*
+      REPS env var: number of independent timing windows per process. Each rep
+      records a fresh cudaEvent bracket around N_TIMED_LAUNCHES kernel calls
+      and reports its mean as one sample. Default 1 preserves legacy behavior;
+      the swizzle/tile sweeps set REPS=N to amortize ~200ms process churn over
+      N samples.
+    */
+    int REPS = 1;
+    if (const char* s = std::getenv("REPS")) { int v = std::atoi(s); if (v > 0) REPS = v; }
+    const int total_launches = N_TIMED_LAUNCHES * REPS;
+    (void)total_launches;
+
+    printf("Timing %d reps × %d iters/rep ...\n", REPS, N_TIMED_LAUNCHES);
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0); cudaEventCreate(&t1);
-    cudaEventRecord(t0);
-    for (int i = 0; i < N_TIMED_LAUNCHES; i++) LAUNCH_KERNEL();
-    cudaEventRecord(t1);
-    cudaEventSynchronize(t1);
-    float ms;
-    cudaEventElapsedTime(&ms, t0, t1);
-    ms /= (float)N_TIMED_LAUNCHES;
+
+    std::vector<float> samples;
+    samples.reserve(REPS);
+    for (int r = 0; r < REPS; r++) {
+        cudaEventRecord(t0);
+        for (int i = 0; i < N_TIMED_LAUNCHES; i++) LAUNCH_KERNEL();
+        cudaEventRecord(t1);
+        cudaEventSynchronize(t1);
+        float dt;
+        cudaEventElapsedTime(&dt, t0, t1);
+        dt /= (float)N_TIMED_LAUNCHES;
+        samples.push_back(dt);
+        printf("@@SAMPLE rep=%d ms=%.5f\n", r + 1, dt);
+    }
+
+    double sum = 0.0;
+    for (float v : samples) sum += v;
+    const double mean = sum / samples.size();
+    double var = 0.0;
+    for (float v : samples) var += ((double)v - mean) * ((double)v - mean);
+    var /= (samples.size() > 1 ? samples.size() - 1 : 1);
+    const double sd = std::sqrt(var);
+    std::vector<float> sorted = samples;
+    std::sort(sorted.begin(), sorted.end());
+    auto pct = [&](double q) -> double {
+        if (sorted.size() == 1) return sorted[0];
+        const double pos = q * (sorted.size() - 1);
+        const size_t lo = (size_t)pos;
+        const size_t hi = std::min(lo + 1, sorted.size() - 1);
+        const double frac = pos - lo;
+        return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
+    };
+    const double p25 = pct(0.25), p50 = pct(0.50), p75 = pct(0.75);
+    printf("@@STATS reps=%zu mean=%.5f std=%.5f min=%.5f p25=%.5f p50=%.5f p75=%.5f max=%.5f iqr=%.5f\n",
+           samples.size(), mean, sd, (double)sorted.front(), p25, p50, p75, (double)sorted.back(), p75 - p25);
+
+    const float ms = (float)mean;
     printf("FC2-W3X kernel: %.3f ms  %.2f TFLOPS\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9);
 
@@ -2031,14 +2075,14 @@ int main(int argc, char** argv) {
         for (int w = 0; w < TOTAL_WARPS; w++) {
             if (warp_count[w] == 0) continue;
             double v = (double)warp_sum[w][PROF_WALL_SLOT]
-                     / ((double)warp_count[w] * tiles_per_cluster_host * N_TIMED_LAUNCHES);
+                     / ((double)warp_count[w] * tiles_per_cluster_host * total_launches);
             if (v > wall_cyc) { wall_cyc = v; wall_src_warp = w; }
         }
         const double eff_clock_ghz = (ms > 0 && tiles_per_cluster_host > 0)
             ? (wall_cyc * tiles_per_cluster_host * 1e-3 / ms) : 0.0;
 
         printf("\n[PROFILE] mean cyc/tile per (warp, phase), across %d clusters × %d timed launches\n",
-               num_clusters_host, N_TIMED_LAUNCHES);
+               num_clusters_host, total_launches);
         printf("  tiles/cluster=%d  wall cyc/tile (measured, W%d) = %.0f  effective clock = %.3f GHz\n",
                tiles_per_cluster_host, wall_src_warp, wall_cyc, eff_clock_ghz);
         printf("  (hard-coded 1.813 GHz would give wall cyc/tile = %.0f — delta %.1f%% indicates actual clock)\n",
@@ -2067,7 +2111,7 @@ int main(int argc, char** argv) {
             if (warp_count[w] == 0) { printf("  [W%d %s] no data\n", w, tag); return; }
             uint64_t total = 0;
             for (int p = 0; p < nph; p++) total += warp_sum[w][p];
-            double denom = (double)warp_count[w] * tiles_per_cluster_host * N_TIMED_LAUNCHES;
+            double denom = (double)warp_count[w] * tiles_per_cluster_host * total_launches;
             double total_per_tile = (double)total / denom;
             double wall_w = (double)warp_sum[w][PROF_WALL_SLOT] / denom;
             printf("  [W%d %-4s  instances=%3d]   cyc/tile  wall%%\n",
@@ -2092,7 +2136,7 @@ int main(int argc, char** argv) {
         dump_warp(WARP_MMA, "MMA", mma_labels, 4);
 
         printf("@@PROFMETA wall_cyc_per_tile=%.2f eff_clock_ghz=%.4f tiles_per_cluster=%d launches=%d\n",
-               wall_cyc, eff_clock_ghz, tiles_per_cluster_host, N_TIMED_LAUNCHES);
+               wall_cyc, eff_clock_ghz, tiles_per_cluster_host, total_launches);
 
         free(h_prof);
     }
