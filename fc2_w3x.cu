@@ -39,6 +39,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <cmath>
 #include <vector>
 #include <algorithm>
@@ -212,33 +213,27 @@ uint64_t make_smem_desc(uint32_t addr) {
 }
 
 /*
-  Dispatch variants for fc2_w3x (all strided layout: lin = c + tt*NC).
+  Dispatch variants for fc2_w3x.  All swizzle helpers and the kernel are
+  templated on (TD, DGG), so every variant compiles to its own SASS via
+  explicit instantiation in main()'s VARIANT_TABLE.  A single binary now
+  holds 20 fully-specialized kernels with byte-identical codegen to the
+  per-build flow that preceded this refactor.
 
-  Base: dgswizzle(DG_GROUP_SIZE=G). Within each group of G*TILES_N tiles,
-  iterate tm fastest then tn (tn-run length = G).
-
-  DG_ROT (probe, 0-delta perf): rotate tn by group_idx — spreads
-  group-boundary position across all tn values. Kept as the structural
-  probe that proved tn=0 surplus is in_g-position-structural, not
-  tn-intrinsic (see memory/project_w3x_tn0_in_g_structural.md).
-
-  DG_GROUP_SIZE=N (build-time): override G ∈ {4, 8, 16, 32}. Trades
-  tn-run length vs group count.
+  Base: dgswizzle(DGG=G). Within each group of G*TILES_N tiles, iterate
+  tm fastest then tn (tn-run length = G).  TD=0 (default) → dgswizzle.
+  DG_ROT (legacy probe, 0-delta perf): rotate tn by group_idx — kept for
+  the tn=0-surplus structural diagnosis (memory/project_w3x_tn0_in_g_structural.md).
 */
+template<int DGG>
 static __device__ __forceinline__
-int dgswizzle(int lin) {
-    const int group_tiles = TILES_N * DG_GROUP_SIZE;
-
+int dgswizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
     const int group_idx = lin / group_tiles;
-    const int first_m = group_idx * DG_GROUP_SIZE;
+    const int first_m = group_idx * DGG;
     const int in_group = lin - group_idx * group_tiles;
-    const int nig = (first_m + DG_GROUP_SIZE <= TILES_M)
-                  ? DG_GROUP_SIZE
-                  : TILES_M - first_m;
-
+    const int nig = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
     const int tm_local = in_group % nig;
     const int tn_raw   = in_group / nig;
-
 #ifdef DG_ROT
     int tn = tn_raw + group_idx;
     while (tn >= TILES_N) tn -= TILES_N;
@@ -248,119 +243,139 @@ int dgswizzle(int lin) {
     return (first_m + tm_local) * TILES_N + tn;
 }
 
+template<int DGG>
 static __device__ __forceinline__
-int dgswizzle_in_group(int lin) {
-    const int group_tiles = TILES_N * DG_GROUP_SIZE;
+int dg_in_group_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
     return lin - (lin / group_tiles) * group_tiles;
 }
 
 /*
-  Non-dgswizzle dispatch variants from tile_dispatch.cuh.  Set -DTILE_DISPATCH=N
-  where N chooses a static_swizzle (see tile_dispatch.cuh):
-     9 zorder, 10 hilbert, 11 zigzag, 13 rowmajor,
-    14 ncycle, 15 nflat, 16 nsnake, 17 nlock, 18 checkered,
-    19 dg-snake (zigzag within dgswizzle band), 21 ncyrot,
-    30 hyb-chet, 31 hyb-pmix, 32 hyb-ingh.
-  Ten fc2_w3x-local probes are inlined below (not shared with fc1/fc2_w3):
-    33 gflip — dgsw within-group + pair-flip group_idx (checkered on group axis).
-    34 tn2br — dgsw within-group; bit-reverse the tm-order on tn=TILES_N-1.
-    35 dg_diag — dgsw + within-group diagonal tn rotation: tn=(ln+lm) mod TN.
-    36 dg_pingpong — dgsw + tn-shift on odd groups: tn=(ln+(g&1)) mod TN.
-
-  TD=37..42 added 2026-04-27 from cluster_swizzle.py / Kendall-τ analysis on
-  the n=200 wall sweep.  Each isolates one of three measured front-tier
-  mechanisms (dgsnake / gflip / tn2br each pull a different feature):
-    37 dg_rowmaj — dgsw with (lm,ln) fast/slow swapped: lm=in_g/TN, ln=in_g%TN.
-                  Pushes adj_tn_diff to ~1.0 within group (vs dgsw's 0.0).
-                  Tests dgsnake's lever at maximum.
-    38 dg_g4swap — gflip-lever with XOR=3 instead of XOR=1: swaps groups in
-                  4-blocks (0↔3, 1↔2, 4↔7, 5↔6, ...).  Tests whether
-                  gflip's perf comes from the group_idx swap mechanism
-                  itself (with a larger swap window) rather than from a
-                  ln-shift dressed up as a group swap.  Note: TD=36
-                  dg_pingpong is the (g&1) ln-shift variant; we don't
-                  re-probe that.
-    39 dg_lmrev — dgsw + 3-bit reverse on lm (G=8 only): lm=bitrev3(in_g%8),
-                  ln=in_g/8.  Lifts adj_tm_diff from 1.5 to ~3.5.  Tests
-                  tn2br's lever generalized across all (tm,tn) tiles.
-    40 dg_combo_AB — TD=37 within-group + TD=38 group_idx XOR=3 swap.
-                    Composes dgsnake×gflip levers; tests whether they
-                    add or are redundant.
-    41 dg_combo_AC — TD=37 + 3-bit reverse on lm.  Composes dgsnake×tn2br;
-                    tests if cluster decorrelation across BOTH axes wins.
-    42 dg_tn_blk — Global tn-blocked: tn=lin/TILES_M, tm=lin%TILES_M.
-                  Each cluster gets ~49 consecutive same-tn ticks.
-                  intra_tn_run maxed (Kendall-τ #1 signal, τ=-0.586 p=0.007).
-                  Sanity check that the τ feature isn't a hidden lever.
-
-  TD=43..45 (tnRun-preserving "max adj_tn_diff" family):
-    Cluster c's in_g advances by NC%group_tiles = 74%24 = 2 per tick.  Only
-    lm%2 is invariant across the cluster's tick sequence (mod-3/4 cycle).
-    Permutations keyed on lm%2 (or ln%2 for the lm-axis variant) preserve
-    cluster c's tnRun.  All three are dgsw bijection.
-    43 dg_sn_rot1 — even lm: tn=ln; odd lm: tn=(ln+1) mod 3.  dgsnake-style
-                  but rotation-by-+1 instead of reverse.  Different |Δtn|
-                  magnitude pattern; tests whether dgsnake's win is
-                  reverse-specific or just "any non-identity at lm%2".
-    44 dg_sn_rot2 — even lm: tn=ln; odd lm: tn=(ln+2) mod 3.  Symmetric
-                  partner to TD=43 (= rot-by-(-1)).
-    45 dg_lmsn — Snake on lm at odd ln: ln=0 → lm=lm_raw; ln=1 → lm reversed
-                  within group; ln=2 → lm=lm_raw.  Tn unchanged from dgsw,
-                  so tnRun = dgsw 3.92 by construction.  Pushes adj_tm_diff
-                  via reversal at every ln-row boundary (cross-row
-                  transitions hold lm constant).  tn2br-lever generalized
-                  but limited to ln%2 (matches dgsw's 4-tick ln stability).
-
-  TD=37..41,43..45 are dgsw-shaped on the lin-to-(tm,tn) bijection —
-  group_tiles unchanged at TILES_N*G; only the (lm, ln) → (tm, tn) mapping
-  differs.  Designed for -DDG_GROUP_SIZE=8.  TD=42 has no group concept
-  (returns 0 from tile_in_group()).
-  Unset (default) → dgswizzle as currently shipping.  tile_swizzle() is the
-  single entry point; tile_in_group() preserves the in_g signal under dgsw
-  and TD=33..41,43..45 (so PROFILE_{W4,TILE}'s in_g field stays meaningful);
-  TD=42 and static_swizzle variants return 0 from tile_in_group().
-  All swizzles are amortized into the per-cluster LUT (W3 populates 147
-  packed (tm,tn) entries at startup), so swizzle compute cost is identical
-  at runtime regardless of complexity.
+  Variants TD=11 zigzag, TD=13 rowmajor, TD=18 checkered, TD=19 dgsnake
+  lifted from tile_dispatch.cuh (which stays macro-based for fc1_w3 /
+  fc2_w3) so all coexist as templates within fc2_w3x's TU.
 */
-#ifdef TILE_DISPATCH
-#include "tile_dispatch.cuh"
-#endif
-
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 33
 static __device__ __forceinline__
-int gflip_swizzle(int lin) {
-    const int G           = DG_GROUP_SIZE;
-    const int group_tiles = TILES_N * G;
-    const int num_groups  = (TILES_M + G - 1) / G;
+int zigzag_swizzle(int lin) {
+    int tm = lin / TILES_N;
+    int tn = lin - tm * TILES_N;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    if (tm & 1) tn = TILES_N - 1 - tn;
+    return tm * TILES_N + tn;
+}
+
+static __device__ __forceinline__
+int rowmajor_swizzle(int lin) {
+    int tm = lin / TILES_N;
+    int tn = lin - tm * TILES_N;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+
+#ifndef CK_GROUP_M
+#define CK_GROUP_M 8
+#endif
+#ifndef CK_GROUP_N
+#if TILES_N > 4
+#define CK_GROUP_N 5
+#else
+#define CK_GROUP_N 2
+#endif
+#endif
+static __device__ __forceinline__
+int checkered_swizzle(int lin) {
+    const int G_M = CK_GROUP_M;
+    const int G_N = CK_GROUP_N;
+    const int stripes_per_row = (TILES_N + G_N - 1) / G_N;
+    const int row_tiles = G_M * TILES_N;
+    const int row_group = lin / row_tiles;
+    const int in_row = lin - row_group * row_tiles;
+    const int first_m = row_group * G_M;
+    int tm, tn;
+    if (first_m + G_M <= TILES_M) {
+        const int full_ss = G_M * G_N;
+        const int interior_total = (stripes_per_row - 1) * full_ss;
+        int stripe, in_stripe;
+        if (stripes_per_row == 1 || in_row < interior_total) {
+            stripe = (stripes_per_row == 1) ? 0 : (in_row / full_ss);
+            in_stripe = in_row - stripe * full_ss;
+        } else {
+            stripe = stripes_per_row - 1;
+            in_stripe = in_row - interior_total;
+        }
+        tm = first_m + in_stripe % G_M;
+        tn = stripe * G_N + in_stripe / G_M;
+    } else {
+        const int num_m = TILES_M - first_m;
+        const int denom_m = num_m > 0 ? num_m : 1;
+        const int full_ss = denom_m * G_N;
+        const int interior_total = (stripes_per_row - 1) * full_ss;
+        int stripe, in_stripe;
+        if (stripes_per_row == 1 || in_row < interior_total) {
+            stripe = (stripes_per_row == 1) ? 0 : (in_row / full_ss);
+            in_stripe = in_row - stripe * full_ss;
+        } else {
+            stripe = stripes_per_row - 1;
+            in_stripe = in_row - interior_total;
+        }
+        tm = first_m + in_stripe % denom_m;
+        tn = stripe * G_N + in_stripe / denom_m;
+    }
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    if (tn >= TILES_N) tn = TILES_N - 1;
+    return tm * TILES_N + tn;
+}
+
+template<int DGG>
+static __device__ __forceinline__
+int dgsnake_swizzle(int lin) {
+    const int group_tiles = TILES_N * DGG;
+    const int group_idx = lin / group_tiles;
+    const int first_m = group_idx * DGG;
+    const int in_group = lin - group_idx * group_tiles;
+    const int num_in_group = min(DGG, TILES_M - first_m);
+    const int local_m = in_group % num_in_group;
+    int local_n = in_group / num_in_group;
+    if (local_m & 1) local_n = TILES_N - 1 - local_n;
+    int tm = first_m + local_m;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + local_n;
+}
+
+/*
+  fc2_w3x-local probes (see git log for the design notes):
+    33 gflip, 34 tn2br, 35 dg_diag, 36 dg_pingpong, 37 dg_rowmaj,
+    38 dg_g4swap, 39 dg_lmrev, 40 dg_combo_ab, 41 dg_combo_ac,
+    42 dg_tn_blk, 43 dg_sn_rot1, 44 dg_sn_rot2, 45 dg_lmsn.
+  All but TD=42 are dgsw-shaped (tile_in_group_t = dg_in_group_t<DGG>);
+  TD=42 has no group concept and returns 0.
+*/
+template<int DGG>
+static __device__ __forceinline__
+int gflip_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
+    const int num_groups  = (TILES_M + DGG - 1) / DGG;
     int group_idx         = lin / group_tiles;
     const int in_group    = lin - group_idx * group_tiles;
     const int paired      = group_idx ^ 1;
     if (paired < num_groups) group_idx = paired;
-    const int first_m  = group_idx * G;
-    const int nig      = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int first_m  = group_idx * DGG;
+    const int nig      = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
     const int tm_local = in_group - (in_group / nig) * nig;
     const int tn       = in_group / nig;
     int tm = first_m + tm_local;
     if (tm >= TILES_M) tm = TILES_M - 1;
     return tm * TILES_N + tn;
 }
-static __device__ __forceinline__
-int gflip_in_group(int lin) {
-    const int G = DG_GROUP_SIZE;
-    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
-}
-#endif
 
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 34
+template<int DGG>
 static __device__ __forceinline__
-int tn2br_swizzle(int lin) {
-    const int G           = DG_GROUP_SIZE;
-    const int group_tiles = TILES_N * G;
+int tn2br_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
     const int group_idx   = lin / group_tiles;
-    const int first_m     = group_idx * G;
+    const int first_m     = group_idx * DGG;
     const int in_group    = lin - group_idx * group_tiles;
-    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
     const int tn          = in_group / nig;
     int tm_local          = in_group - tn * nig;
     if (tn == TILES_N - 1 && nig == 8) {
@@ -370,22 +385,15 @@ int tn2br_swizzle(int lin) {
     if (tm >= TILES_M) tm = TILES_M - 1;
     return tm * TILES_N + tn;
 }
-static __device__ __forceinline__
-int tn2br_in_group(int lin) {
-    const int G = DG_GROUP_SIZE;
-    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
-}
-#endif
 
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 35
+template<int DGG>
 static __device__ __forceinline__
-int dg_diag_swizzle(int lin) {
-    const int G           = DG_GROUP_SIZE;
-    const int group_tiles = TILES_N * G;
+int dg_diag_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
     const int group_idx   = lin / group_tiles;
-    const int first_m     = group_idx * G;
+    const int first_m     = group_idx * DGG;
     const int in_group    = lin - group_idx * group_tiles;
-    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
     const int lm          = in_group - (in_group / nig) * nig;
     const int ln          = in_group / nig;
     int tn = ln + lm;
@@ -394,22 +402,15 @@ int dg_diag_swizzle(int lin) {
     if (tm >= TILES_M) tm = TILES_M - 1;
     return tm * TILES_N + tn;
 }
-static __device__ __forceinline__
-int dg_diag_in_group(int lin) {
-    const int G = DG_GROUP_SIZE;
-    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
-}
-#endif
 
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 36
+template<int DGG>
 static __device__ __forceinline__
-int dg_pingpong_swizzle(int lin) {
-    const int G           = DG_GROUP_SIZE;
-    const int group_tiles = TILES_N * G;
+int dg_pingpong_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
     const int group_idx   = lin / group_tiles;
-    const int first_m     = group_idx * G;
+    const int first_m     = group_idx * DGG;
     const int in_group    = lin - group_idx * group_tiles;
-    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
     const int lm          = in_group - (in_group / nig) * nig;
     const int ln          = in_group / nig;
     int tn = ln + (group_idx & 1);
@@ -418,22 +419,15 @@ int dg_pingpong_swizzle(int lin) {
     if (tm >= TILES_M) tm = TILES_M - 1;
     return tm * TILES_N + tn;
 }
-static __device__ __forceinline__
-int dg_pingpong_in_group(int lin) {
-    const int G = DG_GROUP_SIZE;
-    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
-}
-#endif
 
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 37
+template<int DGG>
 static __device__ __forceinline__
-int dg_rowmaj_swizzle(int lin) {
-    const int G           = DG_GROUP_SIZE;
-    const int group_tiles = TILES_N * G;
+int dg_rowmaj_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
     const int group_idx   = lin / group_tiles;
-    const int first_m     = group_idx * G;
+    const int first_m     = group_idx * DGG;
     const int in_group    = lin - group_idx * group_tiles;
-    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
     const int slots       = nig * TILES_N;
     const int ig_clamped  = (in_group < slots) ? in_group : slots - 1;
     const int tn          = ig_clamped - (ig_clamped / TILES_N) * TILES_N;
@@ -442,25 +436,18 @@ int dg_rowmaj_swizzle(int lin) {
     if (tm >= TILES_M) tm = TILES_M - 1;
     return tm * TILES_N + tn;
 }
-static __device__ __forceinline__
-int dg_rowmaj_in_group(int lin) {
-    const int G = DG_GROUP_SIZE;
-    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
-}
-#endif
 
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 38
+template<int DGG>
 static __device__ __forceinline__
-int dg_g4swap_swizzle(int lin) {
-    const int G           = DG_GROUP_SIZE;
-    const int group_tiles = TILES_N * G;
-    const int num_groups  = (TILES_M + G - 1) / G;
+int dg_g4swap_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
+    const int num_groups  = (TILES_M + DGG - 1) / DGG;
     int group_idx         = lin / group_tiles;
     const int in_group    = lin - (lin / group_tiles) * group_tiles;
     const int paired      = group_idx ^ 3;
     if (paired < num_groups) group_idx = paired;
-    const int first_m     = group_idx * G;
-    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int first_m     = group_idx * DGG;
+    const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
     const int lm          = in_group - (in_group / nig) * nig;
     const int ln          = in_group / nig;
     const int tn = ln;
@@ -468,22 +455,15 @@ int dg_g4swap_swizzle(int lin) {
     if (tm >= TILES_M) tm = TILES_M - 1;
     return tm * TILES_N + tn;
 }
-static __device__ __forceinline__
-int dg_g4swap_in_group(int lin) {
-    const int G = DG_GROUP_SIZE;
-    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
-}
-#endif
 
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 39
+template<int DGG>
 static __device__ __forceinline__
-int dg_lmrev_swizzle(int lin) {
-    const int G           = DG_GROUP_SIZE;
-    const int group_tiles = TILES_N * G;
+int dg_lmrev_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
     const int group_idx   = lin / group_tiles;
-    const int first_m     = group_idx * G;
+    const int first_m     = group_idx * DGG;
     const int in_group    = lin - group_idx * group_tiles;
-    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
     const int lm_raw      = in_group - (in_group / nig) * nig;
     const int ln          = in_group / nig;
     int lm = lm_raw;
@@ -495,25 +475,18 @@ int dg_lmrev_swizzle(int lin) {
     if (tm >= TILES_M) tm = TILES_M - 1;
     return tm * TILES_N + tn;
 }
-static __device__ __forceinline__
-int dg_lmrev_in_group(int lin) {
-    const int G = DG_GROUP_SIZE;
-    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
-}
-#endif
 
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 40
+template<int DGG>
 static __device__ __forceinline__
-int dg_combo_ab_swizzle(int lin) {
-    const int G           = DG_GROUP_SIZE;
-    const int group_tiles = TILES_N * G;
-    const int num_groups  = (TILES_M + G - 1) / G;
+int dg_combo_ab_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
+    const int num_groups  = (TILES_M + DGG - 1) / DGG;
     int group_idx         = lin / group_tiles;
     const int in_group    = lin - (lin / group_tiles) * group_tiles;
     const int paired      = group_idx ^ 3;
     if (paired < num_groups) group_idx = paired;
-    const int first_m     = group_idx * G;
-    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int first_m     = group_idx * DGG;
+    const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
     const int slots       = nig * TILES_N;
     const int ig_clamped  = (in_group < slots) ? in_group : slots - 1;
     const int tn          = ig_clamped - (ig_clamped / TILES_N) * TILES_N;
@@ -522,22 +495,15 @@ int dg_combo_ab_swizzle(int lin) {
     if (tm >= TILES_M) tm = TILES_M - 1;
     return tm * TILES_N + tn;
 }
-static __device__ __forceinline__
-int dg_combo_ab_in_group(int lin) {
-    const int G = DG_GROUP_SIZE;
-    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
-}
-#endif
 
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 41
+template<int DGG>
 static __device__ __forceinline__
-int dg_combo_ac_swizzle(int lin) {
-    const int G           = DG_GROUP_SIZE;
-    const int group_tiles = TILES_N * G;
+int dg_combo_ac_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
     const int group_idx   = lin / group_tiles;
-    const int first_m     = group_idx * G;
+    const int first_m     = group_idx * DGG;
     const int in_group    = lin - group_idx * group_tiles;
-    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
     const int slots       = nig * TILES_N;
     const int ig_clamped  = (in_group < slots) ? in_group : slots - 1;
     const int tn          = ig_clamped - (ig_clamped / TILES_N) * TILES_N;
@@ -550,31 +516,22 @@ int dg_combo_ac_swizzle(int lin) {
     if (tm >= TILES_M) tm = TILES_M - 1;
     return tm * TILES_N + tn;
 }
-static __device__ __forceinline__
-int dg_combo_ac_in_group(int lin) {
-    const int G = DG_GROUP_SIZE;
-    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
-}
-#endif
 
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 42
 static __device__ __forceinline__
 int dg_tn_blk_swizzle(int lin) {
     const int tn = lin / TILES_M;
     const int tm = lin - tn * TILES_M;
     return tm * TILES_N + tn;
 }
-#endif
 
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 43
+template<int DGG>
 static __device__ __forceinline__
-int dg_sn_rot1_swizzle(int lin) {
-    const int G           = DG_GROUP_SIZE;
-    const int group_tiles = TILES_N * G;
+int dg_sn_rot1_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
     const int group_idx   = lin / group_tiles;
-    const int first_m     = group_idx * G;
+    const int first_m     = group_idx * DGG;
     const int in_group    = lin - group_idx * group_tiles;
-    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
     const int lm          = in_group - (in_group / nig) * nig;
     const int ln          = in_group / nig;
     int tn = (lm & 1) ? (ln + 1) : ln;
@@ -583,22 +540,15 @@ int dg_sn_rot1_swizzle(int lin) {
     if (tm >= TILES_M) tm = TILES_M - 1;
     return tm * TILES_N + tn;
 }
-static __device__ __forceinline__
-int dg_sn_rot1_in_group(int lin) {
-    const int G = DG_GROUP_SIZE;
-    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
-}
-#endif
 
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 44
+template<int DGG>
 static __device__ __forceinline__
-int dg_sn_rot2_swizzle(int lin) {
-    const int G           = DG_GROUP_SIZE;
-    const int group_tiles = TILES_N * G;
+int dg_sn_rot2_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
     const int group_idx   = lin / group_tiles;
-    const int first_m     = group_idx * G;
+    const int first_m     = group_idx * DGG;
     const int in_group    = lin - group_idx * group_tiles;
-    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
     const int lm          = in_group - (in_group / nig) * nig;
     const int ln          = in_group / nig;
     int tn = (lm & 1) ? (ln + 2) : ln;
@@ -607,22 +557,15 @@ int dg_sn_rot2_swizzle(int lin) {
     if (tm >= TILES_M) tm = TILES_M - 1;
     return tm * TILES_N + tn;
 }
-static __device__ __forceinline__
-int dg_sn_rot2_in_group(int lin) {
-    const int G = DG_GROUP_SIZE;
-    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
-}
-#endif
 
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 45
+template<int DGG>
 static __device__ __forceinline__
-int dg_lmsn_swizzle(int lin) {
-    const int G           = DG_GROUP_SIZE;
-    const int group_tiles = TILES_N * G;
+int dg_lmsn_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
     const int group_idx   = lin / group_tiles;
-    const int first_m     = group_idx * G;
+    const int first_m     = group_idx * DGG;
     const int in_group    = lin - group_idx * group_tiles;
-    const int nig         = (first_m + G <= TILES_M) ? G : TILES_M - first_m;
+    const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
     const int lm_raw      = in_group - (in_group / nig) * nig;
     const int ln          = in_group / nig;
     const int lm = (ln & 1) ? (nig - 1 - lm_raw) : lm_raw;
@@ -630,83 +573,39 @@ int dg_lmsn_swizzle(int lin) {
     if (tm >= TILES_M) tm = TILES_M - 1;
     return tm * TILES_N + ln;
 }
-static __device__ __forceinline__
-int dg_lmsn_in_group(int lin) {
-    const int G = DG_GROUP_SIZE;
-    return lin - (lin / (TILES_N * G)) * (TILES_N * G);
-}
-#endif
 
+/* Single entry point — dispatched at compile time per kernel instantiation. */
+template<int TD, int DGG>
 static __device__ __forceinline__
-int tile_swizzle(int lin) {
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 33
-    return gflip_swizzle(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 34
-    return tn2br_swizzle(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 35
-    return dg_diag_swizzle(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 36
-    return dg_pingpong_swizzle(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 37
-    return dg_rowmaj_swizzle(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 38
-    return dg_g4swap_swizzle(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 39
-    return dg_lmrev_swizzle(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 40
-    return dg_combo_ab_swizzle(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 41
-    return dg_combo_ac_swizzle(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 42
-    return dg_tn_blk_swizzle(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 43
-    return dg_sn_rot1_swizzle(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 44
-    return dg_sn_rot2_swizzle(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 45
-    return dg_lmsn_swizzle(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH >= 8
-    return static_swizzle(lin);
-#else
-    return dgswizzle(lin);
-#endif
+int tile_swizzle_t(int lin) {
+    if constexpr (TD == 11) return zigzag_swizzle(lin);
+    else if constexpr (TD == 13) return rowmajor_swizzle(lin);
+    else if constexpr (TD == 18) return checkered_swizzle(lin);
+    else if constexpr (TD == 19) return dgsnake_swizzle<DGG>(lin);
+    else if constexpr (TD == 33) return gflip_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 34) return tn2br_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 35) return dg_diag_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 36) return dg_pingpong_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 37) return dg_rowmaj_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 38) return dg_g4swap_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 39) return dg_lmrev_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 40) return dg_combo_ab_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 41) return dg_combo_ac_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 42) return dg_tn_blk_swizzle(lin);
+    else if constexpr (TD == 43) return dg_sn_rot1_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 44) return dg_sn_rot2_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 45) return dg_lmsn_swizzle_t<DGG>(lin);
+    else return dgswizzle_t<DGG>(lin);
 }
 
+template<int TD, int DGG>
 static __device__ __forceinline__
-int tile_in_group(int lin) {
-#if defined(TILE_DISPATCH) && TILE_DISPATCH == 33
-    return gflip_in_group(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 34
-    return tn2br_in_group(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 35
-    return dg_diag_in_group(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 36
-    return dg_pingpong_in_group(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 37
-    return dg_rowmaj_in_group(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 38
-    return dg_g4swap_in_group(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 39
-    return dg_lmrev_in_group(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 40
-    return dg_combo_ab_in_group(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 41
-    return dg_combo_ac_in_group(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 42
-    (void)lin;
-    return 0;
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 43
-    return dg_sn_rot1_in_group(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 44
-    return dg_sn_rot2_in_group(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH == 45
-    return dg_lmsn_in_group(lin);
-#elif defined(TILE_DISPATCH) && TILE_DISPATCH >= 8
-    (void)lin;
-    return 0;
-#else
-    return dgswizzle_in_group(lin);
-#endif
+int tile_in_group_t(int lin) {
+    if constexpr (TD == 11 || TD == 13 || TD == 18 || TD == 42) {
+        (void)lin; return 0;
+    } else {
+        return dg_in_group_t<DGG>(lin);
+    }
 }
 
 static __device__ __forceinline__
@@ -996,6 +895,7 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc,
   (one add per ki) + ~5 cyc/tile (swizzle) + ~10 cyc/tile (global store).
 */
 
+template<int TD, int DGG>
 __global__ void __launch_bounds__(THREADS, 1)
 __cluster_dims__(2, 1, 1)
 fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
@@ -1087,7 +987,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             const int lin_tile = lut_cluster_id + tt * lut_num_clusters;
             uint32_t packed = 0;
             if (lin_tile < TOTAL_TILES) {
-                const int sw   = tile_swizzle(lin_tile);
+                const int sw   = tile_swizzle_t<TD, DGG>(lin_tile);
                 const int tm_v = sw / TILES_N;
                 const int tn_v = sw % TILES_N;
                 packed = (uint32_t)tm_v | ((uint32_t)tn_v << 16);
@@ -1555,7 +1455,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             if (lin_tile >= TOTAL_TILES) break;
             const int buf = tt & 1;
 #if defined(PROFILE_KI_TN) || defined(PROFILE_TILE)
-            const int _sw_tn = tile_swizzle(lin_tile) % TILES_N;
+            const int _sw_tn = tile_swizzle_t<TD, DGG>(lin_tile) % TILES_N;
 #endif
 
 #ifdef PROFILE_W5
@@ -1686,10 +1586,10 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 
 #ifdef PROFILE_TILE
             if (lane == 0 && d_dbg_prof_tile != nullptr) {
-                const int _sw = tile_swizzle(lin_tile);
+                const int _sw = tile_swizzle_t<TD, DGG>(lin_tile);
                 const int _tm = _sw / TILES_N;
                 const int _tn = _sw % TILES_N;
-                const int _ig = tile_in_group(lin_tile);
+                const int _ig = tile_in_group_t<TD, DGG>(lin_tile);
                 const uint64_t _pack =
                       ((uint64_t)(_tm & 0xFFFF) << 48)
                     | ((uint64_t)(_tn & 0xFF)   << 40)
@@ -1703,10 +1603,10 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             if (lane == 0 && d_dbg_prof_w5 != nullptr) {
                 uint64_t _w5_tile_t1; PROF_KI_READ(_w5_tile_t1);
                 uint64_t _tile_total = _w5_tile_t1 - _w5_tile_t0;
-                const int _sw = tile_swizzle(lin_tile);
+                const int _sw = tile_swizzle_t<TD, DGG>(lin_tile);
                 const int _tm = _sw / TILES_N;
                 const int _tn = _sw % TILES_N;
-                const int _ig = tile_in_group(lin_tile);
+                const int _ig = tile_in_group_t<TD, DGG>(lin_tile);
                 uint64_t _tt_cap = _tile_total;
                 if (_tt_cap > 0x3FFFFFFFFFULL) _tt_cap = 0x3FFFFFFFFFULL;
                 uint64_t _mma_cap = _w5_mma_sum; if (_mma_cap > 0xFFFFFFFFULL) _mma_cap = 0xFFFFFFFFULL;
@@ -1757,6 +1657,86 @@ static inline size_t pack_idx_C(long long m, int n) {
     return ((size_t)tm_idx * TILES_N + (size_t)tn_idx)
          * (size_t)(TM_PACK * TN)
          + (size_t)mc * TN + (size_t)nc;
+}
+
+/*
+  Variant infrastructure.  Each (TD, DGG) pair compiles to its own kernel
+  via explicit template instantiation; the wrapper functions below are
+  type-erased entry points so the host can dispatch through a flat table.
+  All swizzle dispatch lives in the kernel — no runtime branching.
+*/
+struct VariantCfg {
+    const char* name;
+    int td;
+    int dgg;
+    void (*launch)(dim3, int,
+                   const CUtensorMap&, const CUtensorMap&, const CUtensorMap&,
+                   const __nv_bfloat16*, __nv_bfloat16*,
+                   uint64_t*, uint64_t*, uint64_t*, uint64_t*);
+    void (*set_attr)(int);
+};
+
+template<int TD, int DGG>
+static void launch_kern(dim3 grid, int smem,
+                        const CUtensorMap& a, const CUtensorMap& b, const CUtensorMap& c,
+                        const __nv_bfloat16* d_bias, __nv_bfloat16* d_C,
+                        uint64_t* p, uint64_t* pki, uint64_t* pt, uint64_t* pw5) {
+    fc2_w3x_kernel<TD, DGG><<<grid, THREADS, smem>>>(
+        a, b, c, d_bias, d_C, p, pki, pt, pw5);
+}
+
+template<int TD, int DGG>
+static void set_attr_kern(int smem) {
+    cudaError_t e = cudaFuncSetAttribute(fc2_w3x_kernel<TD, DGG>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "cudaFuncSetAttribute<%d,%d>: %s\n", TD, DGG, cudaGetErrorString(e));
+        exit(1);
+    }
+}
+
+#define VCFG(NAME, TD, DGG) {NAME, TD, DGG, launch_kern<TD, DGG>, set_attr_kern<TD, DGG>}
+static const VariantCfg VARIANTS[] = {
+    VCFG("dgsw",      0,  8),
+    VCFG("dg2",       0,  2),
+    VCFG("dg4",       0,  4),
+    VCFG("dg16",      0, 16),
+    VCFG("dg32",      0, 32),
+    VCFG("zigzag",   11,  8),
+    VCFG("rowmajor", 13,  8),
+    VCFG("checkered",18,  8),
+    VCFG("dgsnake",  19,  8),
+    VCFG("gflip",    33,  8),
+    VCFG("tn2br",    34,  8),
+    VCFG("dg4diag",  35,  4),
+    VCFG("dg4pp",    36,  4),
+    VCFG("g4swap",   38,  8),
+    VCFG("lmrev",    39,  8),
+    VCFG("comboAB",  40,  8),
+    VCFG("comboAC",  41,  8),
+    VCFG("snrot1",   43,  8),
+    VCFG("snrot2",   44,  8),
+    VCFG("lmsn",     45,  8),
+};
+static const int N_VARIANTS = sizeof(VARIANTS) / sizeof(VARIANTS[0]);
+
+#ifndef TILE_DISPATCH
+#define TILE_DISPATCH 0
+#endif
+
+/*
+  Compile-time default: honors -DTILE_DISPATCH and -DDG_GROUP_SIZE so the
+  legacy per-build flow (make fc2-w3x-dg4, etc.) still works without any
+  env var.  This is the cell launched when neither VARIANT nor SWEEP is set.
+*/
+static const VariantCfg DEFAULT_CFG = VCFG("default", TILE_DISPATCH, DG_GROUP_SIZE);
+#undef VCFG
+
+static int find_variant_idx(const char* name) {
+    for (int i = 0; i < N_VARIANTS; i++) {
+        if (std::strcmp(VARIANTS[i].name, name) == 0) return i;
+    }
+    return -1;
 }
 
 int main(int argc, char** argv) {
@@ -1906,9 +1886,58 @@ int main(int argc, char** argv) {
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }
 
-    CUDA_CHECK(cudaFuncSetAttribute(fc2_w3x_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
-    printf("  TMA descriptors + func attr done (SMEM=%d B)\n", SMEM_BYTES);
+    /*
+      Active config selection (env-driven):
+        SWEEP=all                — pass-major over every entry in VARIANTS
+        SWEEP=name1,name2,...    — pass-major over the named subset
+        VARIANT=name             — single named variant
+        (none)                   — DEFAULT_CFG (TILE_DISPATCH+DG_GROUP_SIZE macros)
+      Each active variant gets its own cudaFuncSetAttribute call.
+    */
+    std::vector<int> active_idx;
+    bool sweep_mode = false;
+    if (const char* s = std::getenv("SWEEP")) {
+        sweep_mode = true;
+        if (std::strcmp(s, "all") == 0) {
+            for (int i = 0; i < N_VARIANTS; i++) active_idx.push_back(i);
+        } else {
+            char* dup = strdup(s);
+            for (char* tok = std::strtok(dup, ","); tok; tok = std::strtok(NULL, ",")) {
+                int idx = find_variant_idx(tok);
+                if (idx < 0) {
+                    fprintf(stderr, "unknown variant in SWEEP: %s\n", tok);
+                    free(dup); return 1;
+                }
+                active_idx.push_back(idx);
+            }
+            free(dup);
+        }
+    } else if (const char* v = std::getenv("VARIANT")) {
+        int idx = find_variant_idx(v);
+        if (idx < 0) {
+            fprintf(stderr, "unknown VARIANT: %s\n", v); return 1;
+        }
+        active_idx.push_back(idx);
+    }
+
+    auto active_cfg = [&](int slot) -> const VariantCfg& {
+        return active_idx.empty() ? DEFAULT_CFG : VARIANTS[active_idx[slot]];
+    };
+    const int n_active = active_idx.empty() ? 1 : (int)active_idx.size();
+
+    if (active_idx.empty()) {
+        DEFAULT_CFG.set_attr(SMEM_BYTES);
+        printf("  TMA + func attr done (SMEM=%d B)  variant=default TD=%d DGG=%d\n",
+               SMEM_BYTES, DEFAULT_CFG.td, DEFAULT_CFG.dgg);
+    } else {
+        for (int idx : active_idx) VARIANTS[idx].set_attr(SMEM_BYTES);
+        printf("  TMA + func attr done (SMEM=%d B)  %s mode, %d variant%s\n",
+               SMEM_BYTES, sweep_mode ? "SWEEP" : "VARIANT",
+               n_active, n_active == 1 ? "" : "s");
+    }
+#define LAUNCH_VARIANT(slot) \
+    active_cfg(slot).launch(grid, SMEM_BYTES, h_tma_a, h_tma_b, h_tma_c, \
+        d_bias, d_C, d_dbg_prof, d_dbg_prof_ki, d_dbg_prof_tile, d_dbg_prof_w5)
 
     uint64_t* d_dbg_prof = nullptr;
     uint64_t* d_dbg_prof_ki = nullptr;
@@ -1941,9 +1970,6 @@ int main(int argc, char** argv) {
 #endif
 
     dim3 grid(SM_COUNT, 1, 1);
-#define LAUNCH_KERNEL() \
-    fc2_w3x_kernel<<<grid, THREADS, SMEM_BYTES>>>( \
-        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C, d_dbg_prof, d_dbg_prof_ki, d_dbg_prof_tile, d_dbg_prof_w5)
 
 #if defined(NCU_PROFILE) || defined(COMBO_QUICK)
     const int N_WARMUP = 1;
@@ -1951,7 +1977,9 @@ int main(int argc, char** argv) {
     const int N_WARMUP = 2;
 #endif
     printf("Warmup (%d iters)...\n", N_WARMUP);
-    for (int i = 0; i < N_WARMUP; i++) LAUNCH_KERNEL();
+    for (int s = 0; s < n_active; s++) {
+        for (int i = 0; i < N_WARMUP; i++) LAUNCH_VARIANT(s);
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
 
 #ifdef PROFILE_CYCLES
@@ -1974,57 +2002,80 @@ int main(int argc, char** argv) {
     const int N_TIMED_LAUNCHES = 10;
 #endif
     /*
-      REPS env var: number of independent timing windows per process. Each rep
-      records a fresh cudaEvent bracket around N_TIMED_LAUNCHES kernel calls
-      and reports its mean as one sample. Default 1 preserves legacy behavior;
-      the swizzle/tile sweeps set REPS=N to amortize ~200ms process churn over
-      N samples.
+      REPS env var: number of pass-major outer iterations.  In single-variant
+      mode each pass is one independent timing window (= one sample); in
+      sweep mode each pass cycles through all active variants once, so each
+      variant gets REPS samples and adjacent variants share clock state.
+      Default 1 preserves legacy behavior.
     */
     int REPS = 1;
     if (const char* s = std::getenv("REPS")) { int v = std::atoi(s); if (v > 0) REPS = v; }
-    const int total_launches = N_TIMED_LAUNCHES * REPS;
+    const int total_launches = N_TIMED_LAUNCHES * REPS * n_active;
     (void)total_launches;
 
-    printf("Timing %d reps × %d iters/rep ...\n", REPS, N_TIMED_LAUNCHES);
+    printf("Timing %d reps × %d iters/rep × %d variant%s ...\n",
+           REPS, N_TIMED_LAUNCHES, n_active, n_active == 1 ? "" : "s");
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0); cudaEventCreate(&t1);
 
-    std::vector<float> samples;
-    samples.reserve(REPS);
+    std::vector<std::vector<float>> samples(n_active);
+    for (auto& v : samples) v.reserve(REPS);
     for (int r = 0; r < REPS; r++) {
-        cudaEventRecord(t0);
-        for (int i = 0; i < N_TIMED_LAUNCHES; i++) LAUNCH_KERNEL();
-        cudaEventRecord(t1);
-        cudaEventSynchronize(t1);
-        float dt;
-        cudaEventElapsedTime(&dt, t0, t1);
-        dt /= (float)N_TIMED_LAUNCHES;
-        samples.push_back(dt);
-        printf("@@SAMPLE rep=%d ms=%.5f\n", r + 1, dt);
+        for (int s = 0; s < n_active; s++) {
+            cudaEventRecord(t0);
+            for (int i = 0; i < N_TIMED_LAUNCHES; i++) LAUNCH_VARIANT(s);
+            cudaEventRecord(t1);
+            cudaEventSynchronize(t1);
+            float dt;
+            cudaEventElapsedTime(&dt, t0, t1);
+            dt /= (float)N_TIMED_LAUNCHES;
+            samples[s].push_back(dt);
+            if (sweep_mode || active_idx.size() > 1) {
+                printf("@@SAMPLE pass=%d variant=%s ms=%.5f\n", r + 1, active_cfg(s).name, dt);
+            } else {
+                printf("@@SAMPLE rep=%d ms=%.5f\n", r + 1, dt);
+            }
+        }
     }
 
-    double sum = 0.0;
-    for (float v : samples) sum += v;
-    const double mean = sum / samples.size();
-    double var = 0.0;
-    for (float v : samples) var += ((double)v - mean) * ((double)v - mean);
-    var /= (samples.size() > 1 ? samples.size() - 1 : 1);
-    const double sd = std::sqrt(var);
-    std::vector<float> sorted = samples;
-    std::sort(sorted.begin(), sorted.end());
-    auto pct = [&](double q) -> double {
-        if (sorted.size() == 1) return sorted[0];
-        const double pos = q * (sorted.size() - 1);
-        const size_t lo = (size_t)pos;
-        const size_t hi = std::min(lo + 1, sorted.size() - 1);
-        const double frac = pos - lo;
-        return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
+    auto stat_block = [&](const char* tag, const std::vector<float>& xs) {
+        if (xs.empty()) return 0.0;
+        double sum = 0.0;
+        for (float v : xs) sum += v;
+        const double mean = sum / xs.size();
+        double var = 0.0;
+        for (float v : xs) var += ((double)v - mean) * ((double)v - mean);
+        var /= (xs.size() > 1 ? xs.size() - 1 : 1);
+        const double sd = std::sqrt(var);
+        std::vector<float> sorted = xs;
+        std::sort(sorted.begin(), sorted.end());
+        auto pct = [&](double q) -> double {
+            if (sorted.size() == 1) return sorted[0];
+            const double pos = q * (sorted.size() - 1);
+            const size_t lo = (size_t)pos;
+            const size_t hi = std::min(lo + 1, sorted.size() - 1);
+            const double frac = pos - lo;
+            return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
+        };
+        const double p25 = pct(0.25), p50 = pct(0.50), p75 = pct(0.75);
+        printf("@@STATS%s reps=%zu mean=%.5f std=%.5f min=%.5f p25=%.5f p50=%.5f p75=%.5f max=%.5f iqr=%.5f\n",
+               tag, xs.size(), mean, sd,
+               (double)sorted.front(), p25, p50, p75, (double)sorted.back(), p75 - p25);
+        return mean;
     };
-    const double p25 = pct(0.25), p50 = pct(0.50), p75 = pct(0.75);
-    printf("@@STATS reps=%zu mean=%.5f std=%.5f min=%.5f p25=%.5f p50=%.5f p75=%.5f max=%.5f iqr=%.5f\n",
-           samples.size(), mean, sd, (double)sorted.front(), p25, p50, p75, (double)sorted.back(), p75 - p25);
 
-    const float ms = (float)mean;
+    double last_mean = 0.0;
+    if (active_idx.size() <= 1) {
+        last_mean = stat_block("", samples[0]);
+    } else {
+        for (int s = 0; s < n_active; s++) {
+            char tag[64];
+            snprintf(tag, sizeof tag, " variant=%s", active_cfg(s).name);
+            last_mean = stat_block(tag, samples[s]);
+        }
+    }
+
+    const float ms = (float)last_mean;
     printf("FC2-W3X kernel: %.3f ms  %.2f TFLOPS\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9);
 
@@ -2260,7 +2311,7 @@ int main(int argc, char** argv) {
         const int tiles_m_host = M_TOTAL / TM / 2;
         const int tiles_n_host = N_DIM / TN;
         const int bin_width = (tiles_m_host + TM_BINS - 1) / TM_BINS;
-        const int IG_SLOTS = tiles_n_host * DG_GROUP_SIZE;
+        const int IG_SLOTS = tiles_n_host * active_cfg(0).dgg;
 
         uint64_t bin_cyc[TM_BINS][3]   = {{0}};
         uint32_t bin_cnt[TM_BINS][3]   = {{0}};
@@ -2361,7 +2412,7 @@ int main(int argc, char** argv) {
         for (int ig = 0; ig < IG_SLOTS && ig < 32; ig++) {
             if (ig_cnt[ig] == 0) continue;
             double m = (double)ig_cyc[ig] / ig_cnt[ig];
-            int raw_tn = ig / DG_GROUP_SIZE;
+            int raw_tn = ig / active_cfg(0).dgg;
             printf("   %3d    %3d   %7.0f  %5lu    %u\n",
                    ig, raw_tn, m, (unsigned long)ig_max[ig], ig_cnt[ig]);
         }
@@ -2375,7 +2426,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(h_prof_w5, d_dbg_prof_w5, prof_w5_bytes, cudaMemcpyDeviceToHost));
 
         const int tiles_n_host = N_DIM / TN;
-        const int IG_SLOTS = tiles_n_host * DG_GROUP_SIZE;
+        const int IG_SLOTS = tiles_n_host * active_cfg(0).dgg;
 
         uint64_t tn_t[8] = {0}, tn_m[8] = {0}, tn_c[8] = {0};
         uint32_t tn_cnt[8] = {0};
@@ -2453,7 +2504,7 @@ int main(int argc, char** argv) {
             double mt = (double)ig_t[ig] / ig_cnt[ig];
             double mm = (double)ig_m[ig] / ig_cnt[ig];
             double mc = (double)ig_c[ig] / ig_cnt[ig];
-            int raw_tn = ig / DG_GROUP_SIZE;
+            int raw_tn = ig / active_cfg(0).dgg;
             printf("   %3d    %3d   %9.0f   %7.0f   %6.0f   %8.0f   %u\n",
                    ig, raw_tn, mt, mm, mc, mt - mm - mc, ig_cnt[ig]);
         }
@@ -2471,7 +2522,7 @@ int main(int argc, char** argv) {
     int valid = 0;
     float c0 = 0.0f;
 #else
-    LAUNCH_KERNEL();
+    LAUNCH_VARIANT(0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     __nv_bfloat16* h_C = (__nv_bfloat16*)malloc(sC * sizeof(__nv_bfloat16));
