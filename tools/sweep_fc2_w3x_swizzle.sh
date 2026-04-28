@@ -48,8 +48,15 @@
 #   tools/sweep_fc2_w3x_swizzle.sh                         # REPS=20, BOOT=0
 #   REPS=5489 BOOT=1000 tools/sweep_fc2_w3x_swizzle.sh     # full B200 run
 #   SWEEP=dgsw,dg4,lmsn REPS=128 tools/sweep_fc2_w3x_swizzle.sh
+#   SWEEP=front REPS=16384 tools/sweep_fc2_w3x_swizzle.sh  # front-tier only,
+#                                                          # higher N to crack tie
 #   CLUSTERS=1 REPS=128 tools/sweep_fc2_w3x_swizzle.sh     # +per-cluster
 #   tools/sweep_fc2_w3x_swizzle.sh my_outdir
+#
+# SWEEP=front expands to: dgsnake, lmrev, gflip (n=5489 front-tier TIE) +
+# snrot2, dgsw (close-behind WEAK + G=8 baseline) + gflip_lmrev, gflip_snrot,
+# gflip_blkswap, gflip_cidperm (the 4 bloom-filter survivors awaiting wall
+# verification).  9 variants vs all=28 → ~3× more passes per wall-clock minute.
 
 set -u
 cd "$(dirname "$0")/.."
@@ -59,6 +66,10 @@ REPS=${REPS:-20}
 SWEEP=${SWEEP:-all}
 BOOT=${BOOT:-0}
 CLUSTERS=${CLUSTERS:-0}
+
+if [ "$SWEEP" = "front" ]; then
+    SWEEP="dgsnake,lmrev,gflip,snrot2,dgsw,gflip_lmrev,gflip_snrot,gflip_blkswap,gflip_cidperm"
+fi
 NVCC=${NVCC:-nvcc}
 CFLAGS='-gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static'
 LDFLAGS='-lcurand_static -lculibos -lcuda'

@@ -706,6 +706,114 @@ int wfd_latin_swizzle_t(int lin) {
     return dgswizzle_t<DGG>(eff_lin);
 }
 
+/*
+  TD=52..53 added 2026-04-28 from bloom_filter score-vs-gflip + analyzer
+  feature signatures.  Both compose gflip's group_idx XOR 1 swap (Lever A:
+  cluster_tm_corr 0.94→0.65) with a within-group transform.
+
+    52 gflip_lmrev — gflip + 3-bit reverse on lm at G=8.  Pushes adj_tm_diff
+                    2.11 → 4.36 (sign-stable τ=-0.50, predicts faster).
+                    Bloom score = +1.46 vs gflip → WORTHY.
+    53 gflip_snrot — gflip + snrot2's tn rotation on odd lm.  Pushes
+                    adj_tn_diff 0.17 → 1.33.  τ not sign-stable globally,
+                    but matches snrot2's empirical 2nd-place signature at
+                    n=32768.  Bloom score ≈ 0 → BUILD-ANYWAY.
+                    Boundary guard: snrot only applied for full-DGG groups
+                    AND in-bounds ln, falls back to plain gflip otherwise
+                    (avoids (ln+2)%3 collisions when in_g overflows nig*TN).
+*/
+template<int DGG>
+static __device__ __forceinline__
+int gflip_lmrev_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
+    const int num_groups  = (TILES_M + DGG - 1) / DGG;
+    int group_idx         = lin / group_tiles;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int paired      = group_idx ^ 1;
+    if (paired < num_groups) group_idx = paired;
+    const int first_m = group_idx * DGG;
+    const int nig     = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+    const int lm_raw  = in_group - (in_group / nig) * nig;
+    const int ln      = in_group / nig;
+    int lm = lm_raw;
+    if (nig == 8) {
+        lm = ((lm_raw & 1) << 2) | (lm_raw & 2) | ((lm_raw >> 2) & 1);
+    }
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + ln;
+}
+
+template<int DGG>
+static __device__ __forceinline__
+int gflip_snrot_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
+    const int num_groups  = (TILES_M + DGG - 1) / DGG;
+    int group_idx         = lin / group_tiles;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int paired      = group_idx ^ 1;
+    if (paired < num_groups) group_idx = paired;
+    const int first_m = group_idx * DGG;
+    const int nig     = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+    const int lm      = in_group - (in_group / nig) * nig;
+    const int ln      = in_group / nig;
+    int tn = ln;
+    if (nig == DGG && ln < TILES_N && (lm & 1)) {
+        tn = ln + 2;
+        if (tn >= TILES_N) tn -= TILES_N;
+    }
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+
+/* TD=54: gflip_blkswap.  gflip XOR=1 + lm^4 on every other group (block-swap
+                of upper/lower halves of a DGG=8 group: {0..7}→{4..7,0..3}).
+                Bloom filter WORTHY (+0.31): adj_tm_diff +0.12, no overshoot.
+                Per-lm bijection trivial (lm^4 is a permutation on [0,8)).
+*/
+template<int DGG>
+static __device__ __forceinline__
+int gflip_blkswap_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
+    const int num_groups  = (TILES_M + DGG - 1) / DGG;
+    int group_idx         = lin / group_tiles;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int paired      = group_idx ^ 1;
+    if (paired < num_groups) group_idx = paired;
+    const int first_m = group_idx * DGG;
+    const int nig     = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+    const int lm_raw  = in_group - (in_group / nig) * nig;
+    const int ln      = in_group / nig;
+    int lm = lm_raw;
+    if (nig == 8 && (group_idx & 1)) lm = lm_raw ^ 4;
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + ln;
+}
+
+/* TD=55: gflip_cidperm.  Permute cluster_id via c' = (c*15) % 74 (gcd(15,74)=1
+                → bijection on [0,74)) before plugging into gflip's body.
+                Wavefront SET unchanged at every tick — only the cluster→tile
+                slot mapping shifts.  Probes SM→L2-partition affinity (the
+                BLIND lever cluster_swizzle.py flagged) without disturbing
+                wavefront geometry.  Bloom filter overshoot-flagged because
+                cluster_tm_corr drops to 0.16 (well past g4swap's 0.63), but
+                tm_extent_mean is identical to gflip's 38.90 — the metric
+                set genuinely cannot rank this axis.  Either a big win or
+                a cautionary case.
+*/
+template<int DGG>
+static __device__ __forceinline__
+int gflip_cidperm_swizzle_t(int lin) {
+    const int c   = lin - (lin / NUM_CLUSTERS) * NUM_CLUSTERS;  /* lin % NC */
+    const int tt  = lin / NUM_CLUSTERS;
+    const int cp_full = c * 15;
+    const int cp  = cp_full - (cp_full / NUM_CLUSTERS) * NUM_CLUSTERS;
+    const int eff_lin = cp + tt * NUM_CLUSTERS;
+    return gflip_swizzle_t<DGG>(eff_lin);
+}
+
 /* Single entry point — dispatched at compile time per kernel instantiation. */
 template<int TD, int DGG>
 static __device__ __forceinline__
@@ -733,6 +841,10 @@ int tile_swizzle_t(int lin) {
     else if constexpr (TD == 49) return dg_antisnake_swizzle_t<DGG>(lin);
     else if constexpr (TD == 50) return dg_tt_phase_swizzle_t<DGG>(lin);
     else if constexpr (TD == 51) return wfd_latin_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 52) return gflip_lmrev_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 53) return gflip_snrot_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 54) return gflip_blkswap_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 55) return gflip_cidperm_swizzle_t<DGG>(lin);
     else return dgswizzle_t<DGG>(lin);
 }
 
@@ -1883,6 +1995,10 @@ static const VariantCfg VARIANTS[] = {
     VCFG("dg_antisnake",49, 8),
     VCFG("dg_tt_phase", 50, 8),
     VCFG("wfd_latin",   51, 8),
+    VCFG("gflip_lmrev", 52, 8),
+    VCFG("gflip_snrot", 53, 8),
+    VCFG("gflip_blkswap",54, 8),
+    VCFG("gflip_cidperm",55, 8),
 };
 static const int N_VARIANTS = sizeof(VARIANTS) / sizeof(VARIANTS[0]);
 

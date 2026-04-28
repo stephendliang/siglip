@@ -603,6 +603,108 @@ def sw_wfd_latin(lin, G=8):
     return sw_dgsw(eff_lin, G)
 
 
+def sw_gflip_snrot(lin, G=8):
+    """PROPOSAL: gflip's group_idx XOR 1 (Lever A: cluster_tm_corr 0.94→0.65)
+    composed with snrot2's tn rotation on odd lm (Lever B: adj_tn_diff
+    0.17→1.33). Two orthogonal levers — neither variant in the binary has
+    both. Bijection: snrot only applied for full-G groups; boundary group
+    falls back to plain gflip to avoid (ln+2)%3 collisions when ln is
+    out-of-range from in_g overflow."""
+    gt = TILES_N * G
+    num_groups = (TILES_M + G - 1) // G
+    group_idx = lin // gt
+    in_g = lin - group_idx * gt
+    paired = group_idx ^ 1
+    if paired < num_groups:
+        group_idx = paired
+    first_m = group_idx * G
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    lm = in_g % nig
+    ln = in_g // nig
+    if nig == G and ln < TILES_N:
+        tn = (ln + 2) % TILES_N if (lm & 1) else ln
+    else:
+        tn = ln
+    return first_m + lm, tn
+
+
+def sw_gflip_lmrev(lin, G=8):
+    """PROPOSAL: gflip + lm bit-reverse on G=8.  Combines gflip's Lever A
+    (low cluster_tm_corr) with lmrev's Lever C (adj_tm_diff 1.5→3.75).
+    adj_tm_diff has τ_AUC = -0.50 sign-stable in study.txt — pushing it
+    higher predicts faster.  Bijection: lm bit-reverse on 8 elements is a
+    permutation; preserves group coverage."""
+    gt = TILES_N * G
+    num_groups = (TILES_M + G - 1) // G
+    group_idx = lin // gt
+    in_g = lin - group_idx * gt
+    paired = group_idx ^ 1
+    if paired < num_groups:
+        group_idx = paired
+    first_m = group_idx * G
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    lmr = in_g % nig
+    ln = in_g // nig
+    if nig == 8:
+        lm = ((lmr & 1) << 2) | (lmr & 2) | ((lmr >> 2) & 1)
+    else:
+        lm = lmr
+    return first_m + lm, ln
+
+
+def sw_gflip_G4(lin):
+    """PROPOSAL: gflip at G=4.  Smaller groups → more frequent flips →
+    predicted lower cluster_tm_corr (gflip G=8 is 0.65; G=4 may reach 0.5).
+    Risk: g4swap (group_idx XOR 3, also low cluster_tm_corr at 0.63) was
+    only 6th — going further on Lever A may overshoot.  Tests whether the
+    sweet spot is at gflip's 0.65 or lower."""
+    return sw_gflip(lin, 4)
+
+
+def sw_gflip_snrot_G4(lin):
+    """PROPOSAL: gflip_snrot at G=4.  Both levers + smaller groups.  The
+    most aggressive design in the proposal set."""
+    return sw_gflip_snrot(lin, 4)
+
+
+def sw_gflip_blkswap(lin, G=8):
+    """PROPOSAL: gflip + lm^4 on every other group (block-swap of upper/lower
+    halves of an 8-element group).  Reorders the lm sequence within group:
+    {0,1,2,3,4,5,6,7} → {4,5,6,7,0,1,2,3}.  Should reduce intra_tn_run
+    (currently 3.92) and tm_extent_mean by widening the wavefront's
+    M-coverage in alternating ticks."""
+    gt = TILES_N * G
+    num_groups = (TILES_M + G - 1) // G
+    group_idx = lin // gt
+    in_g = lin - group_idx * gt
+    paired = group_idx ^ 1
+    if paired < num_groups:
+        group_idx = paired
+    first_m = group_idx * G
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    lmr = in_g % nig
+    ln = in_g // nig
+    if nig == 8 and (group_idx & 1):
+        lm = lmr ^ 4
+    else:
+        lm = lmr
+    return first_m + lm, ln
+
+
+def sw_gflip_cidperm(lin, G=8):
+    """PROPOSAL: permute cluster IDs via c' = (c * 15) % 74 (gcd(15,74)=1
+    → bijection on [0,74)).  Wavefront SET unchanged at every tick; only
+    which cluster owns which slot changes.  Probes SM→L2-partition affinity
+    independent of wavefront shape — addresses the BLIND verdict from
+    cluster_swizzle.py (saturated cluster_affinity test) by hitting a
+    different lever entirely."""
+    c = lin % NC
+    tt = lin // NC
+    cp = (c * 15) % NC
+    eff_lin = cp + tt * NC
+    return sw_gflip(eff_lin, G)
+
+
 # ---------------------------------------------------------------- metrics
 
 
@@ -899,6 +1001,14 @@ VARIANTS = [
     ("dg_antisnake",     sw_dg_antisnake),
     ("dg_tt_phase",      sw_dg_tt_phase),
     ("wfd_latin",        sw_wfd_latin),
+
+    ("gflip_snrot",      sw_gflip_snrot),
+    ("gflip_lmrev",      sw_gflip_lmrev),
+    ("gflip_G4",         sw_gflip_G4),
+    ("gflip_snrot_G4",   sw_gflip_snrot_G4),
+
+    ("gflip_blkswap",     sw_gflip_blkswap),
+    ("gflip_cidperm",     sw_gflip_cidperm),
 ]
 
 
