@@ -574,6 +574,138 @@ int dg_lmsn_swizzle_t(int lin) {
     return tm * TILES_N + ln;
 }
 
+/*
+  TD=46..48 added 2026-04-27 round 3 to beat dgsnake.  Mechanism: dgsnake's
+  lm-parity phase is the unique cluster-trajectory-invariant phasing on the
+  lm axis (under in_g advancing by 2 per tick), capping it at 2 phases.
+  The orthogonal axis we exploit here is the per-cluster TT (visit-order)
+  permutation: cluster c's set of visited tiles is unchanged but the ORDER
+  is shifted, so bijection holds automatically and intra_tn_run is
+  preserved (the tn-stream shape per cluster is unchanged, just rotated).
+
+    46 dg_phasesh3 — cluster c with c%3 phase shifts its tt-sequence by
+                phase × 4 ticks (= one ln-block).  Cluster c=1 starts at
+                ln=1, c=2 starts at ln=2.  At any wall tick, clusters
+                split 25/25/24 across the 3 ln values — finer cross-
+                cluster ln-spread than dgsnake's 2-way lm-parity split.
+                intra_tn_run = 3.92 preserved.  Bijective by construction.
+    47 dg_sn_phasesh3 — dgsnake + c%3 tt-phaseshift.  Six effective
+                cluster phases across (lm%2, c%3).  Hypothesis: dgsnake's
+                L2-adjacency win on ln-block transitions (2→1→0) plus
+                phaseshift's cluster spread.  Bijective.
+    48 dg_sn_lmrev — dgsnake × lm-bitrev (G=8).  3-bit reverse of lm
+                gates dgsnake's tn-reversal.  Pulls lmrev's adj_tm_diff
+                lever plus dgsnake's tn-reversal.  intra_tn_run drops to
+                2.96 (lm-parity after bitrev = bit-2 of original lm,
+                breaking dgsnake's lm-parity invariance).  Likely a
+                LOSS but informative: tests whether adj_tm_diff
+                compensates for tnRun degradation.  Bijective.
+*/
+template<int DGG>
+static __device__ __forceinline__
+int dg_phasesh3_swizzle_t(int lin) {
+    const int c = lin - (lin / NUM_CLUSTERS) * NUM_CLUSTERS;  /* lin % NC */
+    const int tt = lin / NUM_CLUSTERS;
+    const int phase = c - (c / 3) * 3;  /* c % 3 */
+    int eff_tt = tt + phase * 4;
+    if (eff_tt >= TILES_PER_CLUSTER) eff_tt -= TILES_PER_CLUSTER;
+    const int eff_lin = c + eff_tt * NUM_CLUSTERS;
+    return dgswizzle_t<DGG>(eff_lin);
+}
+
+template<int DGG>
+static __device__ __forceinline__
+int dg_sn_phasesh3_swizzle_t(int lin) {
+    const int c = lin - (lin / NUM_CLUSTERS) * NUM_CLUSTERS;
+    const int tt = lin / NUM_CLUSTERS;
+    const int phase = c - (c / 3) * 3;
+    int eff_tt = tt + phase * 4;
+    if (eff_tt >= TILES_PER_CLUSTER) eff_tt -= TILES_PER_CLUSTER;
+    const int eff_lin = c + eff_tt * NUM_CLUSTERS;
+    return dgsnake_swizzle<DGG>(eff_lin);
+}
+
+template<int DGG>
+static __device__ __forceinline__
+int dg_sn_lmrev_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
+    const int group_idx   = lin / group_tiles;
+    const int first_m     = group_idx * DGG;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+    const int lm_raw      = in_group - (in_group / nig) * nig;
+    const int ln          = in_group / nig;
+    int lm = lm_raw;
+    if (nig == 8) {
+        lm = ((lm_raw & 1) << 2) | (lm_raw & 2) | ((lm_raw >> 2) & 1);
+    }
+    int tn = (lm & 1) ? (TILES_N - 1 - ln) : ln;
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + tn;
+}
+
+/*
+  TD=49..51 added 2026-04-27 round 4 to disentangle the dgsnake +443-cyc
+  in-front-tier lever vs dgsw_G8.  All bijective.  See bijection proof in
+  /tmp/bij_test.py and structural metrics in tools/analyze_swizzle.py.
+
+    49 dg_antisnake — flip ln direction on second half of lm range
+                  within each group instead of dgsnake's lm-parity.  Tests
+                  whether snake's lm-parity choice or any flip is the
+                  lever.  Predicted in-hull near checkered/dgsw (FRONT
+                  cluster).  intra_tn_run = 2.96 (vs dgsnake's 3.92).
+    50 dg_tt_phase — like dg_phasesh3 but phase keyed on cluster-band
+                  (c // 25) % 3.  Three contiguous bands of ~25 clusters
+                  share a phase.  Lands at adj_tm_diff = 6.72 (in the gap
+                  between labeled hull max 3.75 and dg_phasesh3's 251.7),
+                  exploring the moderate-extrapolation regime.
+    51 wfd_latin — per-cluster tt-rotation by c.  Each cluster's coverage
+                  is unchanged (cluster-trajectory invariant) but rotation
+                  amount varies per cluster.  Targets cluster_tn_corr
+                  below dgsnake's 0.0005.  uTm=74 (every cluster unique
+                  tm per tick) — likely regression (control).
+*/
+template<int DGG>
+static __device__ __forceinline__
+int dg_antisnake_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
+    const int group_idx   = lin / group_tiles;
+    const int first_m     = group_idx * DGG;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+    const int lm          = in_group - (in_group / nig) * nig;
+    int ln                = in_group / nig;
+    if (lm >= nig / 2) ln = TILES_N - 1 - ln;
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + ln;
+}
+
+template<int DGG>
+static __device__ __forceinline__
+int dg_tt_phase_swizzle_t(int lin) {
+    const int c = lin - (lin / NUM_CLUSTERS) * NUM_CLUSTERS;
+    const int tt = lin / NUM_CLUSTERS;
+    const int band = c / 25;
+    const int phase = band - (band / 3) * 3;
+    int eff_tt = tt + phase * 4;
+    if (eff_tt >= TILES_PER_CLUSTER) eff_tt -= TILES_PER_CLUSTER;
+    const int eff_lin = c + eff_tt * NUM_CLUSTERS;
+    return dgswizzle_t<DGG>(eff_lin);
+}
+
+template<int DGG>
+static __device__ __forceinline__
+int wfd_latin_swizzle_t(int lin) {
+    const int c = lin - (lin / NUM_CLUSTERS) * NUM_CLUSTERS;
+    const int tt = lin / NUM_CLUSTERS;
+    int eff_tt = tt + c;
+    while (eff_tt >= TILES_PER_CLUSTER) eff_tt -= TILES_PER_CLUSTER;
+    const int eff_lin = c + eff_tt * NUM_CLUSTERS;
+    return dgswizzle_t<DGG>(eff_lin);
+}
+
 /* Single entry point — dispatched at compile time per kernel instantiation. */
 template<int TD, int DGG>
 static __device__ __forceinline__
@@ -595,6 +727,12 @@ int tile_swizzle_t(int lin) {
     else if constexpr (TD == 43) return dg_sn_rot1_swizzle_t<DGG>(lin);
     else if constexpr (TD == 44) return dg_sn_rot2_swizzle_t<DGG>(lin);
     else if constexpr (TD == 45) return dg_lmsn_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 46) return dg_phasesh3_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 47) return dg_sn_phasesh3_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 48) return dg_sn_lmrev_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 49) return dg_antisnake_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 50) return dg_tt_phase_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 51) return wfd_latin_swizzle_t<DGG>(lin);
     else return dgswizzle_t<DGG>(lin);
 }
 
@@ -1737,6 +1875,14 @@ static const VariantCfg VARIANTS[] = {
     VCFG("snrot1",   43,  8),
     VCFG("snrot2",   44,  8),
     VCFG("lmsn",     45,  8),
+    VCFG("dg_psh3",  46,  8),
+    VCFG("dg_sn_psh3",47, 8),
+    VCFG("dg_snlmrev",48, 8),
+    VCFG("dgsnake_G4",  19,  4),
+    VCFG("dgsnake_G16", 19, 16),
+    VCFG("dg_antisnake",49, 8),
+    VCFG("dg_tt_phase", 50, 8),
+    VCFG("wfd_latin",   51, 8),
 };
 static const int N_VARIANTS = sizeof(VARIANTS) / sizeof(VARIANTS[0]);
 
@@ -2037,6 +2183,10 @@ int main(int argc, char** argv) {
     if (const char* s = std::getenv("REPS")) { int v = std::atoi(s); if (v > 0) REPS = v; }
     const int total_launches = N_TIMED_LAUNCHES * REPS * n_active;
     (void)total_launches;
+    bool emit_clusters = false;
+    if (const char* s = std::getenv("EMIT_CLUSTERS"); s && std::atoi(s) > 0) {
+        emit_clusters = true;
+    }
 
     printf("Timing %d reps × %d iters/rep × %d variant%s ...\n",
            REPS, N_TIMED_LAUNCHES, n_active, n_active == 1 ? "" : "s");
@@ -2059,16 +2209,55 @@ int main(int argc, char** argv) {
             samples[s].push_back(dt);
             CUDA_CHECK(cudaMemcpy(h_wall_cyc.data(), d_dbg_wall_cyc,
                                   wall_cyc_bytes, cudaMemcpyDeviceToHost));
-            uint64_t cyc_max = 0;
-            for (uint64_t v : h_wall_cyc) if (v > cyc_max) cyc_max = v;
-            uint64_t cyc_per_launch = cyc_max / (uint64_t)N_TIMED_LAUNCHES;
+            std::vector<uint64_t> sorted_cyc(h_wall_cyc.begin(), h_wall_cyc.end());
+            std::sort(sorted_cyc.begin(), sorted_cyc.end());
+            const size_t nc = sorted_cyc.size();
+            const uint64_t scale = (uint64_t)N_TIMED_LAUNCHES;
+            const uint64_t cyc_min = sorted_cyc.front()                     / scale;
+            const uint64_t cyc_p50 = sorted_cyc[nc / 2]                     / scale;
+            const uint64_t cyc_p95 = sorted_cyc[(nc - 1 < (nc * 95) / 100)
+                                                ? nc - 1 : (nc * 95) / 100] / scale;
+            const uint64_t cyc_max = sorted_cyc.back()                      / scale;
+            const uint64_t cyc_per_launch = cyc_max;  /* legacy: max-over-CTAs */
             if (sweep_mode || active_idx.size() > 1) {
-                printf("@@SAMPLE pass=%d variant=%s ms=%.5f cyc=%llu\n",
+                printf("@@SAMPLE pass=%d variant=%s ms=%.5f cyc=%llu "
+                       "cyc_min=%llu cyc_p50=%llu cyc_p95=%llu cyc_max=%llu\n",
                        r + 1, active_cfg(s).name, dt,
-                       (unsigned long long)cyc_per_launch);
+                       (unsigned long long)cyc_per_launch,
+                       (unsigned long long)cyc_min,
+                       (unsigned long long)cyc_p50,
+                       (unsigned long long)cyc_p95,
+                       (unsigned long long)cyc_max);
             } else {
-                printf("@@SAMPLE rep=%d ms=%.5f cyc=%llu\n",
-                       r + 1, dt, (unsigned long long)cyc_per_launch);
+                printf("@@SAMPLE rep=%d ms=%.5f cyc=%llu "
+                       "cyc_min=%llu cyc_p50=%llu cyc_p95=%llu cyc_max=%llu\n",
+                       r + 1, dt,
+                       (unsigned long long)cyc_per_launch,
+                       (unsigned long long)cyc_min,
+                       (unsigned long long)cyc_p50,
+                       (unsigned long long)cyc_p95,
+                       (unsigned long long)cyc_max);
+            }
+            /*
+              Per-cluster identity emission (opt-in: EMIT_CLUSTERS=1).
+              Pairs CTAs (2c, 2c+1) within each 2-CTA cluster, takes the max
+              (slower CTA gates cluster wall) → 74 cluster_cyc values per
+              launch.  Used to diagnose persistent SM/L2-partition affinity
+              across passes (which slot is consistently slow).  Default off
+              to keep the n=5489 sweep output bounded.
+            */
+            if (emit_clusters) {
+                const int n_clusters = (int)h_wall_cyc.size() / 2;
+                const char* vname = (sweep_mode || active_idx.size() > 1)
+                                  ? active_cfg(s).name : "default";
+                for (int c = 0; c < n_clusters; c++) {
+                    uint64_t a = h_wall_cyc[2 * c];
+                    uint64_t b = h_wall_cyc[2 * c + 1];
+                    uint64_t cluster_cyc = (a > b ? a : b) / scale;
+                    printf("@@CLUSTER pass=%d variant=%s c=%d cyc=%llu\n",
+                           r + 1, vname, c,
+                           (unsigned long long)cluster_cyc);
+                }
             }
         }
     }
