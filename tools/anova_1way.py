@@ -55,6 +55,48 @@ import math
 import sys
 
 
+def rank_analysis(rows, factor, metric, paired):
+    """Within-block (per-pass) rank analysis.
+
+    For each block (passes/reps), all variants observed in that block are
+    sorted by metric ascending and assigned ranks 1..k (ties → average rank).
+    Returns:
+      ranks   {variant -> [rank_per_block_1, rank_per_block_2, ...]}
+      wins    {variant -> fractional win count} (k-way tie = 1/k each)
+      n_blocks_used  number of blocks where this variant appeared
+    Win = block where this variant has the minimum metric.  Ties at the
+    minimum split evenly so wins sum to n_blocks.
+    """
+    by_block = {}
+    for r in rows:
+        by_block.setdefault(r[paired], []).append((float(r[metric]), r[factor]))
+    ranks = {}
+    wins = {}
+    n_blocks = 0
+    for _bk, items in by_block.items():
+        if not items:
+            continue
+        items.sort(key=lambda x: x[0])
+        n = len(items)
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and items[j + 1][0] == items[i][0]:
+                j += 1
+            avg_rank = ((i + 1) + (j + 1)) / 2.0
+            for kk in range(i, j + 1):
+                _, v = items[kk]
+                ranks.setdefault(v, []).append(avg_rank)
+            i = j + 1
+        best_val = items[0][0]
+        winners = [v for val, v in items if val == best_val]
+        share = 1.0 / len(winners)
+        for w in winners:
+            wins[w] = wins.get(w, 0.0) + share
+        n_blocks += 1
+    return ranks, wins, n_blocks
+
+
 def empirical_auc(xs, ys):
     """Mann-Whitney U / (n_x * n_y) — empirical P(x < y).
 
@@ -293,6 +335,24 @@ def main():
                  f"   F = {res['F']:.2f}")
     lines.append("  η² bands (Cohen): <0.01 negligible, <0.06 small, <0.14 medium, ≥0.14 large.")
     lines.append("")
+
+    if args.paired is not None:
+        ranks, wins, n_blocks = rank_analysis(rows, args.factor, args.metric, args.paired)
+        lines.append(f"per-pass rank analysis ({n_blocks} blocks of {args.paired}; "
+                     f"rank 1 = fastest in that pass, ties split):")
+        lines.append(f"  {'variant':22s}  {'mean_rank':>9s}  {'σ_rank':>7s}  "
+                     f"{'wins':>14s}  {'win%':>6s}")
+        ranking = sorted(ranks.items(), key=lambda kv: sum(kv[1]) / len(kv[1]))
+        for v, rs in ranking:
+            mr = sum(rs) / len(rs)
+            var = sum((r - mr) ** 2 for r in rs) / (len(rs) - 1) if len(rs) > 1 else 0.0
+            sr = math.sqrt(var)
+            w = wins.get(v, 0.0)
+            pct = 100.0 * w / n_blocks if n_blocks else 0.0
+            lines.append(f"  {v:22s}  {mr:9.3f}  {sr:7.3f}  "
+                         f"{w:7.2f} / {n_blocks:<4d}  {pct:5.2f}%")
+        lines.append("  Random-pick baseline: mean_rank = (k+1)/2, win% = 100/k for k cells.")
+        lines.append("")
 
     sorted_cells = sorted(cell_means.items(), key=lambda kv: kv[1])
     ref_lv, ref_mean = sorted_cells[0]
