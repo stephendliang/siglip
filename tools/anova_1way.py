@@ -2,19 +2,35 @@
 """
 1-way ANOVA + per-cell stats for sweep CSVs with one factor.
 
-Reads a CSV with columns including {factor, ms} and runs:
+Reads a CSV with columns including {factor, <metric>} and runs:
 
   - per-cell stats (mean / σ / SE)
   - 1-way ANOVA: between-cell vs within-cell variance, F-test
-  - pairwise Welch t-test of every cell against the slowest cell
+  - pairwise Welch t-test of every cell against the fastest cell
 
 F-distribution p-values via the regularized incomplete beta function
 (Numerical Recipes Lentz continued fraction). stdlib only.
 
+Thermal-throttle defenses (vast.ai-grade noise):
+
+  --metric cyc        Use integer wall cycles instead of ms; clock-frequency-
+                      invariant, eliminates ~95% of thermal-induced σ.
+  --paired COL        Block-pair samples by COL (e.g. rep / pass) and
+                      analyze residuals = sample − per-block mean.  Cancels
+                      whatever drift correlates with the block index.
+  --trim FRAC         Drop the first FRAC fraction of samples per cell
+                      (sorted by --paired column if given, else input order).
+                      Removes cold-start ramp.
+
+Combine all three for vast.ai locked-clock equivalence:
+
+    python3 anova_1way.py wall_data.csv --factor swizzle \
+        --metric cyc --paired rep --trim 0.33
+
 Usage:
   python3 tools/anova_1way.py wall_data.csv \
         --factor tile_shape \
-        [--out compare.txt]
+        [--metric ms|cyc] [--paired COL] [--trim FRAC] [--out compare.txt]
 """
 import argparse
 import csv
@@ -127,11 +143,11 @@ def fmt_p(p):
     return f"{p:.4f}"
 
 
-def anova_1way(rows, factor):
+def anova_1way(rows, factor, metric="ms"):
     levels = sorted({r[factor] for r in rows})
     cells = {lv: [] for lv in levels}
     for r in rows:
-        cells[r[factor]].append(float(r["ms"]))
+        cells[r[factor]].append(float(r[metric]))
 
     k = len(levels)
     ns = [len(cells[lv]) for lv in levels]
@@ -168,11 +184,57 @@ def anova_1way(rows, factor):
     }
 
 
+def trim_rows(rows, factor, trim, paired):
+    """Drop the first `trim` fraction of samples per cell (per factor level).
+
+    If `paired` is given, sort each cell by paired column (numeric) before
+    dropping; otherwise drop in input order.
+    """
+    if trim <= 0.0:
+        return rows
+    by_cell = {}
+    for r in rows:
+        by_cell.setdefault(r[factor], []).append(r)
+    kept = []
+    for lv, group in by_cell.items():
+        if paired is not None:
+            group = sorted(group, key=lambda x: float(x[paired]))
+        drop = int(len(group) * trim)
+        kept.extend(group[drop:])
+    return kept
+
+
+def pair_residuals(rows, paired, metric):
+    """In-place: replace rows[i][metric] with the residual of the per-`paired`
+    block mean.  E.g. paired='rep' subtracts mean(ms[*, rep=p]) from each
+    sample at rep=p.  Removes whatever drift correlates with the block index.
+    """
+    by_block = {}
+    for r in rows:
+        by_block.setdefault(r[paired], []).append(float(r[metric]))
+    block_mean = {b: sum(vs) / len(vs) for b, vs in by_block.items()}
+    out = []
+    for r in rows:
+        nr = dict(r)
+        nr[metric] = float(r[metric]) - block_mean[r[paired]]
+        out.append(nr)
+    return out, block_mean
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csv")
     ap.add_argument("--factor", required=True,
                     help="column name for the factor (≥2 levels, e.g. tile_shape)")
+    ap.add_argument("--metric", default="ms", choices=("ms", "cyc"),
+                    help="response variable column (default: ms)")
+    ap.add_argument("--paired", default=None,
+                    help="block-pair column (e.g. rep, pass).  ANOVA runs on "
+                         "residuals = sample − per-block mean. Restores cell "
+                         "means in the output for human-readable absolute values.")
+    ap.add_argument("--trim", type=float, default=0.0,
+                    help="drop first FRAC of samples per cell, sorted by "
+                         "--paired if given (e.g. 0.33 drops cold-start third)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -182,46 +244,84 @@ def main():
         print(f"ERROR: empty CSV {args.csv}", file=sys.stderr)
         sys.exit(1)
 
-    for needed in (args.factor, "ms", "variant"):
+    needed_cols = [args.factor, args.metric, "variant"]
+    if args.paired is not None:
+        needed_cols.append(args.paired)
+    for needed in needed_cols:
         if needed not in rows[0]:
             print(f"ERROR: column '{needed}' missing from CSV", file=sys.stderr)
             sys.exit(1)
 
-    res = anova_1way(rows, args.factor)
+    n_raw = len(rows)
+    if args.trim > 0.0:
+        rows = trim_rows(rows, args.factor, args.trim, args.paired)
+
+    raw_by_variant = {}
+    for r in rows:
+        raw_by_variant.setdefault(r["variant"], []).append(float(r[args.metric]))
+
+    if args.paired is not None:
+        rows_ana, _block_mean = pair_residuals(rows, args.paired, args.metric)
+    else:
+        rows_ana = rows
+
+    res = anova_1way(rows_ana, args.factor, args.metric)
     cells = res["cells"]
     cell_means = res["cell_means"]
 
+    is_cyc = (args.metric == "cyc")
+    unit_lbl = "cyc" if is_cyc else "µs"
+    scale = 1.0 if is_cyc else 1000.0
+    delta_lbl = "cyc" if is_cyc else "µs"
+
     lines = []
-    lines.append(f"1-way ANOVA: factor = {args.factor}")
+    lines.append(f"1-way ANOVA: factor = {args.factor}  metric = {args.metric}")
+    if args.paired is not None:
+        lines.append(f"paired by {args.paired} (analysis runs on residuals; "
+                     f"per-cell means below are absolute pre-pairing)")
+    if args.trim > 0.0:
+        lines.append(f"trim = {args.trim:.2f} ({n_raw} → {len(rows)} rows after dropping "
+                     f"first {int(args.trim*100)}% per cell)")
     lines.append(f"reading {args.csv}")
     lines.append("")
 
-    by_variant = {}
-    for r in rows:
-        by_variant.setdefault(r["variant"], []).append(float(r["ms"]))
-
-    lines.append("per-cell stats (µs):")
-    for v in sorted(by_variant):
-        xs = by_variant[v]
+    lines.append(f"per-cell stats ({unit_lbl}):")
+    for v in sorted(raw_by_variant):
+        xs = raw_by_variant[v]
         n = len(xs)
         m = sum(xs) / n
         var = sum((x - m) ** 2 for x in xs) / (n - 1) if n > 1 else 0.0
         s = math.sqrt(var)
         se = s / math.sqrt(n) if n > 0 else 0.0
-        lines.append(f"  {v:24s}  n={n:3d}  mean = {m*1000:8.2f}  "
-                     f"σ = {s*1000:5.3f}  SE = {se*1000:5.3f}")
+        lines.append(f"  {v:24s}  n={n:5d}  mean = {m*scale:10.2f}  "
+                     f"σ = {s*scale:7.3f}  SE = {se*scale:6.3f}")
     lines.append("")
 
-    lines.append("ANOVA table (units: ms² for SS, ms² for MS):")
-    lines.append(f"  {'source':14s}  {'SS':>12s}  {'df':>4s}  {'MS':>12s}  "
+    if args.paired is not None:
+        lines.append(f"per-cell residual stats (after subtracting per-{args.paired} mean):")
+        resid_cells = res["cells"]
+        for v in sorted(resid_cells):
+            xs = resid_cells[v]
+            n = len(xs)
+            m = sum(xs) / n
+            var = sum((x - m) ** 2 for x in xs) / (n - 1) if n > 1 else 0.0
+            s = math.sqrt(var)
+            se = s / math.sqrt(n) if n > 0 else 0.0
+            lines.append(f"  {v:24s}  n={n:5d}  Δ̄ = {m*scale:+9.3f}  "
+                         f"σ = {s*scale:7.3f}  SE = {se*scale:6.3f}")
+        lines.append("")
+
+    ss_unit = f"{args.metric}²"
+    lines.append(f"ANOVA table (units: {ss_unit} for SS, {ss_unit} for MS):")
+    lines.append(f"  {'source':14s}  {'SS':>14s}  {'df':>5s}  {'MS':>14s}  "
                  f"{'F':>9s}  {'p':>10s}  verdict")
     F_proxy = math.sqrt(res["F"]) if res["F"] != float("inf") else 999.0
     v_overall = verdict(F_proxy)
-    lines.append(f"  {args.factor:14s}  {res['ss_between']:12.6f}  "
-                 f"{res['df_between']:4d}  {res['ms_between']:12.6f}  "
+    lines.append(f"  {args.factor:14s}  {res['ss_between']:14.6f}  "
+                 f"{res['df_between']:5d}  {res['ms_between']:14.6f}  "
                  f"{res['F']:9.3f}  {fmt_p(res['p']):>10s}  {v_overall}")
-    lines.append(f"  {'residual':14s}  {res['ss_within']:12.6f}  "
-                 f"{res['df_within']:4d}  {res['ms_within']:12.6f}        —          —    —")
+    lines.append(f"  {'residual':14s}  {res['ss_within']:14.6f}  "
+                 f"{res['df_within']:5d}  {res['ms_within']:14.6f}        —          —    —")
     lines.append("")
     lines.append("Verdict bands by F (proxy via √F vs |z|): "
                  "TIE <1.96, WEAK <2.58, MODERATE <3.29, STRONG ≥3.29.")
@@ -240,8 +340,10 @@ def main():
         if abs(result["t"]) < 1.96:
             sign = "indistinguishable"
         p_two = t_pvalue_two_sided(result["t"], result["df"])
-        lines.append(f"  {lv:22s}  Δ = {result['delta_us']:+8.3f} µs   "
-                     f"SE = {result['se_us']:5.3f}   "
+        delta = result["delta_us"] if not is_cyc else (result["mx"] - result["my"])
+        se = result["se_us"] if not is_cyc else (result["se_us"] / 1000.0)
+        lines.append(f"  {lv:22s}  Δ = {delta:+10.3f} {delta_lbl}   "
+                     f"SE = {se:7.3f}   "
                      f"t = {result['t']:+7.3f}   df ≈ {result['df']:5.1f}   "
                      f"p = {fmt_p(p_two):>10s}   {v:9s} ({sign})")
 

@@ -75,17 +75,20 @@ log "  $n_samples samples across $n_variants variants"
 log ""
 log "=== Phase 3: extracting @@SAMPLE → $OUT/wall_data.csv ==="
 {
-    echo "variant,swizzle,rep,ms"
+    echo "variant,swizzle,rep,ms,cyc"
     grep -E '^@@SAMPLE pass=' "$OUT/run.log" | \
-        sed -E 's/^@@SAMPLE pass=([0-9]+) variant=([^ ]+) ms=([0-9.]+).*/\2,\2,\1,\3/'
+        sed -E 's/^@@SAMPLE pass=([0-9]+) variant=([^ ]+) ms=([0-9.]+) cyc=([0-9]+).*/\2,\2,\1,\3,\4/'
 } > "$OUT/wall_data.csv"
 n_rows=$(( $(wc -l < "$OUT/wall_data.csv") - 1 ))
 log "extracted $n_rows wall measurements"
 
 log ""
-log "=== Phase 4: 1-way ANOVA → $OUT/compare.txt ==="
+log "=== Phase 4: 1-way ANOVA (cyc, paired by pass, trim 33%) → $OUT/compare.txt ==="
 python3 tools/anova_1way.py "$OUT/wall_data.csv" \
     --factor swizzle \
+    --metric cyc \
+    --paired rep \
+    --trim 0.33 \
     --out "$OUT/compare.txt"
 
 log ""

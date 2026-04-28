@@ -906,7 +906,8 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                uint64_t* __restrict__ d_dbg_prof,
                uint64_t* __restrict__ d_dbg_prof_ki,
                uint64_t* __restrict__ d_dbg_prof_tile,
-               uint64_t* __restrict__ d_dbg_prof_w5)
+               uint64_t* __restrict__ d_dbg_prof_w5,
+               uint64_t* __restrict__ d_wall_cyc)
 {
     (void)d_C;
     (void)d_dbg_prof;
@@ -919,6 +920,19 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     const int tid     = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane    = tid & 31;
+
+    /*
+      Per-CTA wall-cycle bracket — tid 0 only.  Reads clock64 at kernel
+      entry, again at exit (just before tcgen05.dealloc), accumulates the
+      delta into d_wall_cyc[blockIdx.x] via non-atomic load+add+store
+      (sequential launches on default stream, no race).  Host takes
+      max-over-CTAs / N_TIMED_LAUNCHES to get average per-launch wall
+      cycles, frequency-invariant by construction.
+    */
+    uint64_t wall_t0 = 0;
+    if (tid == 0 && d_wall_cyc != nullptr) {
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(wall_t0));
+    }
 
     uint32_t cta_rank;
     asm("mov.u32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
@@ -1639,6 +1653,11 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     }
 
     if (warp_id == 0) {
+        if (tid == 0 && d_wall_cyc != nullptr) {
+            uint64_t wall_t1;
+            asm volatile("mov.u64 %0, %%clock64;" : "=l"(wall_t1));
+            d_wall_cyc[blockIdx.x] += (wall_t1 - wall_t0);
+        }
         asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
             :: "r"(0), "n"(TMEM_COLS));
     }
@@ -1672,7 +1691,7 @@ struct VariantCfg {
     void (*launch)(dim3, int,
                    const CUtensorMap&, const CUtensorMap&, const CUtensorMap&,
                    const __nv_bfloat16*, __nv_bfloat16*,
-                   uint64_t*, uint64_t*, uint64_t*, uint64_t*);
+                   uint64_t*, uint64_t*, uint64_t*, uint64_t*, uint64_t*);
     void (*set_attr)(int);
 };
 
@@ -1680,9 +1699,10 @@ template<int TD, int DGG>
 static void launch_kern(dim3 grid, int smem,
                         const CUtensorMap& a, const CUtensorMap& b, const CUtensorMap& c,
                         const __nv_bfloat16* d_bias, __nv_bfloat16* d_C,
-                        uint64_t* p, uint64_t* pki, uint64_t* pt, uint64_t* pw5) {
+                        uint64_t* p, uint64_t* pki, uint64_t* pt, uint64_t* pw5,
+                        uint64_t* pwc) {
     fc2_w3x_kernel<TD, DGG><<<grid, THREADS, smem>>>(
-        a, b, c, d_bias, d_C, p, pki, pt, pw5);
+        a, b, c, d_bias, d_C, p, pki, pt, pw5, pwc);
 }
 
 template<int TD, int DGG>
@@ -1937,12 +1957,17 @@ int main(int argc, char** argv) {
     }
 #define LAUNCH_VARIANT(slot) \
     active_cfg(slot).launch(grid, SMEM_BYTES, h_tma_a, h_tma_b, h_tma_c, \
-        d_bias, d_C, d_dbg_prof, d_dbg_prof_ki, d_dbg_prof_tile, d_dbg_prof_w5)
+        d_bias, d_C, d_dbg_prof, d_dbg_prof_ki, d_dbg_prof_tile, d_dbg_prof_w5, \
+        d_dbg_wall_cyc)
 
     uint64_t* d_dbg_prof = nullptr;
     uint64_t* d_dbg_prof_ki = nullptr;
     uint64_t* d_dbg_prof_tile = nullptr;
     uint64_t* d_dbg_prof_w5 = nullptr;
+    uint64_t* d_dbg_wall_cyc = nullptr;
+    const size_t wall_cyc_bytes = (size_t)SM_COUNT * sizeof(uint64_t);
+    CUDA_CHECK(cudaMalloc(&d_dbg_wall_cyc, wall_cyc_bytes));
+    CUDA_CHECK(cudaMemset(d_dbg_wall_cyc, 0, wall_cyc_bytes));
 #if defined(PROFILE_CYCLES) || defined(PROFILE_KI) || defined(PROFILE_TILE) || defined(PROFILE_W5)
     const int num_clusters_host = SM_COUNT / CLUSTER_CTAS;
     const int tiles_per_cluster_host = (TOTAL_TILES + num_clusters_host - 1) / num_clusters_host;
@@ -2020,8 +2045,10 @@ int main(int argc, char** argv) {
 
     std::vector<std::vector<float>> samples(n_active);
     for (auto& v : samples) v.reserve(REPS);
+    std::vector<uint64_t> h_wall_cyc(SM_COUNT);
     for (int r = 0; r < REPS; r++) {
         for (int s = 0; s < n_active; s++) {
+            CUDA_CHECK(cudaMemset(d_dbg_wall_cyc, 0, wall_cyc_bytes));
             cudaEventRecord(t0);
             for (int i = 0; i < N_TIMED_LAUNCHES; i++) LAUNCH_VARIANT(s);
             cudaEventRecord(t1);
@@ -2030,10 +2057,18 @@ int main(int argc, char** argv) {
             cudaEventElapsedTime(&dt, t0, t1);
             dt /= (float)N_TIMED_LAUNCHES;
             samples[s].push_back(dt);
+            CUDA_CHECK(cudaMemcpy(h_wall_cyc.data(), d_dbg_wall_cyc,
+                                  wall_cyc_bytes, cudaMemcpyDeviceToHost));
+            uint64_t cyc_max = 0;
+            for (uint64_t v : h_wall_cyc) if (v > cyc_max) cyc_max = v;
+            uint64_t cyc_per_launch = cyc_max / (uint64_t)N_TIMED_LAUNCHES;
             if (sweep_mode || active_idx.size() > 1) {
-                printf("@@SAMPLE pass=%d variant=%s ms=%.5f\n", r + 1, active_cfg(s).name, dt);
+                printf("@@SAMPLE pass=%d variant=%s ms=%.5f cyc=%llu\n",
+                       r + 1, active_cfg(s).name, dt,
+                       (unsigned long long)cyc_per_launch);
             } else {
-                printf("@@SAMPLE rep=%d ms=%.5f\n", r + 1, dt);
+                printf("@@SAMPLE rep=%d ms=%.5f cyc=%llu\n",
+                       r + 1, dt, (unsigned long long)cyc_per_launch);
             }
         }
     }
@@ -2572,5 +2607,6 @@ int main(int argc, char** argv) {
 #ifdef PROFILE_W5
     if (d_dbg_prof_w5) cudaFree(d_dbg_prof_w5);
 #endif
+    if (d_dbg_wall_cyc) cudaFree(d_dbg_wall_cyc);
     return errors == 0 ? 0 : 1;
 }
