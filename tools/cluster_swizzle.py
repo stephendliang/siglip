@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Unsupervised clustering + regression on the swizzle metrics from
-analyze_swizzle.py, joined to the n=200 wall measurements (B200,
-2026-04-27, fc2_w3x BIAS_ONLY at K=3072).
+Unsupervised clustering on the swizzle metrics from analyze_swizzle.py,
+joined to the n=200 wall measurements (B200, 2026-04-27, fc2_w3x BIAS_ONLY
+at K=3072).
 
 Goal: discover whether the metric vector explains the wall ranking.
 Specifically — does dgsnake/gflip/tn2br cluster TOGETHER and APART from
@@ -14,6 +14,12 @@ dgsw on the metric vector?
     cluster→tile-within-group permutation has no expression in our
     wavefront-shape metrics; we'd need physical-cache-affinity probing
     (ncu) instead.
+
+Regression (Lasso/OLS) was removed: with 13 labeled points × 8 features
+the βs are unstable, and under the BLIND verdict the predicted wall is
+false-precision noise.  The verdict is centroid-distance-based — that
+generalises to unseen variants (assigns to nearest known cluster) where
+regression would extrapolate confidently and wrongly.
 
 Usage:
     python3 tools/analyze_swizzle.py --csv /tmp/swizzle_metrics.csv
@@ -28,7 +34,6 @@ import sys
 import numpy as np
 from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.decomposition import PCA
-from sklearn.linear_model import Lasso, LinearRegression
 from sklearn.preprocessing import StandardScaler
 
 
@@ -120,7 +125,6 @@ def main():
     Xs_lab = Xs[keep]
     names_lab = [names[i] for i in keep]
     y_lab = np.array([WALL_NS200[n] for n in names_lab])
-    y_lab_delta = y_lab - y_lab.min()
 
     print("=" * 76)
     print("PCA on standardized features (all variants)")
@@ -193,42 +197,6 @@ def main():
             "{" + ",".join(sorted(g, key=lambda n: WALL_NS200[n])) + "}"
             for g in groups.values()
         ))
-    print()
-
-    print("=" * 76)
-    print("Linear regression: wall_delta ~ standardized features (Lasso α=0.05)")
-    print("=" * 76)
-    lasso = Lasso(alpha=0.05, max_iter=20000)
-    lasso.fit(Xs_lab, y_lab_delta)
-    pred = lasso.predict(Xs_lab)
-    r2 = 1 - np.sum((y_lab_delta - pred) ** 2) / np.sum(
-        (y_lab_delta - y_lab_delta.mean()) ** 2
-    )
-    print(f"  R² = {r2:.4f}    intercept = {lasso.intercept_:+.3f}")
-    coefs = list(zip(feature_names, lasso.coef_))
-    coefs.sort(key=lambda kv: -abs(kv[1]))
-    print(f"  {'feature':18s}  {'β (std)':>9s}  {'note'}")
-    for n, c in coefs:
-        if abs(c) < 1e-4:
-            continue
-        print(f"  {n:18s}  {c:+9.3f}")
-    print()
-
-    print("=" * 76)
-    print("Plain OLS for comparison (no shrinkage)")
-    print("=" * 76)
-    ols = LinearRegression()
-    ols.fit(Xs_lab, y_lab_delta)
-    pred = ols.predict(Xs_lab)
-    r2 = 1 - np.sum((y_lab_delta - pred) ** 2) / np.sum(
-        (y_lab_delta - y_lab_delta.mean()) ** 2
-    )
-    print(f"  R² = {r2:.4f}    intercept = {ols.intercept_:+.3f}")
-    coefs = list(zip(feature_names, ols.coef_))
-    coefs.sort(key=lambda kv: -abs(kv[1]))
-    print(f"  {'feature':18s}  {'β (std)':>9s}")
-    for n, c in coefs[:10]:
-        print(f"  {n:18s}  {c:+9.3f}")
     print()
 
     print("=" * 76)

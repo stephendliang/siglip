@@ -105,38 +105,53 @@ path.
 L2 hit rate, 750MB less DRAM. dgswizzle (TD=8) lowest fused at 1.065 but bumps
 register count. LEAN remains in tree for large-K (re-verification under parity open).
 
-### fc2_w3x dispatch is near-flat (locked-clock ncu, 2026-04-23)
+### fc2_w3x dispatch tier ranking (n=5489 paired-pass cycles, 2026-04-27)
 
 The `fc2_w3` table above is fused-with-residual. On `fc2_w3x` (bias-only,
-production for that path), the dispatch lever has compressed: top 8 variants
-land within 1.7 µs of dgsw (n=10 wall, σ=0.2–0.7 µs each — sub-noise).
+production for that path), the dispatch lever is real but compressed.
+Resolved at B200 vast.ai n=5489 paired cycles via `tools/sweep_fc2_w3x_swizzle.sh`
++ `tools/anova_1way.py --metric cyc --paired rep --trim 0.33`. AUC bands
+< 0.55 TIE / < 0.65 WEAK / < 0.75 MODERATE / < 0.85 STRONG / ≥ 0.85 DECISIVE.
 
-| fc2_w3x dispatch | Δ vs dgsw | long_sb | L2 hit% | DRAM rd | amp |
-|---|---|---|---|---|---|
-| dgswizzle G=8 (default)        | —        | 6.71 | 67.44 | 2.988 GB | 1.048× |
-| checkered / dgsnake / dg4 / hilbert / zigzag / rowmajor | ±2 µs | 6.64–7.21 | 65.1–68.7 | 2.94–3.03 | 1.03–1.06× |
-| nlock                          | +52 µs   | — | — | — | — |
-| nflat / ncyrot / nsnake / ncycle | +100–186 µs | — | — | — | — |
-| pmix hybrid (TD=31)            | +181 µs  | 8.51 | 51.82 | **5.724 GB** | **1.99×** |
+| tier | variants | Δ vs fastest (cyc) | AUC vs dgsnake |
+|---|---|---|---|
+| **front (3-way TIE)** | **dgsnake (TD=19)**, lmrev, gflip (TD=33) | 0 / +117 / +151 | — / 0.533 / 0.547 |
+| WEAK behind | g4swap, snrot2, checkered, snrot1, dgsw_G8, lmsn | +180…+811 | 0.55–0.69 |
+| MODERATE | tn2br (TD=34), rowmajor, comboAC, zigzag, dg4diag, dg4pp | +907…+1244 | 0.70–0.73 |
+| STRONG | comboAB, dg4, dg2 | +1169…+1723 | 0.77–0.79 |
+| DECISIVE | dg16, dg32 | +3174 / +5323 | 0.98 / 1.00 |
 
-The 6-warp persistent structure (no W7, no W2 EpilogueLoad) is less dispatch-
-sensitive than fc2_w3. dgsw stays default. PMIX is the cautionary case: a
-dgsw+rowmajor per-cluster mix that passes a tile-bijection check still
+**Default still dgsw_G8** pending one verification sweep before flipping
+to dgsnake. dgsw is +443 cyc / d=0.42 / AUC=0.616 WEAK behind dgsnake —
+real signal at n=5489 but small.
+
+**Demotions from earlier underpowered (n=6) "6-way tie at MMA floor"
+claim:** tn2br no longer tied (MODERATE, +907 cyc); dg4 family no longer
+tied (STRONG, +1296 cyc); dg4diag has the highest *win%* (12.61%) but
+σ_rank=6.2 — bimodal, mean_rank correctly demotes it. Use mean_rank
+over win% for default selection — it's worst-case-aware.
+
+**dg-G curve (cleanest data point):** G=2 +1723, G=4 +1296, G=8 +443
+(WEAK), G=16 +3174 (DECISIVE), G=32 +5323. G=8 is a true minimum.
+dgsnake stays in the G=8 family with a structural mod that nets −443 cyc.
+
+**Methodology validation:** residual σ collapses raw 1500 → 1000 cyc →
+pass-major + per-pass mean subtraction cancels ~33% of raw variance.
+Tightest residual σ (most consistent dispatches): gflip 945, g4swap
+985, checkered 1025, dgsnake 1048. η²=0.45 large but driven by
+dg16/dg32 outlier tail; strip those and front tier is small/medium.
+
+**Older n=10 / n=6 ncu probe data** (long_sb, L2 hit%, DRAM rd, amp)
+for the front cluster — `tools/sweep_fc2_w3x_swizzle.sh` outputs from
+2026-04-23 — is preserved for reference but the wall ranking above
+supersedes the prior "±2 µs" lumping. PMIX (TD=31) cautionary case
+still holds: dgsw+rowmajor per-cluster mix passes bijection check yet
 destroys L2 staggering (51.82% hit) and doubles DRAM traffic.
 
-**gflip (TD=33) / tn2br (TD=34) probes (2026-04-26, B200 n=6, prof sweep):**
-two new dgsw-derived hybrids land marginally below baseline within the noise
-band — gflip 1.0091 ms, tn2br 1.0090 ms vs dgsw 1.0093 ms (Δ ≈ −0.3 µs each,
-σ=0.2–0.4 µs/variant; pooled t≈1.1, p5/p95 bands overlap heavily). Six
-variants now formally tie at the MMA-throughput floor: tn2br, gflip, dgsw,
-checkered, dg4, dgsnake. gflip pulls W4 `cp.async.tensor` 3469 → 2689 cyc
-(−780 cyc, joins the TMA-fast cluster), but the savings disappear into MMA
-shadow — same XPF_A/XPF_B autopsy. tn2br holds dgsw's TMA pattern (3479 cyc)
-since it only diverges at tn=TILES_N-1; bit-reversing tm-order at the
-boundary tn nets ±0 wall, which kills the in_g=16,17 fast-transition hypothesis
-(the in_g positional surplus is structurally welded in, not a tn-boundary
-artifact). W5 MMA wall_bracket pinned at 12484–12490 cyc across all 6 ties
-≈ 24 × 520 cyc/iter floor.
+The 6-warp persistent structure (no W7, no W2 EpilogueLoad) is less
+dispatch-sensitive than fc2_w3, but **not flat** — see
+`memory/project_w3x_n5489_top3.md` for the full sweep + the
+methodology that resolved it.
 
 ### Cleanest "DRAM amp ≠ bottleneck" proof (cutlass-static, 2026-04-23)
 
@@ -152,6 +167,54 @@ cutlass-static hits the optimal 1.000× amp floor and runs **185 µs slower**
 than fc2_w3x at 1.043× amp. CUTLASS uses 21% more instructions (169.9M vs
 140.2M) → 16-pt tensor-pipe gap. Tensor-pipe utilization is the lever, not
 DRAM traffic. fc2_w3x reads 1.3 GB MORE per launch and is faster.
+
+### Swizzle metric pipeline (predicting wall from m/n structure)
+
+Two-stage Python pipeline that simulates each TILE_DISPATCH variant in pure
+host code, extracts per-cluster m/n visit-sequence features, and asks
+whether those features explain the measured wall ranking.
+
+```bash
+python3 tools/analyze_swizzle.py --csv /tmp/swizzle_metrics.csv  # simulate
+python3 tools/cluster_swizzle.py /tmp/swizzle_metrics.csv        # cluster + regress
+```
+
+**Stage 1 — `analyze_swizzle.py`.** Replays `lin_tile = cluster_id + tt*NC`
+(NC=74, TILES_M=3626, TILES_N=3, TICKS=147) for every variant
+(dgsw G∈{2,4,8,16,32}, dgsnake, checkered, zigzag, rowmajor, ncycle/ncyrot/
+nflat/nsnake/nlock, gflip, tn2br, INGH/CHET/PMIX, plus propose_*). Per
+variant emits 8 structural metrics covering A-strip reuse (the only
+DRAM-bound axis since B is L2-resident at 2.3 MB):
+intra-tn / intra-tm run length, wavefront unique-tm count + multiplicity,
+cross-cluster L2-window A reuse, fresh-A influx per tick, peak concurrent
+unique tm, group-locality score.
+
+**Stage 2 — `cluster_swizzle.py`.** Joins to a baked-in `WALL_NS200` table
+(n=200 paired-pass cycles, 13 wall-labeled variants), standardizes,
+runs PCA + KMeans(k=4) + Ward (k=2..5). Closes with a "front-tier
+separation" diagnosis: feature-space distance between {dgsnake, gflip,
+tn2br} centroid and dgsw_G8 baseline, top features by |Δ|, verdict band:
+
+| max |Δ| (std-units) | Verdict |
+|---|---|
+| < 0.3 | **ANALYZER BLIND** — lever lives outside metric set (likely SM→L2-partition cache affinity, ncu-only) |
+| < 1.0 | WEAK SIGNAL — partly captured |
+| ≥ 1.0 | CAPTURES LEVER — top feature names it |
+
+**Current verdict (n=200 sweep, 2026-04-27): BLIND.** dgsnake/gflip/tn2br
+are metric-indistinguishable from dgsw_G8 — the +0.33 µs front-tier lever
+isn't in the wavefront-shape feature set. Use this pipeline before adding
+new TD probes: if the proposal's metric vector matches an existing tied
+cluster, the wall will too.
+
+Why clustering, not regression: with 13 labeled points × 8 features the
+βs are unstable and an OLS/Lasso prediction is false-precision noise.
+Centroid-distance assignment generalises gracefully to unseen variants
+(places them in the nearest known tier) where regression would
+extrapolate confidently and wrongly. The retired `tile_regress.py` /
+`td22_sweep.py` pair predicted ms (not cyc) on older fc2_w3
+fused-residual data — pre-paired-analysis, pre-thermal-defense; deleted
+2026-04-27.
 
 ### Adaptive tuning knobs
 
@@ -297,13 +360,23 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
   EPI_2WARP's 2-warp restructure is fc2_w3x-only (FC1's 7-warp GELU epi
   can't take it), 0.27 µs is ~0.026% wall. See
   `memory/project_w3x_epi2warp_marginal.md`.
+- **LDTM_X32 (widest TMEM-load + STS.128) ties STSM at MMA floor** (Apr 26, B200
+  n=512 pass-major): Δ=−0.021 µs, p=0.6523. `tcgen05.ld.32x32b.x32` (lane t = row
+  t cols 0..31) + 4× `st.shared.v4.b32` interchangeable with rank-1's
+  `LDTM.16dp256bit.x4 ×2` + `STSM.16.MT88.4 ×4`; LDTM cycle savings live in W0-W3
+  MMA shadow. STSM stays default by symmetry with rank-1. LDTM_X64 (.32x32b.x64)
+  forces `NUM_EPI_STAGES=2 → 1` (SMEM budget) and regresses +14 µs at n=16
+  STRONG — confirms NS_EPI=2 is worth ~14 µs (correcting the prior "NS_EPI sweep"
+  ±3 µs footnote, which tested NS_EPI=3,4 vs 2 not NS_EPI=1 vs 2). See
+  `memory/dead_ldtm_x32_tie.md`.
 - **fc2_w3x post-WIN levers (all ±3 µs or regression):** subpass 8→4, cross-tile TMA
-  carry, SWIZZLE_64B, NS_EPI sweep, DROP_TRAIL_BARSYNC, WAIT_GROUP_READ,
+  carry, SWIZZLE_64B, DROP_TRAIL_BARSYNC, WAIT_GROUP_READ,
   XPF_A/B prefetch (Bonferroni-confirmed regression in
   the 2026-04-26 128-cell combo sweep: XPF_A +3.05 µs at z=+6.30, XPF_B
   +1.27 µs at z=+2.62; **macros removed from tree**), CHET/PMIX/INGH hybrid dispatches, 13 non-dgsw
-  TILE_DISPATCH variants (incl. gflip TD=33 / tn2br TD=34, both −0.3 µs marginal
-  within-noise wins — 6-way tie at the MMA-throughput floor), STAGGER=2 split-mbar
+  TILE_DISPATCH variants (incl. gflip TD=33 in front-tier TIE w/ dgsnake at
+  n=5489; tn2br TD=34 demoted MODERATE — see `memory/project_w3x_n5489_top3.md`),
+  STAGGER=2 split-mbar
   (uniformly +3 µs across all 11 dispatches, zero stagger×dispatch interaction —
   +36 cyc on each of W4/W5 from extra arrive + extra mbar_wait; **macro removed
   from tree 2026-04-26**, postmortem in `memory/dead_fc2_w3x_stagger.md`), DG
@@ -374,6 +447,7 @@ Makefile                        # sm_100a, DFLAGS for dim override
 docs/W3X_GRIEVANCES_VS_RANK1.md # 9 SASS-level deltas vs rank-1
 docs/LEVER_C_STATUS.md          # STSM layout playbook
 docs/PURE_PTX_REWRITE_STRATEGY.md
+docs/BENCHMARKING.md            # cycles/AUC/η²/rank study guide — read before benchmarking
 rank1.sass                      # Dumped cuBLASLt rank-1 for diffing
 tools/bench.sh                  # FC1/FC2 × dispatch × packed × decomp (rank-1 baseline)
 tools/probe_cublaslt.sh         # cuBLASLt rank-1 timing
@@ -382,7 +456,9 @@ tools/ncu_bench.sh, ncu_fc2_w3x.sh, ncu_fc2_pipes.sh   # ncu profiling
 tools/sweep_fc2_w3x_*.sh        # tiles / dg / prof sweeps
 tools/aggregate_prof.py         # PROFILE_* aggregator
 tools/ncu_anova.py
-tools/tile_regress.py           # Python TD simulation + regression on tile-sequence features
+tools/analyze_swizzle.py        # per-swizzle structural metric simulator (A/B reuse, group locality)
+tools/cluster_swizzle.py        # PCA + KMeans + Ward — wall-vs-metric blind/captures verdict (centroid-distance)
+tools/anova_1way.py             # paired ANOVA + AUC + Cohen's d + η² + mean-rank/win% (no p-values)
 tools/sass_edit.py              # SASS binary editor + CP-SAT scheduler
 token_count.py                  # tiktoken-based token budgeting for CLAUDE.md / docs / memory
 bench/                          # Microbenchmarks (TMA, MMA, stmatrix, cublaslt_introspect)
@@ -414,6 +490,21 @@ data/                           # Benchmark + ncu results
 - Custom dims require `make -B`
 - W0's K-loop is TMA-sensitive: any global op (atomicAdd, etc.) costs +41–77% tma_issue.
   Non-critical-path global ops (W7 scheduler at tile-boundary) are fine.
+
+## Benchmarking
+
+See `docs/BENCHMARKING.md` for the full playbook. TL;DR for any timing-claim
+work in this repo:
+
+- **Cycles, not ms.** `clock64()` per-CTA in the kernel, `max_over_CTAs / N_TIMED`.
+  Clock-frequency invariant — required on vast.ai (no locked clocks).
+- **Pass-major** (randomized block): outer pass p, inner variant v.
+  `@@SAMPLE pass=p variant=v cyc=Y` per launch.
+- **Trim** first 33–50% of passes (cold L2 + thermal ramp).
+- **Paired analysis** by pass; report **AUC**, **Cohen's d**, **η²**, **mean
+  rank**, **win%**. **No p-values** — they're meaningless at large n.
+- `tools/anova_1way.py --metric cyc --paired rep --trim 0.33` is the canonical
+  invocation; `tools/sweep_fc2_w3x_*.sh` uses it by default.
 
 ## Code style
 
