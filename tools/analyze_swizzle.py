@@ -515,6 +515,94 @@ def sw_dg_lmsn(lin, G=8):
     return first_m + lm, ln
 
 
+def sw_dg_phasesh3(lin, G=8):
+    """TD=46: cluster c with c%3 phase shifts its tt-sequence by phase*4
+    ticks (one ln-block).  Bijective by construction (within-cluster
+    visit-order permutation; coverage set unchanged).  intra_tn_run = 4
+    preserved (per-cluster tn-stream shape unchanged, just rotated).
+    At any tick, clusters split 25/25/24 across the 3 ln values."""
+    c = lin % NC
+    tt = lin // NC
+    phase = c % 3
+    eff_tt = (tt + phase * 4) % TICKS
+    eff_lin = c + eff_tt * NC
+    return sw_dgsw(eff_lin, G)
+
+
+def sw_dg_sn_phasesh3(lin, G=8):
+    """TD=47: dgsnake + c%3 tt-phaseshift.  Six effective phases across
+    (lm%2, c%3).  Bijective (within-cluster order permutation)."""
+    c = lin % NC
+    tt = lin // NC
+    phase = c % 3
+    eff_tt = (tt + phase * 4) % TICKS
+    eff_lin = c + eff_tt * NC
+    return sw_dgsnake(eff_lin, G)
+
+
+def sw_dg_sn_lmrev(lin, G=8):
+    """TD=48: dgsnake × lm-bitrev (G=8).  3-bit reverse of lm gates dgsnake's
+    tn-reversal.  After bitrev, lm-parity = bit-2 of original lm, so cluster's
+    forward/reverse phase is keyed on a different bit of lm.  Combines lmrev's
+    adj_tm_diff lever with dgsnake's tn-reversal."""
+    gt = TILES_N * G
+    group_idx = lin // gt
+    first_m = group_idx * G
+    in_g = lin - group_idx * gt
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    lm_raw = in_g % nig
+    ln = in_g // nig
+    if nig == 8:
+        lm = ((lm_raw & 1) << 2) | (lm_raw & 2) | ((lm_raw >> 2) & 1)
+    else:
+        lm = lm_raw
+    tn = (TILES_N - 1 - ln) if (lm & 1) else ln
+    return first_m + lm, tn
+
+
+def sw_dg_antisnake(lin, G=8):
+    """TD=49: dg_antisnake — flip ln direction on the 2nd half of the lm range
+    within each group instead of dgsnake's lm-parity flip.  Tests whether
+    snake's lm-parity choice or the existence of any flip is the lever."""
+    gt = TILES_N * G
+    group_idx = lin // gt
+    first_m = group_idx * G
+    in_g = lin - group_idx * gt
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    lm = in_g % nig
+    ln = in_g // nig
+    if lm >= nig // 2:
+        ln = TILES_N - 1 - ln
+    return first_m + lm, ln
+
+
+def sw_dg_tt_phase(lin, G=8):
+    """TD=50: dg_tt_phase — like dg_phasesh3 but phase keyed on cluster-band
+    (c // 25) % 3 instead of c % 3.  Three contiguous cluster-bands of ~25
+    clusters each share a phase, instead of every-third-cluster having one.
+    Tests whether per-cluster fine-grained phasing or block-grained phasing
+    is the lever for adj_tm_diff."""
+    c = lin % NC
+    tt = lin // NC
+    phase = (c // 25) % 3
+    eff_tt = (tt + phase * 4) % TICKS
+    eff_lin = c + eff_tt * NC
+    return sw_dgsw(eff_lin, G)
+
+
+def sw_wfd_latin(lin, G=8):
+    """TD=51: wfd_latin — per-cluster tt-rotation by c ticks.  Each cluster's
+    visited (tm,tn) coverage set is unchanged (cluster-trajectory invariant
+    under lin = c + tt*NC) so bijection is preserved by construction.
+    Different rotation per cluster scrambles the cross-cluster (tm,tn)
+    correlation, targeting cluster_tn_corr below dgsnake's 0.0005."""
+    c = lin % NC
+    tt = lin // NC
+    eff_tt = (tt + c) % TICKS
+    eff_lin = c + eff_tt * NC
+    return sw_dgsw(eff_lin, G)
+
+
 # ---------------------------------------------------------------- metrics
 
 
@@ -801,6 +889,16 @@ VARIANTS = [
     ("dg_sn_rot1",       sw_dg_sn_rot1),
     ("dg_sn_rot2",       sw_dg_sn_rot2),
     ("dg_lmsn",          sw_dg_lmsn),
+
+    ("dg_phasesh3",      sw_dg_phasesh3),
+    ("dg_sn_phasesh3",   sw_dg_sn_phasesh3),
+    ("dg_sn_lmrev",      sw_dg_sn_lmrev),
+
+    ("dgsnake_G4",       lambda l: sw_dgsnake(l, 4)),
+    ("dgsnake_G16",      lambda l: sw_dgsnake(l, 16)),
+    ("dg_antisnake",     sw_dg_antisnake),
+    ("dg_tt_phase",      sw_dg_tt_phase),
+    ("wfd_latin",        sw_wfd_latin),
 ]
 
 

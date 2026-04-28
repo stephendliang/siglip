@@ -49,10 +49,15 @@ Usage:
         [--metric ms|cyc] [--paired COL] [--trim FRAC] [--out compare.txt]
 """
 import argparse
+import os
 import bisect
 import csv
 import math
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from stats_boot import (bootstrap_paired_ci, bootstrap_paired_dual, fmt_ci,
+                        empirical_auc as boot_auc, cohens_d as boot_d)
 
 
 def rank_analysis(rows, factor, metric, paired):
@@ -249,6 +254,9 @@ def main():
                     help="drop first FRAC of samples per cell, sorted by "
                          "--paired if given (e.g. 0.33 drops cold-start third)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--boot", type=int, default=0,
+                    help="bootstrap CI resamples for AUC/d/mean_rank/η² "
+                         "(default 0 = off; 1000 typical, paired by --paired)")
     args = ap.parse_args()
 
     with open(args.csv) as f:
@@ -333,6 +341,31 @@ def main():
                  f"{res['df_within']:5d}  {res['ms_within']:16.3f}")
     lines.append(f"  η² = {res['eta_sq']:.4f}  ({eta_squared_verdict(res['eta_sq'])} effect)"
                  f"   F = {res['F']:.2f}")
+    if args.boot > 0 and args.paired is not None:
+        levels = res["levels"]
+        blocks_to_rows = {}
+        for r in rows_ana:
+            blocks_to_rows.setdefault(r[args.paired], []).append(
+                (r[args.factor], float(r[args.metric])))
+
+        def eta_of(flat):
+            if not flat:
+                return 0.0
+            cells = {}
+            for lv, v in flat:
+                cells.setdefault(lv, []).append(v)
+            if len(cells) < 2 or any(len(vs) < 2 for vs in cells.values()):
+                return 0.0
+            all_obs = [v for vs in cells.values() for v in vs]
+            grand = sum(all_obs) / len(all_obs)
+            ss_b = sum(len(vs) * (sum(vs)/len(vs) - grand)**2 for vs in cells.values())
+            ss_t = sum((v - grand)**2 for v in all_obs)
+            return ss_b / ss_t if ss_t > 0 else 0.0
+
+        eta_p, eta_lo, eta_hi = bootstrap_paired_ci(
+            eta_of, blocks_to_rows, n_resamples=args.boot)
+        lines.append(f"  η² bootstrap CI ({args.boot}× paired): "
+                     f"{fmt_ci(eta_p, eta_lo, eta_hi, 4)}")
     lines.append("  η² bands (Cohen): <0.01 negligible, <0.06 small, <0.14 medium, ≥0.14 large.")
     lines.append("")
 
@@ -340,8 +373,12 @@ def main():
         ranks, wins, n_blocks = rank_analysis(rows, args.factor, args.metric, args.paired)
         lines.append(f"per-pass rank analysis ({n_blocks} blocks of {args.paired}; "
                      f"rank 1 = fastest in that pass, ties split):")
-        lines.append(f"  {'variant':22s}  {'mean_rank':>9s}  {'σ_rank':>7s}  "
-                     f"{'wins':>14s}  {'win%':>6s}")
+        if args.boot > 0:
+            lines.append(f"  {'variant':22s}  {'mean_rank':>9s} {'CI95':>17s}  "
+                         f"{'σ_rank':>7s}  {'wins':>14s}  {'win%':>6s}")
+        else:
+            lines.append(f"  {'variant':22s}  {'mean_rank':>9s}  {'σ_rank':>7s}  "
+                         f"{'wins':>14s}  {'win%':>6s}")
         ranking = sorted(ranks.items(), key=lambda kv: sum(kv[1]) / len(kv[1]))
         for v, rs in ranking:
             mr = sum(rs) / len(rs)
@@ -349,8 +386,18 @@ def main():
             sr = math.sqrt(var)
             w = wins.get(v, 0.0)
             pct = 100.0 * w / n_blocks if n_blocks else 0.0
-            lines.append(f"  {v:22s}  {mr:9.3f}  {sr:7.3f}  "
-                         f"{w:7.2f} / {n_blocks:<4d}  {pct:5.2f}%")
+            if args.boot > 0:
+                # Block-bootstrap mean_rank: resample blocks (= ranks).
+                blocks = {i: [r] for i, r in enumerate(rs)}
+                _, lo, hi = bootstrap_paired_ci(
+                    lambda flat: sum(flat) / len(flat) if flat else 0.0,
+                    blocks, n_resamples=args.boot)
+                ci = f"[{lo:5.2f},{hi:5.2f}]"
+                lines.append(f"  {v:22s}  {mr:9.3f} {ci:>17s}  {sr:7.3f}  "
+                             f"{w:7.2f} / {n_blocks:<4d}  {pct:5.2f}%")
+            else:
+                lines.append(f"  {v:22s}  {mr:9.3f}  {sr:7.3f}  "
+                             f"{w:7.2f} / {n_blocks:<4d}  {pct:5.2f}%")
         lines.append("  Random-pick baseline: mean_rank = (k+1)/2, win% = 100/k for k cells.")
         lines.append("")
 
@@ -359,9 +406,20 @@ def main():
     lines.append(f"pairwise effect size vs fastest = {ref_lv}:")
     lines.append(f"  AUC bands: <0.55 TIE, <0.65 WEAK, <0.75 MODERATE, "
                  f"<0.85 STRONG, ≥0.85 DECISIVE")
+    if args.boot > 0:
+        lines.append(f"  CI = 95% paired-bootstrap, {args.boot} resamples")
     lines.append(f"  {'variant':22s}  {'Δ':>14s}        {'d':>7s}    "
                  f"{'AUC':>5s}    verdict")
     ref_xs = cells[ref_lv]
+
+    blocks_pair = None
+    if args.boot > 0 and args.paired is not None:
+        blocks_pair = {}
+        for r in rows_ana:
+            blocks_pair.setdefault(r[args.paired], {})
+            blocks_pair[r[args.paired]].setdefault(r[args.factor], [])
+            blocks_pair[r[args.paired]][r[args.factor]].append(float(r[args.metric]))
+
     for lv, _ in sorted_cells[1:]:
         xs = cells[lv]
         if len(xs) < 2:
@@ -377,8 +435,24 @@ def main():
             sign = "faster"
         delta_raw = sum(xs) / len(xs) - sum(ref_xs) / len(ref_xs)
         delta_disp = delta_raw if is_cyc else delta_raw * 1000.0
-        lines.append(f"  {lv:22s}  Δ = {delta_disp:+10.3f} {delta_lbl}  "
-                     f"d = {d:+6.3f}   AUC = {auc:.3f}   {v:9s} ({sign})")
+        if blocks_pair is not None:
+            blocks_xy = {}
+            for k, by_var in blocks_pair.items():
+                xb = by_var.get(ref_lv, [])
+                yb = by_var.get(lv, [])
+                if xb and yb:
+                    blocks_xy[k] = (xb, yb)
+            _, auc_lo, auc_hi = bootstrap_paired_dual(
+                boot_auc, blocks_xy, n_resamples=args.boot)
+            _, d_lo, d_hi = bootstrap_paired_dual(
+                boot_d, blocks_xy, n_resamples=args.boot)
+            lines.append(f"  {lv:22s}  Δ = {delta_disp:+10.3f} {delta_lbl}  "
+                         f"d = {d:+6.3f} [{d_lo:+5.2f},{d_hi:+5.2f}]   "
+                         f"AUC = {auc:.3f} [{auc_lo:.3f},{auc_hi:.3f}]   "
+                         f"{v:9s} ({sign})")
+        else:
+            lines.append(f"  {lv:22s}  Δ = {delta_disp:+10.3f} {delta_lbl}  "
+                         f"d = {d:+6.3f}   AUC = {auc:.3f}   {v:9s} ({sign})")
 
     text = "\n".join(lines) + "\n"
     sys.stdout.write(text)
