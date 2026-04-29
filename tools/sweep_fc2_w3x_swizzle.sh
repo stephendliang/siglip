@@ -135,11 +135,13 @@ log ""
 log "=== Phase 4: 1-way ANOVA (cyc, paired by pass, trim 33%) → $OUT/compare.txt ==="
 ANOVA_BOOT_ARG=""
 [ "$BOOT" -gt 0 ] && ANOVA_BOOT_ARG="--boot $BOOT"
+ANCHOR=${ANCHOR:-dgsw}
 python3 tools/anova_1way.py "$OUT/wall_data.csv" \
     --factor swizzle \
     --metric cyc \
     --paired rep \
     --trim 0.33 \
+    --anchor "$ANCHOR" \
     $ANOVA_BOOT_ARG \
     --out "$OUT/compare.txt"
 

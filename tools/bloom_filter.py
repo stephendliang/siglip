@@ -3,7 +3,9 @@
 
 Reads metrics.csv (output of analyze_swizzle.py --csv) and verdicts each
 variant against gflip's signature using the sign-stable Kendall-τ vector
-extracted from study_summary.py on the n=32768 sweep.
+refit against consolidated wall labels (tools/build_wall_labels.py +
+tools/refit_tau.py) — most-recent training set spans n=16123 + n=43910 +
+older n=32768/3072 raw paired-pass sweeps, anchored to dgsw.
 
 The point: before paying CUDA build + B200 sweep cost (~30 min × 5 candidates),
 score them in <1 sec against the existing wall data. If a candidate's feature
@@ -11,14 +13,28 @@ vector falls in known-loser territory or is a near-duplicate of an existing
 tested variant, reject it.
 
 Verdict bands:
-  STUPID    — bijection fails, or hits a known-loser pattern
+  STUPID    — bijection fails, hard-reject metric, or score < -0.50
   REDUNDANT — feature signature within ε of an already-tested variant
-  WASH      — distinct but score change vs gflip < |0.05|
-  WORTHY    — distinct AND moves on a sign-stable τ axis in the right direction
+  WASH      — score in [-0.50, -0.10]: gflip-class noise band, build but expect tie
+  MARGINAL  — score in [-0.10, +0.10]: predicted indistinguishable from reference
+  WORTHY    — score ≥ +0.10: clearly faster on sign-stable τ axes
+  WORTHY-BUT-OVERSHOOT-RISK — WORTHY but tripped a soft-reject (cidperm-class)
+
+The τ refit shifted axes from m-axis-dominated (cluster_tm_corr, adj_tm_diff,
+tm_extent_mean — all dropped to |τ|<0.1 in new fit) to tn-axis-dominated
+(wf_uniq_tn_mean, fresh_tm_total, cluster_tn_corr, etc.) — the new training
+set is gflip-family-heavy, where the discriminating lever is XOR=1 + within-
+group tn rotation, not m-axis lm manipulation.  Within-gflip-family
+discrimination (saturation between blkswap/lmrev/blklmrev) sits below model
+resolution: the linear fit cannot capture Lever C saturation; rely on wall.
 
 Usage:
   python3 tools/analyze_swizzle.py --csv /tmp/m.csv --summary > /dev/null
-  python3 tools/bloom_filter.py /tmp/m.csv [--candidates gflip_snrot,gflip_lmrev,...]
+  python3 tools/bloom_filter.py /tmp/m.csv [--candidates gflip_snrot,...]
+
+Retrain after collecting new wall data:
+  python3 tools/build_wall_labels.py
+  python3 tools/refit_tau.py --boot 2000
 """
 import argparse
 import csv
@@ -27,30 +43,33 @@ from collections import defaultdict
 
 
 GFLIP_REF = {
-    "cluster_tm_corr":  0.6505,
+    "wf_uniq_tn_mean":  3.0612,
+    "fresh_tm_total":   3624.0,
+    "tick_irreg_mean":  1.0274,
+    "cluster_tn_corr":  0.1339,
+    "wf_tn_entropy":    1.5920,
+    "pair_same_tn":     0.3238,
+    "intra_tn_run":     3.8971,
     "adj_tn_diff":      0.1661,
-    "adj_tm_diff":      2.108,
+    "tm_density_mean":  0.7943,
+    "wf_uniq_tm_mean":  29.9184,
+    "cluster_tm_corr":  0.6505,
     "tm_extent_mean":   38.90,
-    "tm_density_mean":  0.794,
-    "intra_tn_run":     3.897,
-    "tm_tick_spread":   0.4045,
-    "tick_irreg_mean":  1.027,
     "wf_uniq_tm_max":   32,
     "l2_warm_w8":       0.106,
-    "wf_uniq_tm_mean":  29.92,
+    "adj_tm_diff":      2.108,
 }
 
 
 SIGN_STABLE_TAU = {
-    "cluster_tm_corr":  +0.50,
-    "adj_tm_diff":      -0.50,
-    "tm_tick_spread":   -0.66,
-    "tick_irreg_mean":  -0.66,
-    "wf_uniq_tm_max":   -0.59,
-    "l2_warm_w8":       -0.59,
-    "tm_extent_mean":   -0.57,
-    "wf_uniq_tm_mean":  -0.40,
-    "intra_tn_run":     -0.38,
+    "wf_uniq_tn_mean":  -0.52,
+    "fresh_tm_total":   +0.52,
+    "tick_irreg_mean":  -0.46,
+    "cluster_tn_corr":  -0.43,
+    "wf_tn_entropy":    -0.39,
+    "pair_same_tn":     +0.39,
+    "intra_tn_run":     -0.23,
+    "adj_tn_diff":      +0.21,
 }
 
 
@@ -179,14 +198,23 @@ def closest_neighbor(target_metrics, all_rows, keys, exclude=None):
 
 
 def empirical_match(metrics):
-    """Flag variants matching empirical winner signatures the τ ranking can't
-    see (snrot2 won 2nd at n=32768 via adj_tn_diff which is NOT sign-stable
-    globally — but the empirical n=32768 mean_rank = 6.18 vs gflip's 4.88
-    says it's a real but hidden lever)."""
+    """Flag variants matching the gflip_snrot empirical winner signature:
+    XOR=1 base (cluster_tm_corr in gflip band ~0.60-0.70) PLUS within-group
+    tn rotation (adj_tn_diff > 1.0).  At n=16123 gflip_snrot won mean_rank
+    despite scoring near-zero on the refit τ vector — the within-group
+    tn rotation lever is real but undercaptured by Kendall-τ on a global
+    label set.  Pre-2026-04-29 channel was 'snrot2-class adj_tn_diff > 0.5'
+    — snrot2 itself is now confirmed +311/+1750 cyc slower, so the older
+    threshold drowned signal in noise.  Tighter signature: gflip-class ctm
+    + high adj_tn_diff."""
     flags = []
-    v = num(metrics.get("adj_tn_diff"))
-    if v is not None and v > 0.5:
-        flags.append(f"adj_tn_diff={v:.2f} (snrot2-class, empirical 2nd at n=32768)")
+    ctm = num(metrics.get("cluster_tm_corr"))
+    atn = num(metrics.get("adj_tn_diff"))
+    if ctm is None or atn is None:
+        return flags
+    if atn > 1.0 and 0.55 <= ctm <= 0.75:
+        flags.append(f"adj_tn_diff={atn:.2f} ctm={ctm:.2f} "
+                     f"(gflip_snrot-class within-group tn rotation)")
     return flags
 
 
@@ -207,28 +235,29 @@ def verdict(metrics, all_rows):
 
     if soft:
         flag_str = "; ".join(f"{f}={v:.2f} ({r})" for f, v, t, r in soft)
-        if s > 0.10:
+        if s > -0.50:
             return "WORTHY-BUT-OVERSHOOT-RISK", flag_str, nn, contribs
         return "STUPID", flag_str, nn, contribs
 
-    if s > 0.10:
+    if s >= 0.10:
         emp_str = (" + " + "; ".join(emp)) if emp else ""
         return ("WORTHY",
                 f"score = {s:+.3f} vs gflip on sign-stable τ{emp_str}",
                 nn, contribs)
-    if s > 0.03:
+    if s >= -0.10:
         emp_str = (" + " + "; ".join(emp)) if emp else ""
         return ("MARGINAL", f"score = {s:+.3f}{emp_str}", nn, contribs)
 
-    if s > -0.10 and emp:
+    if s >= -0.50 and emp:
         return ("BUILD-ANYWAY",
-                f"score = {s:+.3f} on sign-stable τ (≈ gflip), but matches "
-                f"empirical winner signature: {'; '.join(emp)}",
+                f"score = {s:+.3f} on sign-stable τ but matches empirical "
+                f"winner signature: {'; '.join(emp)}",
                 nn, contribs)
 
-    if s > -0.03:
+    if s >= -0.50:
         return ("WASH",
-                f"score = {s:+.3f} (within ±0.03 of gflip on every τ axis)",
+                f"score = {s:+.3f} (gflip-class noise band, build but "
+                f"expect ≤ ref)",
                 nn, contribs)
     return ("STUPID",
             f"score = {s:+.3f} vs gflip — predicted slower"
@@ -272,7 +301,7 @@ def main():
     for k, v in sorted(GFLIP_REF.items()):
         print(f"  {k:18s} = {v:.4f}")
     print()
-    print("Sign-stable τ (from study_summary.py n=32768):")
+    print("Sign-stable τ (refit on consolidated wall labels n=35 variants):")
     for k, t in sorted(SIGN_STABLE_TAU.items(), key=lambda kv: -abs(kv[1])):
         print(f"  {k:18s} τ = {t:+.2f}  ({'higher worse' if t > 0 else 'lower worse'})")
     print()

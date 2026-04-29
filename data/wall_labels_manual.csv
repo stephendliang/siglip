@@ -1,0 +1,14 @@
+variant,delta_cyc_med,n_passes,sweep_id,note
+gflip_snrot,-823,16123,manual_20260429_n16123,from chat n=16123; baseline gflip_snrot 0; dgsw +823
+gflip_lmrev,-779,16123,manual_20260429_n16123,delta_vs_snrot=+44
+gflip_blkswap,-751,16123,manual_20260429_n16123,delta_vs_snrot=+72
+gflip_blkmul3,-615,16123,manual_20260429_n16123,delta_vs_snrot=+208
+gflip_quartswap,-603,16123,manual_20260429_n16123,delta_vs_snrot=+220
+gflip_blklmrev,-426,16123,manual_20260429_n16123,delta_vs_snrot=+397
+gflip,-360,16123,manual_20260429_n16123,delta_vs_snrot=+463
+lmrev,-312,16123,manual_20260429_n16123,delta_vs_snrot=+511
+dg4,-225,16123,manual_20260429_n16123,delta_vs_snrot=+598
+dgsnake,-20,16123,manual_20260429_n16123,delta_vs_snrot=+803
+dg_antisnake,87,16123,manual_20260429_n16123,delta_vs_snrot=+910
+snrot2,311,16123,manual_20260429_n16123,delta_vs_snrot=+1134
+gflip_cidperm,929,43910,manual_20260428_n43910,from CLAUDE.md n=43910 front sweep; delta_vs_blkswap=+1568; in-sweep dgsw_vs_blkswap=+639 -> cidperm-vs-dgsw = 1568 - 639

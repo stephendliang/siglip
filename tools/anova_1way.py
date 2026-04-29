@@ -257,6 +257,12 @@ def main():
     ap.add_argument("--boot", type=int, default=0,
                     help="bootstrap CI resamples for AUC/d/mean_rank/η² "
                          "(default 0 = off; 1000 typical, paired by --paired)")
+    ap.add_argument("--anchor", default=None,
+                    help="cell to use as the pairwise reference (default: "
+                         "fastest in cohort).  Pass a fixed name (e.g. "
+                         "dgsw) to make the Δ table cohort-invariant — same "
+                         "Δ values regardless of which other cells are in "
+                         "the sweep.")
     args = ap.parse_args()
 
     with open(args.csv) as f:
@@ -402,8 +408,20 @@ def main():
         lines.append("")
 
     sorted_cells = sorted(cell_means.items(), key=lambda kv: kv[1])
-    ref_lv, ref_mean = sorted_cells[0]
-    lines.append(f"pairwise effect size vs fastest = {ref_lv}:")
+    if args.anchor is not None:
+        if args.anchor not in cell_means:
+            print(f"ERROR: --anchor {args.anchor!r} not in factor levels: "
+                  f"{sorted(cell_means)}", file=sys.stderr)
+            sys.exit(1)
+        ref_lv = args.anchor
+        ref_mean = cell_means[ref_lv]
+        lines.append(f"pairwise effect size vs anchor = {ref_lv} "
+                     f"(cohort-invariant Δ; other cells sorted by mean):")
+    else:
+        ref_lv, ref_mean = sorted_cells[0]
+        lines.append(f"pairwise effect size vs fastest = {ref_lv} "
+                     f"(reference cohort-dependent — re-run with "
+                     f"--anchor for cohort-invariant Δ):")
     lines.append(f"  AUC bands: <0.55 TIE, <0.65 WEAK, <0.75 MODERATE, "
                  f"<0.85 STRONG, ≥0.85 DECISIVE")
     if args.boot > 0:
@@ -420,7 +438,8 @@ def main():
             blocks_pair[r[args.paired]].setdefault(r[args.factor], [])
             blocks_pair[r[args.paired]][r[args.factor]].append(float(r[args.metric]))
 
-    for lv, _ in sorted_cells[1:]:
+    cells_to_compare = [(lv, m) for lv, m in sorted_cells if lv != ref_lv]
+    for lv, _ in cells_to_compare:
         xs = cells[lv]
         if len(xs) < 2:
             continue
