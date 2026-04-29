@@ -814,6 +814,91 @@ int gflip_cidperm_swizzle_t(int lin) {
     return gflip_swizzle_t<DGG>(eff_lin);
 }
 
+/* TD=56: gflip_blklmrev.  Stack of lmrev (uniform lm bit-reverse on every
+                group) + blkswap (^4 on alt groups).  Asks whether Lever C
+                (adj_tm_diff) composes or saturates: blkswap and lmrev each
+                tied for first at n=43910, this stacks both mechanisms.
+                Bloom WORTHY (+1.53, edges lmrev's +1.46 by 0.07).  Bijection:
+                bitrev × XOR_alt = permutation × permutation = permutation.
+*/
+template<int DGG>
+static __device__ __forceinline__
+int gflip_blklmrev_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
+    const int num_groups  = (TILES_M + DGG - 1) / DGG;
+    int group_idx         = lin / group_tiles;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int paired      = group_idx ^ 1;
+    if (paired < num_groups) group_idx = paired;
+    const int first_m = group_idx * DGG;
+    const int nig     = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+    const int lm_raw  = in_group - (in_group / nig) * nig;
+    const int ln      = in_group / nig;
+    int lm = lm_raw;
+    if (nig == 8) {
+        lm = ((lm_raw & 1) << 2) | (lm_raw & 2) | ((lm_raw >> 2) & 1);
+        if (group_idx & 1) lm ^= 4;
+    }
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + ln;
+}
+
+/* TD=57: gflip_blkmul3.  Same alt-group structure as blkswap, but uses a
+                multiplicative permutation lm = (lm * 3) % 8 instead of XOR ^4.
+                gcd(3,8)=1 → bijection {0..7} → {0,3,6,1,4,7,2,5}.  More
+                disruptive than ^4: ^4 swaps two halves; *3 mod 8 scrambles
+                the order within.  Bloom WORTHY (+0.67).  Tests "is the
+                SPECIFIC lm^4 in blkswap optimal or any decorrelation works."
+*/
+template<int DGG>
+static __device__ __forceinline__
+int gflip_blkmul3_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
+    const int num_groups  = (TILES_M + DGG - 1) / DGG;
+    int group_idx         = lin / group_tiles;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int paired      = group_idx ^ 1;
+    if (paired < num_groups) group_idx = paired;
+    const int first_m = group_idx * DGG;
+    const int nig     = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+    const int lm_raw  = in_group - (in_group / nig) * nig;
+    const int ln      = in_group / nig;
+    int lm = lm_raw;
+    if (nig == 8 && (group_idx & 1)) lm = (lm_raw * 3) & 7;  /* mod 8 */
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + ln;
+}
+
+/* TD=58: gflip_quartswap.  Lighter blkswap — apply lm^4 only on group_idx %
+                4 == 1 (every 4th group), not every 2nd.  Halves the
+                perturbation density: 1/4 of paired groups have the ^4 twist
+                vs blkswap's 1/2.  Bloom WORTHY (+0.15, just above +0.10
+                threshold).  Calibration probe: if quartswap > blkswap, the
+                density optimum is finer; if quartswap < blkswap, blkswap is
+                already at the right density.
+*/
+template<int DGG>
+static __device__ __forceinline__
+int gflip_quartswap_swizzle_t(int lin) {
+    const int group_tiles = TILES_N * DGG;
+    const int num_groups  = (TILES_M + DGG - 1) / DGG;
+    int group_idx         = lin / group_tiles;
+    const int in_group    = lin - group_idx * group_tiles;
+    const int paired      = group_idx ^ 1;
+    if (paired < num_groups) group_idx = paired;
+    const int first_m = group_idx * DGG;
+    const int nig     = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+    const int lm_raw  = in_group - (in_group / nig) * nig;
+    const int ln      = in_group / nig;
+    int lm = lm_raw;
+    if (nig == 8 && (group_idx & 3) == 1) lm = lm_raw ^ 4;
+    int tm = first_m + lm;
+    if (tm >= TILES_M) tm = TILES_M - 1;
+    return tm * TILES_N + ln;
+}
+
 /* Single entry point — dispatched at compile time per kernel instantiation. */
 template<int TD, int DGG>
 static __device__ __forceinline__
@@ -845,6 +930,9 @@ int tile_swizzle_t(int lin) {
     else if constexpr (TD == 53) return gflip_snrot_swizzle_t<DGG>(lin);
     else if constexpr (TD == 54) return gflip_blkswap_swizzle_t<DGG>(lin);
     else if constexpr (TD == 55) return gflip_cidperm_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 56) return gflip_blklmrev_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 57) return gflip_blkmul3_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 58) return gflip_quartswap_swizzle_t<DGG>(lin);
     else return dgswizzle_t<DGG>(lin);
 }
 
@@ -1999,6 +2087,9 @@ static const VariantCfg VARIANTS[] = {
     VCFG("gflip_snrot", 53, 8),
     VCFG("gflip_blkswap",54, 8),
     VCFG("gflip_cidperm",55, 8),
+    VCFG("gflip_blklmrev",56, 8),
+    VCFG("gflip_blkmul3", 57, 8),
+    VCFG("gflip_quartswap",58, 8),
 };
 static const int N_VARIANTS = sizeof(VARIANTS) / sizeof(VARIANTS[0]);
 

@@ -697,12 +697,95 @@ def sw_gflip_cidperm(lin, G=8):
     which cluster owns which slot changes.  Probes SM→L2-partition affinity
     independent of wavefront shape — addresses the BLIND verdict from
     cluster_swizzle.py (saturated cluster_affinity test) by hitting a
-    different lever entirely."""
+    different lever entirely.
+
+    HISTORICAL: confirmed DECISIVE LOSER at n=43910 (+1568 cyc, AUC=0.891).
+    Bloom-filter overshoot threshold caught this pre-build (cluster_tm_corr
+    0.16 vs gflip 0.65, threshold 0.55).  Kept in tree as overshoot
+    calibration point."""
     c = lin % NC
     tt = lin // NC
     cp = (c * 15) % NC
     eff_lin = cp + tt * NC
     return sw_gflip(eff_lin, G)
+
+
+def sw_gflip_blklmrev(lin, G=8):
+    """PROPOSAL: stack lmrev (uniform lm bit-reverse) + blkswap (alt-group
+    lm^4).  Composes Lever C in two ways: lmrev's bit-rev permutation on
+    every group, then ^4 on the upper-half block of odd groups.  Both
+    blkswap and lmrev are tied at the n=43910 front (AUC=0.541 TIE) — this
+    asks whether their mechanisms compose (further +cyc reduction) or are
+    redundant (saturation, ties them).  Bijection: bitrev × XOR_alt =
+    permutation × permutation = permutation."""
+    gt = TILES_N * G
+    num_groups = (TILES_M + G - 1) // G
+    group_idx = lin // gt
+    in_g = lin - group_idx * gt
+    paired = group_idx ^ 1
+    if paired < num_groups:
+        group_idx = paired
+    first_m = group_idx * G
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    lmr = in_g % nig
+    ln = in_g // nig
+    if nig == 8:
+        lm = ((lmr & 1) << 2) | (lmr & 2) | ((lmr >> 2) & 1)
+        if group_idx & 1:
+            lm ^= 4
+    else:
+        lm = lmr
+    return first_m + lm, ln
+
+
+def sw_gflip_blkmul3(lin, G=8):
+    """PROPOSAL: gflip + alt-group lm = (lm * 3) % 8 instead of blkswap's
+    lm^4.  Same alt-group structure as blkswap, but uses a multiplicative
+    permutation (gcd(3,8)=1 → bijection: 0,1,2,3,4,5,6,7 → 0,3,6,1,4,7,2,5)
+    instead of XOR.  Tests whether the SPECIFIC lm^4 in blkswap is what wins
+    or any alt-group decorrelation suffices.  More disruptive: ^4 swaps two
+    halves; *3 mod 8 scrambles the order within."""
+    gt = TILES_N * G
+    num_groups = (TILES_M + G - 1) // G
+    group_idx = lin // gt
+    in_g = lin - group_idx * gt
+    paired = group_idx ^ 1
+    if paired < num_groups:
+        group_idx = paired
+    first_m = group_idx * G
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    lmr = in_g % nig
+    ln = in_g // nig
+    if nig == 8 and (group_idx & 1):
+        lm = (lmr * 3) % 8
+    else:
+        lm = lmr
+    return first_m + lm, ln
+
+
+def sw_gflip_quartswap(lin, G=8):
+    """PROPOSAL: blkswap-but-quarter — apply lm^4 only on group_idx % 4 == 1
+    (every 4th group), not every other (every 2nd).  Lighter perturbation
+    than blkswap's alt-group decorrelation: only 1/4 of groups have the ^4
+    twist, so 3/4 of paired CTAs traverse symmetrically.  Tests "is more
+    decorrelation or less better" — if quartswap > blkswap, the optimum is
+    finer; if quartswap < blkswap, blkswap is already at the right density."""
+    gt = TILES_N * G
+    num_groups = (TILES_M + G - 1) // G
+    group_idx = lin // gt
+    in_g = lin - group_idx * gt
+    paired = group_idx ^ 1
+    if paired < num_groups:
+        group_idx = paired
+    first_m = group_idx * G
+    nig = G if first_m + G <= TILES_M else TILES_M - first_m
+    lmr = in_g % nig
+    ln = in_g // nig
+    if nig == 8 and (group_idx % 4 == 1):
+        lm = lmr ^ 4
+    else:
+        lm = lmr
+    return first_m + lm, ln
 
 
 # ---------------------------------------------------------------- metrics
@@ -1009,6 +1092,10 @@ VARIANTS = [
 
     ("gflip_blkswap",     sw_gflip_blkswap),
     ("gflip_cidperm",     sw_gflip_cidperm),
+
+    ("gflip_blklmrev",    sw_gflip_blklmrev),
+    ("gflip_blkmul3",     sw_gflip_blkmul3),
+    ("gflip_quartswap",   sw_gflip_quartswap),
 ]
 
 

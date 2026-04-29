@@ -13,7 +13,7 @@
 # one whole-cell run.
 #
 # Variants in the sweep (matches main()'s VARIANT_TABLE in fc2_w3x.cu;
-# 28 templated cells, all built into one binary, SWEEP=all enumerates):
+# 31 templated cells, all built into one binary, SWEEP=all enumerates):
 #   dgsw / dg2 / dg4 / dg16 / dg32 — DG_GROUP_SIZE curve
 #   zigzag / rowmajor              — reference outliers (TD=11/13)
 #   checkered / dgsnake            — structural alternatives (TD=18/19)
@@ -28,6 +28,12 @@
 #   dg_antisnake / dg_tt_phase /   — round-4 probes (TD=49/50/51,
 #     wfd_latin                      lm-half / cluster-band / per-cluster
 #                                    tt-rotation)
+#   gflip_lmrev / gflip_snrot /    — round-5 (TD=52/53), round-6 (TD=54/55)
+#     gflip_blkswap / gflip_cidperm  bloom-filter survivors;
+#                                    blkswap+lmrev TIE @ n=43910 (front).
+#   gflip_blklmrev / gflip_blkmul3 — round-7 probes (TD=56/57/58, 2026-04-28
+#     / gflip_quartswap              bloom WORTHY, asking saturation/
+#                                    perturbation/density questions).
 #
 # History: TD=37 rowmaj and TD=42 tnblk are still in the binary as
 # documented dead-ends but are not in this sweep (n=4 confirmed losers
@@ -53,10 +59,24 @@
 #   CLUSTERS=1 REPS=128 tools/sweep_fc2_w3x_swizzle.sh     # +per-cluster
 #   tools/sweep_fc2_w3x_swizzle.sh my_outdir
 #
-# SWEEP=front expands to: dgsnake, lmrev, gflip (n=5489 front-tier TIE) +
-# snrot2, dgsw (close-behind WEAK + G=8 baseline) + gflip_lmrev, gflip_snrot,
-# gflip_blkswap, gflip_cidperm (the 4 bloom-filter survivors awaiting wall
-# verification).  9 variants vs all=28 → ~3× more passes per wall-clock minute.
+# SWEEP=front expands to the top 10 wall-vetted variants + 3 bloom-filter
+# survivors awaiting wall verification:
+#   front pair (TIE @ AUC=0.541): gflip_blkswap (TD=54, 3.29) + gflip_lmrev
+#     (TD=52, 3.48)
+#   MODERATE band: dgsnake (4.80) + gflip (4.98) + gflip_snrot (5.07) +
+#     lmrev (5.17) + snrot2 (5.34) + dgsw_G8 (5.40)
+#   STRONG anchors (full-sweep): dg_antisnake (10.04, +1140 cyc) +
+#     dg4 (11.99, +1809 cyc) — different-mechanism references.
+#   round-2 candidates (bloom WORTHY, 2026-04-28):
+#     gflip_blklmrev  (TD=56, s=+1.53) — lmrev × blkswap stack, asks "is
+#                     Lever C saturated?"
+#     gflip_blkmul3   (TD=57, s=+0.67) — alt-group lm = (lm*3)%8 instead of
+#                     blkswap's lm^4, asks "is the perturbation magnitude
+#                     the lever or any decorrelation?"
+#     gflip_quartswap (TD=58, s=+0.15) — lm^4 only every 4th group (vs
+#                     blkswap's every other), density-calibration probe.
+# Dropped: gflip_cidperm (DEAD, +1568 DECISIVE).
+# 13 variants vs all=31 → ~2.4× more passes per wall-clock minute.
 
 set -u
 cd "$(dirname "$0")/.."
@@ -68,7 +88,7 @@ BOOT=${BOOT:-0}
 CLUSTERS=${CLUSTERS:-0}
 
 if [ "$SWEEP" = "front" ]; then
-    SWEEP="dgsnake,lmrev,gflip,snrot2,dgsw,gflip_lmrev,gflip_snrot,gflip_blkswap,gflip_cidperm"
+    SWEEP="gflip_blkswap,gflip_lmrev,dgsnake,gflip,gflip_snrot,lmrev,snrot2,dgsw,dg_antisnake,dg4,gflip_blklmrev,gflip_blkmul3,gflip_quartswap"
 fi
 NVCC=${NVCC:-nvcc}
 CFLAGS='-gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static'

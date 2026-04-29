@@ -4,11 +4,11 @@ Hand-tuned SM100a persistent GEMM kernels for FC1 and FC2 layers of `google/sigl
 FP8 (E4M3) inputs, BF16 output, tcgen05 MMA, TMA, `cta_group::2` with 2-CTA clusters.
 Cross-compiled on CPU VPS, runs on B200 (148 SMs, 74 clusters). PE kernel is done — see `CLAUDE.md.mothballed`.
 
-## Current best (B200, 2026-04-26)
+## Current best (B200, 2026-04-28)
 
 | target | ms | kernel | dispatch | vs cuBLASLt rank-1 |
 |---|---|---|---|---|
-| FC2 K=3072 BIAS_ONLY | **~1.009** | `fc2_w3x` (bias-preload default, STSM-only) | dgswizzle PACKED | **−37 µs** (rank-1: 1.046) |
+| FC2 K=3072 BIAS_ONLY | **~1.008** | `fc2_w3x` (bias-preload default, STSM-only) | gflip_blkswap (TD=54) | **−38 µs** (rank-1: 1.046) |
 | FC2 K=3072 fused (+residual) | 1.063 | `fc2_w3` | dgswizzle TD=8 PACKED | (no apples-to-apples ref) |
 | FC1 K=768 fused (+GELU+bias) | 1.998 | `fc1_w3` | zigzag TD=11 + K_STAGGER=1 | +104 µs (rank-1: 1.894) |
 
@@ -105,53 +105,99 @@ path.
 L2 hit rate, 750MB less DRAM. dgswizzle (TD=8) lowest fused at 1.065 but bumps
 register count. LEAN remains in tree for large-K (re-verification under parity open).
 
-### fc2_w3x dispatch tier ranking (n=5489 paired-pass cycles, 2026-04-27)
+### fc2_w3x dispatch tier ranking (n=43910 front / n=10978 full, 2026-04-28)
 
 The `fc2_w3` table above is fused-with-residual. On `fc2_w3x` (bias-only,
-production for that path), the dispatch lever is real but compressed.
-Resolved at B200 vast.ai n=5489 paired cycles via `tools/sweep_fc2_w3x_swizzle.sh`
-+ `tools/anova_1way.py --metric cyc --paired rep --trim 0.33`. AUC bands
+production for that path), the dispatch lever is real and bigger than the
+n=5489 sweep suggested — once the bloom-filter survivors **gflip_blkswap
+(TD=54)** and **gflip_lmrev (TD=53)** were added to the candidate set, both
+displaced the entire prior "front-tier 3-way TIE" by ~500-1300 cyc.
+
+Two paired-pass sweeps via `tools/sweep_fc2_w3x_swizzle.sh` +
+`tools/anova_1way.py --metric cyc --paired rep --trim 0.33`. AUC bands
 < 0.55 TIE / < 0.65 WEAK / < 0.75 MODERATE / < 0.85 STRONG / ≥ 0.85 DECISIVE.
 
-| tier | variants | Δ vs fastest (cyc) | AUC vs dgsnake |
-|---|---|---|---|
-| **front (3-way TIE)** | **dgsnake (TD=19)**, lmrev, gflip (TD=33) | 0 / +117 / +151 | — / 0.533 / 0.547 |
-| WEAK behind | g4swap, snrot2, checkered, snrot1, dgsw_G8, lmsn | +180…+811 | 0.55–0.69 |
-| MODERATE | tn2br (TD=34), rowmajor, comboAC, zigzag, dg4diag, dg4pp | +907…+1244 | 0.70–0.73 |
-| STRONG | comboAB, dg4, dg2 | +1169…+1723 | 0.77–0.79 |
-| DECISIVE | dg16, dg32 | +3174 / +5323 | 0.98 / 1.00 |
+**Front-only sweep (9 cells, n=43910):**
 
-**Default still dgsw_G8** pending one verification sweep before flipping
-to dgsnake. dgsw is +443 cyc / d=0.42 / AUC=0.616 WEAK behind dgsnake —
-real signal at n=5489 but small.
+| variant | mean_rank | win% | Δ vs blkswap (cyc) | AUC |
+|---|---|---|---|---|
+| **gflip_blkswap (TD=54)** | **3.29** | **26.1%** | 0 | — |
+| **gflip_lmrev (TD=53)** | 3.48 | 20.8% | +131 | **0.541 TIE** |
+| dgsnake | 4.80 | 11.7% | +514 | 0.668 MODERATE |
+| gflip | 4.98 | 8.7% | +522 | 0.699 MODERATE |
+| gflip_snrot | 5.07 | 7.1% | +583 | 0.710 MODERATE |
+| snrot2 | 5.34 | 7.5% | +598 | 0.732 MODERATE |
+| lmrev | 5.17 | 7.8% | +610 | 0.710 MODERATE |
+| dgsw_G8 | 5.40 | 6.9% | +639 | 0.739 MODERATE |
+| gflip_cidperm | 7.48 | 3.5% | +1568 | 0.891 DECISIVE |
 
-**Demotions from earlier underpowered (n=6) "6-way tie at MMA floor"
-claim:** tn2br no longer tied (MODERATE, +907 cyc); dg4 family no longer
-tied (STRONG, +1296 cyc); dg4diag has the highest *win%* (12.61%) but
-σ_rank=6.2 — bimodal, mean_rank correctly demotes it. Use mean_rank
-over win% for default selection — it's worst-case-aware.
+blkswap and lmrev are statistically tied (AUC 0.541 at n=43910). blkswap
+won the front-only sweep, lmrev won the full 32-cell sweep — pick one;
+blkswap is default per slightly tighter front-only edge and L2-decorrelation
+mechanism (see below).
 
-**dg-G curve (cleanest data point):** G=2 +1723, G=4 +1296, G=8 +443
-(WEAK), G=16 +3174 (DECISIVE), G=32 +5323. G=8 is a true minimum.
-dgsnake stays in the G=8 family with a structural mod that nets −443 cyc.
+**Default flip: dgsw_G8 → gflip_blkswap (TD=54).** ~600 cyc / ~0.33 µs
+faster than the prior n=5489 front-tier; the n=5489 front (dgsnake/lmrev/
+gflip) is now MODERATE behind, not tied for first.
+
+**Why blkswap wins.** gflip pairs groups (g, g^1) onto the same B-strip
+via XOR=1. blkswap's `lm^4 if (group_idx & 1)` makes paired CTAs traverse
+the same M-window in *opposite* sub-orderings, decorrelating L2 access
+patterns within a wavefront slot. Mechanistic stack: gflip Lever A
+(cluster_tm_corr ↓) + half-application of Lever C (adj_tm_diff ↑ on alt
+groups). lmrev applies Lever C uniformly — different mechanism, same
+~tied-for-first wall.
+
+**cidperm DEAD as predicted by overshoot logic.** Permuting cluster_id
+by `*15 mod 74` keeps wavefront shape identical to gflip but breaks the
+natural cluster→SM→L2 contiguity that round-robin SM dispatch was
+already doing for free. cluster_tm_corr 0.16 (vs gflip 0.65) overshot
+the bloom-filter soft-reject threshold of 0.55 — wall confirmed +1568 cyc
+DECISIVE. Confirmed "overshoot = real" calibration point.
+
+**Demotions from prior n=5489 ranking:** lmrev moved 3rd→10th in full
+sweep with 32 competing cells (mean_rank 11.58); the n=5489 "front-tier
+TIE" was a small-cohort artifact. blkswap+lmrev are the clean front;
+everything else is MODERATE behind. dg4 family (G=2/4/8/16/32 curve)
+ranking unchanged: G=8 still the minimum within dg-only, but +639 cyc
+behind blkswap.
 
 **Methodology validation:** residual σ collapses raw 1500 → 1000 cyc →
 pass-major + per-pass mean subtraction cancels ~33% of raw variance.
-Tightest residual σ (most consistent dispatches): gflip 945, g4swap
-985, checkered 1025, dgsnake 1048. η²=0.45 large but driven by
-dg16/dg32 outlier tail; strip those and front tier is small/medium.
-
-**Older n=10 / n=6 ncu probe data** (long_sb, L2 hit%, DRAM rd, amp)
-for the front cluster — `tools/sweep_fc2_w3x_swizzle.sh` outputs from
-2026-04-23 — is preserved for reference but the wall ranking above
-supersedes the prior "±2 µs" lumping. PMIX (TD=31) cautionary case
-still holds: dgsw+rowmajor per-cluster mix passes bijection check yet
-destroys L2 staggering (51.82% hit) and doubles DRAM traffic.
+PMIX (TD=31) cautionary case still holds: dgsw+rowmajor per-cluster mix
+passes bijection check yet destroys L2 staggering (51.82% hit) and
+doubles DRAM traffic.
 
 The 6-warp persistent structure (no W7, no W2 EpilogueLoad) is less
-dispatch-sensitive than fc2_w3, but **not flat** — see
-`memory/project_w3x_n5489_top3.md` for the full sweep + the
-methodology that resolved it.
+dispatch-sensitive than fc2_w3 — but the lever is ~600 cyc / ~0.33 µs,
+not the +0.33 µs lumping the n=5489 ranking implied. See
+`memory/project_w3x_n43910_blkswap_win.md`.
+
+### Bloom filter validation (n=4 wall test, 2026-04-28)
+
+`tools/bloom_filter.py` correctly let through both winners (zero false
+negatives — paramount). Ground-truth scorecard:
+
+| variant | bloom verdict | s | wall result | match? |
+|---|---|---|---|---|
+| gflip_lmrev | WORTHY | +1.46 | WIN (full) | ✅ |
+| gflip_blkswap | WORTHY | +0.31 | WIN (front) | ✅ |
+| gflip_snrot | BUILD-ANYWAY | -0.00 | mid-tier (3rd) | ⚠️ over-promoted |
+| gflip_cidperm | WORTHY-BUT-OVERSHOOT-RISK | +5.45 | DECISIVE LOSER | ✅ flag fired |
+
+**False negatives: 0/2 winners.** lmrev's `adj_tm_diff` lift (×−τ=−0.50,
+contrib +1.13) and tm_extent gain (contrib +0.34) cleared the +0.10
+threshold cleanly. blkswap's smaller lift via half-application + tm_extent
+gain barely cleared (+0.31), but cleared. Use this pipeline before paying
+CUDA build + B200 sweep cost on new TD probes — both winners scored
+positive on the sign-stable τ axis.
+
+**Caveat — adj_tn_diff empirical channel may be stale.** snrot2 was
+originally labeled "empirical 2nd at n=32768" — at the new n=10978 with 32
+cells, snrot2 is 12th at +1750 cyc DECISIVE behind blkswap. The empirical
+channel correctly let gflip_snrot through (it landed mid-tier, not
+catastrophic), but the wording "snrot2-class, empirical 2nd" should be
+updated when next reviewed.
 
 ### Cleanest "DRAM amp ≠ bottleneck" proof (cutlass-static, 2026-04-23)
 
@@ -201,11 +247,15 @@ tn2br} centroid and dgsw_G8 baseline, top features by |Δ|, verdict band:
 | < 1.0 | WEAK SIGNAL — partly captured |
 | ≥ 1.0 | CAPTURES LEVER — top feature names it |
 
-**Current verdict (n=200 sweep, 2026-04-27): BLIND.** dgsnake/gflip/tn2br
-are metric-indistinguishable from dgsw_G8 — the +0.33 µs front-tier lever
-isn't in the wavefront-shape feature set. Use this pipeline before adding
-new TD probes: if the proposal's metric vector matches an existing tied
-cluster, the wall will too.
+**Current verdict (2026-04-28): PARTIALLY CAPTURES.** The earlier n=200
+"BLIND" call was on dgsnake/gflip/lmrev, which sit within ~150 cyc of each
+other and ARE metric-indistinguishable. But the bigger lever — `gflip_blkswap`
+(TD=54) and `gflip_lmrev` (TD=53), now front-tier — IS captured by the
+sign-stable τ axes (`adj_tm_diff`, `tm_extent_mean`). Both predicted WORTHY
+by `bloom_filter.py` (s=+0.31 and +1.46) before the wall test that confirmed
+them as winners. Use this pipeline before paying CUDA build + B200 sweep
+cost: WORTHY = build, OVERSHOOT-RISK = build but expect possible big
+regression (cidperm caught here), STUPID = don't.
 
 Why clustering, not regression: with 13 labeled points × 8 features the
 βs are unstable and an OLS/Lasso prediction is false-precision noise.
@@ -222,7 +272,7 @@ fused-residual data — pre-paired-analysis, pre-thermal-defense; deleted
 |---|---|---|
 | N_STAGES | NS6 for N≤1536, NS5 for N>1536 | SMEM per stage grows with N |
 | PREFILL | On for K_ITERS≥20, off otherwise | Short K-loop deadlocks (parity wrap) |
-| Dispatch | FC2: zigzag or dgswizzle. FC1: zigzag + K_STAGGER=1. | PACKED_TILES + odd ks on FC1; FC2 wash on ks. |
+| Dispatch | FC2 fused: zigzag or dgswizzle. FC2 bias-only: gflip_blkswap (TD=54) or gflip_lmrev (TD=53). FC1: zigzag + K_STAGGER=1. | PACKED_TILES + odd ks on FC1; FC2 wash on ks. |
 
 ## Compute floor
 
@@ -251,7 +301,7 @@ measured the **default heuristic pick**, not rank-1.
 |------|-----------|-----------|-----|
 | 1024 | ERR       | 0.859 (lean)        | n/a |
 | 2048 | ERR       | 0.922 (zigzag)      | n/a |
-| 3072 | **1.046** | 1.064 (dgsw fused) / **1.007 (w3x bias-only)** | +18 µs / **−39 µs** |
+| 3072 | **1.046** | 1.064 (dgsw fused) / **1.008 (w3x bias-only, blkswap TD=54)** | +18 µs / **−38 µs** |
 | 4096 | **1.360** | 1.476 (dgsw)        | +116 µs |
 | 6144 | **1.997** | 2.007 (dgsw)        | +10 µs |
 | 8192 | **2.682** | 2.731 (lean)        | +49 µs |
@@ -280,11 +330,13 @@ variant at compile time.
 
 K=1024/2048 still report ERR — one heuristic IMAs on the device.
 
-### Status (2026-04-26): bias-preload + STSM mandatory; baseline at ~1.009 ms
+### Status (2026-04-28): blkswap default + bias-preload + STSM mandatory; baseline at ~1.008 ms
 
-`fc2_w3x` bias-only at ~1.009 ms; W5 is MMA-ceiling-bound (~12482 cyc/tile ≈
-24 × 520 cyc/iter, per `PROFILE_W5`). Tensor pipe 95.84% active. See
-`docs/W3X_GRIEVANCES_VS_RANK1.md` for 9 remaining SASS deltas (15-25 µs total upside).
+`fc2_w3x` bias-only at ~1.008 ms with **gflip_blkswap (TD=54)** dispatch
+(prior dgsw_G8 default ~1.009 ms, +0.33 µs slower); W5 is MMA-ceiling-bound
+(~12482 cyc/tile ≈ 24 × 520 cyc/iter, per `PROFILE_W5`). Tensor pipe 95.84%
+active. See `docs/W3X_GRIEVANCES_VS_RANK1.md` for 9 remaining SASS deltas
+(15-25 µs total upside).
 
 **bias-preload (default, 2026-04-26)** — pre-loads full bias [768 bf16] into
 per-lane registers at kernel start; subpass-level shfl×4 replaces the per-rh
@@ -373,9 +425,12 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
   carry, SWIZZLE_64B, DROP_TRAIL_BARSYNC, WAIT_GROUP_READ,
   XPF_A/B prefetch (Bonferroni-confirmed regression in
   the 2026-04-26 128-cell combo sweep: XPF_A +3.05 µs at z=+6.30, XPF_B
-  +1.27 µs at z=+2.62; **macros removed from tree**), CHET/PMIX/INGH hybrid dispatches, 13 non-dgsw
-  TILE_DISPATCH variants (incl. gflip TD=33 in front-tier TIE w/ dgsnake at
-  n=5489; tn2br TD=34 demoted MODERATE — see `memory/project_w3x_n5489_top3.md`),
+  +1.27 µs at z=+2.62; **macros removed from tree**), CHET/PMIX/INGH hybrid dispatches,
+  gflip_cidperm (TD=55) +1568 cyc DECISIVE at n=43910 — `c*15 mod 74` cluster
+  permutation breaks SM→L2 contiguity (cluster_tm_corr 0.16 vs gflip 0.65,
+  bloom-filter overshoot threshold caught this). The earlier n=5489 "3-way
+  front TIE" (dgsnake/lmrev/gflip) is now MODERATE behind blkswap+lmrev at
+  n=43910 — superseded, see `memory/project_w3x_n43910_blkswap_win.md`.
   STAGGER=2 split-mbar
   (uniformly +3 µs across all 11 dispatches, zero stagger×dispatch interaction —
   +36 cyc on each of W4/W5 from extra arrive + extra mbar_wait; **macro removed
