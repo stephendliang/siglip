@@ -1,0 +1,1 @@
+gflip_xk2_blkswap,gflip_xk3_blkswap,gflip_xk5_blkswap,gflip_xk7_blkswap,gflip_blkx1,gflip_blkx2,gflip_blkx3,gflip_blkx5,gflip_blkx6,gflip_blkx7,gflip_blk_alt0,gflip_blk_qrt0,gflip_blk_qrt2,gflip_blk_qrt3,gflip_blk_n3k1,gflip_mul3,gflip_mul5,gflip_bitrev_xor1_alt1,gflip_bitrev_xor2_alt1,gflip_mul3_xor4_alt1

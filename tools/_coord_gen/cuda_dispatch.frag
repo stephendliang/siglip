@@ -1,0 +1,21 @@
+/* tile_swizzle_t<TD,DGG> switch arms — splice into the if/else chain */
+    else if constexpr (TD == 80) return gflip_xk2_blkswap_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 81) return gflip_xk3_blkswap_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 82) return gflip_xk5_blkswap_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 83) return gflip_xk7_blkswap_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 84) return gflip_blkx1_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 85) return gflip_blkx2_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 86) return gflip_blkx3_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 87) return gflip_blkx5_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 88) return gflip_blkx6_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 89) return gflip_blkx7_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 90) return gflip_blk_alt0_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 91) return gflip_blk_qrt0_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 92) return gflip_blk_qrt2_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 93) return gflip_blk_qrt3_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 94) return gflip_blk_n3k1_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 95) return gflip_mul3_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 96) return gflip_mul5_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 97) return gflip_bitrev_xor1_alt1_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 98) return gflip_bitrev_xor2_alt1_swizzle_t<DGG>(lin);
+    else if constexpr (TD == 99) return gflip_mul3_xor4_alt1_swizzle_t<DGG>(lin);
