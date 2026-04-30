@@ -116,8 +116,8 @@ Compile-time flags:
 #include "tile_dispatch.cuh"
 
 
-/* ── Epilogue store levers (A, B, C) ── */
-/* Lever A: TMA_STORE_WIDE=1 — tma_c box {64,32}->{64,64}, halves UTMASTG by
+/* ── Epilogue store flags (TMA_STORE_WIDE / EPI_SINGLE_PASS / USE_STMATRIX) ── */
+/* TMA_STORE_WIDE=1 — tma_c box {64,32}->{64,64}, halves UTMASTG by
    doubling rows (NOT cols: CU_TENSOR_MAP_SWIZZLE_128B caps boxDim[0]*esize
    at 128B, so 128 BF16 cols = 256B is illegal).  Wide-rows packs 2 warps
    worth of row groups into one TMA issue: warp 0 row group + warp 1 row
@@ -125,11 +125,11 @@ Compile-time flags:
    pair issues the TMA (the odd warp's STS completes before BAR_EPI_SYNC).
    SMEM layout is unchanged vs narrow — 4 row groups × 4 KB each — the TMA
    descriptor is the only thing that widens.
-   Lever B: EPI_SINGLE_PASS=1 — collapses NUM_EPI_SUBITERS 4->1 (full TN in
+   EPI_SINGLE_PASS=1 — collapses NUM_EPI_SUBITERS 4->1 (full TN in
    one pass), eliminates 3 inter-sub-iter BAR_EPI_SYNC + 3 wait_group 1 stalls,
    batches all TMAs under one commit_group.  Default forces N_STAGES=5 and
    NUM_EPI_STAGES=1 to fit SMEM budget (full-tile staging doubles epilogue SMEM).
-   Lever C: USE_STMATRIX=1 — stmatrix.sync.aligned.x4.m8n8.shared.b16 instead
+   USE_STMATRIX=1 — stmatrix.sync.aligned.x4.m8n8.shared.b16 instead
    of st.shared.v4.b32.  NOT a drop-in correctness-wise on this kernel —
    rank-2 uses LDTM.16dp256bit.x4 which produces a 16-row x4-matrix register
    layout that matches stmatrix, whereas our tcgen05.ld.32x32b.x32.b32 gives
@@ -164,8 +164,8 @@ Compile-time flags:
 #define NO_INTRA_WAIT    0
 #endif
 
-/* All levers keep 64-col, 128B-row SMEM staging — only TMA descriptor +
-   issue pattern changes under Lever A. */
+/* All flags keep 64-col, 128B-row SMEM staging — only TMA descriptor +
+   issue pattern changes under TMA_STORE_WIDE. */
 #define EPI_COL_STRIDE            64
 #define TMA_BOX_COLS              64
 #define STAGING_REGION_ROW_BYTES  128
@@ -191,8 +191,8 @@ Compile-time flags:
    (measured). Default: drop one mainloop stage (NS=6 → NS=5) when a lever
    needs +32 KB staging, rather than forcing EPI_REUSE_SMEM. To force
    REUSE at NS=6 instead, pass -DEPI_REUSE_FORCE=1.
-   Lever A wide-rows keeps the SMEM footprint identical to narrow (same row
-   stride, same region size), so NS=6 always fits under A alone.
+   TMA_STORE_WIDE wide-rows keeps the SMEM footprint identical to narrow (same row
+   stride, same region size), so NS=6 always fits with TMA_STORE_WIDE alone.
    Only true single-pass (needs 64 KB/stage regardless) forces NS=5. */
 #ifndef N_STAGES
 #if defined(EPI_REUSE_FORCE) && EPI_REUSE_FORCE
@@ -425,9 +425,9 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 
 /*
 EPI_REUSE_SMEM: borrow the last mainloop stage(s) for epilogue staging.
-Empirically slower than dropping N_STAGES on FC2 (see note above on levers).
+Empirically slower than dropping N_STAGES on FC2 (see note above on store flags).
 Auto-enabled only when NS>=7 (mainloop alone doesn't fit).
-Opt-in for lever configs via -DEPI_REUSE_FORCE=1.
+Opt-in via -DEPI_REUSE_FORCE=1.
 */
 #if N_STAGES >= 7
 #define EPI_REUSE_SMEM     1
@@ -452,7 +452,7 @@ Opt-in for lever configs via -DEPI_REUSE_FORCE=1.
 
 /* Epilogue staging: ReuseSmemC — 2-stage circular pipe.
    Each per-warp region holds 32 rows × 64 cols × 2B = 4 KB.
-   Lever A widens the TMA box rows 32->64 but NOT the SMEM layout — the wide
+   TMA_STORE_WIDE widens the TMA box rows 32->64 but NOT the SMEM layout — the wide
    TMA just reads 2 adjacent warp regions as one 64-row × 128B block (8 KB).
    EPI_SINGLE_PASS=1: one stage holds all 4 sub-iter's data for a tile
    (EPI_TMAS_PER_WARP=4), so stage size scales by TN/TMA_BOX_COLS. */
@@ -630,7 +630,7 @@ void tcgen05_commit_mcast(uint32_t mbar_addr, uint16_t cta_mask) {
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory")
 
 /*
-Lever C: stmatrix.sync.aligned.x4.m8n8.shared.b16 instead of st.shared.v4.b32.
+STSM: stmatrix.sync.aligned.x4.m8n8.shared.b16 instead of st.shared.v4.b32.
 Same 16 B/lane payload, but routed through the dedicated stmatrix unit.
 
 CAVEAT (untested): our TMEM load (tcgen05.ld.sync x64.b32) produces a
@@ -3492,7 +3492,7 @@ __global__ void init_residual(__nv_bfloat16* __restrict__ res, int n_dim, long l
 }
 
 /*
-Row-varying A init for Lever C diagnostic.
+Row-varying A init for STSM diagnostic.
 A[row, k] = 0x38 + (row & 7), giving 8 distinct E4M3 values per 8-row block:
     0x38=1.0, 0x39=1.125, 0x3A=1.25, 0x3B=1.375,
     0x3C=1.5, 0x3D=1.625, 0x3E=1.75, 0x3F=1.875.
@@ -3596,7 +3596,7 @@ int main() {
 
     /* A: row-varying FP8 pattern — A[row, k] = 0x38 + (row & 7).
        8 distinct values cycle every 8 rows, matching LDTM's 8-row stride so
-       STSM row-permutation bugs (Lever C) become visible in the validator. */
+       STSM row-permutation bugs become visible in the validator. */
     {
         long long total = (long long)M_TOTAL * K_DIM;
         int tpb = 256;
@@ -3957,14 +3957,14 @@ int main() {
            __bfloat162float(h_C[2]), __bfloat162float(h_C[3]));
 
     /*
-    Lever C diagnostic: dump tile [0,0] first 8 rows × 8 cols, show inferred
+    STSM diagnostic: dump tile [0,0] first 8 rows × 8 cols, show inferred
     source row by back-solving a_val from the observed BF16 value. If STSM
     permutes rows, we'll see e.g. row 0 dst holding data from src row 8. If
     STSM collides addresses (3/4 of SMEM stale), we'll see zeros or garbage.
     Always prints — useful both to confirm correct behavior and to diagnose.
     */
     if (valid == 0 || getenv("FC2_DIAG") != nullptr) {
-        printf("\n=== Lever C DIAGNOSTIC: tile[0,0] rows 0..7 × cols 0..7 ===\n");
+        printf("\n=== STSM DIAGNOSTIC: tile[0,0] rows 0..7 × cols 0..7 ===\n");
         printf("a_val table: row&7=0:1.000 1:1.125 2:1.250 3:1.375 4:1.500 5:1.625 6:1.750 7:1.875\n");
         printf("%-4s %-52s %-16s %s\n", "row", "observed cols 0..7", "src_row", "note");
         for (int row = 0; row < 8; row++) {

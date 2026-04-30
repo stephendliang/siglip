@@ -4,11 +4,11 @@ Hand-tuned SM100a persistent GEMM kernels for FC1 and FC2 layers of `google/sigl
 FP8 (E4M3) inputs, BF16 output, tcgen05 MMA, TMA, `cta_group::2` with 2-CTA clusters.
 Cross-compiled on CPU VPS, runs on B200 (148 SMs, 74 clusters). PE kernel is done — see `CLAUDE.md.mothballed`.
 
-## Current best (B200, 2026-04-28)
+## Current best (B200, 2026-04-29)
 
 | target | ms | kernel | dispatch | vs cuBLASLt rank-1 |
 |---|---|---|---|---|
-| FC2 K=3072 BIAS_ONLY | **~1.008** | `fc2_w3x` (bias-preload default, STSM-only) | gflip_blkswap (TD=54) | **−38 µs** (rank-1: 1.046) |
+| FC2 K=3072 BIAS_ONLY | **~1.008** | `fc2_w3x` (bias-preload default, STSM-only) | any of `{blkswap, blkx5/6/7, blk_qrt0/2/3}` (basin floor) | **−38 µs** (rank-1: 1.046) |
 | FC2 K=3072 fused (+residual) | 1.063 | `fc2_w3` | dgswizzle TD=8 PACKED | (no apples-to-apples ref) |
 | FC1 K=768 fused (+GELU+bias) | 1.998 | `fc1_w3` | zigzag TD=11 + K_STAGGER=1 | +104 µs (rank-1: 1.894) |
 
@@ -105,92 +105,103 @@ path.
 L2 hit rate, 750MB less DRAM. dgswizzle (TD=8) lowest fused at 1.065 but bumps
 register count. LEAN remains in tree for large-K (re-verification under parity open).
 
-### fc2_w3x dispatch tier ranking (n=43910 front / n=10978 full, 2026-04-28)
+### fc2_w3x dispatch — basin floor, not a peak (n=29420, 2026-04-29)
 
 The `fc2_w3` table above is fused-with-residual. On `fc2_w3x` (bias-only,
-production for that path), the dispatch lever is real and bigger than the
-n=5489 sweep suggested — once the bloom-filter survivors **gflip_blkswap
-(TD=54)** and **gflip_lmrev (TD=53)** were added to the candidate set, both
-displaced the entire prior "front-tier 3-way TIE" by ~500-1300 cyc.
+production for that path), the m-axis dispatch lever is **a wide tied
+basin, not a sharp peak**. A 2-stage coord-descent sweep over 20 byte-cheap
+neighborhood probes (TD=80..99) + the 3 prior round-7 probes converged on
+this conclusion.
 
 Two paired-pass sweeps via `tools/sweep_fc2_w3x_swizzle.sh` +
 `tools/anova_1way.py --metric cyc --paired rep --trim 0.33`. AUC bands
 < 0.55 TIE / < 0.65 WEAK / < 0.75 MODERATE / < 0.85 STRONG / ≥ 0.85 DECISIVE.
 
-**Front-only sweep (9 cells, n=43910):**
+**Stage 2 sweep (11 cells, n=29420):**
 
-| variant | mean_rank | win% | Δ vs blkswap (cyc) | AUC |
-|---|---|---|---|---|
-| **gflip_blkswap (TD=54)** | **3.29** | **26.1%** | 0 | — |
-| **gflip_lmrev (TD=53)** | 3.48 | 20.8% | +131 | **0.541 TIE** |
-| dgsnake | 4.80 | 11.7% | +514 | 0.668 MODERATE |
-| gflip | 4.98 | 8.7% | +522 | 0.699 MODERATE |
-| gflip_snrot | 5.07 | 7.1% | +583 | 0.710 MODERATE |
-| snrot2 | 5.34 | 7.5% | +598 | 0.732 MODERATE |
-| lmrev | 5.17 | 7.8% | +610 | 0.710 MODERATE |
-| dgsw_G8 | 5.40 | 6.9% | +639 | 0.739 MODERATE |
-| gflip_cidperm | 7.48 | 3.5% | +1568 | 0.891 DECISIVE |
+| variant | mean_rank | Δ̄ resid | σ resid | Δ vs dgsw | AUC vs dgsw |
+|---|---|---|---|---|---|
+| gflip_blkx7 | **5.25** | −205 | 6761 ⚠ | −738 | 0.315 MODERATE |
+| gflip_blk_qrt3 | 5.31 | −234 | 1415 | −767 | 0.318 MODERATE |
+| gflip_blkx6 | 5.32 | −237 | 1351 | −770 | 0.315 MODERATE |
+| gflip_blk_qrt2 | 5.43 | −211 | 1362 | −744 | 0.321 MODERATE |
+| gflip_blk_qrt0 | 5.59 | −100 | 6928 ⚠ | −634 | 0.341 MODERATE |
+| gflip_blkswap | 5.63 | −119 | 1443 | −652 | 0.349 MODERATE |
+| gflip_blkx5 | 5.69 | −122 | 1352 | −655 | 0.341 MODERATE |
+| gflip_bitrev_xor1_alt1 | 6.06 | −16 | 1379 | −550 | 0.365 WEAK |
+| gflip_lmrev | 6.54 | +172 | 1506 | −362 | 0.412 WEAK |
+| dgsw | 7.47 | +533 | 1576 | 0 | — |
+| dg_snlmrev | 7.73 | +539 | 1420 | +5 | 0.501 TIE |
 
-blkswap and lmrev are statistically tied (AUC 0.541 at n=43910). blkswap
-won the front-only sweep, lmrev won the full 32-cell sweep — pick one;
-blkswap is default per slightly tighter front-only edge and L2-decorrelation
-mechanism (see below).
+**Top 7 cells form a tied basin** (mean_rank 5.25–5.69, residual Δ̄ within
+~135 cyc). η²=0.0075 NEGLIGIBLE — the swizzle factor barely explains
+within-basin variance at this resolution. blkx6 and blk_qrt3 are the
+cleanest leaders (low σ, MODERATE faster than dgsw); blkx7/blk_qrt0 have
+better mean_rank but σ_residual=~7000 indicates outlier-tail in their
+point estimates.
 
-**Default flip: dgsw_G8 → gflip_blkswap (TD=54).** ~600 cyc / ~0.33 µs
-faster than the prior n=5489 front-tier; the n=5489 front (dgsnake/lmrev/
-gflip) is now MODERATE behind, not tied for first.
+**lmrev demoted: prior "blkswap+lmrev TIE for first" was n=43910 sweep
+artifact.** With the wider candidate set lmrev lands ~5th-9th depending
+on resolution. The bloom filter pre-flagged it MARGINAL (not WORTHY) — so
+the demotion is consistent with the model. lmrev's σ=768 in the earlier
+n=2048 stage-1 was a fluke that produced a misleading DECISIVE call;
+Stage 2 corrected it.
 
-**Why blkswap wins.** gflip pairs groups (g, g^1) onto the same B-strip
-via XOR=1. blkswap's `lm^4 if (group_idx & 1)` makes paired CTAs traverse
-the same M-window in *opposite* sub-orderings, decorrelating L2 access
-patterns within a wavefront slot. Mechanistic stack: gflip Lever A
-(cluster_tm_corr ↓) + half-application of Lever C (adj_tm_diff ↑ on alt
-groups). lmrev applies Lever C uniformly — different mechanism, same
-~tied-for-first wall.
+**Why the basin exists.** Once gflip's XOR=1 group pairing is in place
+(pair-axis: `cluster_tm_corr ↓` from 0.94 → 0.65), *any* m-axis
+perturbation that decorrelates paired CTAs' tm-traversal saturates the
+gain. blkswap (`lm^4` on alt groups), lmrev (uniform bit-rev), blkx5/6/7
+(varying alt-mask), blk_qrt0/2/3 (qtr-density mask) all produce the same
+~600-770 cyc improvement. The sub-tier within the basin (~135 cyc spread)
+is below paired-pass resolution at n=29420.
 
-**cidperm DEAD as predicted by overshoot logic.** Permuting cluster_id
-by `*15 mod 74` keeps wavefront shape identical to gflip but breaks the
-natural cluster→SM→L2 contiguity that round-robin SM dispatch was
-already doing for free. cluster_tm_corr 0.16 (vs gflip 0.65) overshot
-the bloom-filter soft-reject threshold of 0.55 — wall confirmed +1568 cyc
-DECISIVE. Confirmed "overshoot = real" calibration point.
+**Three sub-tiers within the gflip family (Stage 1 n=2048, 28 variants):**
 
-**Demotions from prior n=5489 ranking:** lmrev moved 3rd→10th in full
-sweep with 32 competing cells (mean_rank 11.58); the n=5489 "front-tier
-TIE" was a small-cohort artifact. blkswap+lmrev are the clean front;
-everything else is MODERATE behind. dg4 family (G=2/4/8/16/32 curve)
-ranking unchanged: G=8 still the minimum within dg-only, but +639 cyc
-behind blkswap.
+| sub-tier | members | Δ vs dgsw | mean_rank |
+|---|---|---|---|
+| **floor** (XK=1 + m-axis perturbation) | blkx5/6/7, blk_qrt0/2/3, blkswap, lmrev, bitrev_xor1_alt1 | −600 to −770 | 5–17 |
+| **mid** (weaker m-axis perturbation) | blklmrev, blkmul3, blkx1/2, mul5 | −400 to −500 | 19–21 |
+| **shallow** (gflip alone or wrong pairing axis) | bare gflip, xk2/3/5/7_blkswap, snrot | −100 to −300 | 22–27 |
 
-**Methodology validation:** residual σ collapses raw 1500 → 1000 cyc →
-pass-major + per-pass mean subtraction cancels ~33% of raw variance.
-PMIX (TD=31) cautionary case still holds: dgsw+rowmajor per-cluster mix
-passes bijection check yet destroys L2 staggering (51.82% hit) and
-doubles DRAM traffic.
+Three catastrophic gflip failures stay relevant: `gflip_cidperm` (TD=55,
++1718 DECISIVE — `*15 mod 74` cluster permutation breaks SM→L2
+contiguity, cluster_tm_corr 0.16 vs gflip 0.65), `gflip_xk2/3/5/7_blkswap`
+(non-XK=1 pairing pairs non-adjacent groups, slower than blkswap), and
+bare `gflip` (does pair-axis only, ~80% of gain comes from the m-axis
+perturbation).
 
-The 6-warp persistent structure (no W7, no W2 EpilogueLoad) is less
-dispatch-sensitive than fc2_w3 — but the lever is ~600 cyc / ~0.33 µs,
-not the +0.33 µs lumping the n=5489 ranking implied. See
-`memory/project_w3x_n43910_blkswap_win.md`.
+**Default dispatch:** `gflip_blkswap` (TD=54) stays — middle of the basin,
+zero churn. blkx6/blk_qrt3 are ~115 cyc faster but at TIE-band resolution
+(~0.06 µs wall, below thermal-drift noise on B200). The basin shape is
+the load-bearing finding, not the choice within it. See
+`memory/project_w3x_n29420_basin.md` (write-up pending).
 
-### Bloom filter validation (n=4 wall test, 2026-04-28)
+### Bloom filter validation (n=24 wall test across 2 sweeps, 2026-04-29)
 
-`tools/bloom_filter.py` correctly let through both winners (zero false
-negatives — paramount). Ground-truth scorecard:
+`tools/bloom_filter.py` is **conservative-let-through, not predictive** —
+its purpose is zero false negatives on wall winners, and that bar is
+satisfied. Cumulative scorecard across the n=43910 + n=29420 sweeps:
 
-| variant | bloom verdict | s | wall result | match? |
-|---|---|---|---|---|
-| gflip_lmrev | WORTHY | +1.46 | WIN (full) | ✅ |
-| gflip_blkswap | WORTHY | +0.31 | WIN (front) | ✅ |
-| gflip_snrot | BUILD-ANYWAY | -0.00 | mid-tier (3rd) | ⚠️ over-promoted |
-| gflip_cidperm | WORTHY-BUT-OVERSHOOT-RISK | +5.45 | DECISIVE LOSER | ✅ flag fired |
+| bloom verdict | count | wall outcome | match? |
+|---|---|---|---|
+| WORTHY (s ≥ +0.10) | 4 | 4 in basin floor | ✅ |
+| MARGINAL (−0.10 < s < +0.10) | 16 | 14 basin/MODERATE faster, 2 WEAK | ✅ no false reject |
+| STUPID / OVERSHOOT-RISK | 5 | all in TIE/WEAK or DECISIVE LOSER (cidperm) | ✅ no false promote |
 
-**False negatives: 0/2 winners.** lmrev's `adj_tm_diff` lift (×−τ=−0.50,
-contrib +1.13) and tm_extent gain (contrib +0.34) cleared the +0.10
-threshold cleanly. blkswap's smaller lift via half-application + tm_extent
-gain barely cleared (+0.31), but cleared. Use this pipeline before paying
-CUDA build + B200 sweep cost on new TD probes — both winners scored
-positive on the sign-stable τ axis.
+**False negatives: 0/7 floor-tier winners.** The model can't discriminate
+within the basin (16 MARGINAL cells include known basin-floor members
+like blkx6 and blk_qrt3 — bloom let them through, wall confirmed). Use
+this pipeline before paying CUDA build + B200 sweep cost: WORTHY = build,
+MARGINAL = build (treat as unknown), OVERSHOOT-RISK = build but expect
+possible regression, STUPID = skip unless you want negative-control data.
+
+**Calibration data point — Stage 1 lmrev DECISIVE collapsed at Stage 2.**
+n=2048 paired-pass mean_rank had lmrev at 6.18 win% 36.2% (DECISIVE Δ
+−1605 vs dgsw); n=29420 demoted it to mean_rank 6.54, win% 6.6% (WEAK
+Δ −362). The bloom filter pre-flagged it MARGINAL (not WORTHY) — so
+the model was correctly skeptical even when small-cohort wall data
+appeared decisive. Don't trust mean_rank-based ordering at n<5000 for
+sub-σ_residual (~600 cyc) effects.
 
 **Caveat — adj_tn_diff empirical channel may be stale.** snrot2 was
 originally labeled "empirical 2nd at n=32768" — at the new n=10978 with 32
@@ -272,7 +283,7 @@ fused-residual data — pre-paired-analysis, pre-thermal-defense; deleted
 |---|---|---|
 | N_STAGES | NS6 for N≤1536, NS5 for N>1536 | SMEM per stage grows with N |
 | PREFILL | On for K_ITERS≥20, off otherwise | Short K-loop deadlocks (parity wrap) |
-| Dispatch | FC2 fused: zigzag or dgswizzle. FC2 bias-only: gflip_blkswap (TD=54) or gflip_lmrev (TD=53). FC1: zigzag + K_STAGGER=1. | PACKED_TILES + odd ks on FC1; FC2 wash on ks. |
+| Dispatch | FC2 fused: zigzag or dgswizzle. FC2 bias-only: any basin-floor variant — `gflip_blkswap` (TD=54) is default, `blkx6`/`blk_qrt3` ~115 cyc faster at TIE-band. FC1: zigzag + K_STAGGER=1. | PACKED_TILES + odd ks on FC1; FC2 wash on ks. |
 
 ## Compute floor
 
@@ -347,7 +358,7 @@ race risk (same SMEM data, just read once vs N times). Regs 56→65 / stack
 16 B / 0 spills. Promoted to default + `!BIAS_PRELOAD` path stripped from the
 tree. See `memory/project_w3x_bias_preload_win.md`.
 
-**STSM (Lever C, mandatory)** — `bcce329` layout fix matches rank-1 SASS
+**STSM (mandatory)** — `bcce329` layout fix matches rank-1 SASS
 opcode mix (STS.128 4→0, STSM.16.M88.4 0→4). B200 n=10 (2026-04-25): PASS,
 mean 1.0039 ± 0.0004 ms vs legacy STS 1.0043 ± 0.0002 ms. The legacy
 STS.128 path was retired with bias-preload (the bias-broadcast pattern only
@@ -429,8 +440,10 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
   gflip_cidperm (TD=55) +1568 cyc DECISIVE at n=43910 — `c*15 mod 74` cluster
   permutation breaks SM→L2 contiguity (cluster_tm_corr 0.16 vs gflip 0.65,
   bloom-filter overshoot threshold caught this). The earlier n=5489 "3-way
-  front TIE" (dgsnake/lmrev/gflip) is now MODERATE behind blkswap+lmrev at
-  n=43910 — superseded, see `memory/project_w3x_n43910_blkswap_win.md`.
+  front TIE" (dgsnake/lmrev/gflip) is MODERATE behind the n=29420 7-cell
+  basin (blkswap, blkx5/6/7, blk_qrt0/2/3); the n=43910 "blkswap+lmrev
+  TIE" is also superseded — lmrev demoted to mid-pack with the wider
+  candidate set. See basin section above.
   STAGGER=2 split-mbar
   (uniformly +3 µs across all 11 dispatches, zero stagger×dispatch interaction —
   +36 cyc on each of W4/W5 from extra arrive + extra mbar_wait; **macro removed
@@ -500,7 +513,7 @@ fc2_hybrid.cu, fc2_ldg.cu, fc2.cu  # DEAD
 kernel_common.cuh, kernel_body.cuh # Shared infra
 Makefile                        # sm_100a, DFLAGS for dim override
 docs/W3X_GRIEVANCES_VS_RANK1.md # 9 SASS-level deltas vs rank-1
-docs/LEVER_C_STATUS.md          # STSM layout playbook
+docs/STSM_STATUS.md             # STSM layout playbook
 docs/PURE_PTX_REWRITE_STRATEGY.md
 docs/BENCHMARKING.md            # cycles/AUC/η²/rank study guide — read before benchmarking
 rank1.sass                      # Dumped cuBLASLt rank-1 for diffing
@@ -560,6 +573,14 @@ work in this repo:
   rank**, **win%**. **No p-values** — they're meaningless at large n.
 - `tools/anova_1way.py --metric cyc --paired rep --trim 0.33` is the canonical
   invocation; `tools/sweep_fc2_w3x_*.sh` uses it by default.
+- **n thresholds for paired-pass (σ_residual ~1400 cyc on fc2_w3x):**
+  n<5000 unreliable for sub-σ effects (Stage 1 of coord-descend had lmrev
+  DECISIVE at n=2048; Stage 2 demoted it to mid-pack at n=29420). For
+  ~600 cyc Δ across MODERATE-band cells use **n≥10978**; to crack TIE band
+  (~150 cyc) use **n≥43910** — but expect that within-basin separations
+  may sit below the resolution floor regardless of n. Default 2-stage flow:
+  Stage 1 REPS=2048 across all candidates to filter to top ~7, Stage 2
+  REPS=43910 on survivors + anchors.
 
 ## Code style
 

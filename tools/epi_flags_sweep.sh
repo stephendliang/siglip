@@ -1,5 +1,5 @@
 #!/bin/bash
-# FC2 epi-lever combinatorial sweep.
+# FC2 epi-store-flags combinatorial sweep.
 #
 # Axes (3-bit ABC):
 #   A = TMA_STORE_WIDE  (0=narrow 64-col box, 1=wide 128-col)
@@ -12,17 +12,17 @@
 #   gemm-reuse — gemm + EPI_REUSE_SMEM (NS=6 single-pass path via borrow;
 #                only legal for single-pass variants B=1)
 #
-# Timeouts guard against variants that deadlock on B200 (Lever B / REUSE
+# Timeouts guard against variants that deadlock on B200 (EPI_SINGLE_PASS / REUSE
 # paths are new and untested). Per-binary reps are averaged via @@RESULT.
 #
 # Usage:
-#   ./tools/epi_lever_sweep.sh                   # build + run all
-#   ./tools/epi_lever_sweep.sh --build-only      # build only, no run
-#   ./tools/epi_lever_sweep.sh --run-only        # skip build
-#   ./tools/epi_lever_sweep.sh --reps=3          # 3 runs per variant, take min
-#   TIMEOUT=20 ./tools/epi_lever_sweep.sh        # override 15s default
-#   ./tools/epi_lever_sweep.sh --only=gemm       # only GEMM_ONLY group
-#   ./tools/epi_lever_sweep.sh --out=data/run1   # custom outdir
+#   ./tools/epi_flags_sweep.sh                   # build + run all
+#   ./tools/epi_flags_sweep.sh --build-only      # build only, no run
+#   ./tools/epi_flags_sweep.sh --run-only        # skip build
+#   ./tools/epi_flags_sweep.sh --reps=3          # 3 runs per variant, take min
+#   TIMEOUT=20 ./tools/epi_flags_sweep.sh        # override 15s default
+#   ./tools/epi_flags_sweep.sh --only=gemm       # only GEMM_ONLY group
+#   ./tools/epi_flags_sweep.sh --out=data/run1   # custom outdir
 
 set -uo pipefail
 cd "$(dirname "$0")/.."

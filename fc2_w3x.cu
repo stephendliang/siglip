@@ -708,7 +708,7 @@ int wfd_latin_swizzle_t(int lin) {
 
 /*
   TD=52..53 added 2026-04-28 from bloom_filter score-vs-gflip + analyzer
-  feature signatures.  Both compose gflip's group_idx XOR 1 swap (Lever A:
+  feature signatures.  Both compose gflip's group_idx XOR 1 swap (pair-axis:
   cluster_tm_corr 0.94→0.65) with a within-group transform.
 
     52 gflip_lmrev — gflip + 3-bit reverse on lm at G=8.  Pushes adj_tm_diff
@@ -796,7 +796,7 @@ int gflip_blkswap_swizzle_t(int lin) {
                 → bijection on [0,74)) before plugging into gflip's body.
                 Wavefront SET unchanged at every tick — only the cluster→tile
                 slot mapping shifts.  Probes SM→L2-partition affinity (the
-                BLIND lever cluster_swizzle.py flagged) without disturbing
+                BLIND axis cluster_swizzle.py flagged) without disturbing
                 wavefront geometry.  Bloom filter overshoot-flagged because
                 cluster_tm_corr drops to 0.16 (well past g4swap's 0.63), but
                 tm_extent_mean is identical to gflip's 38.90 — the metric
@@ -815,7 +815,7 @@ int gflip_cidperm_swizzle_t(int lin) {
 }
 
 /* TD=56: gflip_blklmrev.  Stack of lmrev (uniform lm bit-reverse on every
-                group) + blkswap (^4 on alt groups).  Asks whether Lever C
+                group) + blkswap (^4 on alt groups).  Asks whether m-axis
                 (adj_tm_diff) composes or saturates: blkswap and lmrev each
                 tied for first at n=43910, this stacks both mechanisms.
                 Bloom WORTHY (+1.53, edges lmrev's +1.46 by 0.07).  Bijection:
@@ -1509,7 +1509,7 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc,
         : "r"(TADDR))
 
 /*
-  Lever C — stmatrix-native TMEM load.
+  STSM-native TMEM load.
 
   tcgen05.ld.sync.aligned.16x256b.x4.b32 loads 16 TMEM rows × (4 × 256 bits)
   into 16 b32 regs per lane.  Register layout is stmatrix.x4 compatible:
@@ -1535,7 +1535,7 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc,
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory")
 
 /*
-  Lever C — STSM (stmatrix) SMEM store, NON-transposed variant.
+  STSM (stmatrix) SMEM store, NON-transposed variant.
 
   stmatrix.sync.aligned.x4.m8n8.shared.b16 stores 4 8x8 bf16 matrices per
   call.  Per PTX ISA, lane t's reg #m (m in 0..3) contributes 2 bf16 values

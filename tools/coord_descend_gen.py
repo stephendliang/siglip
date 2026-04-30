@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""coord_descend_gen.py — emit gflip-family Lever-C neighborhood templates.
+"""coord_descend_gen.py — emit gflip-family m-axis neighborhood templates.
 
 Mines the parameter space around blkswap (TD=54) + lmrev (TD=52) — both
 front-tier-tied at n=43910 — to map out where in the m-axis perturbation

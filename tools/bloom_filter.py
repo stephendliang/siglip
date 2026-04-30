@@ -26,7 +26,7 @@ tm_extent_mean — all dropped to |τ|<0.1 in new fit) to tn-axis-dominated
 set is gflip-family-heavy, where the discriminating lever is XOR=1 + within-
 group tn rotation, not m-axis lm manipulation.  Within-gflip-family
 discrimination (saturation between blkswap/lmrev/blklmrev) sits below model
-resolution: the linear fit cannot capture Lever C saturation; rely on wall.
+resolution: the linear fit cannot capture m-axis saturation; rely on wall.
 
 Usage:
   python3 tools/analyze_swizzle.py --csv /tmp/m.csv --summary > /dev/null

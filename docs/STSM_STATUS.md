@@ -1,4 +1,4 @@
-# Lever C (USE_STMATRIX=1) on fc2_w3x — implementation status
+# STSM (USE_STMATRIX=1) on fc2_w3x — implementation status
 
 Status: compiles, emits target SASS shape, correctness **unverified** on B200.
 Implemented in worktree `worktree-agent-a4cce994` on top of master.
@@ -54,7 +54,7 @@ absolute counts aren't directly comparable).
 
 The STS / STSM flip in the epilogue path is clean: 4 STS.128 → 0, and
 4 STSM.16.MT88.4 emitted.  `STS.U16` count is unchanged (bias LDG+STS on
-W4 runs once pre-tile-loop and has nothing to do with Lever C).  The 3 raw
+W4 runs once pre-tile-loop and has nothing to do with STSM).  The 3 raw
 `STS` instructions are `mbarrier.init` scaffolds, also unrelated.
 
 Rank-1 emits far more LDTM/STSM because its K-loop is tight-looped and all
@@ -160,7 +160,7 @@ run and we've landed 5–10 µs.  If it doesn't, the back-solve diagnostic in
 the memory doc says we'll see a specific permutation pattern in the output
 that identifies exactly which assumption is wrong.
 
-Lever C was tagged as obsolete in the 2026-04-21 update (fc2_w3x already
+STSM was tagged as obsolete in the 2026-04-21 update (fc2_w3x already
 beats rank-1 by 39 µs without it).  Running it is still worthwhile as a
 SASS-shape validation — if correct it gives us the emission pattern rank-1
 uses, which helps for future ports (fused-residual, FC1, different K).

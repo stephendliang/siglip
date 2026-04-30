@@ -604,9 +604,9 @@ def sw_wfd_latin(lin, G=8):
 
 
 def sw_gflip_snrot(lin, G=8):
-    """PROPOSAL: gflip's group_idx XOR 1 (Lever A: cluster_tm_corr 0.94→0.65)
-    composed with snrot2's tn rotation on odd lm (Lever B: adj_tn_diff
-    0.17→1.33). Two orthogonal levers — neither variant in the binary has
+    """PROPOSAL: gflip's group_idx XOR 1 (pair-axis: cluster_tm_corr 0.94→0.65)
+    composed with snrot2's tn rotation on odd lm (n-axis: adj_tn_diff
+    0.17→1.33). Two orthogonal axes — neither variant in the binary has
     both. Bijection: snrot only applied for full-G groups; boundary group
     falls back to plain gflip to avoid (ln+2)%3 collisions when ln is
     out-of-range from in_g overflow."""
@@ -629,8 +629,8 @@ def sw_gflip_snrot(lin, G=8):
 
 
 def sw_gflip_lmrev(lin, G=8):
-    """PROPOSAL: gflip + lm bit-reverse on G=8.  Combines gflip's Lever A
-    (low cluster_tm_corr) with lmrev's Lever C (adj_tm_diff 1.5→3.75).
+    """PROPOSAL: gflip + lm bit-reverse on G=8.  Combines gflip's pair-axis
+    (low cluster_tm_corr) with lmrev's m-axis (adj_tm_diff 1.5→3.75).
     adj_tm_diff has τ_AUC = -0.50 sign-stable in study.txt — pushing it
     higher predicts faster.  Bijection: lm bit-reverse on 8 elements is a
     permutation; preserves group coverage."""
@@ -656,7 +656,7 @@ def sw_gflip_G4(lin):
     """PROPOSAL: gflip at G=4.  Smaller groups → more frequent flips →
     predicted lower cluster_tm_corr (gflip G=8 is 0.65; G=4 may reach 0.5).
     Risk: g4swap (group_idx XOR 3, also low cluster_tm_corr at 0.63) was
-    only 6th — going further on Lever A may overshoot.  Tests whether the
+    only 6th — going further on pair-axis may overshoot.  Tests whether the
     sweet spot is at gflip's 0.65 or lower."""
     return sw_gflip(lin, 4)
 
@@ -712,7 +712,7 @@ def sw_gflip_cidperm(lin, G=8):
 
 def sw_gflip_blklmrev(lin, G=8):
     """PROPOSAL: stack lmrev (uniform lm bit-reverse) + blkswap (alt-group
-    lm^4).  Composes Lever C in two ways: lmrev's bit-rev permutation on
+    lm^4).  Composes m-axis in two ways: lmrev's bit-rev permutation on
     every group, then ^4 on the upper-half block of odd groups.  Both
     blkswap and lmrev are tied at the n=43910 front (AUC=0.541 TIE) — this
     asks whether their mechanisms compose (further +cyc reduction) or are

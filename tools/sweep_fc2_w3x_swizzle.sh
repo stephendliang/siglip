@@ -69,7 +69,7 @@
 #     dg4 (11.99, +1809 cyc) — different-mechanism references.
 #   round-2 candidates (bloom WORTHY, 2026-04-28):
 #     gflip_blklmrev  (TD=56, s=+1.53) — lmrev × blkswap stack, asks "is
-#                     Lever C saturated?"
+#                     m-axis saturated?"
 #     gflip_blkmul3   (TD=57, s=+0.67) — alt-group lm = (lm*3)%8 instead of
 #                     blkswap's lm^4, asks "is the perturbation magnitude
 #                     the lever or any decorrelation?"

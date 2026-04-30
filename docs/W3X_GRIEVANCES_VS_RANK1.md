@@ -43,7 +43,7 @@ Tier 1 #1. Reference target is the **hardware MMA-retirement floor**
 | # | Grievance | Status | Verdict |
 |---|---|---|---|
 | G1 | No packed BF16 epilogue (FFMA2/F2FP.PACK) | Implemented (`native BF16 epilogue`) | DEAD as wall lever (±0 µs, cleaner) |
-| G2 | No stmatrix (STSM) | Lever C `bcce329` lands SASS shape match | At-baseline n=10 (Δ −0.4 µs ≈ noise floor) |
+| G2 | No stmatrix (STSM) | STSM `bcce329` lands SASS shape match | At-baseline n=10 (Δ −0.4 µs ≈ noise floor) |
 | G3 | Per-thread IMAD addressing | Bundled with G4 | DEAD |
 | G4 | 495 R2UR round-trips | `dead_r2ur_elect_smem_fix.md` | DEAD — ptxas won't ULDS-promote inside `if(lane==0)`; UIADD3=706 already uses UR via constant prop |
 | G5 | Per-asm ELECT/BSSY/BSYNC scaffold | K-loop single-asm DEAD; **multi-block consolidation untested** | See Tier 2 #2 |
@@ -307,7 +307,7 @@ matter only as data points on alternative design choices.
 
 - 557 more BRA when fully unrolled — only relevant if i-cache pressure
   becomes load-bearing.
-- 32 STSM ops — Lever C lands the same shape and is at-baseline.
+- 32 STSM ops — STSM lands the same shape and is at-baseline.
 - Tight looped K-body — explored via K_UNROLL sweep; tied default at
   multiples-of-NS, regressed at non-multiples.
 - Non-persistent dispatch — see Tier 3 #4. Both rank-1 and CUTLASS
