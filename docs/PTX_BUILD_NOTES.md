@@ -132,11 +132,12 @@ What this PTX port is good for
 1. **Deterministic SASS baseline**: any future edit to the kernel body
    in `fc2_w3x.ptx` produces SASS diffs that are purely due to the
    source change, not NVVM drift across CUDA versions.
-2. **Grievance targeting**: the doc in
-   `docs/W3X_GRIEVANCES_VS_RANK1.md` lists 9 concrete SASS-level
-   deltas vs rank-1.  With this PTX, individual edits can be made
-   (e.g., consolidating ELECT sites, changing descriptor constraint
-   from `r` to `u`) and their SASS impact measured in isolation.
+2. **Targeted SASS edits**: with this PTX, individual edits can be
+   made (e.g., consolidating ELECT sites, changing descriptor
+   constraint from `r` to `u`) and their SASS impact measured in
+   isolation.  Note: the original 9-grievance delta list vs rank-1
+   is now fully exhausted; this remains useful only for a future
+   rank-1 re-baseline.
 3. **Freeze point for future CUDA toolchain churn**: if NVVM's
    ptx-gen changes in a future CUDA, the reference SASS of `fc2_w3x`
    can drift silently.  The hand-PTX bypasses NVVM.
@@ -196,21 +197,14 @@ Next steps (for future PTX work)
 ---------------------------------
 
 The SASS-byte equivalence means there's no point maintaining two
-copies (the .cu and the .ptx) unless we plan to diverge them.  The
-intended divergence plan (per `W3X_GRIEVANCES_VS_RANK1.md` priority
-ranking):
+copies (the .cu and the .ptx) unless we plan to diverge them.  No
+divergence is planned: the original 9-grievance delta list vs rank-1
+has been fully exhausted (STSM is the mandatory default; R2UR/ELECT
+were confirmed orthogonal to W5's MMA-issue critical path; descriptor
+operand class is ptxas-owned and the pure-PTX rewrite produced
+byte-identical SASS — see dead-end log entries
+`dead_ptx_handwrite_byte_identical.md` and
+`project_lever_c_orthogonal_to_r2ur.md`).
 
-1. **Grievance 4 (R2UR=32 → ~3)** — try `"u"` operand constraints in
-   the asm volatile blocks.  In pure PTX, declare descriptor regs with
-   `.reg .b64` backed by `mov.u64` from uniform sources; avoid
-   round-tripping through `"r"`-typed asm outputs.
-2. **Grievance 5 (ELECT=10 → 0)** — merge adjacent lane-0 asm blocks
-   into fewer, larger units.  The 4×MMA block already does this; W4's
-   TMA-load block can be similarly consolidated.
-3. **Grievance 2 (STSM)** — swap plain STS for stmatrix; requires
-   matching LDTM layout change (see
-   `project_lever_c_bugs_confirmed.md`).
-
-Each edit should be benchmarked on B200 before commit.  Source-of-truth
-is the `fc2_w3x.ptx` file; `fc2_w3x.cu` stays as the reference (and
-hosts the PROFILE_* diagnostics that are out of scope for the PTX port).
+`fc2_w3x.ptx` is frozen as a reference baseline; `fc2_w3x.cu` is the
+source of truth for ongoing work and hosts the PROFILE_* diagnostics.

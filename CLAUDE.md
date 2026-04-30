@@ -346,8 +346,9 @@ K=1024/2048 still report ERR — one heuristic IMAs on the device.
 `fc2_w3x` bias-only at ~1.008 ms with **gflip_blkswap (TD=54)** dispatch
 (prior dgsw_G8 default ~1.009 ms, +0.33 µs slower); W5 is MMA-ceiling-bound
 (~12482 cyc/tile ≈ 24 × 520 cyc/iter, per `PROFILE_W5`). Tensor pipe 95.84%
-active. See `docs/W3X_GRIEVANCES_VS_RANK1.md` for 9 remaining SASS deltas
-(15-25 µs total upside).
+active. The 9-grievance SASS delta list vs rank-1 is exhausted (STSM
+mandatory, R2UR/ELECT confirmed orthogonal-to-W5, ptxas-owned descriptor
+operand class — see dead-end log).
 
 **bias-preload (default, 2026-04-26)** — pre-loads full bias [768 bf16] into
 per-lane registers at kernel start; subpass-level shfl×4 replaces the per-rh
@@ -512,7 +513,6 @@ fc2_cutlass.cu                  # CUTLASS reference
 fc2_hybrid.cu, fc2_ldg.cu, fc2.cu  # DEAD
 kernel_common.cuh, kernel_body.cuh # Shared infra
 Makefile                        # sm_100a, DFLAGS for dim override
-docs/W3X_GRIEVANCES_VS_RANK1.md # 9 SASS-level deltas vs rank-1
 docs/STSM_STATUS.md             # STSM layout playbook
 docs/PURE_PTX_REWRITE_STRATEGY.md
 docs/BENCHMARKING.md            # cycles/AUC/η²/rank study guide — read before benchmarking
@@ -607,6 +607,6 @@ Claude's tokenizer to within ~10% — fine for budgeting, not for billing.
 
 ```bash
 python3 token_count.py CLAUDE.md          # baseline
-python3 token_count.py docs/W3X_GRIEVANCES_VS_RANK1.md
+python3 token_count.py docs/STSM_STATUS.md
 find docs/ memory/ -name '*.md' | xargs -I{} python3 token_count.py {} | grep o200k_base
 ```
