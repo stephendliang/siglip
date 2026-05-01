@@ -150,7 +150,12 @@ static_assert((TN / 2) % B_BOX_N == 0,
 #define MBAR_TMA_EMPTY      (MBAR_TMA_FULL + N_STAGES * 8)
 #define MBAR_TMEM_READY     (MBAR_TMA_EMPTY + N_STAGES * 8)
 #define MBAR_TMEM_CONSUMED  (MBAR_TMEM_READY + 2 * 8)
-#define MBARS_END           (MBAR_TMEM_CONSUMED + 2 * 8)
+#define MBAR_STSM_DONE      (MBAR_TMEM_CONSUMED + 2 * 8)
+#define MBARS_END           (MBAR_STSM_DONE + NUM_EPI_STAGES * 8)
+
+#if defined(DROP_LEAD_BARSYNC) && defined(DROP_LEAD_BARSYNC_SAFE)
+#error "DROP_LEAD_BARSYNC and DROP_LEAD_BARSYNC_SAFE are mutually exclusive"
+#endif
 
 #define OFF_TMEM       ((MBARS_END + 15) & ~15)
 #define OFF_SWIZZLE_LUT ((OFF_TMEM + 8 + 15) & ~15)
@@ -1816,6 +1821,11 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             mbar_init(smem_to_uint(smem + MBAR_TMEM_CONSUMED + b * 8), 2);
 #endif
         }
+#ifdef DROP_LEAD_BARSYNC_SAFE
+        for (int e = 0; e < NUM_EPI_STAGES; e++) {
+            mbar_init(smem_to_uint(smem + MBAR_STSM_DONE + e * 8), N_EPI_WARPS);
+        }
+#endif
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp_id == 0) {
@@ -1902,6 +1912,10 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         const int row_group = warp_id;
 
         uint32_t mma_phase_0 = 0, mma_phase_1 = 0;
+#ifdef DROP_LEAD_BARSYNC_SAFE
+        const uint32_t mbar_stsm_done_base = smem_to_uint(smem + MBAR_STSM_DONE);
+        uint32_t stsm_done_phase[NUM_EPI_STAGES] = {0};
+#endif
 
 #ifdef PROFILE_CYCLES
         uint64_t prof[PROF_N_PHASES] = {0};
@@ -2162,13 +2176,29 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 PROF_END(e1, 1);
 
                 PROF_BEGIN(e2);
-#ifndef DROP_LEAD_BARSYNC
+#if defined(DROP_LEAD_BARSYNC_SAFE)
+                /*
+                  Race-free DROP_LEAD: replace bar.sync 0, N_EPI_WARPS*32 with
+                  a per-es N_EPI_WARPS-arrival mbar.  Each warp leader arrives
+                  (release) after its own STSMs + fence.proxy.async; tid==0
+                  waits (acquire) before issuing TMA.  Non-leader lanes free-
+                  run to the trail bar.sync — safe because the next subpass's
+                  STSM uses the alternating es buffer.
+                */
+                if (lane == 0) {
+                    mbar_arrive(mbar_stsm_done_base + es * 8);
+                }
+#elif !defined(DROP_LEAD_BARSYNC)
                 asm volatile(EPI_BARSYNC_ASM ::: "memory");
 #endif
                 PROF_END(e2, 2);
 
                 if (tid == 0) {
                     PROF_BEGIN(e3);
+#ifdef DROP_LEAD_BARSYNC_SAFE
+                    mbar_wait(mbar_stsm_done_base + es * 8, stsm_done_phase[es]);
+                    stsm_done_phase[es] ^= 1;
+#endif
                     if (tt > 0 || sp >= NUM_EPI_STAGES) {
                         BULK_ASM(BULK_WAIT_GROUP(1));
                     }
