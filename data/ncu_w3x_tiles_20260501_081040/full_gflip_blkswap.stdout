@@ -1,0 +1,17 @@
+==PROF== Connected to process 11317 (/root/siglip/fc2-w3x-ncu)
+==WARNING== Unable to access the following 6 metrics: ctc__rx_bytes_data_user.sum, ctc__rx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__rx_bytes_data_user.sum.per_second, ctc__tx_bytes_data_user.sum, ctc__tx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__tx_bytes_data_user.sum.per_second.
+
+
+==PROF== Profiling "fc2_w3x_kernel": 0%....50%....100% - 39 passes
+FC2 W3X kernel — 6-warp bias-only rank-1-shaped persistent
+  [928256,3072] x [768,3072]^T  NS=6  THREADS=192  SMEM=215296 B  (cap 228KB)
+  Alloc + init + pack done
+  TMA + func attr done (SMEM=215296 B)  VARIANT mode, 1 variant
+Warmup (1 iters)...
+Timing 1 reps × 1 iters/rep × 1 variant ...
+@@SAMPLE rep=1 ms=5399.41113 cyc=1823992 cyc_min=1821545 cyc_p50=1822800 cyc_p95=1823648 cyc_max=1823992
+@@STATS reps=1 mean=5399.41113 std=0.00000 min=5399.41113 p25=5399.41113 p50=5399.41113 p75=5399.41113 max=5399.41113 iqr=0.00000
+FC2-W3X kernel: 5399.411 ms  0.81 TFLOPS
+@@RESULT ms=5399.4111 tflops=0.81 checksum=0.000000 valid=0 c0=0.0
+==PROF== Disconnected from process 11317
+==PROF== Report: /root/siglip/data/ncu_w3x_tiles_20260501_081040/full_gflip_blkswap.ncu-rep
