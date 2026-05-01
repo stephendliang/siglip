@@ -1467,17 +1467,22 @@ void mbar_arrive(uint32_t addr) {
         :: "r"(addr) : "memory");
 }
 
+#ifndef NANOSLEEP_CYC
+#define NANOSLEEP_CYC 20
+#endif
+
+template<int NS_CYC>
 static __device__ __forceinline__
 void mbar_wait(uint32_t addr, uint32_t phase) {
     asm volatile("{\n\t"
                  ".reg .pred p;\n\t"
                  "LOOP: mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%0], %1;\n\t"
                  "@p bra DONE;\n\t"
-                 "nanosleep.u32 20;\n\t"
+                 "nanosleep.u32 %2;\n\t"
                  "bra LOOP;\n\t"
                  "DONE:\n\t"
                  "}"
-        :: "r"(addr), "r"(phase));
+        :: "r"(addr), "r"(phase), "n"(NS_CYC));
 }
 
 static __device__ __forceinline__
@@ -1742,7 +1747,7 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc,
   (one add per ki) + ~5 cyc/tile (swizzle) + ~10 cyc/tile (global store).
 */
 
-template<int TD, int DGG>
+template<int TD, int DGG, int NS_CYC = NANOSLEEP_CYC>
 __global__ void __launch_bounds__(THREADS, 1)
 __cluster_dims__(2, 1, 1)
 fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
@@ -1946,7 +1951,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 
             PROF_BEGIN(e0);
             const uint32_t cur_phase = (buf == 0) ? mma_phase_0 : mma_phase_1;
-            mbar_wait(mbar_tmem_ready_base + buf * 8, cur_phase);
+            mbar_wait<NS_CYC>(mbar_tmem_ready_base + buf * 8, cur_phase);
             PROF_END(e0, 0);
             if (buf == 0) mma_phase_0 ^= 1;
             else          mma_phase_1 ^= 1;
@@ -2228,7 +2233,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 const int s = ki % N_STAGES;
                 if (ki >= N_STAGES || tt > 0) {
                     PROF_BEGIN(t0);
-                    mbar_wait(tma_empty_arr[s], tma_empty_phase[s]);
+                    mbar_wait<NS_CYC>(tma_empty_arr[s], tma_empty_phase[s]);
                     PROF_END(t0, 0);
                     tma_empty_phase[s] ^= 1;
                 }
@@ -2328,7 +2333,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 
 #ifdef NO_PREFILL
             PROF_BEGIN(m3);
-            mbar_wait(mbar_tmem_consumed_base + buf * 8, tmem_cons_phase[buf]);
+            mbar_wait<NS_CYC>(mbar_tmem_consumed_base + buf * 8, tmem_cons_phase[buf]);
             PROF_END(m3, 3);
             tmem_cons_phase[buf] ^= 1;
 #endif
@@ -2346,7 +2351,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 uint64_t _ki_start; PROF_KI_READ(_ki_start);
 #endif
                 PROF_BEGIN(m0);
-                mbar_wait(tma_full_arr[s], tma_full_phase[s]);
+                mbar_wait<NS_CYC>(tma_full_arr[s], tma_full_phase[s]);
                 PROF_END(m0, 0);
 #if defined(PROFILE_KI) || defined(PROFILE_TILE)
                 {
@@ -2535,6 +2540,7 @@ struct VariantCfg {
     const char* name;
     int td;
     int dgg;
+    int ns;
     void (*launch)(dim3, int,
                    const CUtensorMap&, const CUtensorMap&, const CUtensorMap&,
                    const __nv_bfloat16*, __nv_bfloat16*,
@@ -2542,27 +2548,31 @@ struct VariantCfg {
     void (*set_attr)(int);
 };
 
-template<int TD, int DGG>
+template<int TD, int DGG, int NS_CYC = NANOSLEEP_CYC>
 static void launch_kern(dim3 grid, int smem,
                         const CUtensorMap& a, const CUtensorMap& b, const CUtensorMap& c,
                         const __nv_bfloat16* d_bias, __nv_bfloat16* d_C,
                         uint64_t* p, uint64_t* pki, uint64_t* pt, uint64_t* pw5,
                         uint64_t* pwc) {
-    fc2_w3x_kernel<TD, DGG><<<grid, THREADS, smem>>>(
+    fc2_w3x_kernel<TD, DGG, NS_CYC><<<grid, THREADS, smem>>>(
         a, b, c, d_bias, d_C, p, pki, pt, pw5, pwc);
 }
 
-template<int TD, int DGG>
+template<int TD, int DGG, int NS_CYC = NANOSLEEP_CYC>
 static void set_attr_kern(int smem) {
-    cudaError_t e = cudaFuncSetAttribute(fc2_w3x_kernel<TD, DGG>,
+    cudaError_t e = cudaFuncSetAttribute(fc2_w3x_kernel<TD, DGG, NS_CYC>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     if (e != cudaSuccess) {
-        fprintf(stderr, "cudaFuncSetAttribute<%d,%d>: %s\n", TD, DGG, cudaGetErrorString(e));
+        fprintf(stderr, "cudaFuncSetAttribute<%d,%d,%d>: %s\n", TD, DGG, NS_CYC,
+                cudaGetErrorString(e));
         exit(1);
     }
 }
 
-#define VCFG(NAME, TD, DGG) {NAME, TD, DGG, launch_kern<TD, DGG>, set_attr_kern<TD, DGG>}
+#define VCFG(NAME, TD, DGG) {NAME, TD, DGG, NANOSLEEP_CYC, \
+                             launch_kern<TD, DGG>, set_attr_kern<TD, DGG>}
+#define VCFG_NS(NAME, TD, DGG, NS) {NAME, TD, DGG, NS, \
+                                    launch_kern<TD, DGG, NS>, set_attr_kern<TD, DGG, NS>}
 static const VariantCfg VARIANTS[] = {
     VCFG("dgsw",      0,  8),
     VCFG("dg2",       0,  2),
@@ -2621,6 +2631,20 @@ static const VariantCfg VARIANTS[] = {
     VCFG("gflip_bitrev_xor2_alt1", 98, 8),
     VCFG("gflip_mul3_xor4_alt1", 99, 8),
     /* END COORD_DESCEND table */
+
+    /* NANOSLEEP grid: gflip_blkswap (TD=54, DGG=8) basin-floor pinned, NS_CYC swept.
+       ns20 = current production default (NANOSLEEP_CYC).  Existing variants above
+       all use NS_CYC=NANOSLEEP_CYC by default — these are the explicit overrides. */
+    VCFG_NS("ns0",  54, 8,  0),
+    VCFG_NS("ns4",  54, 8,  4),
+    VCFG_NS("ns8",  54, 8,  8),
+    VCFG_NS("ns12", 54, 8, 12),
+    VCFG_NS("ns16", 54, 8, 16),
+    VCFG_NS("ns20", 54, 8, 20),
+    VCFG_NS("ns24", 54, 8, 24),
+    VCFG_NS("ns32", 54, 8, 32),
+    VCFG_NS("ns48", 54, 8, 48),
+    VCFG_NS("ns64", 54, 8, 64),
 };
 static const int N_VARIANTS = sizeof(VARIANTS) / sizeof(VARIANTS[0]);
 
@@ -2635,6 +2659,7 @@ static const int N_VARIANTS = sizeof(VARIANTS) / sizeof(VARIANTS[0]);
 */
 static const VariantCfg DEFAULT_CFG = VCFG("default", TILE_DISPATCH, DG_GROUP_SIZE);
 #undef VCFG
+#undef VCFG_NS
 
 static int find_variant_idx(const char* name) {
     for (int i = 0; i < N_VARIANTS; i++) {
