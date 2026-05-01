@@ -316,9 +316,48 @@ This contradicts the earlier "epi 100% in MMA shadow" framing from PROFILE_W5.
 
 The earlier "~100 µs headroom" framing referenced the unreachable pure-MMA
 ceiling. **Real headroom on fc2-w3x is ~16 µs** vs the structural NS=6+PREFILL
-floor; by past-win standards (bias-preload 1.7 µs, STSM 0.4 µs) significant, but
-some fraction is inevitable (final-tile drain, proxy fence, cluster bar.sync).
-**Realistically recoverable: ~5-10 µs.**
+floor — but per the SASS-attribution + per-tt PROFILE_W5 analysis below,
+**realistic recoverable is ~1-3 µs, not the earlier ~5-10 µs estimate**.
+
+### Strip-vs-full localization (ncu --set full + per-tt PROFILE_W5, 2026-05-01)
+
+**SASS-attributed stall hotspots** — see `docs/fc2_w3x_ncu_sass.txt`
+(per-line stall sampling) + `docs/fc2_w3x_ncu_details.txt` (Speed-of-Light /
+Memory Workload / Scheduler / Warp State sections):
+
+| stall samples | instruction | what it is |
+|---|---|---|
+| **5,024,622** | `SYNCS.PHASECHK.TRANS64.TRYWAIT` (mbar phase check) | **mbar spin-wait body — 7× the next category** |
+| ~696K each | `F2FP.BF16.F32.PACK_AB`, `HADD2.BF16_V2`, `SHFL.IDX`, `IMAD`, `VIADD` | epi compute body (8 subpasses × 147 tiles) |
+| ~174K each | `UTMACMDFLUSH`, `UTMASTG.4D`, `R2UR.OR`, `BSYNC.RECONVERGENT` | TMA store + scaffolding |
+
+Confirms the +0.85 pt barrier delta from focused metrics is mbar-dominated
+steady-state work, not mis-attribution. TC pipeline 98.49% → strip 0.985 ms
+IS the MMA-staging structural floor.
+
+**Final-tile drain is FALSE.** Per-tt PROFILE_W5 (`make -B fc2-w3x
+DFLAGS='-DPROFILE_W5 -DPROFILE_TILE'`, 2026-05-01): **tt=146 = 11872 cyc =
+the *fastest* tile** (mean 12098). Slowest is tt=0 (13723 cyc, cold-start)
+and a periodic +200-840 cyc bump at tt=4/20/36/52/68/84/100/116/132
+(~16-tile spacing — looks like L2-replacement-cycle hits). The 12 µs gap
+between ncu `cyc_avg` (Δ +4664) and wall `cyc_max` (Δ +31460) is
+**cross-CTA workload variance** (one CTA finishes ~26800 cyc later than
+the average), not a final-tile artifact. LAST_TILE_FAST_PATH would have
+saved <1 µs — not implemented.
+
+**16 µs gap decomposition (revised):**
+- **~4 µs steady-state mbar / cluster bar.sync** (sass-attributed at 5.02M
+  samples; symptomatic of the 6-warp design + `cta_group::2` cluster sync —
+  not addressable without rewriting the warp-specialization or cluster shape)
+- **~12 µs cross-CTA tail variance** (structural; basin-floor dispatch
+  already minimizes it, within-basin spread is at TIE-band)
+
+**ncu warnings to IGNORE in `docs/fc2_w3x_ncu_details.txt`:**
+- `"13398-way bank conflict, 40.22% Est. Speedup"` — **STSM mis-attribution**.
+  ncu doesn't model `stmatrix`'s dedicated bank-routed datapath; reports
+  the lane→bank fan-out as generic shared-store conflicts. Not real.
+- `"35.01% Est. Speedup, 21.3 active threads/warp"` — warp-specialization by
+  design (W4/W5 single-warp issue, lane-split epi). Not a lever.
 
 FC1 strip is TMA-load-dominated, not compute-bound.
 
@@ -581,6 +620,8 @@ Makefile                        # sm_100a, DFLAGS for dim override
 docs/STSM_STATUS.md             # STSM layout playbook
 docs/PURE_PTX_REWRITE_STRATEGY.md
 docs/BENCHMARKING.md            # cycles/AUC/η²/rank study guide — read before benchmarking
+docs/fc2_w3x_ncu_sass.txt       # ncu --set full per-SASS stall sampling (2026-05-01) — mbar spin-wait dominates 7×
+docs/fc2_w3x_ncu_details.txt    # ncu --page details (SoL/Memory/Scheduler/Warp State) — 98.5% TC pipe, ignore STSM bank-conflict warnings
 rank1.sass                      # Dumped cuBLASLt rank-1 for diffing
 tools/bench.sh                  # FC1/FC2 × dispatch × packed × decomp (rank-1 baseline)
 tools/probe_cublaslt.sh         # cuBLASLt rank-1 timing
