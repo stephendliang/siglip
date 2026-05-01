@@ -3361,8 +3361,8 @@ int main(int argc, char** argv) {
         }
 
         printf("\n  by tt (tile-sequence index within cluster, averaged over clusters)\n");
-        printf("   tt   cyc/tile  (first 32 entries)\n");
-        int n_show = tiles_per_cluster_host < 32 ? tiles_per_cluster_host : 32;
+        printf("   tt   cyc/tile\n");
+        int n_show = tiles_per_cluster_host < 256 ? tiles_per_cluster_host : 256;
         for (int t = 0; t < n_show; t++) {
             if (tt_cnt[t] == 0) continue;
             double m = (double)tt_cyc[t] / tt_cnt[t];
@@ -3394,6 +3394,8 @@ int main(int argc, char** argv) {
         uint32_t tn_cnt[8] = {0};
         uint64_t ig_t[32] = {0}, ig_m[32] = {0}, ig_c[32] = {0};
         uint32_t ig_cnt[32] = {0};
+        uint64_t tt_t[256] = {0}, tt_m[256] = {0}, tt_c[256] = {0};
+        uint32_t tt_cnt[256] = {0};
         uint64_t grand_t = 0, grand_m = 0, grand_c = 0;
         uint32_t grand_cnt = 0;
         uint64_t t_min = ~0ULL, t_max = 0;
@@ -3420,6 +3422,12 @@ int main(int argc, char** argv) {
                     ig_m[ig]   += mma_s;
                     ig_c[ig]   += cmt_s;
                     ig_cnt[ig]++;
+                }
+                if (t < 256) {
+                    tt_t[t]   += tot;
+                    tt_m[t]   += mma_s;
+                    tt_c[t]   += cmt_s;
+                    tt_cnt[t]++;
                 }
                 grand_t   += tot;
                 grand_m   += mma_s;
@@ -3470,11 +3478,24 @@ int main(int argc, char** argv) {
             printf("   %3d    %3d   %9.0f   %7.0f   %6.0f   %8.0f   %u\n",
                    ig, raw_tn, mt, mm, mc, mt - mm - mc, ig_cnt[ig]);
         }
+        printf("\n  by tt (tile-sequence index within cluster, averaged over clusters)\n");
+        printf("    tt   tile_total   mma_asm   field2   residual\n");
+        int n_show_tt = tiles_per_cluster_host < 256 ? tiles_per_cluster_host : 256;
+        for (int t = 0; t < n_show_tt; t++) {
+            if (tt_cnt[t] == 0) continue;
+            double mt = (double)tt_t[t] / tt_cnt[t];
+            double mm = (double)tt_m[t] / tt_cnt[t];
+            double mc = (double)tt_c[t] / tt_cnt[t];
+            printf("   %3d    %9.0f   %7.0f   %6.0f   %8.0f\n",
+                   t, mt, mm, mc, mt - mm - mc);
+        }
+
         printf("\n  diagnosis:\n");
         printf("    A (epi-TMEM backpressure): residual high at in_g=0..3 only   → cross-group B-prefetch\n");
         printf("    B (issue-side gaps):       mma_asm high at all in_g          → manual UR desc handling\n");
         printf("    C (cold B at group start): residual AND tma_wait high in_g=0 → B-prefetch at group end\n");
         printf("    D (uniform):               all buckets within ±3%% of mean    → declare done at wall\n");
+        printf("    E (final-tile drain):      tile_total at tt=N-1 >> mean      → LAST_TILE_FAST_PATH lever\n");
         free(h_prof_w5);
     }
 #endif
