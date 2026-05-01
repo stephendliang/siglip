@@ -4,11 +4,12 @@ Hand-tuned SM100a persistent GEMM kernels for FC1 and FC2 layers of `google/sigl
 FP8 (E4M3) inputs, BF16 output, tcgen05 MMA, TMA, `cta_group::2` with 2-CTA clusters.
 Cross-compiled on CPU VPS, runs on B200 (148 SMs, 74 clusters). PE kernel is done — see `CLAUDE.md.mothballed`.
 
-## Current best (B200, 2026-04-29)
+## Current best (B200, 2026-04-30)
 
 | target | ms | kernel | dispatch | vs cuBLASLt rank-1 |
 |---|---|---|---|---|
-| FC2 K=3072 BIAS_ONLY | **~1.008** | `fc2_w3x` (bias-preload default, STSM-only) | any of `{blkswap, blkx5/6/7, blk_qrt0/2/3}` (basin floor) | **−38 µs** (rank-1: 1.046) |
+| FC2 K=3072 BIAS_ONLY (strip floor) | 0.98502 | `fc2_w3x` `-DSTRIP_EPILOGUE` | n/a | NS=6+PREFILL structural floor (1814685 cyc) |
+| FC2 K=3072 BIAS_ONLY (full) | **1.00092** | `fc2_w3x` (bias-preload default, STSM-only) | any of `{blkswap, blkx5/6/7, blk_qrt0/2/3}` (basin floor) | **−45 µs** (rank-1: 1.046); +16 µs exposed epi vs strip |
 | FC2 K=3072 fused (+residual) | 1.063 | `fc2_w3` | dgswizzle TD=8 PACKED | (no apples-to-apples ref) |
 | FC1 K=768 fused (+GELU+bias) | 1.998 | `fc1_w3` | zigzag TD=11 + K_STAGGER=1 | +104 µs (rank-1: 1.894) |
 
@@ -76,8 +77,9 @@ Tile: 256x256x128. K_ITERS=K_DIM/128. FC2: K=3072 (24), FC1: K=768 (6).
 
 PREFILL overlaps previous tile's epilogue drain with the first 6 K-iters of the next
 tile's MMA. W1 skips epilogue_mbar check for first 6 iters. Saves ~10µs at K=3072.
-**Unsafe at K_ITERS<20** (parity wrap → deadlock); auto-guarded `#if K_DIM/128 < 20`.
-FC1 (K_ITERS=6) always uses NO_PREFILL.
+**Unsafe at K_ITERS<20** (parity wrap → deadlock). fc2_w3 auto-guards via
+`#if K_DIM/128 < 20`; **fc2_w3x does NOT auto-guard** — caller must pass
+`-DNO_PREFILL` explicitly for short K. FC1 (K_ITERS=6) always uses NO_PREFILL.
 
 NS5 required for N>1536. NS7 doesn't fit in 228KB.
 
@@ -282,23 +284,72 @@ fused-residual data — pre-paired-analysis, pre-thermal-defense; deleted
 | Knob | Rule | Why |
 |---|---|---|
 | N_STAGES | NS6 for N≤1536, NS5 for N>1536 | SMEM per stage grows with N |
-| PREFILL | On for K_ITERS≥20, off otherwise | Short K-loop deadlocks (parity wrap) |
+| PREFILL | On for K_ITERS≥20, off otherwise | Short K-loop deadlocks (parity wrap). Also: NO_PREFILL caps eff at ~0.77 vs MMA-staging ceiling, PREFILL pushes to ~0.91 — the eff jump confirmed in n=20 dim sweep (2026-04-30, see below). |
 | Dispatch | FC2 fused: zigzag or dgswizzle. FC2 bias-only: any basin-floor variant — `gflip_blkswap` (TD=54) is default, `blkx6`/`blk_qrt3` ~115 cyc faster at TIE-band. FC1: zigzag + K_STAGGER=1. | PACKED_TILES + odd ks on FC1; FC2 wash on ks. |
 
 ## Compute floor
 
-`tcgen05.mma.cta_group::2` produces cluster-wide work per instruction (no extra ×2 CTA
-factor). Per-cluster floor = `147 tiles × 24 K_iters × cyc/iter / clock`:
+`tcgen05.mma.cta_group::2` produces cluster-wide work per instruction (no extra ×2
+CTA factor). Per-cluster cycles = `147 tiles × 24 K_iters × cyc/iter`:
 
-| cyc/iter | what | @ 1.813 GHz | @ 1.965 GHz |
+| source | cyc/iter | wall (B200) | notes |
 |---|---|---|---|
-| 460 | hardware MMA retirement (no staging) | 0.896 ms | 0.827 ms |
-| 520.8 | bench NS=4 + W0-TMA overlap | 1.014 ms | 0.935 ms |
-| 525.6 | bench NS=4, no TMA overlap | 1.023 ms | 0.944 ms |
+| hardware MMA retirement | 460 | 0.896 ms | absolute ceiling, no staging — **unreachable** |
+| bench NS=4 + W0-TMA overlap | 520.8 | 1.014 ms | published microbench |
+| bench NS=4, no TMA overlap | 525.6 | 1.023 ms | published microbench |
+| **fc2-w3x-strip** (NS=6 + PREFILL) | **493** | **0.98502 ms** | **measured staging floor (1814685 cyc, 2026-04-30)** |
+| **fc2-w3x** (full kernel) | **502** | **1.00092 ms** | measured production (1846145 cyc) |
+| cuBLASLt rank-1 (L2) | ~520 | 1.046 ms | reference ceiling |
 
-`fc2_w3x` at 1.007 ms back-solves to 517 cyc/iter (base) or 561 (boost). ~100 µs
-headroom remains to pure-MMA floor — staging + pipeline bubbles, not compute-bound.
+**Strip vs full = 15.9 µs / 31460 cyc / 214 cyc/tile** (1.7% of 12482 cyc MMA
+budget per tile) — exposed-on-critical-path epilogue work, what `bar.sync` /
+`mbar_wait` couples between W0-W3 epi-end and W5's next-tile MMA. **~98% of the
+epilogue body IS hidden in MMA shadow**; the 2% that isn't is our real headroom.
+This contradicts the earlier "epi 100% in MMA shadow" framing from PROFILE_W5.
+
+**Gap decomposition** (vs structural floor, not the unreachable 460-cyc ceiling):
+- 89 µs (pure-MMA → strip) = NS=6 staging bubble. **Unreachable** without
+  removing staging.
+- 16 µs (strip → fc2-w3x) = exposed epi. **Real headroom**, addressable.
+- 61 µs (strip → cuBLASLt rank-1) = rank-1 has 4× more exposed-epi than us.
+  We've already cleaned up most of the W0-W3/W5 coupling.
+
+The earlier "~100 µs headroom" framing referenced the unreachable pure-MMA
+ceiling. **Real headroom on fc2-w3x is ~16 µs** vs the structural NS=6+PREFILL
+floor; by past-win standards (bias-preload 1.7 µs, STSM 0.4 µs) significant, but
+some fraction is inevitable (final-tile drain, proxy fence, cluster bar.sync).
+**Realistically recoverable: ~5-10 µs.**
+
 FC1 strip is TMA-load-dominated, not compute-bound.
+
+### N×K dim-sweep findings (2026-04-30, n=20 cells)
+
+`tools/dim_sweep_w3x.py` swept fc2_w3x across N∈{256,512,768,1024,1536} ×
+K∈{768,1536,3072,6144}. Headline pattern (eff = pure-MMA-floor / measured ms;
+note this overstates headroom — vs realistic NS=4 ceiling 525 cyc/iter most
+cells are ≥1.0):
+
+| | K=1536 NO_PREFILL | K=3072 PREFILL | K=6144 PREFILL |
+|---|---|---|---|
+| **eff at N=768** | 0.77 | **0.89** (production) | 0.91 |
+| **eff at N=1536** | 0.77 | 0.91 | 0.91 |
+| **eff at N=256** | 0.54 | 0.62 | 0.67 |
+
+- **PREFILL crossover is the big lever**: K_iters=12 → K_iters=24 jumps eff
+  +0.12 (NO_PREFILL caps you at ~0.77 of pure-MMA regardless of N). Confirms
+  K_ITERS≥20 threshold is real, not just safety guard.
+- **K=3072 sweet spot**: K=6144 gains only +0.02 eff → diminishing returns.
+- **N≥512 K≥3072 plateaus at ~0.91** — that's the asymptotic staged ceiling
+  on this geometry, matches strip-vs-full 16 µs gap analysis.
+- **N=256 starved**: only 49 tiles/cluster — pipeline never fully saturates
+  (eff caps at 0.67 even at K=6144).
+
+**Known issue: K=768 (K_iters=6) + N≥512 fails.** N=256 K=768 passes; N=512+
+fails (return code 1, undiagnosed). Suspect: K_iters==N_STAGES==6 + multi-column
+dispatch (TILES_N≥2). Either kernel-side bug at full-pipeline-fill K-loops with
+multi-tile transitions, or host-side validation/ABI issue. Diagnose via
+`grep -A20 "FAIL" data/dim_sweep_w3x_<ts>/sweep.log` before relying on short-K
+results.
 
 ## cuBLASLt rank-1
 
@@ -341,14 +392,26 @@ variant at compile time.
 
 K=1024/2048 still report ERR — one heuristic IMAs on the device.
 
-### Status (2026-04-28): blkswap default + bias-preload + STSM mandatory; baseline at ~1.008 ms
+### Status (2026-04-30): strip-measured floor 0.985 ms, full kernel 1.001 ms (16 µs exposed epi)
 
-`fc2_w3x` bias-only at ~1.008 ms with **gflip_blkswap (TD=54)** dispatch
+`fc2_w3x` bias-only at 1.00092 ms with **gflip_blkswap (TD=54)** dispatch
 (prior dgsw_G8 default ~1.009 ms, +0.33 µs slower); W5 is MMA-ceiling-bound
 (~12482 cyc/tile ≈ 24 × 520 cyc/iter, per `PROFILE_W5`). Tensor pipe 95.84%
 active. The 9-grievance SASS delta list vs rank-1 is exhausted (STSM
 mandatory, R2UR/ELECT confirmed orthogonal-to-W5, ptxas-owned descriptor
 operand class — see dead-end log).
+
+**Strip-measured floor (2026-04-30):** `fc2-w3x-strip` at **0.98502 ms**
+(1814685 cyc) = NS=6 + PREFILL + W4-TMA structural floor on this geometry.
+Full at 1.00092 ms → **15.9 µs / 31460 cyc / 214 cyc/tile exposed epi** =
+real remaining headroom. ~98% of epi body is MMA-shadowed; remaining 2% is
+cluster-barrier coupling between W0-W3 epi-end and W5's next-tile MMA.
+The earlier "epi 100% in MMA shadow" framing from PROFILE_W5 was directionally
+right but quantitatively wrong. Realistically recoverable: ~5-10 µs (some
+fraction is inevitable: final-tile drain, proxy fence, cluster bar.sync).
+By past-win standards (bias-preload 1.7 µs, STSM 0.4 µs) this is the largest
+single remaining target — but probably needs new lever class, not more
+SASS-level epi tuning.
 
 **bias-preload (default, 2026-04-26)** — pre-loads full bias [768 bf16] into
 per-lane registers at kernel start; subpass-level shfl×4 replaces the per-rh
@@ -460,7 +523,8 @@ See `memory/MEMORY.md` for full chronological dead-end log. Highlights:
 
 ```bash
 # FC2 BIAS_ONLY (BEST — beats cuBLASLt rank-1)
-make fc2-w3x && ./fc2-w3x                        # ~1.009 ms (bias-preload + STSM mandatory)
+make fc2-w3x && ./fc2-w3x                        # ~1.001 ms (bias-preload + STSM mandatory)
+make fc2-w3x-strip && ./fc2-w3x-strip            # NS=6+PREFILL staging floor (~0.985 ms)
 make fc2-w3x-ptx                                 # hand-written PTX, byte-identical SASS
 
 # fc2_w3x sweeps + diagnostics
@@ -497,7 +561,8 @@ bash tools/bench.sh --comprehensive              # rank-1-baselined
 bash tools/ncu_bench.sh && python3 tools/ncu_anova.py
 bash tools/ncu_fc2_w3x.sh --max --reps 3
 bash tools/ncu_fc2_pipes.sh                      # dodges --set full deadlock
-./tools/dim_sweep.sh --fast                      # 80 configs
+./tools/dim_sweep.sh --fast                      # fc2_w3 80 configs (M×N×K)
+./tools/dim_sweep_w3x.py                         # fc2_w3x N×K grid (default 20 cells, N≤1536)
 ```
 
 ## Key files
@@ -519,7 +584,8 @@ docs/BENCHMARKING.md            # cycles/AUC/η²/rank study guide — read befo
 rank1.sass                      # Dumped cuBLASLt rank-1 for diffing
 tools/bench.sh                  # FC1/FC2 × dispatch × packed × decomp (rank-1 baseline)
 tools/probe_cublaslt.sh         # cuBLASLt rank-1 timing
-tools/dim_sweep.sh              # M/N/K grid
+tools/dim_sweep.sh              # fc2_w3 M/N/K grid (bash)
+tools/dim_sweep_w3x.py          # fc2_w3x N×K grid (Python; per-cell binaries for cross-machine)
 tools/ncu_bench.sh, ncu_fc2_w3x.sh, ncu_fc2_pipes.sh   # ncu profiling
 tools/sweep_fc2_w3x_*.sh        # tiles / dg / prof sweeps
 tools/aggregate_prof.py         # PROFILE_* aggregator
