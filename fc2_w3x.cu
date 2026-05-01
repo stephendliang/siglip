@@ -150,8 +150,7 @@ static_assert((TN / 2) % B_BOX_N == 0,
 #define MBAR_TMA_EMPTY      (MBAR_TMA_FULL + N_STAGES * 8)
 #define MBAR_TMEM_READY     (MBAR_TMA_EMPTY + N_STAGES * 8)
 #define MBAR_TMEM_CONSUMED  (MBAR_TMEM_READY + 2 * 8)
-#define MBAR_STSM_DONE      (MBAR_TMEM_CONSUMED + 2 * 8)
-#define MBARS_END           (MBAR_STSM_DONE + NUM_EPI_STAGES * 8)
+#define MBARS_END           (MBAR_TMEM_CONSUMED + 2 * 8)
 
 #define OFF_TMEM       ((MBARS_END + 15) & ~15)
 #define OFF_SWIZZLE_LUT ((OFF_TMEM + 8 + 15) & ~15)
@@ -1743,7 +1742,7 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc,
   (one add per ki) + ~5 cyc/tile (swizzle) + ~10 cyc/tile (global store).
 */
 
-template<int TD, int DGG, bool SAFE_DROP_LEAD = false>
+template<int TD, int DGG>
 __global__ void __launch_bounds__(THREADS, 1)
 __cluster_dims__(2, 1, 1)
 fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
@@ -1816,11 +1815,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #ifdef NO_PREFILL
             mbar_init(smem_to_uint(smem + MBAR_TMEM_CONSUMED + b * 8), 2);
 #endif
-        }
-        if constexpr (SAFE_DROP_LEAD) {
-            for (int e = 0; e < NUM_EPI_STAGES; e++) {
-                mbar_init(smem_to_uint(smem + MBAR_STSM_DONE + e * 8), N_EPI_WARPS);
-            }
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -1908,9 +1902,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         const int row_group = warp_id;
 
         uint32_t mma_phase_0 = 0, mma_phase_1 = 0;
-        [[maybe_unused]] const uint32_t mbar_stsm_done_base =
-            smem_to_uint(smem + MBAR_STSM_DONE);
-        [[maybe_unused]] uint32_t stsm_done_phase[NUM_EPI_STAGES] = {0};
 
 #ifdef PROFILE_CYCLES
         uint64_t prof[PROF_N_PHASES] = {0};
@@ -2171,33 +2162,13 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 PROF_END(e1, 1);
 
                 PROF_BEGIN(e2);
-                if constexpr (SAFE_DROP_LEAD) {
-                    /*
-                      Race-free DROP_LEAD: replace bar.sync 0,N_EPI_WARPS*32
-                      with a per-es N_EPI_WARPS-arrival mbar.  Each warp
-                      leader arrives (release) after its own STSMs +
-                      fence.proxy.async; tid==0 waits (acquire) before
-                      issuing TMA.  Non-leader lanes free-run to the trail
-                      bar.sync — safe because the next subpass's STSM uses
-                      the alternating es buffer.
-                    */
-                    if (lane == 0) {
-                        mbar_arrive(mbar_stsm_done_base + es * 8);
-                    }
-                } else {
 #ifndef DROP_LEAD_BARSYNC
-                    asm volatile(EPI_BARSYNC_ASM ::: "memory");
+                asm volatile(EPI_BARSYNC_ASM ::: "memory");
 #endif
-                }
                 PROF_END(e2, 2);
 
                 if (tid == 0) {
                     PROF_BEGIN(e3);
-                    if constexpr (SAFE_DROP_LEAD) {
-                        mbar_wait(mbar_stsm_done_base + es * 8,
-                                  stsm_done_phase[es]);
-                        stsm_done_phase[es] ^= 1;
-                    }
                     if (tt > 0 || sp >= NUM_EPI_STAGES) {
                         BULK_ASM(BULK_WAIT_GROUP(1));
                     }
@@ -2571,31 +2542,27 @@ struct VariantCfg {
     void (*set_attr)(int);
 };
 
-template<int TD, int DGG, bool SAFE_DROP_LEAD = false>
+template<int TD, int DGG>
 static void launch_kern(dim3 grid, int smem,
                         const CUtensorMap& a, const CUtensorMap& b, const CUtensorMap& c,
                         const __nv_bfloat16* d_bias, __nv_bfloat16* d_C,
                         uint64_t* p, uint64_t* pki, uint64_t* pt, uint64_t* pw5,
                         uint64_t* pwc) {
-    fc2_w3x_kernel<TD, DGG, SAFE_DROP_LEAD><<<grid, THREADS, smem>>>(
+    fc2_w3x_kernel<TD, DGG><<<grid, THREADS, smem>>>(
         a, b, c, d_bias, d_C, p, pki, pt, pw5, pwc);
 }
 
-template<int TD, int DGG, bool SAFE_DROP_LEAD = false>
+template<int TD, int DGG>
 static void set_attr_kern(int smem) {
-    cudaError_t e = cudaFuncSetAttribute(fc2_w3x_kernel<TD, DGG, SAFE_DROP_LEAD>,
+    cudaError_t e = cudaFuncSetAttribute(fc2_w3x_kernel<TD, DGG>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     if (e != cudaSuccess) {
-        fprintf(stderr, "cudaFuncSetAttribute<%d,%d,%d>: %s\n",
-                TD, DGG, (int)SAFE_DROP_LEAD, cudaGetErrorString(e));
+        fprintf(stderr, "cudaFuncSetAttribute<%d,%d>: %s\n", TD, DGG, cudaGetErrorString(e));
         exit(1);
     }
 }
 
-#define VCFG(NAME, TD, DGG) \
-    {NAME, TD, DGG, launch_kern<TD, DGG, false>, set_attr_kern<TD, DGG, false>}
-#define VCFG_SAFE(NAME, TD, DGG) \
-    {NAME, TD, DGG, launch_kern<TD, DGG, true>,  set_attr_kern<TD, DGG, true>}
+#define VCFG(NAME, TD, DGG) {NAME, TD, DGG, launch_kern<TD, DGG>, set_attr_kern<TD, DGG>}
 static const VariantCfg VARIANTS[] = {
     VCFG("dgsw",      0,  8),
     VCFG("dg2",       0,  2),
@@ -2654,11 +2621,6 @@ static const VariantCfg VARIANTS[] = {
     VCFG("gflip_bitrev_xor2_alt1", 98, 8),
     VCFG("gflip_mul3_xor4_alt1", 99, 8),
     /* END COORD_DESCEND table */
-    /* SAFE_DROP_LEAD opt-in: race-free replacement of the lead bar.sync
-       between per-warp fence.proxy.async and tid==0's TMA store.  Same
-       TD=54 as gflip_blkswap so SWEEP=gflip_blkswap,gflip_blkswap_safe
-       isolates the bar.sync→mbar swap. */
-    VCFG_SAFE("gflip_blkswap_safe", 54, 8),
 };
 static const int N_VARIANTS = sizeof(VARIANTS) / sizeof(VARIANTS[0]);
 
