@@ -1,38 +1,42 @@
 #!/usr/bin/env python3
 """
-fc2_w3x N×K dimension sweep, head-to-head vs cuBLASLt rank-1.
+fc2_w3x N×K dimension sweep, head-to-head vs cuBLASLt rank-1 (BIAS and noBIAS).
 
 Sweeps fc2_w3x across a grid of (N, K) at fixed M, and at each cell runs
-cublaslt-introspect (full heuristic search → rank-1) to get cuBLASLt's
-best timing for the same shape. Comparison is in **cycles**, not ms:
-fc2_w3x emits per-CTA wall_cyc via clock64, cublaslt-introspect brackets
-its N_TIME loop with clock64-sentinel kernels — both measurements are
-SM-clock cycles, invariant to GPU frequency throttling (essential on
-unlocked-clock vast.ai boxes).
+cublaslt-introspect twice (EPI=3 BIAS_ONLY and EPI=0 plain GEMM, both
+full heuristic search → rank-1) to get cuBLASLt's best for the same
+shape with and without epilogue cost. Comparison is in **cycles**, not
+ms: fc2_w3x emits per-CTA wall_cyc via clock64, cublaslt-introspect
+brackets its N_TIME loop with clock64-sentinel kernels — both
+measurements are SM-clock cycles, invariant to GPU frequency throttling
+(essential on unlocked-clock vast.ai boxes).
 
-N is capped at 1536 (NS=6 SMEM ceiling). M kept fixed because it only
-sets tile count, not per-tile shape.
+Default grid is power-of-2 (1024/2048/4096/8192) to dodge cuBLASLt's
+sparse heuristic table for non-pow2 K (per-tensor FP8 BIAS_ONLY misses
+~1/3 of cells at K=1536 etc.) and our kernel's K_iters==NS=6 boundary
+bug at K=768. N >1536 uses adaptive N_STAGES (NS5/NS4/NS3) to fit SMEM.
 
 Constraints (from fc2_w3x.cu):
-    - N must be multiple of TN=256
+    - N must be multiple of TN=256, and of 64 (BIAS_REG_COUNT static)
     - K must be multiple of TK=128
     - M must be multiple of TM*2=256 (cluster stride)
     - K_iters < 20 → must build with -DNO_PREFILL (kernel doesn't auto-guard)
-    - N > 1536 → must use NS5 (we cap at 1536 to stay on NS6)
+    - N adaptive NS: 6 if N≤1536, 5 if N≤2048, 4 if N≤4096, 3 if N≤8192
 
 Output:
     data/dim_sweep_w3x_<ts>/results.tsv
     Tables sorted by (N, K), by K/N ratio, by cyc (us, fastest first),
-    and by Δ% vs cuBLASLt rank-1 (most negative = biggest fc2_w3x win).
-    Δcyc < 0 → fc2_w3x faster than cuBLASLt rank-1 at that (N, K).
+    and by Δ% vs cuBLASLt rank-1 BIAS (most negative = biggest fc2_w3x win).
 
 Usage:
-    ./tools/dim_sweep_w3x.py                       # default 5N × 4K grid + cuBLASLt
-    ./tools/dim_sweep_w3x.py --full                # 6N × 8K = 48 cells
-    ./tools/dim_sweep_w3x.py --quick               # 3N × 3K = 9 cells
-    ./tools/dim_sweep_w3x.py --n 256,768,1536 --k 1024,3072,8192
+    ./tools/dim_sweep_w3x.py                       # default 4N × 4K pow2 grid + cuBLASLt bias+nobias
+    ./tools/dim_sweep_w3x.py --full                # 5N × 8K = 40 cells
+    ./tools/dim_sweep_w3x.py --quick               # 2N × 2K = 4 cells
+    ./tools/dim_sweep_w3x.py --legacy              # old non-pow2 grid (5N × 4K)
+    ./tools/dim_sweep_w3x.py --n 1024,2048 --k 2048,4096
     ./tools/dim_sweep_w3x.py --reps 5              # 5 launches/cell, take min
-    ./tools/dim_sweep_w3x.py --no-cublaslt         # skip head-to-head
+    ./tools/dim_sweep_w3x.py --no-cublaslt         # skip both head-to-heads
+    ./tools/dim_sweep_w3x.py --no-cublaslt-nobias  # skip the EPI=0 second run
     ./tools/dim_sweep_w3x.py --build-only          # CPU-VPS-friendly
     ./tools/dim_sweep_w3x.py --run-only            # skip build phase
     ./tools/dim_sweep_w3x.py --m 464128            # override fixed M
@@ -57,18 +61,33 @@ GHZ_BASE = 1.813
 
 GRIDS = {
     "default": {
+        "n": [256, 512, 1024, 2048],
+        "k": [1024, 2048, 4096, 8192],
+    },
+    "full": {
+        "n": [256, 512, 1024, 1536, 2048],
+        "k": [1024, 2048, 4096, 8192],
+    },
+    "quick": {
+        "n": [1024, 2048],
+        "k": [2048, 4096],
+    },
+    "legacy": {
         "n": [256, 512, 768, 1024, 1536],
         "k": [768, 1536, 3072, 6144],
     },
-    "full": {
-        "n": [256, 512, 768, 1024, 1280, 1536],
-        "k": [768, 1024, 1536, 2048, 3072, 4096, 6144, 8192],
-    },
-    "quick": {
-        "n": [256, 768, 1536],
-        "k": [1024, 3072, 6144],
-    },
 }
+
+
+def pick_n_stages(n):
+    """Pick N_STAGES so MAIN_SMEM (NS * 32KB) + epi/bias fits in 228KB.
+    NS=6 for N<=1536 is the in-tree default; larger N forces shallower
+    pipeline depth to make room for the bigger BIAS_BYTES (=2*N).
+    """
+    if n <= 1536: return 6
+    if n <= 2048: return 5
+    if n <= 4096: return 4
+    return 3
 
 RESULT_RE = re.compile(
     r"^@@RESULT\s+ms=(?P<ms>[\d.]+)\s+tflops=(?P<tf>[\d.]+)"
@@ -83,7 +102,8 @@ CUBLAS_RESULT_RE = re.compile(
 def validate_dim(n, k, m):
     errs = []
     if n % TN: errs.append(f"N={n} not %{TN}=0")
-    if n > 1536: errs.append(f"N={n} > 1536 (NS=6 SMEM ceiling)")
+    if n % 64: errs.append(f"N={n} not %64=0 (BIAS_REG_COUNT static_assert)")
+    if n > 8192: errs.append(f"N={n} > 8192 (no NS that fits)")
     if k % TK: errs.append(f"K={k} not %{TK}=0")
     if m % TM_PACK: errs.append(f"M={m} not %{TM_PACK}=0")
     return errs
@@ -100,7 +120,9 @@ def cell_binary(n, k, save_per_cell):
 
 def build_cell(n, k, m, log_fp, save_per_cell=False):
     k_iters = k // TK
-    dflags = [f"-DM_TOTAL={m}", f"-DN_DIM={n}", f"-DK_DIM={k}"]
+    ns = pick_n_stages(n)
+    dflags = [f"-DM_TOTAL={m}", f"-DN_DIM={n}", f"-DK_DIM={k}",
+              f"-DN_STAGES={ns}"]
     if k_iters < 20:
         dflags.append("-DNO_PREFILL")
     binary = cell_binary(n, k, save_per_cell)
@@ -174,12 +196,13 @@ def run_cell(reps, timeout, log_fp, binary=None):
             "tflops": last_tf, "valid": last_valid}
 
 
-def run_cublaslt(n, k, m, reps, timeout, log_fp):
-    """Run cublaslt-introspect and return best (ms, cyc) across reps."""
+def run_cublaslt(n, k, m, reps, timeout, log_fp, epi):
+    """Run cublaslt-introspect at the given EPI and return best (ms, cyc).
+    epi: 0 = no epilogue, 3 = BIAS_ONLY."""
     binary = REPO / "cublaslt-introspect"
     if not binary.exists():
         return {"status": "MISSING_CUBLASLT", "ms": None, "cyc": None}
-    args = [str(binary), str(m), str(n), str(k), "3"]  # epi=3 BIAS_ONLY
+    args = [str(binary), str(m), str(n), str(k), str(epi)]
     best_ms = None
     best_cyc = None
     status = "ok"
@@ -190,7 +213,7 @@ def run_cublaslt(n, k, m, reps, timeout, log_fp):
         except subprocess.TimeoutExpired:
             status = "TIMEOUT"
             break
-        log_fp.write(f"--- cublas rep {r+1}/{reps} ec={proc.returncode}\n")
+        log_fp.write(f"--- cublas epi={epi} rep {r+1}/{reps} ec={proc.returncode}\n")
         log_fp.write(proc.stdout)
         if proc.returncode != 0:
             log_fp.write(proc.stderr)
@@ -232,6 +255,7 @@ def cell_meta(n, k, m):
         tiles_per_cluster=tiles_per_cluster,
         kn_ratio=k / n, floor_ms=floor_ms(n, k, m),
         prefill="off" if k_iters < 20 else "on",
+        n_stages=pick_n_stages(n),
     )
 
 
@@ -245,11 +269,12 @@ def fmt_row(meta, res, fields):
         elif f in ("floor_ms",): out.append(f"{v:.3f}")
         elif f in ("tflops",) and v is not None: out.append(f"{v:.1f}")
         elif f == "eff" and v is not None: out.append(f"{v:.2f}")
-        elif f in ("cyc", "cublas_cyc") and v: out.append(f"{int(v)/1e3:.1f}k")
-        elif f == "cublas_ms" and v: out.append(f"{v:.4f}")
-        elif f == "dcyc" and v is not None:
+        elif f in ("cyc", "cublas_cyc", "cublas_none_cyc") and v:
+            out.append(f"{int(v)/1e3:.1f}k")
+        elif f in ("cublas_ms", "cublas_none_ms") and v: out.append(f"{v:.4f}")
+        elif f in ("dcyc", "dn_cyc") and v is not None:
             out.append(f"{int(v)/1e3:+.1f}k")
-        elif f == "dpct" and v is not None:
+        elif f in ("dpct", "dn_pct") and v is not None:
             out.append(f"{v:+.2f}%")
         else: out.append(str(v))
     return out
@@ -281,6 +306,8 @@ def main():
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--legacy", action="store_true",
+                    help="use the old non-pow2 grid (5N × 4K)")
     ap.add_argument("--n", help="comma-sep N list (overrides grid)")
     ap.add_argument("--k", help="comma-sep K list (overrides grid)")
     ap.add_argument("--m", type=int, default=M_DEFAULT)
@@ -290,14 +317,19 @@ def main():
     ap.add_argument("--build-only", action="store_true")
     ap.add_argument("--run-only", action="store_true")
     ap.add_argument("--no-cublaslt", action="store_true",
-                    help="skip cuBLASLt rank-1 head-to-head")
+                    help="skip both cuBLASLt rank-1 head-to-heads")
+    ap.add_argument("--no-cublaslt-nobias", action="store_true",
+                    help="skip the EPI=0 (no-epilogue) cuBLASLt run; keep BIAS only")
     ap.add_argument("--cublaslt-reps", type=int, default=1,
-                    help="reps per cell for cuBLASLt rank-1 (each rep does its "
-                         "own full heuristic search)")
+                    help="reps per cell per EPI mode (each rep does its own "
+                         "full heuristic search)")
     ap.add_argument("--cublaslt-timeout", type=int, default=240)
     args = ap.parse_args()
 
-    grid_name = "full" if args.full else "quick" if args.quick else "default"
+    if args.legacy:
+        grid_name = "legacy"
+    else:
+        grid_name = "full" if args.full else "quick" if args.quick else "default"
     grid = GRIDS[grid_name]
     n_list = [int(x) for x in args.n.split(",")] if args.n else grid["n"]
     k_list = [int(x) for x in args.k.split(",")] if args.k else grid["k"]
@@ -334,9 +366,10 @@ def main():
     log_fp = open(log_path, "w")
     tsv_fp = open(tsv_path, "w")
     tsv_fp.write("\t".join([
-        "n", "k", "k_iters", "n_tiles", "tiles_per_cluster",
+        "n", "k", "n_stages", "k_iters", "n_tiles", "tiles_per_cluster",
         "kn_ratio", "prefill", "floor_ms", "ms", "cyc", "tflops", "eff",
         "cublas_ms", "cublas_cyc", "dcyc", "dpct",
+        "cublas_none_ms", "cublas_none_cyc", "dn_cyc", "dn_pct",
         "valid", "status",
     ]) + "\n")
 
@@ -371,37 +404,53 @@ def main():
         res = run_cell(args.reps, args.timeout, log_fp, binary=binary)
         eff = (meta["floor_ms"] / res["ms"]) if res["ms"] else None
         cub = {"status": "skip", "ms": None, "cyc": None}
+        cubn = {"status": "skip", "ms": None, "cyc": None}
         if do_cublaslt:
             cub = run_cublaslt(n, k, args.m, args.cublaslt_reps,
-                                args.cublaslt_timeout, log_fp)
+                                args.cublaslt_timeout, log_fp, epi=3)
+            if not args.no_cublaslt_nobias:
+                cubn = run_cublaslt(n, k, args.m, args.cublaslt_reps,
+                                    args.cublaslt_timeout, log_fp, epi=0)
         dcyc = None; dpct = None
         if res["cyc"] and cub["cyc"]:
             dcyc = res["cyc"] - cub["cyc"]
             dpct = 100.0 * dcyc / cub["cyc"]
+        dn_cyc = None; dn_pct = None
+        if res["cyc"] and cubn["cyc"]:
+            dn_cyc = res["cyc"] - cubn["cyc"]
+            dn_pct = 100.0 * dn_cyc / cubn["cyc"]
         merged = dict(res)
         merged["cublas_ms"] = cub["ms"]
         merged["cublas_cyc"] = cub["cyc"]
         merged["cublas_status"] = cub["status"]
         merged["dcyc"] = dcyc
         merged["dpct"] = dpct
+        merged["cublas_none_ms"] = cubn["ms"]
+        merged["cublas_none_cyc"] = cubn["cyc"]
+        merged["cublas_none_status"] = cubn["status"]
+        merged["dn_cyc"] = dn_cyc
+        merged["dn_pct"] = dn_pct
         rows.append((meta, merged))
         ms = f"{res['ms']:.4f}" if res["ms"] else "-"
         tf = f"{res['tflops']:.1f}" if res["tflops"] else "-"
         ef = f"{eff:.2f}" if eff else "-"
         cy_us = f"{res['cyc']/1e3:.1f}" if res["cyc"] else "-"
-        if cub["cyc"]:
-            cb_cy = f"{cub['cyc']/1e3:.1f}"
-            sign = "" if dcyc is None or dcyc >= 0 else "−"
-            mag = abs(dcyc) if dcyc is not None else 0
-            dlabel = f"{sign}{mag/1e3:.1f}k ({dpct:+.2f}%)" if dcyc is not None else "-"
-        else:
-            cb_cy = cub["status"][:8]
-            dlabel = "-"
+        def _fmt_cb(c, status, dc, dp):
+            if c:
+                sign = "" if dc is None or dc >= 0 else "−"
+                mag = abs(dc) if dc is not None else 0
+                d = f"{sign}{mag/1e3:.1f}k ({dp:+.2f}%)" if dc is not None else "-"
+                return f"{c/1e3:.1f}k", d
+            return status[:8], "-"
+        cb_cy, dlabel = _fmt_cb(cub["cyc"], cub["status"], dcyc, dpct)
+        cbn_cy, dnlabel = _fmt_cb(cubn["cyc"], cubn["status"], dn_cyc, dn_pct)
         print(f"    ms={ms} cyc={cy_us}k tflops={tf} eff={ef} "
-              f"v={res.get('valid','-')}  cublas_cyc={cb_cy}k  Δ={dlabel}  "
+              f"v={res.get('valid','-')} NS={meta['n_stages']}  "
+              f"cb_bias={cb_cy} Δb={dlabel}  cb_none={cbn_cy} Δn={dnlabel}  "
               f"{res['status']}")
         tsv_fp.write("\t".join(str(x) for x in [
-            meta["n"], meta["k"], meta["k_iters"], meta["n_tiles"],
+            meta["n"], meta["k"], meta["n_stages"],
+            meta["k_iters"], meta["n_tiles"],
             meta["tiles_per_cluster"], f"{meta['kn_ratio']:.4f}",
             meta["prefill"], f"{meta['floor_ms']:.4f}",
             res["ms"] if res["ms"] else "",
@@ -412,6 +461,10 @@ def main():
             cub["cyc"] if cub["cyc"] else "",
             dcyc if dcyc is not None else "",
             f"{dpct:.4f}" if dpct is not None else "",
+            cubn["ms"] if cubn["ms"] else "",
+            cubn["cyc"] if cubn["cyc"] else "",
+            dn_cyc if dn_cyc is not None else "",
+            f"{dn_pct:.4f}" if dn_pct is not None else "",
             res["valid"] if res["valid"] is not None else "",
             res["status"],
         ]) + "\n")
@@ -424,13 +477,15 @@ def main():
         print(f"\n[build-only] {len(rows)} variants built. Run with --run-only on B200.")
         return
 
-    fields = ["n", "k", "k_iters", "kn_ratio", "tiles_per_cluster",
+    fields = ["n", "k", "n_stages", "k_iters", "kn_ratio", "tiles_per_cluster",
               "floor_ms", "ms", "cyc", "eff",
               "cublas_cyc", "dcyc", "dpct",
+              "cublas_none_cyc", "dn_cyc", "dn_pct",
               "valid", "status"]
-    headers = ["N", "K", "K_it", "K/N", "tile/cl",
+    headers = ["N", "K", "NS", "K_it", "K/N", "tile/cl",
                "floor", "ms", "cyc", "eff",
-               "cublas_cyc", "Δcyc", "Δ%",
+               "cb_bias", "Δb", "Δb%",
+               "cb_none", "Δn", "Δn%",
                "v", "status"]
 
     print_table(rows, "── by raw size (N then K) ──",
@@ -439,8 +494,11 @@ def main():
                 lambda r: r[0]["kn_ratio"], fields, headers)
     print_table(rows, "── by cyc (fastest first) ──",
                 lambda r: r[1].get("cyc") or 1e18, fields, headers)
-    print_table(rows, "── by Δ% vs cuBLASLt rank-1 (most negative = biggest win) ──",
+    print_table(rows, "── by Δ% vs cuBLASLt rank-1 BIAS (most negative = biggest win) ──",
                 lambda r: (r[1].get("dpct") if r[1].get("dpct") is not None else 1e9),
+                fields, headers)
+    print_table(rows, "── by Δ% vs cuBLASLt rank-1 noBIAS (apples-to-oranges; for awareness) ──",
+                lambda r: (r[1].get("dn_pct") if r[1].get("dn_pct") is not None else 1e9),
                 fields, headers)
 
     summary = outdir / "summary.txt"
@@ -449,8 +507,10 @@ def main():
             ("by raw size", lambda r: (r[0]["n"], r[0]["k"])),
             ("by K/N ratio", lambda r: r[0]["kn_ratio"]),
             ("by cyc", lambda r: r[1].get("cyc") or 1e18),
-            ("by Δ% vs cuBLASLt rank-1",
+            ("by Δ% vs cuBLASLt rank-1 BIAS",
              lambda r: (r[1].get("dpct") if r[1].get("dpct") is not None else 1e9)),
+            ("by Δ% vs cuBLASLt rank-1 noBIAS",
+             lambda r: (r[1].get("dn_pct") if r[1].get("dn_pct") is not None else 1e9)),
         ]:
             print_table(rows, f"── {title} ──", key, fields, headers, fp=fp)
 
