@@ -348,9 +348,71 @@ saved <1 µs — not implemented.
 **16 µs gap decomposition (revised):**
 - **~4 µs steady-state mbar / cluster bar.sync** (sass-attributed at 5.02M
   samples; symptomatic of the 6-warp design + `cta_group::2` cluster sync —
-  not addressable without rewriting the warp-specialization or cluster shape)
+  largely not addressable without rewriting the warp-specialization or
+  cluster shape; the **NANOSLEEP_CYC** sweep below proves only ~0.06 µs of
+  this is tunable via the spin-wait nap — ns32 is the lone WEAK-faster
+  cell at n=5489, the rest tie ns20)
 - **~12 µs cross-CTA tail variance** (structural; basin-floor dispatch
   already minimizes it, within-basin spread is at TIE-band)
+
+### NANOSLEEP_CYC sweep — ns32 lone WEAK winner, ns20 default stays (n=5489, 2026-05-01)
+
+10-cell sweep over `mbar_wait`'s `nanosleep.u32 N` immediate, all pinned to
+`gflip_blkswap` (TD=54, DGG=8). NS_CYC threaded as a template parameter so
+each cell bakes the immediate into its SASS (zero runtime cost). Driven by
+`tools/sweep_fc2_w3x_nanosleep.sh`; **n=5489 paired blocks** via
+`anova_1way --metric cyc --paired rep` (a smaller n=1373 first pass had
+4 cells WEAK-faster; tightening to n=5489 demoted three to TIE — see
+calibration note below).
+
+| variant | mean_rank | win% | Δ vs ns20 | Cohen d | AUC | verdict |
+|---|---|---|---|---|---|---|
+| **ns32** | **4.90** | 12.7% | **−111 cyc** | −0.198 | 0.441 | WEAK faster |
+| ns8  | 5.00 | 13.4% | −95 cyc  | −0.164 | 0.451 | TIE |
+| ns16 | 5.01 | 10.2% | −81 cyc  | −0.151 | 0.451 | TIE |
+| ns4  | 5.11 | 13.5% | −62 cyc  | −0.105 | 0.466 | TIE |
+| **ns20** (default) | 5.53 | 8.4% | 0 (anchor) | — | — | — |
+| ns64 | 5.67 | 10.6% | +27 cyc  | +0.044 | 0.517 | TIE |
+| ns12 | 5.69 | 7.8%  | +44 cyc  | +0.081 | 0.520 | TIE |
+| ns48 | 5.72 | 8.7%  | +41 cyc  | +0.070 | 0.522 | TIE |
+| ns24 | 6.15 | 5.7%  | +122 cyc | +0.221 | 0.564 | WEAK slower |
+| ns0 (busy-spin) | 6.21 | 9.0% | +170 cyc | +0.275 | 0.577 | WEAK slower |
+
+**Total spread ~281 cyc / 0.15 µs end-to-end.** **ns32 is the only
+WEAK-faster cell** at n=5489 (Δ=−111 cyc, AUC=0.441); the prior n=1373
+"ns4/8/16/32 all WEAK faster" picture collapsed — at 4× more data,
+ns8/ns16/ns4 sit at TIE band relative to ns20. The lever is real but
+the basin is narrow (only ns32 separates from the anchor) and the
+addressable headroom is ~0.06 µs / ~0.006% wall — **same standing as
+within-basin dispatch: real but below the promotion bar.**
+
+**Calibration: n=1373 → n=5489 demoted 3 of 4 "WEAK faster" cells to
+TIE.** Stage 1 mean_rank ordering (ns32=4.63, ns16=4.82, ns4=4.96,
+ns8=5.20) was clean and Δs were −164/−130/−106/−84 cyc, all WEAK faster.
+Stage 2 with 4× the data shrunk those to −111/−81/−62/−95 cyc and only
+ns32 held WEAK. Same canonical pattern as the gflip dispatch sweep
+(Stage 1 lmrev DECISIVE → Stage 2 mid-pack at n=29420). **σ_residual
+≈ 1400 cyc dominates a 100-cyc effect even at n=5489**; only ns32's
+mean_rank pulls clear of the basin.
+
+**Why ns0 (busy-spin) is only WEAK slower, not DECISIVE.** The spin-loop
+body (`SYNCS.PHASECHK.TRYWAIT` + branch, ~25 cyc) at 5M samples is the
+sass-flagged hotspot, BUT mbar_wait runs on warps that have nothing else
+productive to do (W0-W3 epi after STSM, W5 after MMA arrive). Removing
+the nap doesn't add productive work, only burns more issue slots that
+were already idle. The +170 cyc cost of ns0 is the wakeup-latency tax
+from "no nap" → back-to-back tryWAIT polls keep the issue port busy in
+the wrong way. The gap WIDENED from +121 (n=1373) to +170 (n=5489),
+consistent with a real but small effect.
+
+**Default stays ns20.** ns32 leads at ~0.06 µs / ~0.006% wall at WEAK
+confidence — below promotion bar, zero-churn principle holds. ns24
+(WEAK slower at +122 cyc) and ns0 (WEAK slower at +170 cyc) bound the
+bad side of the basin. Anything in [4..32] is functionally equivalent
+to ns20.
+
+See `memory/project_w3x_nanosleep_basin.md` for full data + calibration
+table comparing n=1373 vs n=5489.
 
 **ncu warnings to IGNORE in `docs/fc2_w3x_ncu_details.txt`:**
 - `"13398-way bank conflict, 40.22% Est. Speedup"` — **STSM mis-attribution**.
@@ -384,11 +446,53 @@ cells are ≥1.0):
   (eff caps at 0.67 even at K=6144).
 
 **Known issue: K=768 (K_iters=6) + N≥512 fails.** N=256 K=768 passes; N=512+
-fails (return code 1, undiagnosed). Suspect: K_iters==N_STAGES==6 + multi-column
-dispatch (TILES_N≥2). Either kernel-side bug at full-pipeline-fill K-loops with
-multi-tile transitions, or host-side validation/ABI issue. Diagnose via
-`grep -A20 "FAIL" data/dim_sweep_w3x_<ts>/sweep.log` before relying on short-K
-results.
+fails (return code 1, undiagnosed). Confirmed across two sweeps: 4/4 cells
+N∈{512,768,1024,1536} × K=768 fail. N=256 K=768 (TILES_N=1) is the only
+K=768 cell that survives. Suspect: K_iters==N_STAGES==6 + multi-column
+dispatch (TILES_N≥2). Either kernel-side bug at full-pipeline-fill K-loops
+with multi-tile transitions, or host-side validation/ABI issue. Cheapest
+bisection probes: (a) build N=512 K=1024 NO_PREFILL — does K_iters=8 vs
+NS=6 (gap of 2) survive? If yes, bug is precisely K_iters==NS. (b) build
+N=512 K=768 with `-DN_STAGES=4` — does NS<K_iters fix it? If yes, fix is
+to clamp NS≤K_iters−2 in adaptive tuning. Diagnose via
+`grep -A20 "FAIL" data/dim_sweep_w3x_<ts>/sweep.log` before relying on
+short-K results.
+
+### Head-to-head vs cuBLASLt rank-1 in cycles (2026-05-01, n=20 cells)
+
+`tools/dim_sweep_w3x.py` now runs `cublaslt-introspect` at each (M,N,K)
+cell and pairs cycles via stream-serialized `clock64()` sentinels (same
+SM-clock domain as fc2_w3x's per-CTA `wall_cyc`, throttling-invariant).
+EPI=3 BIAS_ONLY both sides. **fc2_w3x beats cuBLASLt rank-1 in 8/9 cells
+where both report data**:
+
+| N | K | tile/cl | ours cyc | cublas cyc | Δcyc | Δ% |
+|---|---|---|---|---|---|---|
+| **768**  | 3072 | 147 | 1845.4k | 1925.3k | **−79.9k** | **−4.15%** | (production point) |
+| 512  | 6144 | 98  | 2484.4k | 2588.0k | −103.6k | −4.00% |
+| 1024 | 3072 | 196 | 2439.1k | 2517.8k | −78.7k | −3.13% |
+| 1536 | 3072 | 294 | 3640.6k | 3719.6k | −79.0k | −2.12% |
+| 256  | 768  | 49  | 333.1k  | 339.1k  | −6.0k  | −1.76% |
+| 768  | 6144 | 147 | 3639.0k | 3692.0k | −53.0k | −1.44% |
+| 1024 | 6144 | 196 | 4837.1k | 4886.9k | −49.8k | −1.02% |
+| 1536 | 6144 | 294 | 7245.0k | 7286.8k | −41.7k | −0.57% |
+| 1536 | 1536 | 294 | 2149.0k | 2108.1k | **+40.9k** | **+1.94%** | (only loss) |
+
+The production point (N=768, K=3072) lands at −4.15% — bigger margin in
+cycles than the 1.046→1.001 ms gap suggested. The only loss is square-ish
+N=K=1536 K_iters=12 NO_PREFILL — where (a) cuBLASLt's heuristic table is
+densest and (b) we hit the 0.77 NO_PREFILL eff cap (see N×K table above).
+
+**cuBLASLt rank-1 missing data — sparse heuristic table (7 cells):**
+256×{1536, 3072, 6144}, 512×{1536, 3072}, 768×1536, 1024×1536. Pattern:
+K=1536 returns zero algos almost everywhere (only N=1536 works);
+small-N (N≤512) needs K large AND specifically supported. Not a
+"K too small" cliff — both axes have shape-specific gaps in the
+per-tensor FP8 + BIAS_ONLY heuristic table. To recover most of these
+cells: extend `bench/cublaslt_introspect.cu` to retry with EPI=0 (plain
+FP8 GEMM, denser table) when BIAS_ONLY heuristic search returns zero.
+
+See `memory/project_w3x_dim_sweep_vs_cublas.md`.
 
 ## cuBLASLt rank-1
 
