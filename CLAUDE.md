@@ -494,6 +494,83 @@ FP8 GEMM, denser table) when BIAS_ONLY heuristic search returns zero.
 
 See `memory/project_w3x_dim_sweep_vs_cublas.md`.
 
+### Pow2 N×K sweep + auto NS picker (2026-05-01, 16 cells)
+
+`tools/dim_sweep_w3x.py` default flipped to power-of-2 grid (N ∈
+{256,512,1024,2048} × K ∈ {1024,2048,4096,8192}) and the kernel now
+auto-picks `N_STAGES` + `NO_PREFILL` from `N_DIM` and `K_ITERS`:
+
+```
+NS_BY_N    = 6/5/4/3 for N ≤ 1536/2048/4096/larger    (SMEM ceiling)
+NS         = min(NS_BY_N, max(2, K_ITERS - 3))         (pipeline-fill margin)
+NO_PREFILL = (K_ITERS < 20)
+```
+
+The `K_ITERS - 3` rule comes from `recent_vs_cublas.tsv`: gap=2 (K=1024
+N≥512 NS=6 K_ITERS=8) FAILs; gap=3 (forced NS=5) works. Three previously-
+FAIL cells (K=1024 N∈{512,1024} and K=768 N≥512 from the legacy grid)
+build cleanly under the new clamp; production point K=3072 N=768
+unchanged at NS=6.
+
+| N | K | K_it | NS | ours cyc | cb_bias cyc | cb_none cyc | Δb% | Δn% |
+|---|---|---|---|---|---|---|---|---|
+| 256 | 1024 | 8  | 5\* | 397.6k  | n/a       | 390.3k    | n/a   | +1.88 |
+| 256 | 2048 | 16 | 6   | 634.5k  | n/a       | 664.9k    | n/a   | −4.57 |
+| 256 | 4096 | 32 | 6   | 1152.4k | n/a       | 1172.1k   | n/a   | −1.68 |
+| 256 | 8192 | 64 | 6   | 2150.6k | 2453.4k   | 2451.9k   | −12.34| −12.29|
+| 512 | 1024 | 8  | 5   | (was FAIL@NS=6 — auto-picker now NS=5)            |
+| 512 | 2048 | 16 | 6   | 951.2k  | n/a       | 991.9k    | n/a   | −4.11 |
+| 512 | 4096 | 32 | 6   | 1783.1k | 1767.7k   | 1753.7k   | +0.87 | +1.67 |
+| 512 | 8192 | 64 | 6   | 3386.9k | 3451.5k   | 3446.9k   | −1.87 | −1.74 |
+| 1024| 1024 | 8  | 5   | (was FAIL@NS=6 — auto-picker now NS=5)            |
+| 1024| 2048 | 16 | 6   | 1692.5k | 1817.1k   | 1773.3k   | −6.86 | −4.55 |
+| 1024| 4096 | 32 | 6   | 3405.1k | 3302.0k   | 3292.6k   | +3.12 | +3.42 |
+| 1024| 8192 | 64 | 6   | 6510.4k | 6525.2k   | 6532.7k   | −0.23 | −0.34 |
+| 2048| 1024 | 8  | 5   | 2717.4k | 2289.9k   | 2135.3k   |+18.67 |+27.26 |
+| 2048| 2048 | 16 | 5   | 3288.5k | 3434.0k   | 3422.8k   | −4.24 | −3.92 |
+| 2048| 4096 | 32 | 5   | 6727.9k | 6510.7k   | 6497.5k   | +3.34 | +3.55 |
+| 2048| 8192 | 64 | 5   | 12940.7k| 12908.1k  | 12908.6k  | +0.25 | +0.25 |
+
+\*N=256 K=1024 picks NS=5 (`min(NS_BY_N=6, K_ITERS-3=5)`).
+N=2048 cells run at NS=5 (SMEM-cap penalty: 1 stage of latency-hiding
+gone vs N≤1536).
+"n/a" cuBLASLt BIAS columns = sparse heuristic table at small-N + medium-K
+(all 4 N=256 cells K∈{1024,2048,4096} return zero algos, ditto N=512
+K∈{1024,2048}); EPI=0 plain GEMM (denser table) covers everything except
+the FAIL cells.
+
+**Three loss patterns visible in this data:**
+
+1. **N=2048 K=1024 catastrophe (+27%, eff=0.54).** Three penalties stack:
+   NS=5 (forced), `NO_PREFILL` (CLAUDE.md says caps eff at ~0.77 even on
+   normal cells), and gap=3 minimum-safe-margin. Probably needs a
+   different short-K kernel (no PREFILL ever, smaller tile) rather than
+   tuning fc2_w3x.
+
+2. **K=4096 systematic loss across N≥512 (+1.7% to +3.5%).** Most
+   actionable. cuBLASLt's eff jumps 0.81→0.88 going K=2048→K=4096 while
+   ours stays flat at 0.86. Something in their K=4096 algo path scales
+   better. Pending: capture rank-1 algo identity (tile/stages/cluster/
+   splitk) per cell — the dim_sweep harness now parses `# Winner:` from
+   `cublaslt-introspect` and emits these as TSV columns. Plausible
+   suspects: a 256×96 tile (TILE_ID=495) for narrower N-tiles, deeper
+   NS, or split-K. Re-run on B200 to fill in.
+
+3. **N=2048 NS=5 SMEM tax (~1-3.5% across K).** Pure 1-stage-of-latency-
+   hiding loss. The gap shrinks as K grows (3.5% at K=4096 vs 0.25% at
+   K=8192) because at long K the lost stage matters less. Only fixable
+   by shrinking something else (e.g., NUM_EPI_STAGES=1, but LDTM_X64
+   dead-end says that costs +14 µs).
+
+**Sweet spots (where we win):**
+- **K=2048 across all N**: clean −4 to −7% wins. K_ITERS=16 past PREFILL
+  threshold; gap=10 from NS=6; cuBLASLt heuristic at this K is the same
+  as production K=3072. Sub-pattern: K=2048 is now the *new* head-to-head
+  winner alongside K=3072; widen production benchmark coverage.
+- **Small N (N=256)**: −1 to −12%. Less a win than cuBLASLt's heuristic
+  floor degrading at small N (49 tiles/cluster underutilization on both
+  sides; theirs more).
+
 ## cuBLASLt rank-1
 
 `tools/probe_cublaslt.sh` (probe 1) enumerates every heuristic, times each, reports
