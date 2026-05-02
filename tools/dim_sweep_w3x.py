@@ -79,15 +79,19 @@ GRIDS = {
 }
 
 
-def pick_n_stages(n):
-    """Pick N_STAGES so MAIN_SMEM (NS * 32KB) + epi/bias fits in 228KB.
-    NS=6 for N<=1536 is the in-tree default; larger N forces shallower
-    pipeline depth to make room for the bigger BIAS_BYTES (=2*N).
+def pick_n_stages(n, k):
+    """Mirror of fc2_w3x.cu's auto-picker. Two ceilings:
+    (1) SMEM by N_DIM: NS=6 fits up to N=1536; larger N steps down.
+    (2) Pipeline-fill margin: NS <= K_iters - 3 (gap=2 FAILs at K=1024
+        empirically; gap=3 is the smallest known-safe).
+    The kernel now owns this; this function is for diagnostics + TSV.
     """
-    if n <= 1536: return 6
-    if n <= 2048: return 5
-    if n <= 4096: return 4
-    return 3
+    k_iters = k // TK
+    if n <= 1536: ns_by_n = 6
+    elif n <= 2048: ns_by_n = 5
+    elif n <= 4096: ns_by_n = 4
+    else: ns_by_n = 3
+    return max(2, min(ns_by_n, k_iters - 3))
 
 RESULT_RE = re.compile(
     r"^@@RESULT\s+ms=(?P<ms>[\d.]+)\s+tflops=(?P<tf>[\d.]+)"
@@ -97,6 +101,15 @@ SAMPLE_CYC_RE = re.compile(r"^@@SAMPLE\s+\S+.*?\bcyc=(?P<cyc>\d+)")
 CUBLAS_RESULT_RE = re.compile(
     r"^@@RESULT\s+ms=(?P<ms>[\d.]+)\s+cyc=(?P<cyc>\d+)"
 )
+CUBLAS_WINNER_RE = re.compile(
+    r"^# Winner:\s+rank=1\s+tile=(?P<tile>\d+)\s+stages=(?P<stages>\d+)"
+    r"\s+cluster=(?P<cluster>\d+)\s+splitk=(?P<splitk>\d+)"
+    r"\s+swizzle=(?P<swizzle>\d+)"
+)
+TILE_ID_NAME = {
+    23: "128x256", 24: "256x128", 32: "128x192",
+    197: "168x128", 201: "176x128", 495: "256x96", 535: "320x192",
+}
 
 
 def validate_dim(n, k, m):
@@ -119,12 +132,10 @@ def cell_binary(n, k, save_per_cell):
 
 
 def build_cell(n, k, m, log_fp, save_per_cell=False):
-    k_iters = k // TK
-    ns = pick_n_stages(n)
-    dflags = [f"-DM_TOTAL={m}", f"-DN_DIM={n}", f"-DK_DIM={k}",
-              f"-DN_STAGES={ns}"]
-    if k_iters < 20:
-        dflags.append("-DNO_PREFILL")
+    """The kernel auto-picks N_STAGES + NO_PREFILL from N_DIM/K_DIM now;
+    we just hand it the dims and let it decide. The picked NS is mirrored
+    into TSV via pick_n_stages() for offline diagnostics."""
+    dflags = [f"-DM_TOTAL={m}", f"-DN_DIM={n}", f"-DK_DIM={k}"]
     binary = cell_binary(n, k, save_per_cell)
     cmd = ["make", "-B", "fc2-w3x", f"DFLAGS={' '.join(dflags)}"]
     log_fp.write(f"\n[build] N={n} K={k} M={m} flags={dflags}\n$ {' '.join(cmd)}\n")
@@ -197,14 +208,19 @@ def run_cell(reps, timeout, log_fp, binary=None):
 
 
 def run_cublaslt(n, k, m, reps, timeout, log_fp, epi):
-    """Run cublaslt-introspect at the given EPI and return best (ms, cyc).
+    """Run cublaslt-introspect at the given EPI and return best (ms, cyc) +
+    rank-1 algo identity (tile/stages/cluster/splitk/swizzle).
     epi: 0 = no epilogue, 3 = BIAS_ONLY."""
     binary = REPO / "cublaslt-introspect"
     if not binary.exists():
-        return {"status": "MISSING_CUBLASLT", "ms": None, "cyc": None}
+        return {"status": "MISSING_CUBLASLT", "ms": None, "cyc": None,
+                "tile": None, "stages": None, "cluster": None,
+                "splitk": None, "swizzle": None}
     args = [str(binary), str(m), str(n), str(k), str(epi)]
     best_ms = None
     best_cyc = None
+    best_algo = {"tile": None, "stages": None, "cluster": None,
+                 "splitk": None, "swizzle": None}
     status = "ok"
     for r in range(reps):
         try:
@@ -220,17 +236,29 @@ def run_cublaslt(n, k, m, reps, timeout, log_fp, epi):
             status = f"FAIL({proc.returncode})"
             break
         rm = None
+        wm = None
         for line in proc.stdout.splitlines():
-            cm = CUBLAS_RESULT_RE.match(line)
-            if cm: rm = cm; break
+            if rm is None:
+                m_ = CUBLAS_RESULT_RE.match(line)
+                if m_: rm = m_
+            if wm is None:
+                m_ = CUBLAS_WINNER_RE.match(line)
+                if m_: wm = m_
         if not rm:
             status = "NO_RESULT"
             break
         ms = float(rm["ms"]); cyc = int(rm["cyc"])
+        is_better = (best_ms is None or ms < best_ms)
         if best_ms is None or ms < best_ms: best_ms = ms
         if best_cyc is None or cyc < best_cyc: best_cyc = cyc
+        if is_better and wm is not None:
+            best_algo = {"tile":    int(wm["tile"]),
+                         "stages":  int(wm["stages"]),
+                         "cluster": int(wm["cluster"]),
+                         "splitk":  int(wm["splitk"]),
+                         "swizzle": int(wm["swizzle"])}
     log_fp.flush()
-    return {"status": status, "ms": best_ms, "cyc": best_cyc}
+    return {"status": status, "ms": best_ms, "cyc": best_cyc, **best_algo}
 
 
 def floor_ms(n, k, m):
@@ -255,13 +283,28 @@ def cell_meta(n, k, m):
         tiles_per_cluster=tiles_per_cluster,
         kn_ratio=k / n, floor_ms=floor_ms(n, k, m),
         prefill="off" if k_iters < 20 else "on",
-        n_stages=pick_n_stages(n),
+        n_stages=pick_n_stages(n, k),
     )
+
+
+def _algo_brief(merged, prefix):
+    tile = merged.get(f"cb_{prefix}_tile")
+    if tile is None: return None
+    tname = TILE_ID_NAME.get(tile, f"id={tile}")
+    return (f"{tname}/st{merged.get(f'cb_{prefix}_stages','?')}"
+            f"/cl{merged.get(f'cb_{prefix}_cluster','?')}"
+            f"/sk{merged.get(f'cb_{prefix}_splitk','?')}")
 
 
 def fmt_row(meta, res, fields):
     out = []
     for f in fields:
+        if f == "cb_b_algo":
+            v = _algo_brief(res, "b")
+            out.append(v if v else "-"); continue
+        if f == "cb_n_algo":
+            v = _algo_brief(res, "n")
+            out.append(v if v else "-"); continue
         v = meta.get(f, res.get(f))
         if v is None: out.append("-"); continue
         if f == "ms" and v is not None: out.append(f"{v:.4f}")
@@ -369,7 +412,9 @@ def main():
         "n", "k", "n_stages", "k_iters", "n_tiles", "tiles_per_cluster",
         "kn_ratio", "prefill", "floor_ms", "ms", "cyc", "tflops", "eff",
         "cublas_ms", "cublas_cyc", "dcyc", "dpct",
+        "cb_b_tile", "cb_b_stages", "cb_b_cluster", "cb_b_splitk",
         "cublas_none_ms", "cublas_none_cyc", "dn_cyc", "dn_pct",
+        "cb_n_tile", "cb_n_stages", "cb_n_cluster", "cb_n_splitk",
         "valid", "status",
     ]) + "\n")
 
@@ -425,11 +470,19 @@ def main():
         merged["cublas_status"] = cub["status"]
         merged["dcyc"] = dcyc
         merged["dpct"] = dpct
+        merged["cb_b_tile"]    = cub.get("tile")
+        merged["cb_b_stages"]  = cub.get("stages")
+        merged["cb_b_cluster"] = cub.get("cluster")
+        merged["cb_b_splitk"]  = cub.get("splitk")
         merged["cublas_none_ms"] = cubn["ms"]
         merged["cublas_none_cyc"] = cubn["cyc"]
         merged["cublas_none_status"] = cubn["status"]
         merged["dn_cyc"] = dn_cyc
         merged["dn_pct"] = dn_pct
+        merged["cb_n_tile"]    = cubn.get("tile")
+        merged["cb_n_stages"]  = cubn.get("stages")
+        merged["cb_n_cluster"] = cubn.get("cluster")
+        merged["cb_n_splitk"]  = cubn.get("splitk")
         rows.append((meta, merged))
         ms = f"{res['ms']:.4f}" if res["ms"] else "-"
         tf = f"{res['tflops']:.1f}" if res["tflops"] else "-"
@@ -444,10 +497,19 @@ def main():
             return status[:8], "-"
         cb_cy, dlabel = _fmt_cb(cub["cyc"], cub["status"], dcyc, dpct)
         cbn_cy, dnlabel = _fmt_cb(cubn["cyc"], cubn["status"], dn_cyc, dn_pct)
+        def _algo_str(a):
+            if a.get("tile") is None: return ""
+            tname = TILE_ID_NAME.get(a["tile"], f"id={a['tile']}")
+            return (f"  algo[{tname} st={a['stages']} cl={a['cluster']}"
+                    f" sk={a['splitk']}]")
+        algo_b = _algo_str(cub)
+        algo_n = _algo_str(cubn)
         print(f"    ms={ms} cyc={cy_us}k tflops={tf} eff={ef} "
               f"v={res.get('valid','-')} NS={meta['n_stages']}  "
-              f"cb_bias={cb_cy} Δb={dlabel}  cb_none={cbn_cy} Δn={dnlabel}  "
+              f"cb_bias={cb_cy} Δb={dlabel}{algo_b}  "
+              f"cb_none={cbn_cy} Δn={dnlabel}{algo_n}  "
               f"{res['status']}")
+        def _opt(x): return "" if x is None else x
         tsv_fp.write("\t".join(str(x) for x in [
             meta["n"], meta["k"], meta["n_stages"],
             meta["k_iters"], meta["n_tiles"],
@@ -461,10 +523,14 @@ def main():
             cub["cyc"] if cub["cyc"] else "",
             dcyc if dcyc is not None else "",
             f"{dpct:.4f}" if dpct is not None else "",
+            _opt(cub.get("tile")), _opt(cub.get("stages")),
+            _opt(cub.get("cluster")), _opt(cub.get("splitk")),
             cubn["ms"] if cubn["ms"] else "",
             cubn["cyc"] if cubn["cyc"] else "",
             dn_cyc if dn_cyc is not None else "",
             f"{dn_pct:.4f}" if dn_pct is not None else "",
+            _opt(cubn.get("tile")), _opt(cubn.get("stages")),
+            _opt(cubn.get("cluster")), _opt(cubn.get("splitk")),
             res["valid"] if res["valid"] is not None else "",
             res["status"],
         ]) + "\n")
@@ -479,13 +545,13 @@ def main():
 
     fields = ["n", "k", "n_stages", "k_iters", "kn_ratio", "tiles_per_cluster",
               "floor_ms", "ms", "cyc", "eff",
-              "cublas_cyc", "dcyc", "dpct",
-              "cublas_none_cyc", "dn_cyc", "dn_pct",
+              "cublas_cyc", "dcyc", "dpct", "cb_b_algo",
+              "cublas_none_cyc", "dn_cyc", "dn_pct", "cb_n_algo",
               "valid", "status"]
     headers = ["N", "K", "NS", "K_it", "K/N", "tile/cl",
                "floor", "ms", "cyc", "eff",
-               "cb_bias", "Δb", "Δb%",
-               "cb_none", "Δn", "Δn%",
+               "cb_bias", "Δb", "Δb%", "cb_b algo",
+               "cb_none", "Δn", "Δn%", "cb_n algo",
                "v", "status"]
 
     print_table(rows, "── by raw size (N then K) ──",
