@@ -34,11 +34,27 @@ static constexpr int    N_WARM = 3;
 struct AlgoInfo {
     int heur_idx;
     float ms;
+    uint64_t cyc;
     int algo_id, tile_id, stages_id, cluster_id;
     int splitk, reduction, swizzle, custom;
     size_t ws_size;
     float waves;
 };
+
+/*
+  Stream-serialized clock64 sentinel.  Bracketing the cublasLtMatmul
+  N_TIME loop with two single-block launches lets the host read SM-clock
+  cycles elapsed during the GEMM — clock-throttling-invariant, same domain
+  as fc2_w3x's per-CTA wall_cyc clock64 bracket, so the two are
+  apples-to-apples comparable.
+*/
+__global__ void read_clock_sentinel(uint64_t* out) {
+    if (threadIdx.x == 0) {
+        uint64_t c;
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(c));
+        out[0] = c;
+    }
+}
 
 static const char* epi_name(int e) {
     switch(e){case 0:return"none";case 2:return"gelu_bias";case 3:return"bias_only";}
@@ -147,6 +163,9 @@ int main(int argc, char** argv) {
     float alpha=1.0f, beta=0.0f;
     cudaEvent_t t0,t1; CUDA_CHECK(cudaEventCreate(&t0)); CUDA_CHECK(cudaEventCreate(&t1));
 
+    uint64_t* d_clk = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_clk, 2 * sizeof(uint64_t)));
+
     std::vector<AlgoInfo> infos;
     for (int i = 0; i < n; i++) {
         // warm + time
@@ -159,19 +178,26 @@ int main(int argc, char** argv) {
                                 dD, layD, dD, layD, &heur[i].algo, dWS, WS, 0);
         if (s != CUBLAS_STATUS_SUCCESS) continue;
         CUDA_CHECK(cudaDeviceSynchronize());
+        read_clock_sentinel<<<1, 1>>>(d_clk + 0);
         CUDA_CHECK(cudaEventRecord(t0));
         for (int r=0;r<N_TIME;r++) {
             cublasLtMatmul(lt, desc, &alpha, dA, layA, dB, layB, &beta,
                            dD, layD, dD, layD, &heur[i].algo, dWS, WS, 0);
         }
         CUDA_CHECK(cudaEventRecord(t1));
+        read_clock_sentinel<<<1, 1>>>(d_clk + 1);
         CUDA_CHECK(cudaEventSynchronize(t1));
+        CUDA_CHECK(cudaDeviceSynchronize());
         float ms=0.0f; CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
         ms /= N_TIME;
+        uint64_t clk[2];
+        CUDA_CHECK(cudaMemcpy(clk, d_clk, sizeof(clk), cudaMemcpyDeviceToHost));
+        uint64_t cyc = (clk[1] > clk[0]) ? (clk[1] - clk[0]) / (uint64_t)N_TIME : 0;
 
         AlgoInfo a{};
         a.heur_idx = i;
         a.ms       = ms;
+        a.cyc      = cyc;
         a.ws_size  = heur[i].workspaceSize;
         a.waves    = heur[i].wavesCount;
         a.algo_id    = get_algo_int(&heur[i].algo, CUBLASLT_ALGO_CONFIG_ID);
@@ -189,11 +215,12 @@ int main(int argc, char** argv) {
 
     // TSV for easy awk'ing
     printf("# TSV\n");
-    printf("rank\theur\tms\talgoId\ttile\tstages\tcluster\tsplitk\tredux\tswizzle\tcustom\twaves\tws_MB\n");
+    printf("rank\theur\tms\tcyc\talgoId\ttile\tstages\tcluster\tsplitk\tredux\tswizzle\tcustom\twaves\tws_MB\n");
     for (size_t r = 0; r < infos.size(); r++) {
         const auto& a = infos[r];
-        printf("%zu\t%d\t%.4f\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\t%.1f\n",
-               r+1, a.heur_idx, a.ms, a.algo_id, a.tile_id, a.stages_id,
+        printf("%zu\t%d\t%.4f\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\t%.1f\n",
+               r+1, a.heur_idx, a.ms, (unsigned long long)a.cyc,
+               a.algo_id, a.tile_id, a.stages_id,
                a.cluster_id, a.splitk, a.reduction,
                a.swizzle, a.custom, a.waves, a.ws_size / (1024.0*1024.0));
     }
@@ -208,14 +235,15 @@ int main(int argc, char** argv) {
     }
 
     if (infos.empty()) {
-        printf("\n@@RESULT ms=ERR tflops=0.00 checksum=0.000000 valid=0 c0=0.0\n");
+        printf("\n@@RESULT ms=ERR cyc=0 tflops=0.00 checksum=0.000000 valid=0 c0=0.0\n");
         return 1;
     }
-    printf("\n# Winner:  rank=1  tile=%d  stages=%d  cluster=%d  splitk=%d  swizzle=%d  ms=%.4f\n",
+    printf("\n# Winner:  rank=1  tile=%d  stages=%d  cluster=%d  splitk=%d  swizzle=%d  ms=%.4f  cyc=%llu\n",
            infos[0].tile_id, infos[0].stages_id, infos[0].cluster_id,
-           infos[0].splitk, infos[0].swizzle, infos[0].ms);
+           infos[0].splitk, infos[0].swizzle, infos[0].ms,
+           (unsigned long long)infos[0].cyc);
     double tflops = 2.0 * (double)M * (double)N * (double)K / ((double)infos[0].ms * 1e9);
-    printf("\n@@RESULT ms=%.4f tflops=%.2f checksum=0.000000 valid=1 c0=0.0\n",
-           infos[0].ms, tflops);
+    printf("\n@@RESULT ms=%.4f cyc=%llu tflops=%.2f checksum=0.000000 valid=1 c0=0.0\n",
+           infos[0].ms, (unsigned long long)infos[0].cyc, tflops);
     return 0;
 }
