@@ -94,7 +94,53 @@ static_assert(N_DIM  %  TN       == 0,
 #define K_UNROLL_PRAGMA _DO_PRAGMA(unroll K_UNROLL)
 #endif
 
-#define N_STAGES       6
+/*
+  N_STAGES auto-picker. Two ceilings:
+  (1) SMEM by N_DIM: MAIN_SMEM=NS*32KB shares the 228KB budget with OUT
+      staging (16KB) + BIAS (2*N_DIM) + scaffold. NS=6 fits up to N=1536;
+      larger N forces a shallower pipeline.
+  (2) Pipeline fill margin: at small K_ITERS the persistent kernel's
+      cross-tile parity wrap deadlocks if NS is too close to K_ITERS.
+      Empirical (recent_vs_cublas.tsv 2026-05-01): gap=2 (K_ITERS=8,
+      NS=6) FAILs, gap=3 (K_ITERS=8, NS=5) works. Use NS <= K_ITERS - 3.
+  Override with -DN_STAGES=<n> for sweeps / hand-tuning.
+*/
+#ifndef N_STAGES
+  #if N_DIM <= 1536
+    #define _NS_BY_N 6
+  #elif N_DIM <= 2048
+    #define _NS_BY_N 5
+  #elif N_DIM <= 4096
+    #define _NS_BY_N 4
+  #else
+    #define _NS_BY_N 3
+  #endif
+  #if K_ITERS - 3 >= _NS_BY_N
+    #define N_STAGES _NS_BY_N
+  #elif K_ITERS - 3 >= 5
+    #define N_STAGES 5
+  #elif K_ITERS - 3 >= 4
+    #define N_STAGES 4
+  #elif K_ITERS - 3 >= 3
+    #define N_STAGES 3
+  #else
+    #define N_STAGES 2
+  #endif
+#endif
+
+/*
+  PREFILL auto-guard. The cross-tile prefill optimization (overlap prev-
+  tile epi drain with next-tile MMA's first NS K-iters) deadlocks at
+  K_ITERS < 20 due to parity wrap. fc2_w3 auto-guards already; mirror
+  it here so callers don't need -DNO_PREFILL for short K. -DPREFILL
+  forces it on (don't, unless you know K_ITERS is safe).
+*/
+#if !defined(NO_PREFILL) && !defined(PREFILL)
+  #if K_ITERS < 20
+    #define NO_PREFILL
+  #endif
+#endif
+
 #define NUM_EPI_STAGES 2
 #define NUM_SUBPASSES  (TN / 32)
 
