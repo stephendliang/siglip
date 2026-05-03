@@ -99,24 +99,52 @@ static void cap_dump(const cublasLtMatmulAlgo_t* a, const char* prefix) {
     CAP_INT(CUBLASLT_ALGO_CAP_POINTER_MODE_MASK);
     CAP_INT(CUBLASLT_ALGO_CAP_EPILOGUE_MASK);
 
-    std::vector<int> buf(128);
-    #define CAP_LIST(attr) do { \
-        if (cublasLtMatmulAlgoCapGetAttribute(a, attr, buf.data(), buf.size()*sizeof(int), &w)==CUBLAS_STATUS_SUCCESS) { \
-            int n = (int)(w/sizeof(int)); \
+    /*
+      Element width matters: TILE_IDS/STAGES_IDS are uint32_t[], but
+      CLUSTER_SHAPE_IDS/INNER_SHAPE_IDS are uint16_t[]. Reading the latter
+      as int[] gave a half-length, half-aligned read. Pass the type explicitly.
+    */
+    #define CAP_LIST_T(attr, T) do { \
+        std::vector<T> b(256); size_t ww = 0; \
+        auto s = cublasLtMatmulAlgoCapGetAttribute(a, attr, b.data(), b.size()*sizeof(T), &ww); \
+        if (s == CUBLAS_STATUS_SUCCESS && ww > 0) { \
+            int n = (int)(ww/sizeof(T)); \
             printf("%s  %-44s = [", prefix, #attr); \
-            for (int i=0;i<n && i<24;i++) printf("%s%d", i?",":"", buf[i]); \
+            for (int i=0;i<n && i<24;i++) printf("%s%d", i?",":"", (int)b[i]); \
             if (n>24) printf(",...+%d", n-24); \
-            printf("] (n=%d)\n", n); \
+            printf("] (n=%d, elem=%dB)\n", n, (int)sizeof(T)); \
+        } else { \
+            printf("%s  %-44s = --  (status=%d wrote=%zu)\n", prefix, #attr, (int)s, ww); \
         } \
     } while(0)
-    CAP_LIST(CUBLASLT_ALGO_CAP_TILE_IDS);
-    CAP_LIST(CUBLASLT_ALGO_CAP_STAGES_IDS);
+    CAP_LIST_T(CUBLASLT_ALGO_CAP_TILE_IDS,           uint32_t);
+    CAP_LIST_T(CUBLASLT_ALGO_CAP_STAGES_IDS,         uint32_t);
 #ifdef CUBLASLT_ALGO_CAP_CLUSTER_SHAPE_IDS
-    CAP_LIST(CUBLASLT_ALGO_CAP_CLUSTER_SHAPE_IDS);
+    CAP_LIST_T(CUBLASLT_ALGO_CAP_CLUSTER_SHAPE_IDS,  uint16_t);
 #endif
 #ifdef CUBLASLT_ALGO_CAP_INNER_SHAPE_IDS
-    CAP_LIST(CUBLASLT_ALGO_CAP_INNER_SHAPE_IDS);
+    CAP_LIST_T(CUBLASLT_ALGO_CAP_INNER_SHAPE_IDS,    uint16_t);
 #endif
+
+    /*
+      Diagnostic: probe CONFIG INNER_SHAPE_ID + CLUSTER_SHAPE_ID with each
+      candidate width. status=NOT_SUPPORTED means the attr isn't applicable
+      to this algo at heuristic time (probably picked at launch). Other
+      statuses mean the attr exists but our width was wrong.
+    */
+    #define PROBE_CONFIG(attr) do { \
+        for (size_t sz : {(size_t)2, (size_t)4, (size_t)8, (size_t)1}) { \
+            uint64_t vv = 0; size_t ww = 0; \
+            auto s = cublasLtMatmulAlgoConfigGetAttribute(a, attr, &vv, sz, &ww); \
+            printf("%s  %-30s sz=%zu → status=%d wrote=%zu val=%llu\n", \
+                   prefix, #attr, sz, (int)s, ww, (unsigned long long)vv); \
+            if (s == CUBLAS_STATUS_SUCCESS && ww > 0) break; \
+        } \
+    } while(0)
+#ifdef CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID
+    PROBE_CONFIG(CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID);
+#endif
+    PROBE_CONFIG(CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID);
 }
 
 int main(int argc, char** argv) {
