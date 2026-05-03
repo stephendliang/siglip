@@ -140,7 +140,7 @@ tile_name() {
 }
 
 TSV="$OUT_DIR/summary.tsv"
-echo -e "M\tN\tK\tEPI\trank\tstatus\tms\tcyc\talgoId\ttile\tstages\tcluster\tsplitk\tswizzle\twaves\tws_MB\ttile_name" > "$TSV"
+echo -e "M\tN\tK\tEPI\trank\tstatus\tms\tcyc\talgoId\ttile\tstages\tcluster\tinner\tsplitk\tswizzle\twaves\tws_MB\ttile_name" > "$TSV"
 
 # Extract top-N data rows from the "# TSV" block in introspect output.
 # Block layout (bench/cublaslt_introspect.cu:217-226):
@@ -172,25 +172,25 @@ for cell in "${CELLS_ARR[@]}"; do
             > "$OUT_FILE" 2>&1; then
         rc=$?
         log "   FAIL ec=$rc (see $(basename "$OUT_FILE"))"
-        echo -e "$M\t$N\t$K\t$E\t-\tFAIL($rc)\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-" >> "$TSV"
+        echo -e "$M\t$N\t$K\t$E\t-\tFAIL($rc)\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-" >> "$TSV"
         continue
     fi
     # Pull top-N rows from the TSV block.
     rows=$(extract_top "$OUT_FILE" "$TOP_N")
     if [ -z "$rows" ]; then
         log "   no TSV rows (heuristic returned 0 valid algos?)"
-        echo -e "$M\t$N\t$K\t$E\t-\tNO_RESULT\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-" >> "$TSV"
+        echo -e "$M\t$N\t$K\t$E\t-\tNO_RESULT\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-" >> "$TSV"
         continue
     fi
     # Echo top-3 to log; emit one TSV row per rank.
-    while IFS=$'\t' read -r rank heur ms cyc algoId tile stages cluster splitk redux swizzle custom waves ws_MB; do
+    while IFS=$'\t' read -r rank heur ms cyc algoId tile stages cluster inner splitk redux swizzle custom waves ws_MB; do
         tn=$(tile_name "$tile")
         if [ "$rank" = "1" ]; then
-            log "   r1 ms=$ms tile=$tile($tn) st=$stages cl=$cluster sk=$splitk sw=$swizzle cyc=$cyc"
+            log "   r1 ms=$ms tile=$tile($tn) st=$stages cl=$cluster in=$inner sk=$splitk sw=$swizzle cyc=$cyc"
         else
-            log "   r$rank ms=$ms tile=$tile($tn) st=$stages cl=$cluster sk=$splitk"
+            log "   r$rank ms=$ms tile=$tile($tn) st=$stages cl=$cluster in=$inner sk=$splitk"
         fi
-        echo -e "$M\t$N\t$K\t$E\t$rank\tOK\t$ms\t$cyc\t$algoId\t$tile\t$stages\t$cluster\t$splitk\t$swizzle\t$waves\t$ws_MB\t$tn" >> "$TSV"
+        echo -e "$M\t$N\t$K\t$E\t$rank\tOK\t$ms\t$cyc\t$algoId\t$tile\t$stages\t$cluster\t$inner\t$splitk\t$swizzle\t$waves\t$ws_MB\t$tn" >> "$TSV"
     done <<< "$rows"
 done
 

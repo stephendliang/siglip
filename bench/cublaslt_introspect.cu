@@ -35,7 +35,7 @@ struct AlgoInfo {
     int heur_idx;
     float ms;
     uint64_t cyc;
-    int algo_id, tile_id, stages_id, cluster_id;
+    int algo_id, tile_id, stages_id, cluster_id, inner_id;
     int splitk, reduction, swizzle, custom;
     size_t ws_size;
     float waves;
@@ -61,11 +61,28 @@ static const char* epi_name(int e) {
     return "?";
 }
 
+/*
+  Some CONFIG attributes are uint16_t (CLUSTER_SHAPE_ID, INNER_SHAPE_ID),
+  some are uint32_t (TILE_ID, SPLITK_NUM, ...), some uint64_t. Strict-size
+  impls reject mismatched widths, so retry common widths and decode based
+  on the size cublasLt actually wrote back.
+*/
 static int get_algo_int(const cublasLtMatmulAlgo_t* a, cublasLtMatmulAlgoConfigAttributes_t at) {
-    int v = -1; size_t w = 0;
-    if (cublasLtMatmulAlgoConfigGetAttribute(a, at, &v, sizeof(v), &w) != CUBLAS_STATUS_SUCCESS)
-        return -1;
-    return v;
+    union { uint8_t u8; uint16_t u16; uint32_t u32; uint64_t u64; } b;
+    size_t w = 0;
+    for (size_t sz : {sizeof(uint32_t), sizeof(uint16_t), sizeof(uint64_t), sizeof(uint8_t)}) {
+        b.u64 = 0;
+        if (cublasLtMatmulAlgoConfigGetAttribute(a, at, &b, sz, &w) == CUBLAS_STATUS_SUCCESS && w > 0) {
+            switch (w) {
+                case 1: return (int)b.u8;
+                case 2: return (int)b.u16;
+                case 4: return (int)b.u32;
+                case 8: return (int)b.u64;
+                default: return -1;
+            }
+        }
+    }
+    return -1;
 }
 
 static void cap_dump(const cublasLtMatmulAlgo_t* a, const char* prefix) {
@@ -94,6 +111,12 @@ static void cap_dump(const cublasLtMatmulAlgo_t* a, const char* prefix) {
     } while(0)
     CAP_LIST(CUBLASLT_ALGO_CAP_TILE_IDS);
     CAP_LIST(CUBLASLT_ALGO_CAP_STAGES_IDS);
+#ifdef CUBLASLT_ALGO_CAP_CLUSTER_SHAPE_IDS
+    CAP_LIST(CUBLASLT_ALGO_CAP_CLUSTER_SHAPE_IDS);
+#endif
+#ifdef CUBLASLT_ALGO_CAP_INNER_SHAPE_IDS
+    CAP_LIST(CUBLASLT_ALGO_CAP_INNER_SHAPE_IDS);
+#endif
 }
 
 int main(int argc, char** argv) {
@@ -204,6 +227,11 @@ int main(int argc, char** argv) {
         a.tile_id    = get_algo_int(&heur[i].algo, CUBLASLT_ALGO_CONFIG_TILE_ID);
         a.stages_id  = get_algo_int(&heur[i].algo, CUBLASLT_ALGO_CONFIG_STAGES_ID);
         a.cluster_id = get_algo_int(&heur[i].algo, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID);
+#ifdef CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID
+        a.inner_id   = get_algo_int(&heur[i].algo, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID);
+#else
+        a.inner_id   = -1;
+#endif
         a.splitk     = get_algo_int(&heur[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM);
         a.reduction  = get_algo_int(&heur[i].algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME);
         a.swizzle    = get_algo_int(&heur[i].algo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING);
@@ -215,13 +243,13 @@ int main(int argc, char** argv) {
 
     // TSV for easy awk'ing
     printf("# TSV\n");
-    printf("rank\theur\tms\tcyc\talgoId\ttile\tstages\tcluster\tsplitk\tredux\tswizzle\tcustom\twaves\tws_MB\n");
+    printf("rank\theur\tms\tcyc\talgoId\ttile\tstages\tcluster\tinner\tsplitk\tredux\tswizzle\tcustom\twaves\tws_MB\n");
     for (size_t r = 0; r < infos.size(); r++) {
         const auto& a = infos[r];
-        printf("%zu\t%d\t%.4f\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\t%.1f\n",
+        printf("%zu\t%d\t%.4f\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\t%.1f\n",
                r+1, a.heur_idx, a.ms, (unsigned long long)a.cyc,
                a.algo_id, a.tile_id, a.stages_id,
-               a.cluster_id, a.splitk, a.reduction,
+               a.cluster_id, a.inner_id, a.splitk, a.reduction,
                a.swizzle, a.custom, a.waves, a.ws_size / (1024.0*1024.0));
     }
 
@@ -229,8 +257,8 @@ int main(int argc, char** argv) {
     int top = std::min<int>(3, (int)infos.size());
     for (int r = 0; r < top; r++) {
         const auto& a = infos[r];
-        printf("\n## rank=%d  algoId=%d  tile=%d  stages=%d  cluster=%d  ms=%.4f\n",
-               r+1, a.algo_id, a.tile_id, a.stages_id, a.cluster_id, a.ms);
+        printf("\n## rank=%d  algoId=%d  tile=%d  stages=%d  cluster=%d  inner=%d  ms=%.4f\n",
+               r+1, a.algo_id, a.tile_id, a.stages_id, a.cluster_id, a.inner_id, a.ms);
         cap_dump(&heur[a.heur_idx].algo, "  ");
     }
 
@@ -238,8 +266,8 @@ int main(int argc, char** argv) {
         printf("\n@@RESULT ms=ERR cyc=0 tflops=0.00 checksum=0.000000 valid=0 c0=0.0\n");
         return 1;
     }
-    printf("\n# Winner:  rank=1  tile=%d  stages=%d  cluster=%d  splitk=%d  swizzle=%d  ms=%.4f  cyc=%llu\n",
-           infos[0].tile_id, infos[0].stages_id, infos[0].cluster_id,
+    printf("\n# Winner:  rank=1  tile=%d  stages=%d  cluster=%d  inner=%d  splitk=%d  swizzle=%d  ms=%.4f  cyc=%llu\n",
+           infos[0].tile_id, infos[0].stages_id, infos[0].cluster_id, infos[0].inner_id,
            infos[0].splitk, infos[0].swizzle, infos[0].ms,
            (unsigned long long)infos[0].cyc);
     double tflops = 2.0 * (double)M * (double)N * (double)K / ((double)infos[0].ms * 1e9);
