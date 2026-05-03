@@ -15,7 +15,7 @@
 #
 # Override:
 #   CELLS="M:N:K:E,M:N:K:E,..." ./tools/probe_cublaslt_picker.sh
-#   GROUPS="production,loss_focus" ./tools/probe_cublaslt_picker.sh
+#   PROBE_GROUPS="production,loss_focus" ./tools/probe_cublaslt_picker.sh
 #   M_FC=464128 ./tools/probe_cublaslt_picker.sh
 #   OUT_DIR=data/my_picker ./tools/probe_cublaslt_picker.sh
 #   TIMEOUT=120 ./tools/probe_cublaslt_picker.sh
@@ -37,7 +37,7 @@ OUT_DIR="${OUT_DIR:-data/cublaslt_picker_${STAMP}}"
 TIMEOUT="${TIMEOUT:-90}"
 M_FC="${M_FC:-928256}"
 TOP_N="${TOP_N:-3}"
-GROUPS="${GROUPS:-production,loss_focus,fc2_ksweep,dim_sweep_bias,dim_sweep_none}"
+PROBE_GROUPS="${PROBE_GROUPS:-production,loss_focus,fc2_ksweep,dim_sweep_bias,dim_sweep_none}"
 mkdir -p "$OUT_DIR"
 
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT_DIR/session.log"; }
@@ -83,7 +83,7 @@ CELLS_ARR=()
 if [ -n "${CELLS:-}" ]; then
     IFS=',' read -r -a CELLS_ARR <<< "$CELLS"
 else
-    IFS=',' read -r -a GROUP_LIST <<< "$GROUPS"
+    IFS=',' read -r -a GROUP_LIST <<< "$PROBE_GROUPS"
     declare -A SEEN
     for grp in "${GROUP_LIST[@]}"; do
         case "$grp" in
@@ -106,7 +106,7 @@ fi
 log "============================================================"
 log "  cuBLASLt picker probe  ${STAMP}"
 log "  out=$OUT_DIR  timeout=${TIMEOUT}s  top_n=${TOP_N}"
-log "  groups=${GROUPS}  cells=${#CELLS_ARR[@]}"
+log "  groups=${PROBE_GROUPS}  cells=${#CELLS_ARR[@]}"
 log "============================================================"
 nvidia-smi --query-gpu=gpu_name,clocks.sm --format=csv,noheader 2>&1 \
     | tee -a "$OUT_DIR/session.log" || true
