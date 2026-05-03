@@ -1,0 +1,4 @@
+CUDA bench/cublaslt_introspect.cu:180: an illegal memory access was encountered
+### CUBLASLT INTROSPECT M=928256 N=1024 K=1024 epi=bias_only
+### Heuristics returned: 8
+
