@@ -169,7 +169,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&dA, szA));
     CUDA_CHECK(cudaMalloc(&dB, szB));
     CUDA_CHECK(cudaMalloc(&dD, szD));
-    CUDA_CHECK(cudaMalloc(&dBias, N*2));
+    CUDA_CHECK(cudaMalloc(&dBias, N*4));
     CUDA_CHECK(cudaMalloc(&dSA, 4));
     CUDA_CHECK(cudaMalloc(&dSB, 4));
     CUDA_CHECK(cudaMalloc(&dWS, WS));
@@ -178,7 +178,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(dSB, &one, 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(dA,0,szA));
     CUDA_CHECK(cudaMemset(dB,0,szB));
-    CUDA_CHECK(cudaMemset(dBias,0,N*2));
+    CUDA_CHECK(cudaMemset(dBias,0,N*4));
 
     cublasLtMatrixLayout_t layA,layB,layD;
     CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&layA, CUDA_R_8F_E4M3, K, M, K));
@@ -196,7 +196,12 @@ int main(int argc, char** argv) {
         cublasLtEpilogue_t e = (EPI==2) ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS;
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &e, sizeof(e)));
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &dBias, sizeof(dBias)));
-        cudaDataType_t btype = CUDA_R_16BF;
+        /*
+          Match bench/cublas_bench.cu line 401: FP32 bias dtype, not BF16.
+          cuBLASLt returns DIFFERENT heuristics for FP32 vs BF16 bias —
+          our prior introspect ran a different code path than cublas-bench-fc1.
+        */
+        cudaDataType_t btype = CUDA_R_32F;
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &btype, sizeof(btype)));
     }
 
