@@ -211,24 +211,28 @@ stream-serialized `clock64()` sentinels (same SM-clock domain). Both
 the prior table had `cb_bias` blocked by FP32-bias enumeration failure;
 fixed in `bench/fc_problem.cuh` (BF16-bias default).
 
-| N | K | K_it | NS | ours cyc | cb_bias cyc | Δb% | cb_none cyc | Δn% |
-|---|---|---|---|---|---|---|---|---|
-| 256 | 1024 | 8  | 5\* | 397.4k  | 372.4k   | +6.71  | 378.6k   | +4.96  |
-| 256 | 2048 | 16 | 6   | 634.8k  | 666.5k   | −4.75  | 669.8k   | −5.22  |
-| 256 | 4096 | 32 | 6   | 1152.8k | 1181.0k  | −2.38  | 1179.0k  | −2.22  |
-| 256 | 8192 | 64 | 6   | 2149.4k | 2417.8k  | −11.10 | 2414.2k  | −10.97 |
-| 512 | 1024 | 8  | 5   | 662.4k  | 618.0k   | +7.18  | 582.8k   | +13.66 |
-| 512 | 2048 | 16 | 6   | 952.1k  | 959.1k   | −0.72  | 949.5k   | +0.28  |
-| 512 | 4096 | 32 | 6   | 1780.1k | 1744.0k  | +2.07  | 1734.8k  | +2.61  |
-| 512 | 8192 | 64 | 6   | 3383.8k | 3573.1k  | −5.30  | 3543.9k  | −4.52  |
-| 1024| 1024 | 8  | 5   | 1333.7k | 1089.9k  | +22.38 | 1010.9k  | +31.93 |
-| 1024| 2048 | 16 | 6   | 1691.2k | 1728.9k  | −2.18  | 1718.7k  | −1.60  |
-| 1024| 4096 | 32 | 6   | 3410.4k | 3280.5k  | +3.96  | 3277.1k  | +4.07  |
-| 1024| 8192 | 64 | 6   | 6510.2k | 6594.8k  | −1.28  | 6582.4k  | −1.10  |
-| 2048| 1024 | 8  | 5   | 2692.1k | 2093.6k  | +28.59 | 1965.6k  | +36.96 |
-| 2048| 2048 | 16 | 5   | 3756.3k | 3303.1k  | +13.72 | 3295.7k  | +13.97 |
-| 2048| 4096 | 32 | 5   | 6739.7k | 6484.0k  | +3.94  | 6487.1k  | +3.89  |
-| 2048| 8192 | 64 | 5   | 12951.5k| 12969.6k | −0.14  | 13007.8k | −0.43  |
+| N | K | K_it | NS | ours cyc | cb_bias cyc | Δb% | cb_b tile | cb_none cyc | Δn% | cb_n tile |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 256 | 1024 | 8  | 5\* | 398.1k  | 372.5k   | +6.85  | 128x160 | 378.7k  | +5.13  | 128x128 |
+| 256 | 2048 | 16 | 6   | 634.9k  | 668.0k   | −4.96  | 128x256 | 669.6k  | −5.17  | 128x256 |
+| 256 | 4096 | 32 | 6   | 1152.7k | 1180.7k  | −2.38  | 128x256 | 1179.9k | −2.31  | 128x256 |
+| 256 | 8192 | 64 | 6   | 2151.7k | 2417.8k  | −11.01 | **128x384** | 2416.8k | −10.97 | 128x256 |
+| 512 | 1024 | 8  | 5   | 661.9k  | 618.8k   | +6.97  | 128x256 | 582.0k  | +13.72 | 128x256 |
+| 512 | 2048 | 16 | 6   | 952.5k  | 959.1k   | −0.69  | 128x256 | 949.2k  | +0.35  | 128x256 |
+| 512 | 4096 | 32 | 6   | 1779.6k | 1743.9k  | +2.05  | 128x256 | 1736.0k | +2.51  | 128x256 |
+| 512 | 8192 | 64 | 6   | 3384.3k | 3574.2k  | −5.31  | 128x256 | 3542.7k | −4.47  | id=513  |
+| 1024| 1024 | 8  | 5   | 1333.9k | 1090.6k  | +22.30 | 128x256 | 1011.8k | +31.83 | 128x256 |
+| 1024| 2048 | 16 | 6   | 1691.2k | 1729.5k  | −2.21  | 128x256 | 1719.6k | −1.65  | 128x256 |
+| 1024| 4096 | 32 | 6   | 3409.6k | 3280.5k  | +3.94  | 128x256 | 3277.5k | +4.03  | 128x256 |
+| 1024| 8192 | 64 | 6   | 6512.0k | 6593.9k  | −1.24  | **128x192** | 6580.9k | −1.05  | 128x192 |
+| 2048| 1024 | 8  | 5   | 2691.4k | 2092.9k  | +28.60 | 128x256 | 1964.3k | +37.02 | 128x256 |
+| 2048| 2048 | 16 | 5   | 3761.1k | 3303.0k  | +13.87 | 128x256 | 3295.7k | +14.12 | 128x256 |
+| 2048| 4096 | 32 | 5   | 6738.3k | 6483.4k  | +3.93  | 128x256 | 6487.1k | +3.87  | 128x256 |
+| 2048| 8192 | 64 | 5   | 12963.5k| 12974.9k | −0.09  | 128x256 | 13006.1k| −0.33  | 128x256 |
+
+cluster_id=2x1x1 (id=3) on every cell, both columns. tile=23 (128x256) is
+the default; **bold** = cuBLASLt picks a non-default tile. id=513 is a
+vendor-private tile id beyond the standard `cublasLtMatmulTile_t` enum.
 
 \*N=256 K=1024 picks NS=5 via `min(NS_BY_N=6, K_ITERS−3=5)`. K=1024 N∈{512,1024}
 was FAIL@NS=6; auto-picker now NS=5.
@@ -236,13 +240,21 @@ was FAIL@NS=6; auto-picker now NS=5.
 cb_bias is generally within 1-2% of cb_none — cuBLASLt's algoId=66 fuses
 bias nearly free into the same family of kernels.
 
+**cuBLASLt rank-1 picks tile=128x256 cluster=2x1x1 in 13 of 16 cells**
+for the BIAS_ONLY column. Outliers: N=256 K=1024 → tile=29 (128x160);
+N=256 K=8192 → tile=177 (128x384); N=1024 K=8192 → tile=32 (128x192).
+noBIAS column has 14 of 16 at 128x256, with N=256 K=1024 → 128x128 and
+N=512 K=8192 → vendor-private tile id=513. At small N (=256) cuBLASLt
+narrows the N-tile dimension; at long K with mid N it picks 128x192.
+Cluster_id=3 (2x1x1) holds across every cell — exactly fc2_w3x's geometry.
+
 **Production point K=3072 N=768: fc2_w3x 1.0043 ms vs cuBLASLt
 BIAS_ONLY rank-1 1.0270 ms = −22.7 µs / −2.2% in cycles** (apples-to-apples
 fused-bias-on-bias). Confirmed via separate K-sweep below.
 
 **Loss patterns (sharper now that cb_bias is visible):**
 1. **K=1024 universal loss (+5 to +29% across N).** cuBLASLt's K=1024 BIAS_ONLY
-   kernel (algoId=66 tile=23 NS=36 cluster=3, same family as K=3072) is much
+   kernel (algoId=66 tile=23 NS=36 cluster=2x1x1, same family as K=3072) is much
    tighter at small K — our NS=5 + NO_PREFILL + gap=3 stack pays heavily here.
    N=2048 K=1024 catastrophe (+28.59% bias / +36.96% none, eff=0.54) is the
    extreme.
@@ -271,36 +283,40 @@ cuBLASLt rank-1 via `cublaslt-introspect` at EPI=2 (GELU+BIAS) and
 EPI=0 (GEMM-only). Comparison in **ms** — fc1_w3 doesn't emit per-CTA
 clock64 cyc.
 
-| N | K | K_it | NS | ms | cb_gelu | Δg µs | Δg% | cb_none | Δn% |
-|---|---|---|---|---|---|---|---|---|---|
-| 1024 | 512  | 4  | 3 | 0.7120 | 0.8052 | −93   | −11.57 | 0.4074 | +74.77 |
-| 1024 | 768  | 6  | 5 | 0.6700 | 0.8125 | −142  | −17.54 | 0.4666 | +43.59 |
-| 1024 | 1024 | 8  | 5 | 0.6980 | 0.8295 | −131  | −15.85 | 0.5478 | +27.42 |
-| 1024 | 1536 | 12 | 5 | 0.8960 | 0.8484 | +47   | +5.61  | 0.7334 | +22.17 |
-| 2048 | 512  | 4  | 3 | 1.4140 | 1.5992 | −185  | −11.58 | 0.8084 | +74.91 |
-| 2048 | 768  | 6  | 5 | 1.3300 | 1.6131 | −283  | −17.55 | 0.9260 | +43.63 |
-| 2048 | 1024 | 8  | 5 | 1.3860 | 1.6477 | −261  | −15.88 | 1.0647 | +30.18 |
-| 2048 | 1536 | 12 | 5 | 1.7040 | 1.6803 | +23   | +1.41  | 1.3685 | +24.52 |
-| **3072**| **768**| 6 | 5 |**2.0250**| **2.4129**| **−387** | **−16.08** | 1.3635 | +48.51 |
-| 3072 | 512  | 4  | 3 | 2.1210 | 2.3943 | −273  | −11.41 | 1.2097 | +75.33 |
-| 3072 | 1024 | 8  | 5 | 2.0810 | 2.4651 | −384  | −15.58 | 1.5997 | +30.09 |
-| 3072 | 1536 | 12 | 5 | 2.5320 | 2.5115 | +20   | +0.82  | 2.0518 | +23.40 |
-| 4096 | 512  | 4  | 3 | 2.8100 | 3.1909 | −380  | −11.94 | 1.6098 | +74.56 |
-| 4096 | 768  | 6  | 5 | 2.6480 | 3.2137 | **−565** | **−17.60** | 1.8252 | +45.08 |
-| 4096 | 1024 | 8  | 5 | 2.7680 | 3.2814 | −513  | −15.65 | 2.1330 | +29.77 |
-| 4096 | 1536 | 12 | 5 | 3.2840 | 3.3437 | −59   | −1.79  | 2.7707 | +18.53 |
+| N | K | K_it | NS | ms | cb_gelu | Δg µs | Δg% | cb_g cl | cb_none | Δn% |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1024 | 512  | 4  | 3 | 0.7120 | 0.8049 | −93   | −11.54 | 2x2x1 | 0.4079 | +74.55 |
+| 1024 | 768  | 6  | 5 | 0.6700 | 0.8130 | −143  | −17.59 | 2x2x1 | 0.4665 | +43.62 |
+| 1024 | 1024 | 8  | 5 | 0.6970 | 0.8298 | −133  | −16.00 | 2x2x1 | 0.5476 | +27.28 |
+| 1024 | 1536 | 12 | 5 | 0.8960 | 0.8481 | +48   | +5.65  | 2x2x1 | 0.7335 | +22.15 |
+| 2048 | 512  | 4  | 3 | 1.4140 | 1.5991 | −185  | −11.58 | 2x2x1 | 0.8083 | +74.94 |
+| 2048 | 768  | 6  | 5 | 1.3300 | 1.6126 | −283  | −17.52 | 2x2x1 | 0.9267 | +43.52 |
+| 2048 | 1024 | 8  | 5 | 1.3860 | 1.6474 | −261  | −15.87 | 2x2x1 | 1.0647 | +30.18 |
+| 2048 | 1536 | 12 | 5 | 1.7050 | 1.6805 | +24   | +1.46  | 2x2x1 | 1.3685 | +24.59 |
+| 3072 | 512  | 4  | 3 | 2.1210 | 2.3943 | −273  | −11.41 | **4x4x1** | 1.2097 | +75.33 |
+| **3072**| **768**| 6 | 5 |**2.0260**| **2.4135**| **−388** | **−16.06** | 2x2x1 | 1.3642 | +48.51 |
+| 3072 | 1024 | 8  | 5 | 2.0810 | 2.4649 | −384  | −15.57 | 2x2x1 | 1.5997 | +30.09 |
+| 3072 | 1536 | 12 | 5 | 2.5310 | 2.5118 | +19   | +0.76  | 2x2x1 | 2.0520 | +23.34 |
+| 4096 | 512  | 4  | 3 | 2.8080 | 3.1902 | −382  | −11.98 | 2x2x1 | 1.6100 | +74.41 |
+| 4096 | 768  | 6  | 5 | 2.6490 | 3.2137 | **−565** | **−17.57** | 2x2x1 | 1.8253 | +45.13 |
+| 4096 | 1024 | 8  | 5 | 2.7690 | 3.2821 | −513  | −15.63 | 2x2x1 | 2.1331 | +29.81 |
+| 4096 | 1536 | 12 | 5 | 3.2840 | 3.3433 | −59   | −1.77  | **2x4x1** | 2.7720 | +18.47 |
 
-**Production point N=3072 K=768: −16.08% / −387 µs vs PerTensor rank-1.**
-Reproduces 2.025 ms (within run-variance of the published 1.998 reference).
+GELU+BIAS column: tile=128x256 in every cell; cluster mostly 2x2x1
+(id=6), two outliers in **bold**. cb_none column: tile=128x256 cluster
+2x1x1 (id=3) uniformly across all 16 cells — same family fc2_w3x targets.
+
+**Production point N=3072 K=768: −16.06% / −388 µs vs PerTensor rank-1.**
+Reproduces 2.026 ms (within run-variance of the published 1.998 reference).
 
 **Three K regions, consistent across all N tested:**
 1. **K∈{512,768,1024} — ours dominates by 11.4 to 17.6%.** fc1_w3 was tuned
    exactly for this regime (K=768 gets a flat −17.5% across all N from
-   1024 to 4096). cuBLASLt's algoId=66 GELU+BIAS family doesn't have an
+   1024 to 4096). cuBLASLt's algoId=71 GELU+BIAS family doesn't have an
    efficient short-K kernel.
 2. **K=1536 — flip to near-tie or slight loss.** Ranges +5.61% (N=1024)
    to −1.79% (N=4096). Crossover where cuBLASLt's K-amortization catches
-   up — K_iters=12 lets the algoId=66 family hide GELU.
+   up — K_iters=12 lets the algoId=71 family hide GELU.
 3. **K≥2048** (from FC1 K-sweep, not in this grid): ours decisively
    loses vs PerTensor (+177 to +653 µs at K=2048), still beats MXFP8 at
    K=3072/4096.
@@ -312,6 +328,14 @@ MXFP8 (per separate K-sweep) — real headroom signal at FC1 small-K geometry.
 `cb_none` (GEMM-only) is a noBIAS reference; ours is +18 to +75% over it
 because we're doing GELU+BIAS the cb_none entry isn't. Useful only as a
 GEMM-floor anchor.
+
+**Cluster shape across cells:** GELU+BIAS rank-1 is `tile=128x256 cl=2x2x1`
+(id=6) in 14 of 16 cells. Two outliers: N=3072 K=512 → `cl=4x4x1` (id=10),
+N=4096 K=1536 → `cl=2x4x1` (id=9). noBIAS rank-1 is `tile=128x256
+cl=2x1x1` (id=3) uniformly — same family fc2_w3x targets. fc1_w3 uses
+2-CTA cluster (2x1x1) like fc2_w3x; cuBLASLt's GELU+BIAS family runs on
+4-CTA clusters (2x2x1). The 50 µs MXFP8 gap may be a function of cluster
+choice as much as algo family.
 
 
 ## cuBLASLt reference
@@ -340,8 +364,8 @@ transposed [M,N] geometry.
 
 | variant                                       | ms     | algo     |
 |-----------------------------------------------|--------|----------|
-| cuBLASLt fused BIAS_ONLY rank-1 (PerTensor)   | 1.028  | algoId=66 tile=128x256 NS=36 cluster=3 |
-| cuBLASLt fused BIAS_ONLY rank-1 (MXFP8)       | 1.117  | same family, MXFP8 codepath |
+| cuBLASLt fused BIAS_ONLY rank-1 (PerTensor)   | 1.028  | algoId=66 tile=128x256 NS=36 cluster=2x1x1 (id=3) |
+| cuBLASLt fused BIAS_ONLY rank-1 (MXFP8)       | 1.117  | algoId=66 tile=128x256 NS=36 cluster=2x1x1 (id=3) |
 | cuBLASLt GEMM-only rank-1                     | 1.043  | per-tensor, no epilogue |
 | cuBLASLt unfused (GEMM + post-kernel bias)    | 1.546  | sequential |
 | **fc2_w3x** (bias-only, fully fused)          | **1.001** | gflip_blkswap TD=54 |
@@ -353,22 +377,34 @@ the GEMM-only path (-42 µs while fused).
 
 | variant                                       | ms     | algo     |
 |-----------------------------------------------|--------|----------|
-| cuBLASLt fused GELU+BIAS rank-1 (PerTensor)   | 2.414  | algoId=71 tile=128x256 cluster=6 |
-| cuBLASLt fused GELU+BIAS rank-1 (MXFP8)       | 1.951  | algoId=71, MXFP8 codepath wins here |
+| cuBLASLt fused GELU+BIAS rank-1 (PerTensor)   | 2.414  | algoId=71 tile=128x256 NS=36 cluster=2x2x1 (id=6) |
+| cuBLASLt fused GELU+BIAS rank-1 (MXFP8)       | 1.951  | algoId=66 tile=128x256 NS=36 cluster=2x1x1 (id=3) |
 | cuBLASLt fused BIAS_ONLY (no GELU, hypothetical) | 1.520 | algoId=66 — much faster without GELU |
 | cuBLASLt GEMM-only rank-1                     | 1.363  | per-tensor |
 | cuBLASLt unfused (GEMM + post-kernel GELU+bias) | 4.320 | sequential |
 | **fc1_w3** (zigzag TD=11 + ks=1, fully fused) | **1.998** | |
 
 fc1_w3 beats per-tensor fused (-416 µs) but trails MXFP8 fused (+47 µs).
-**MXFP8 has different FC1 kernels** (algoId=71 with cluster=6) that are more
-efficient at small-K. This is a real headroom signal — fc1_w3 is leaving
-~50 µs vs MXFP8 cuBLASLt at FC1's K=768 geometry.
+**MXFP8 wins by switching algo families:** algoId=66 (the BIAS_ONLY family)
++ cluster=2x1x1 instead of PT's algoId=71 (GELU+BIAS family) + cluster=2x2x1.
+The MXFP8 codepath effectively runs the BIAS_ONLY kernel and folds GELU into
+the same kernel-internal apply pass that MXFP8 already needs for VEC32_UE8M0
+scales — so GELU is "free" piggyback while PT pays the algoId=71 GELU pass.
+fc1_w3 leaves ~50 µs vs MXFP8 at FC1's K=768 geometry; the lever is matching
+this 2x1x1 cluster choice + algoId=66 family discipline.
 
 The +894 µs jump from BIAS_ONLY (1.520) to GELU+BIAS (2.414) on the
 PerTensor path tells you GELU is expensive in cuBLASLt's algoId=71 family.
 fc1_w3's fused-GELU path doesn't pay this — likely because we vectorize
 GELU directly in the epilogue compute warps without an extra pass.
+
+**MXFP8 algo enumeration is uniform** across every (FC1, FC2) × every K
+we've measured: algoId=66 tile=23 (128x256) NS=36 cluster=3 (2x1x1)
+splitk=1 swizzle=0. PerTensor varies cluster_id by problem (FC2 BIAS_ONLY
+always 2x1x1; FC1 GELU+BIAS shifts 4x4x1/2x2x1/2x4x1 by K). MXFP8 only ever
+uses the BIAS_ONLY-family kernel — even when the epilogue requests
+GELU+BIAS — apparently because the GELU+BIAS algoId=71 family hasn't been
+ported to the VEC32_UE8M0 codepath. Source: `data/mxfp8_introspect_20260506/`.
 
 ### FC2 K-sweep (cuBLASLt fused BIAS_ONLY rank-1, PerTensor; N=768)
 
@@ -385,7 +421,8 @@ cuBLASLt is fused BIAS_ONLY rank-1). Prior table mixed kernels and had
 | 6144 | 1.9996         | 1.9762              | −23.4 µs |
 | 8192 | 2.7378         | 2.6711              | −66.7 µs |
 
-All cuBLASLt K values pick algoId=66 tile=23 (128x256) NS=36 cluster=3.
+All cuBLASLt K values pick algoId=66 tile=23 (128x256) NS=36 cluster=2x1x1
+(id=3). MXFP8 picks the same kernel identity at every K (just slower).
 
 **Two new losses surfaced:**
 1. **K=1024 +92 µs** — cuBLASLt's same algoId=66 family runs much tighter at
@@ -415,8 +452,10 @@ K_STAGGER=1 + auto NO_PREFILL).
 | 3072 | 3.952       | 4.470          | 4.129  | +177 µs  | −341 µs    |
 | 4096 | 5.249       | 5.838          | 5.709  | +460 µs  | −129 µs    |
 
-cuBLASLt PT picks algoId=66 tile=23 NS=36 across K (cluster_id varies:
-10/6/6/6/9/6/6 from K=512→4096).
+cuBLASLt PT picks algoId=71 tile=23 (128x256) NS=36 across K. cluster shape
+varies: 4x4x1 / 2x2x1 / 2x2x1 / 2x2x1 / 2x4x1 / 2x2x1 / 2x2x1 from K=512→4096
+(cluster_id 10/6/6/6/9/6/6). algoId=71 = GELU+BIAS family; FC2 BIAS_ONLY uses
+algoId=66 with cluster=2x1x1 (id=3).
 
 **Three regions:**
 1. **Small K (≤1024)** — fc1_w3 tracks MXFP8 within ~25-200 µs, decisively
@@ -439,17 +478,31 @@ CLAUDE.md (2.413 / 1.951).
 Kernel name pattern: `nvjet_sm100_qqtst_<M>x<N>_128x<NS>_<CM>x<CN>_[2cta_]<h|v>_<...>_T<A><B>`.
 `2cta` = `cta_group::2`. Algo enumeration:
 
-| rank | algoId | tile_id | tile     | NS | cluster_id | ms     |
-|------|--------|---------|----------|----|------------|--------|
-| 1    | 66     | 23      | 128x256  | 36 | 3          | 1.0277 |
-| 2    | 66     | 29      | 128x192  | 36 | 3          | 1.1128 |
-| 3    | 66     | 31      | 256x128  | 36 | 3          | 1.2252 |
+| rank | algoId | tile_id | tile     | NS | cluster_id | cluster | ms     |
+|------|--------|---------|----------|----|------------|---------|--------|
+| 1    | 66     | 23      | 128x256  | 36 | 3          | 2x1x1   | 1.0277 |
+| 2    | 66     | 29      | 128x160  | 36 | 3          | 2x1x1   | 1.1128 |
+| 3    | 66     | 31      | 192x128  | 36 | 3          | 2x1x1   | 1.2252 |
 
 Tile 23 = 128x256 = our exact geometry. NS=36 in the algoConfig encodes
 "AUTO" (NS resolved per kernel; reads as 36 = 0x24 = AUTO marker). cluster=3
-is the heur table index for `(2,1,1)` 2-CTA cluster. `rank1.sass` (dumped
-from pre-fix [M,N] runs) is the same algo family — the SASS opcodes are
-real, the ms timing was for the transposed problem.
+is the cuBLASLt enum value for `(2,1,1)` 2-CTA cluster
+(`CUBLASLT_CLUSTER_SHAPE_2x1x1`). `rank1.sass` (dumped from pre-fix [M,N]
+runs) is the same algo family — the SASS opcodes are real, the ms timing
+was for the transposed problem.
+
+**Cluster_id → shape map** (subset of `cublasLtClusterShape_t`):
+
+| id | shape  | id | shape  | id | shape  | id | shape  | id | shape   |
+|----|--------|----|--------|----|--------|----|--------|----|---------|
+| 2  | 1x1x1  | 3  | 2x1x1  | 4  | 4x1x1  | 5  | 1x2x1  | 6  | 2x2x1   |
+| 7  | 4x2x1  | 8  | 1x4x1  | 9  | 2x4x1  | 10 | 4x4x1  | 11 | 8x1x1   |
+| 12 | 1x8x1  | 13 | 8x2x1  | 14 | 2x8x1  | 15 | 16x1x1 | 16 | 1x16x1  |
+
+Full map encoded in `tools/dim_sweep_w3x.py:CLUSTER_SHAPE_NAME` and
+`tools/dim_sweep_fc1.py:CLUSTER_SHAPE_NAME`. The introspect tool now also
+runs MXFP8 (`./cublaslt-introspect <M> <N> <K> <epi> 1`) — see
+`data/mxfp8_introspect_20260506/`.
 
 ## Status (2026-04-30)
 

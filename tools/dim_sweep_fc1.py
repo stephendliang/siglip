@@ -103,13 +103,45 @@ CUBLAS_RESULT_RE = re.compile(
 )
 CUBLAS_WINNER_RE = re.compile(
     r"^# Winner:\s+rank=1\s+tile=(?P<tile>\d+)\s+stages=(?P<stages>\d+)"
-    r"\s+cluster=(?P<cluster>\d+)\s+splitk=(?P<splitk>\d+)"
-    r"\s+swizzle=(?P<swizzle>\d+)"
+    r"\s+cluster=(?P<cluster>\d+)(?:\s+inner=-?\d+)?"
+    r"\s+splitk=(?P<splitk>\d+)\s+swizzle=(?P<swizzle>\d+)"
 )
 TILE_ID_NAME = {
     23: "128x256", 24: "256x128", 32: "128x192",
     197: "168x128", 201: "176x128", 495: "256x96", 535: "320x192",
 }
+"""Auto-extend TILE_ID_NAME from cublasLt.h — see dim_sweep_w3x.py."""
+def _load_tile_names():
+    paths = ("/usr/local/cuda/include/cublasLt.h", "/opt/cuda/include/cublasLt.h")
+    rx = re.compile(r"CUBLASLT_MATMUL_TILE_(\d+x\d+)\s*=\s*(\d+)")
+    for p in paths:
+        try:
+            with open(p) as fp:
+                for line in fp:
+                    m = rx.search(line)
+                    if m:
+                        tid = int(m.group(2))
+                        TILE_ID_NAME.setdefault(tid, m.group(1))
+            break
+        except FileNotFoundError:
+            continue
+_load_tile_names()
+CLUSTER_SHAPE_NAME = {0: "AUTO"}
+"""Auto-load cluster shape enum — see dim_sweep_w3x.py."""
+def _load_cluster_names():
+    paths = ("/usr/local/cuda/include/cublasLt.h", "/opt/cuda/include/cublasLt.h")
+    rx = re.compile(r"CUBLASLT_CLUSTER_SHAPE_(\d+x\d+x\d+)\s*=\s*(\d+)")
+    for p in paths:
+        try:
+            with open(p) as fp:
+                for line in fp:
+                    m = rx.search(line)
+                    if m:
+                        CLUSTER_SHAPE_NAME.setdefault(int(m.group(2)), m.group(1))
+            break
+        except FileNotFoundError:
+            continue
+_load_cluster_names()
 
 
 def validate_dim(n, k, m):
@@ -281,8 +313,10 @@ def _algo_brief(merged, prefix):
     tile = merged.get(f"cb_{prefix}_tile")
     if tile is None: return None
     tname = TILE_ID_NAME.get(tile, f"id={tile}")
+    cl = merged.get(f"cb_{prefix}_cluster")
+    cl_str = CLUSTER_SHAPE_NAME.get(cl, f"cl={cl}") if cl is not None else "?"
     return (f"{tname}/st{merged.get(f'cb_{prefix}_stages','?')}"
-            f"/cl{merged.get(f'cb_{prefix}_cluster','?')}"
+            f"/{cl_str}"
             f"/sk{merged.get(f'cb_{prefix}_splitk','?')}")
 
 
@@ -485,7 +519,8 @@ def main():
         def _algo_str(a):
             if a.get("tile") is None: return ""
             tname = TILE_ID_NAME.get(a["tile"], f"id={a['tile']}")
-            return (f"  algo[{tname} st={a['stages']} cl={a['cluster']}"
+            cl_str = CLUSTER_SHAPE_NAME.get(a["cluster"], f"cl={a['cluster']}")
+            return (f"  algo[{tname} st={a['stages']} {cl_str}"
                     f" sk={a['splitk']}]")
         algo_g = _algo_str(cubg)
         algo_n = _algo_str(cubn)

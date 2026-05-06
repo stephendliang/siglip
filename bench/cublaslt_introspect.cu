@@ -9,8 +9,9 @@ top-3 actually-used algos ranked by measured time (not heuristic).
 Output is both human-readable and a TSV header+rows so the shell script can
 grep/awk it.
 
-Usage: ./cublaslt-introspect <M> <N> <K> <epi>
-  epi: 0=none, 2=gelu_bias, 3=bias_only
+Usage: ./cublaslt-introspect <M> <N> <K> <epi> [scale]
+  epi:   0=none, 2=gelu_bias, 3=bias_only
+  scale: 0=per_tensor (default), 1=mxfp8 (VEC32_UE8M0 block scales)
 */
 
 #include <cstdio>
@@ -151,17 +152,24 @@ static void cap_dump(const cublasLtMatmulAlgo_t* a, const char* prefix) {
 
 int main(int argc, char** argv) {
 #ifdef DEFAULT_M
-    int M   = (argc >= 2) ? atoi(argv[1]) : DEFAULT_M;
-    int N   = (argc >= 3) ? atoi(argv[2]) : DEFAULT_N;
-    int K   = (argc >= 4) ? atoi(argv[3]) : DEFAULT_K;
-    int EPI = (argc >= 5) ? atoi(argv[4]) : DEFAULT_EPI;
+    int M     = (argc >= 2) ? atoi(argv[1]) : DEFAULT_M;
+    int N     = (argc >= 3) ? atoi(argv[2]) : DEFAULT_N;
+    int K     = (argc >= 4) ? atoi(argv[3]) : DEFAULT_K;
+    int EPI   = (argc >= 5) ? atoi(argv[4]) : DEFAULT_EPI;
+    int SCALE = (argc >= 6) ? atoi(argv[5]) : 0;
 #else
-    if (argc < 5) { fprintf(stderr,"usage: %s <M> <N> <K> <epi:0|2|3>\n",argv[0]); return 1; }
-    int M   = atoi(argv[1]);
-    int N   = atoi(argv[2]);
-    int K   = atoi(argv[3]);
-    int EPI = atoi(argv[4]);
+    if (argc < 5) { fprintf(stderr,"usage: %s <M> <N> <K> <epi:0|2|3> [scale:0=PT|1=MXFP8]\n",argv[0]); return 1; }
+    int M     = atoi(argv[1]);
+    int N     = atoi(argv[2]);
+    int K     = atoi(argv[3]);
+    int EPI   = atoi(argv[4]);
+    int SCALE = (argc >= 6) ? atoi(argv[5]) : 0;
 #endif
+    bool MXFP8 = (SCALE == 1);
+    if (MXFP8 && (K % 32) != 0) {
+        fprintf(stderr, "MXFP8 requires K %% 32 == 0 (got K=%d)\n", K);
+        return 1;
+    }
 
     cublasLtHandle_t lt; CUBLAS_CHECK(cublasLtCreate(&lt));
 
@@ -176,12 +184,25 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&dB, szB));
     CUDA_CHECK(cudaMalloc(&dD, szD));
     CUDA_CHECK(cudaMalloc(&dBias, fc::bias_bytes(N)));
-    CUDA_CHECK(cudaMalloc(&dSA, 4));
-    CUDA_CHECK(cudaMalloc(&dSB, 4));
+    /*
+      MXFP8 needs VEC32_UE8M0 block-scale buffers — sf_K = ceil(K/32)
+      scales per N (A) and per M (B), 1 byte each. 0x7F = UE8M0 1.0.
+      PER_TENSOR uses single-fp32 scales (4 bytes each).
+    */
+    size_t sf_K = ((size_t)K + 31) / 32;
+    size_t sa_bytes = MXFP8 ? sf_K * (size_t)N : 4;
+    size_t sb_bytes = MXFP8 ? sf_K * (size_t)M : 4;
+    CUDA_CHECK(cudaMalloc(&dSA, sa_bytes));
+    CUDA_CHECK(cudaMalloc(&dSB, sb_bytes));
     CUDA_CHECK(cudaMalloc(&dWS, WS));
-    float one = 1.0f;
-    CUDA_CHECK(cudaMemcpy(dSA, &one, 4, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dSB, &one, 4, cudaMemcpyHostToDevice));
+    if (MXFP8) {
+        CUDA_CHECK(cudaMemset(dSA, 0x7F, sa_bytes));
+        CUDA_CHECK(cudaMemset(dSB, 0x7F, sb_bytes));
+    } else {
+        float one = 1.0f;
+        CUDA_CHECK(cudaMemcpy(dSA, &one, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dSB, &one, 4, cudaMemcpyHostToDevice));
+    }
     CUDA_CHECK(cudaMemset(dA,0,szA));
     CUDA_CHECK(cudaMemset(dB,0,szB));
     CUDA_CHECK(cudaMemset(dBias, 0, fc::bias_bytes(N)));
@@ -193,7 +214,7 @@ int main(int argc, char** argv) {
 
     fc::DescConfig cfg;
     cfg.epi = static_cast<fc::Epilogue>(EPI);
-    cfg.scale = fc::ScaleMode::PER_TENSOR;
+    cfg.scale = MXFP8 ? fc::ScaleMode::MXFP8 : fc::ScaleMode::PER_TENSOR;
     cfg.d_scaleA = dSA;
     cfg.d_scaleB = dSB;
     cfg.d_bias = dBias;
@@ -207,7 +228,7 @@ int main(int argc, char** argv) {
     cublasLtMatmulHeuristicResult_t heur[MAX]; int n = 0;
     CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(lt, desc, layA, layB, layD, layD, pref, MAX, heur, &n));
 
-    printf("### CUBLASLT INTROSPECT M=%d N=%d K=%d epi=%s\n", M, N, K, epi_name_int(EPI));
+    printf("### CUBLASLT INTROSPECT M=%d N=%d K=%d epi=%s scale=%s\n", M, N, K, epi_name_int(EPI), MXFP8 ? "mxfp8" : "per_tensor");
     printf("### Heuristics returned: %d\n\n", n);
 
     float alpha=1.0f, beta=0.0f;
