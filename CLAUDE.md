@@ -5,7 +5,7 @@ FP8 (E4M3) → BF16, tcgen05 MMA, TMA, `cta_group::2`, 2-CTA clusters. Cross-com
 on CPU VPS, runs B200 (148 SMs, 74 clusters). PE kernel done — see
 `CLAUDE.md.mothballed`.
 
-## Current best (B200, 2026-05-01)
+## Current best (B200, 2026-05-06)
 
 | target | ms | kernel | dispatch | vs cuBLASLt fused rank-1 |
 |---|---|---|---|---|
@@ -202,7 +202,7 @@ budget. Spread ~281 cyc; anything in [4..32] equivalent. ns20 default stays.
 Calibration: n=1373→n=5489 demoted 3 of 4 "WEAK faster" cells to TIE — same
 canonical pattern as gflip basin. See `memory/project_w3x_nanosleep_basin.md`.
 
-## N×K dim sweep (pow2 grid, 2026-05-06, 16 cells)
+## FC2 N×K dim sweep (pow2 grid, 2026-05-06, 16 cells)
 
 `tools/dim_sweep_w3x.py` default = `N ∈ {256,512,1024,2048} × K ∈
 {1024,2048,4096,8192}`. Cycles paired with cuBLASLt rank-1 via
@@ -261,6 +261,58 @@ amortizes our pipeline depth advantage); K=2048 at small N (N=256/512/1024:
 
 See `memory/project_w3x_dim_sweep_vs_cublas.md` for cuBLASLt sparse-heuristic
 gaps at non-pow2 K.
+
+## FC1 N×K dim sweep (2026-05-06, 16 cells)
+
+`tools/dim_sweep_fc1.py` default = `N ∈ {1024,2048,3072,4096} × K ∈
+{512,768,1024,1536}` — centered on FC1 production (N=3072, K=768).
+fc1_w3 with production tune (zigzag TILE_DISPATCH=11 + K_STAGGER=1).
+cuBLASLt rank-1 via `cublaslt-introspect` at EPI=2 (GELU+BIAS) and
+EPI=0 (GEMM-only). Comparison in **ms** — fc1_w3 doesn't emit per-CTA
+clock64 cyc.
+
+| N | K | K_it | NS | ms | cb_gelu | Δg µs | Δg% | cb_none | Δn% |
+|---|---|---|---|---|---|---|---|---|---|
+| 1024 | 512  | 4  | 3 | 0.7120 | 0.8052 | −93   | −11.57 | 0.4074 | +74.77 |
+| 1024 | 768  | 6  | 5 | 0.6700 | 0.8125 | −142  | −17.54 | 0.4666 | +43.59 |
+| 1024 | 1024 | 8  | 5 | 0.6980 | 0.8295 | −131  | −15.85 | 0.5478 | +27.42 |
+| 1024 | 1536 | 12 | 5 | 0.8960 | 0.8484 | +47   | +5.61  | 0.7334 | +22.17 |
+| 2048 | 512  | 4  | 3 | 1.4140 | 1.5992 | −185  | −11.58 | 0.8084 | +74.91 |
+| 2048 | 768  | 6  | 5 | 1.3300 | 1.6131 | −283  | −17.55 | 0.9260 | +43.63 |
+| 2048 | 1024 | 8  | 5 | 1.3860 | 1.6477 | −261  | −15.88 | 1.0647 | +30.18 |
+| 2048 | 1536 | 12 | 5 | 1.7040 | 1.6803 | +23   | +1.41  | 1.3685 | +24.52 |
+| **3072**| **768**| 6 | 5 |**2.0250**| **2.4129**| **−387** | **−16.08** | 1.3635 | +48.51 |
+| 3072 | 512  | 4  | 3 | 2.1210 | 2.3943 | −273  | −11.41 | 1.2097 | +75.33 |
+| 3072 | 1024 | 8  | 5 | 2.0810 | 2.4651 | −384  | −15.58 | 1.5997 | +30.09 |
+| 3072 | 1536 | 12 | 5 | 2.5320 | 2.5115 | +20   | +0.82  | 2.0518 | +23.40 |
+| 4096 | 512  | 4  | 3 | 2.8100 | 3.1909 | −380  | −11.94 | 1.6098 | +74.56 |
+| 4096 | 768  | 6  | 5 | 2.6480 | 3.2137 | **−565** | **−17.60** | 1.8252 | +45.08 |
+| 4096 | 1024 | 8  | 5 | 2.7680 | 3.2814 | −513  | −15.65 | 2.1330 | +29.77 |
+| 4096 | 1536 | 12 | 5 | 3.2840 | 3.3437 | −59   | −1.79  | 2.7707 | +18.53 |
+
+**Production point N=3072 K=768: −16.08% / −387 µs vs PerTensor rank-1.**
+Reproduces 2.025 ms (within run-variance of the published 1.998 reference).
+
+**Three K regions, consistent across all N tested:**
+1. **K∈{512,768,1024} — ours dominates by 11.4 to 17.6%.** fc1_w3 was tuned
+   exactly for this regime (K=768 gets a flat −17.5% across all N from
+   1024 to 4096). cuBLASLt's algoId=66 GELU+BIAS family doesn't have an
+   efficient short-K kernel.
+2. **K=1536 — flip to near-tie or slight loss.** Ranges +5.61% (N=1024)
+   to −1.79% (N=4096). Crossover where cuBLASLt's K-amortization catches
+   up — K_iters=12 lets the algoId=66 family hide GELU.
+3. **K≥2048** (from FC1 K-sweep, not in this grid): ours decisively
+   loses vs PerTensor (+177 to +653 µs at K=2048), still beats MXFP8 at
+   K=3072/4096.
+
+**Best absolute Δ%: K=768 at every N** (−17.4 to −17.6%). **Best absolute
+µs: N=4096 K=768 = −565 µs.** Production N=3072 K=768 leaves ~50 µs vs
+MXFP8 (per separate K-sweep) — real headroom signal at FC1 small-K geometry.
+
+`cb_none` (GEMM-only) is a noBIAS reference; ours is +18 to +75% over it
+because we're doing GELU+BIAS the cb_none entry isn't. Useful only as a
+GEMM-floor anchor.
+
 
 ## cuBLASLt reference
 
@@ -481,7 +533,8 @@ bash tools/ncu_bench.sh && python3 tools/ncu_anova.py
 bash tools/ncu_fc2_w3x.sh --max --reps 3
 bash tools/ncu_fc2_pipes.sh                 # dodges --set full deadlock
 ./tools/dim_sweep.sh --fast                 # fc2_w3 80 configs (M×N×K)
-./tools/dim_sweep_w3x.py                    # fc2_w3x N×K pow2 grid (vs cuBLASLt)
+./tools/dim_sweep_w3x.py                    # fc2_w3x N×K pow2 grid (vs cuBLASLt BIAS_ONLY)
+./tools/dim_sweep_fc1.py                    # fc1_w3 N×K grid (vs cuBLASLt GELU+BIAS, prod tune)
 ```
 
 ## Key files
@@ -500,7 +553,8 @@ docs/STSM_STATUS.md, PURE_PTX_REWRITE_STRATEGY.md, BENCHMARKING.md
 docs/fc2_w3x_ncu_sass.txt    ncu --set full per-SASS stalls (mbar 7×)
 docs/fc2_w3x_ncu_details.txt 98.5% TC pipe (ignore STSM bank-conflict warns)
 rank1.sass         Dumped cuBLASLt FP8 BIAS_ONLY kernel (real algoId=66 tile=128x256; SASS opcodes apply, but its 1.046 ms timing was on transposed [M,N] geometry — see "cuBLASLt reference" for correct [N,M] numbers)
-tools/bench.sh, probe_cublaslt.sh, dim_sweep.sh, dim_sweep_w3x.py
+bench/fc_problem.cuh       Shared cuBLASLt FP8 problem definition (BF16 bias [N,M]) — single source of truth for cublas_bench + cublaslt_introspect
+tools/bench.sh, probe_cublaslt.sh, dim_sweep.sh, dim_sweep_w3x.py, dim_sweep_fc1.py
 tools/sweep_fc2_w3x_*.sh   tiles / dg / nanosleep / prof
 tools/ncu_*.sh, ncu_anova.py, aggregate_prof.py
 tools/analyze_swizzle.py, cluster_swizzle.py    structural metric + verdict
