@@ -1,0 +1,11 @@
+FC2 W3X kernel — 6-warp bias-only rank-1-shaped persistent
+  [928256,2048] x [768,2048]^T  NS=6  THREADS=192  SMEM=215296 B  (cap 228KB)
+  Alloc + init + pack done
+  TMA + func attr done (SMEM=215296 B)  variant=default TD=0 DGG=8
+Warmup (2 iters)...
+Timing 1 reps × 10 iters/rep × 1 variant ...
+@@SAMPLE rep=1 ms=0.72341 cyc=1325622 cyc_min=1316561 cyc_p50=1321128 cyc_p95=1325005 cyc_max=1325622
+@@STATS reps=1 mean=0.72341 std=0.00000 min=0.72341 p25=0.72341 p50=0.72341 p75=0.72341 max=0.72341 iqr=0.00000
+FC2-W3X kernel: 0.723 ms  4036.49 TFLOPS
+PASS  errors=0/32
+@@RESULT ms=0.7234 tflops=4036.49 checksum=0.000000 valid=1 c0=3072.0

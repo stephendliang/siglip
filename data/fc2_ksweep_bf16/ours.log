@@ -1,0 +1,12 @@
+=== fc2_w3x K=1024 ===
+@@RESULT ms=0.5462 tflops=2673.09 checksum=0.000000 valid=1 c0=1536.0
+=== fc2_w3x K=2048 ===
+@@RESULT ms=0.7234 tflops=4036.49 checksum=0.000000 valid=1 c0=3072.0
+=== fc2_w3x K=3072 ===
+@@RESULT ms=1.0048 tflops=4359.35 checksum=0.000000 valid=1 c0=4608.0
+=== fc2_w3x K=4096 ===
+@@RESULT ms=1.4051 tflops=4156.33 checksum=0.000000 valid=1 c0=6144.0
+=== fc2_w3x K=6144 ===
+@@RESULT ms=1.9760 tflops=4433.21 checksum=0.000000 valid=1 c0=9216.0
+=== fc2_w3x K=8192 ===
+@@RESULT ms=2.6718 tflops=4371.62 checksum=0.000000 valid=1 c0=12288.0

@@ -1,0 +1,55 @@
+### CUBLASLT INTROSPECT M=928256 N=768 K=4096 epi=bias_only
+### Heuristics returned: 8
+
+# TSV
+rank	heur	ms	cyc	algoId	tile	stages	cluster	inner	splitk	redux	swizzle	custom	waves	ws_MB
+1	0	1.3459	2483856	66	23	36	3	-1	1	0	0	1	147.00	0.0
+2	5	1.4431	2662902	66	29	36	3	-1	1	0	0	1	235.22	0.0
+3	6	1.4734	2718614	66	210	36	3	-1	1	0	0	1	98.00	0.0
+4	7	1.5624	2882397	66	447	36	3	-1	1	0	0	1	73.50	0.0
+5	2	1.5921	2938284	66	32	36	6	-1	1	0	0	3	196.01	0.0
+6	4	1.6101	2969513	66	513	36	5	-1	1	0	0	3	73.50	0.0
+7	1	1.6863	3111398	66	24	36	5	-1	1	0	0	3	147.00	0.0
+8	3	1.7268	3186794	66	31	36	6	-1	1	0	0	3	196.00	0.0
+
+# Top-3 caps:
+
+## rank=1  algoId=66  tile=23  stages=36  cluster=3  inner=-1  ms=1.3459
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=2  algoId=66  tile=29  stages=36  cluster=3  inner=-1  ms=1.4431
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=3  algoId=66  tile=210  stages=36  cluster=3  inner=-1  ms=1.4734
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+# Winner:  rank=1  tile=23  stages=36  cluster=3  inner=-1  splitk=1  swizzle=0  ms=1.3459  cyc=2483856
+
+@@RESULT ms=1.3459 cyc=2483856 tflops=4339.28 checksum=0.000000 valid=1 c0=0.0

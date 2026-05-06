@@ -28,6 +28,8 @@ Examples:
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
 
+#include "fc_problem.cuh"
+
 // Compile-time configuration
 
 #ifndef BENCH_N
@@ -40,7 +42,7 @@ Examples:
 #define BENCH_EPILOGUE 1
 #endif
 
-enum class Epilogue { NONE = 0, PERIODIC_ADD = 1, GELU_BIAS = 2, BIAS_ONLY = 3 };
+using Epilogue = fc::Epilogue;
 
 constexpr int N_DIM = BENCH_N;
 constexpr int K_DIM = BENCH_K;
@@ -366,42 +368,28 @@ int main(int argc, char** argv) {
     CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
         pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &WORKSPACE_BYTES, sizeof(WORKSPACE_BYTES)));
 
-    cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;
-    int32_t scale_mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+    /*
+      Layouts and descriptor come from bench/fc_problem.cuh — same factory
+      used by cublaslt_introspect so the two harnesses share one definition.
+      `legacy` aliases keep the rest of this file readable.
+    */
+    fc::Layouts lay = fc::make_layouts(M, N_DIM, K_DIM);
+    cublasLtMatrixLayout_t& layoutA = lay.A;
+    cublasLtMatrixLayout_t& layoutB = lay.B;
+    cublasLtMatrixLayout_t& layoutC = lay.D;
 
-    // Layouts: A=[K,N] transa=T, B=[K,M] transb=N, C/D=[N,M]
-    cublasLtMatrixLayout_t layoutA, layoutB, layoutC;
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_8F_E4M3, K_DIM, N_DIM, K_DIM));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_8F_E4M3, K_DIM, M, K_DIM));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&layoutC, CUDA_R_16BF, N_DIM, M, N_DIM));
-
-    // Descriptor factory
     auto make_desc = [&](bool mxfp8, bool fused) -> cublasLtMatmulDesc_t {
-        cublasLtMatmulDesc_t d;
-        CUBLAS_CHECK(cublasLtMatmulDescCreate(&d, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)));
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)));
+        fc::DescConfig cfg;
+        cfg.scale = mxfp8 ? fc::ScaleMode::MXFP8 : fc::ScaleMode::PER_TENSOR;
         if (mxfp8) {
-            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
-            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
-            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_scaleA, sizeof(d_scaleA)));
-            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_scaleB, sizeof(d_scaleB)));
+            cfg.d_scaleA = d_scaleA;
+            cfg.d_scaleB = d_scaleB;
         }
-        if (fused) {
-            if constexpr (EPI == Epilogue::GELU_BIAS) {
-                cublasLtEpilogue_t epi = CUBLASLT_EPILOGUE_GELU_BIAS;
-                CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
-            } else if constexpr (EPI == Epilogue::BIAS_ONLY) {
-                cublasLtEpilogue_t epi = CUBLASLT_EPILOGUE_BIAS;
-                CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
-            }
-            if constexpr (EPI == Epilogue::GELU_BIAS || EPI == Epilogue::BIAS_ONLY) {
-                CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &d_bias, sizeof(d_bias)));
-                cudaDataType_t btype = CUDA_R_32F;
-                CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &btype, sizeof(btype)));
-            }
+        if (fused && fc::epi_uses_bias(EPI)) {
+            cfg.epi = EPI;
+            cfg.d_bias = d_bias;
         }
-        return d;
+        return fc::make_desc(cfg);
     };
 
     // Base descs (GEMM-only)

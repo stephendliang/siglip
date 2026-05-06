@@ -24,6 +24,8 @@ Usage: ./cublaslt-introspect <M> <N> <K> <epi>
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
 
+#include "fc_problem.cuh"
+
 #define CUDA_CHECK(x)   do { auto e=(x); if(e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);}}while(0)
 #define CUBLAS_CHECK(x) do { auto s=(x); if(s!=CUBLAS_STATUS_SUCCESS){fprintf(stderr,"cuBLAS %s:%d: %d\n",__FILE__,__LINE__,(int)s);exit(1);}}while(0)
 
@@ -56,9 +58,9 @@ __global__ void read_clock_sentinel(uint64_t* out) {
     }
 }
 
-static const char* epi_name(int e) {
-    switch(e){case 0:return"none";case 2:return"gelu_bias";case 3:return"bias_only";}
-    return "?";
+/* epi_name comes from fc_problem.cuh — accept the int form from argv. */
+static const char* epi_name_int(int e) {
+    return fc::epi_name(static_cast<fc::Epilogue>(e));
 }
 
 /*
@@ -163,13 +165,17 @@ int main(int argc, char** argv) {
 
     cublasLtHandle_t lt; CUBLAS_CHECK(cublasLtCreate(&lt));
 
-    // Buffers: A [K,M] col-major fp8, B [K,N] col-major fp8, D [M,N] bf16
-    size_t szA = (size_t)K*M, szB = (size_t)K*N, szD = (size_t)M*N*2;
+    /*
+      Layouts and descriptor come from bench/fc_problem.cuh — same factory
+      used by cublas_bench.cu so the two harnesses can never drift again.
+      D is col-major [N,M], bias is length N (output channels), FP32.
+    */
+    size_t szA = (size_t)K*N, szB = (size_t)K*M, szD = (size_t)N*M*2;
     void *dA,*dB,*dD,*dBias,*dSA,*dSB,*dWS;
     CUDA_CHECK(cudaMalloc(&dA, szA));
     CUDA_CHECK(cudaMalloc(&dB, szB));
     CUDA_CHECK(cudaMalloc(&dD, szD));
-    CUDA_CHECK(cudaMalloc(&dBias, N*4));
+    CUDA_CHECK(cudaMalloc(&dBias, fc::bias_bytes(N)));
     CUDA_CHECK(cudaMalloc(&dSA, 4));
     CUDA_CHECK(cudaMalloc(&dSB, 4));
     CUDA_CHECK(cudaMalloc(&dWS, WS));
@@ -178,32 +184,20 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(dSB, &one, 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(dA,0,szA));
     CUDA_CHECK(cudaMemset(dB,0,szB));
-    CUDA_CHECK(cudaMemset(dBias,0,N*4));
+    CUDA_CHECK(cudaMemset(dBias, 0, fc::bias_bytes(N)));
 
-    cublasLtMatrixLayout_t layA,layB,layD;
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&layA, CUDA_R_8F_E4M3, K, M, K));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&layB, CUDA_R_8F_E4M3, K, N, K));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&layD, CUDA_R_16BF,    M, N, M));
+    fc::Layouts lay = fc::make_layouts(M, N, K);
+    cublasLtMatrixLayout_t& layA = lay.A;
+    cublasLtMatrixLayout_t& layB = lay.B;
+    cublasLtMatrixLayout_t& layD = lay.D;
 
-    cublasLtMatmulDesc_t desc;
-    CUBLAS_CHECK(cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-    cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &dSA, sizeof(dSA)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &dSB, sizeof(dSB)));
-    if (EPI == 2 || EPI == 3) {
-        cublasLtEpilogue_t e = (EPI==2) ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS;
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &e, sizeof(e)));
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &dBias, sizeof(dBias)));
-        /*
-          Match bench/cublas_bench.cu line 401: FP32 bias dtype, not BF16.
-          cuBLASLt returns DIFFERENT heuristics for FP32 vs BF16 bias —
-          our prior introspect ran a different code path than cublas-bench-fc1.
-        */
-        cudaDataType_t btype = CUDA_R_32F;
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &btype, sizeof(btype)));
-    }
+    fc::DescConfig cfg;
+    cfg.epi = static_cast<fc::Epilogue>(EPI);
+    cfg.scale = fc::ScaleMode::PER_TENSOR;
+    cfg.d_scaleA = dSA;
+    cfg.d_scaleB = dSB;
+    cfg.d_bias = dBias;
+    cublasLtMatmulDesc_t desc = fc::make_desc(cfg);
 
     cublasLtMatmulPreference_t pref;
     CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
@@ -213,7 +207,7 @@ int main(int argc, char** argv) {
     cublasLtMatmulHeuristicResult_t heur[MAX]; int n = 0;
     CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(lt, desc, layA, layB, layD, layD, pref, MAX, heur, &n));
 
-    printf("### CUBLASLT INTROSPECT M=%d N=%d K=%d epi=%s\n", M, N, K, epi_name(EPI));
+    printf("### CUBLASLT INTROSPECT M=%d N=%d K=%d epi=%s\n", M, N, K, epi_name_int(EPI));
     printf("### Heuristics returned: %d\n\n", n);
 
     float alpha=1.0f, beta=0.0f;

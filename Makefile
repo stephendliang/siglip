@@ -787,28 +787,28 @@ tma-swizzle-probe-sw-x3: bench/tma_swizzle_probe.cu
 tma-swizzle-probe-sw-x4: bench/tma_swizzle_probe.cu
 	$(NVCC) $(CFLAGS) -DXOR_MODE=4 $< -o $@ -lcuda
 
-cublas-bench: bench/cublas_bench.cu
+cublas-bench: bench/cublas_bench.cu bench/fc_problem.cuh
 	$(NVCC) $(CFLAGS) -std=c++17 $< -o $@ -lcublasLt -lcublas
 
-cublas-bench-fc1: bench/cublas_bench.cu
+cublas-bench-fc1: bench/cublas_bench.cu bench/fc_problem.cuh
 	$(NVCC) $(CFLAGS) -std=c++17 -DBENCH_N=3072 -DBENCH_EPILOGUE=2 $< -o $@ -lcublasLt -lcublas
 
-cublas-bench-fc2: bench/cublas_bench.cu
+cublas-bench-fc2: bench/cublas_bench.cu bench/fc_problem.cuh
 	$(NVCC) $(CFLAGS) -std=c++17 -DBENCH_N=768 -DBENCH_K=3072 -DBENCH_EPILOGUE=3 $< -o $@ -lcublasLt -lcublas
 
-cublas-bench-fc1-ncu: bench/cublas_bench.cu
+cublas-bench-fc1-ncu: bench/cublas_bench.cu bench/fc_problem.cuh
 	$(NVCC) $(CFLAGS) -std=c++17 -DBENCH_N=3072 -DBENCH_EPILOGUE=2 -DNCU_MODE $< -o $@ -lcublasLt -lcublas
 
-cublas-bench-fc2-ncu: bench/cublas_bench.cu
+cublas-bench-fc2-ncu: bench/cublas_bench.cu bench/fc_problem.cuh
 	$(NVCC) $(CFLAGS) -std=c++17 -DBENCH_N=768 -DBENCH_K=3072 -DBENCH_EPILOGUE=3 -DNCU_MODE $< -o $@ -lcublasLt -lcublas
 
-cublaslt-introspect: bench/cublaslt_introspect.cu
+cublaslt-introspect: bench/cublaslt_introspect.cu bench/fc_problem.cuh
 	$(NVCC) $(CFLAGS) -std=c++17 $< -o $@ -lcublasLt -lcublas
 
-cublaslt-fc1: bench/cublaslt_introspect.cu
+cublaslt-fc1: bench/cublaslt_introspect.cu bench/fc_problem.cuh
 	$(NVCC) $(CFLAGS) -std=c++17 -DDEFAULT_M=928256 -DDEFAULT_N=3072 -DDEFAULT_K=768 -DDEFAULT_EPI=2 $< -o $@ -lcublasLt -lcublas
 
-cublaslt-fc2: bench/cublaslt_introspect.cu
+cublaslt-fc2: bench/cublaslt_introspect.cu bench/fc_problem.cuh
 	$(NVCC) $(CFLAGS) -std=c++17 -DDEFAULT_M=928256 -DDEFAULT_N=768 -DDEFAULT_K=3072 -DDEFAULT_EPI=3 $< -o $@ -lcublasLt -lcublas
 
 # ── SASS analysis C++ tool ──
