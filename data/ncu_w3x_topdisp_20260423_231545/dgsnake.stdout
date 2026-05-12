@@ -1,8 +1,0 @@
-FC2 W3X kernel — 6-warp bias-only rank-1-shaped persistent
-  [928256,3072] x [768,3072]^T  NS=6  THREADS=192  SMEM=214784 B  (cap 228KB)
-  Alloc + init + pack done
-  TMA descriptors + func attr done (SMEM=214784 B)
-Warmup (1 iters)...
-Timing 1 iters...
-FC2-W3X kernel: 834.707 ms  5.25 TFLOPS
-@@RESULT ms=834.7068 tflops=5.25 checksum=0.000000 valid=0 c0=0.0

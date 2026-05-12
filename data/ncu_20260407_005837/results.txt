@@ -1,8 +1,0 @@
-@@RESULT ms=1.088 tflops=4025.45 checksum=0.000000 valid=0 c0=0.0 label=w3_strip
-@@RESULT ms=1.479 tflops=2961.53 checksum=7315328.000000 valid=1 c0=6912.0 label=w3_fused
-@@RESULT ms=1.223 tflops=3580.88 checksum=7316096.000000 valid=1 c0=6912.0 label=cutlass_fused
-@@RESULT ms=1.152 tflops=3801.94 checksum=7077888.000000 valid=1 c0=6912.0 label=cutlass_strip
-@@RESULT ms=1.223 tflops=3580.05 checksum=7316096.000000 valid=1 c0=6912.0 label=hybrid_fused
-@@RESULT ms=1.149 tflops=3810.95 checksum=7077888.000000 valid=1 c0=6912.0 label=hybrid_strip
-@@RESULT ms=2.633 tflops=1663.31 checksum=7077888.000000 valid=1 c0=6912.0 label=phase4_strip
-@@RESULT ms=2.770 tflops=1581.08 checksum=7316096.000000 valid=1 c0=6912.0 label=phase4_fused

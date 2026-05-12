@@ -1,5 +1,0 @@
-@@RESULT ms=1.016 tflops=4310.64 checksum=0.000000 valid=0 c0=0.0 label=w3_strip
-@@RESULT ms=1.242 tflops=3527.26 checksum=7315328.000000 valid=1 c0=6912.0 label=w3_fused
-@@RESULT ms=1.151 tflops=3804.92 checksum=7077888.000000 valid=1 c0=6912.0 label=cutlass_strip
-@@RESULT ms=1.225 tflops=3576.45 checksum=7316096.000000 valid=1 c0=6912.0 label=cutlass_fused
-@@RESULT ms=1.244 tflops=3519.93 checksum=7315328.000000 valid=1 c0=6912.0 label=epi1_fused

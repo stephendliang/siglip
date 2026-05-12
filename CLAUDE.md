@@ -573,8 +573,11 @@ make fc2-w3x-tile-sweep                     # TILE_DISPATCH variants
 python3 tools/aggregate_prof.py data/<dir>
 make fc2-w3x DFLAGS='-DPROFILE_CYCLES'      # |-DPROFILE_KI|-DPROFILE_TILE|-DPROFILE_W5
 
+make fc1-w3x && ./fc1-w3x                   # FC1 GELU+BIAS (clean-sheet, target ~2.025 ms ± basin)
+make fc1-w3x-tile-sweep                     # TILE_DISPATCH variants for FC1
+make fc1-w3x-ks-sweep                       # K_STAGGER sweep (default ks=1)
 make fc2-w3 && ./fc2-w3                     # fused 1.063 (dgswizzle TD=8)
-make fc1-w3 && ./fc1-w3                     # FC1 1.998 (zigzag+ks=1)
+make fc1-w3 && ./fc1-w3                     # FC1 legacy 1.998 (zigzag+ks=1) — fc1_w3x supersedes for non-residual
 
 make -B fc2-w3 DFLAGS='-DM_TOTAL=464128 -DN_DIM=1024 -DK_DIM=2048'  # custom dims need -B
 # Decomp: -DSTRIP_EPILOGUE / -DGEMM_ONLY
@@ -594,20 +597,23 @@ bash tools/ncu_fc2_pipes.sh                 # dodges --set full deadlock
 
 ```
 fc2_w3x.cu         FC2 bias-only (ACTIVE — beats cuBLASLt fused PerTensor & MXFP8 rank-1)
+fc1_w3x.cu         FC1 GELU+BIAS (ACTIVE — clean-sheet port of fc2_w3x architecture)
 fc2_w3x.ptx        Hand-written PTX, byte-identical SASS (frozen)
-fc2_w3.cu          FC2 fused-residual (ACTIVE)
-fc1_w3.cu          FC1 (ACTIVE)
-fc2_ws.cu          FC2 warp-specialized w/ early-warp retirement
-tile_dispatch.cuh  Shared TD=8..58 (CHET/PMIX/INGH, gflip family)
+fc2_w3.cu          FC2 fused-residual (legacy, retained for residual path)
+fc1_w3.cu          FC1 (legacy; superseded by fc1_w3x for non-residual)
+swizzle_w3x.cuh    Shared 48 swizzle templates (TD=11..99) for fc1_w3x/fc2_w3x
+epilogue_ops.cuh   Shared CVT_ADD/CVT_GELU_ADD macros + gelu_approx + pack_idx_C
+gen/bias_switch_inc_<N>.cuh  Build-time codegen — see tools/gen_bias_switch.py
+tile_dispatch.cuh  Legacy TD=8..58 used by fc1_w3 / fc2_w3 (NOT w3x family)
 fc2_cutlass.cu     CUTLASS reference
-fc2_hybrid.cu, fc2_ldg.cu, fc2.cu  DEAD
-kernel_common.cuh, kernel_body.cuh  Shared infra
+kernel_common.cuh, kernel_body.cuh  Legacy w3 infra (NOT used by w3x family)
 docs/STSM_STATUS.md, PURE_PTX_REWRITE_STRATEGY.md, BENCHMARKING.md
 docs/fc2_w3x_ncu_sass.txt    ncu --set full per-SASS stalls (mbar 7×)
 docs/fc2_w3x_ncu_details.txt 98.5% TC pipe (ignore STSM bank-conflict warns)
 rank1.sass         Dumped cuBLASLt FP8 BIAS_ONLY kernel (real algoId=66 tile=128x256; SASS opcodes apply, but its 1.046 ms timing was on transposed [M,N] geometry — see "cuBLASLt reference" for correct [N,M] numbers)
 bench/fc_problem.cuh       Shared cuBLASLt FP8 problem definition (BF16 bias [N,M]) — single source of truth for cublas_bench + cublaslt_introspect
 tools/bench.sh, probe_cublaslt.sh, dim_sweep.sh, dim_sweep_w3x.py, dim_sweep_fc1.py
+tools/gen_bias_switch.py   Codegen for bias-load switch chain (avoids local-mem spill)
 tools/sweep_fc2_w3x_*.sh   tiles / dg / nanosleep / prof
 tools/ncu_*.sh, ncu_anova.py, aggregate_prof.py
 tools/analyze_swizzle.py, cluster_swizzle.py    structural metric + verdict
@@ -663,6 +669,19 @@ decorated block comments. Bare `/*`, undecorated lines, `*/`.
 
 Don't narrate tool calls; don't echo file contents; parallelize independent
 tool calls; offset/limit for large files.
+
+**w3x shared-header structure (2026-05-07):** fc1_w3x.cu and fc2_w3x.cu share
+three pieces of infrastructure — edit once, both kernels rebuild:
+  - `swizzle_w3x.cuh`  — 48 swizzle templates + tile_swizzle_t / tile_in_group_t
+  - `epilogue_ops.cuh` — CVT_ADD / CVT_GELU_ADD macros + gelu_approx + pack_idx_C
+  - `gen/bias_switch_inc_<N>.cuh` — build-time codegen via tools/gen_bias_switch.py
+    (Makefile rule `gen/bias_switch_inc_%.cuh`; new BIAS_REG_COUNT just needs the
+    Makefile prereq line updated, .cu uses `#include "gen/bias_switch_inc_<N>.cuh"`)
+SASS-verified zero codegen change vs prior in-line copies (cuobjdump diff = 0).
+**Real fc1↔fc2 lever surface is now ~150 lines** (header / dim defines / NS
+picker / GELU vs BIAS-only macro at the subpass site / K_STAGGER / golden ref).
+Legacy w3 family (fc1_w3, fc2_w3) still uses kernel_common.cuh / kernel_body.cuh
+/ tile_dispatch.cuh — do NOT cross-include between w3 and w3x families.
 
 LLM context is the binding constraint — treat CLAUDE.md, docs, memory as a
 token budget. Prefer brief pointers to topic files. `./token_count.py <file>`

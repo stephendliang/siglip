@@ -63,3 +63,4 @@ __pycache__/
 *.swp
 *.swo
 *~
+/gen/

@@ -1,7 +1,0 @@
-@@RESULT ms=1.027 tflops=4264.16 checksum=0.000000 valid=0 c0=0.0 label=c2_strip
-@@RESULT ms=1.074 tflops=4079.76 checksum=7077888.000000 valid=1 c0=6912.0 label=c2_gemm
-@@RESULT ms=1.069 tflops=4096.09 checksum=7461504.000000 valid=1 c0=6912.0 label=c2_fused
-@@RESULT ms=1.107 tflops=3956.54 checksum=7461504.000000 valid=1 c0=6912.0 label=c2_lean
-@@RESULT ms=1.978 tflops=2214.42 checksum=0.000000 valid=1 c0=0.0 label=c4_strip
-@@RESULT ms=2.122 tflops=2064.51 checksum=7077888.000000 valid=1 c0=6912.0 label=c4_gemm
-@@RESULT ms=2.052 tflops=2134.16 checksum=7461504.000000 valid=1 c0=6912.0 label=c4_fused
