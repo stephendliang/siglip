@@ -928,29 +928,23 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 PROF_END(e1, 1);
 
-                PROF_BEGIN(e2);
-#ifndef DROP_LEAD_BARSYNC
-                asm volatile(EPI_BARSYNC_ASM ::: "memory");
-#endif
-                PROF_END(e2, 2);
-
-                if (tid == 0) {
-                    PROF_BEGIN(e3);
+                PROF_BEGIN(e3);
+                /* Per-warp TMA: each epilogue warp issues for its own 32-row slice.
+                   Eliminates lead/trail bar.sync; parallel TMA dispatch from 4 warps. */
+                if (lane == 0) {
                     if (tt > 0 || sp >= NUM_EPI_STAGES) {
                         BULK_ASM(BULK_WAIT_GROUP(1));
                     }
                     const uint32_t tma_base = (es == 0) ? out_smem_0 : out_smem_1;
-                    tma_store(tma_base, &tma_c,
-                              nc, cta_rank * ROWS_PER_CTA, tn, tm);
+                    const uint32_t warp_tma_src = tma_base
+                        + (uint32_t)row_group * ROWS_PER_WARP * SUBPASS_COLS * 2;
+                    tma_store(warp_tma_src, &tma_c,
+                              nc,
+                              cta_rank * ROWS_PER_CTA + row_group * ROWS_PER_WARP,
+                              tn, tm);
                     BULK_ASM("cp.async.bulk.commit_group;");
-                    PROF_END(e3, 3);
                 }
-
-#ifndef DROP_TRAIL_BARSYNC
-                PROF_BEGIN(e4);
-                asm volatile(EPI_BARSYNC_ASM ::: "memory");
-                PROF_END(e4, 4);
-#endif
+                PROF_END(e3, 3);
             }
 
 #ifdef NO_PREFILL
@@ -960,7 +954,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
 #endif
 #endif /* STRIP_EPILOGUE */
         }
-        if (tid == 0) {
+        if (lane == 0) {
             BULK_ASM(BULK_WAIT_GROUP(0));
         }
         PROF_WALL_END();
@@ -1555,7 +1549,8 @@ int main(int argc, char** argv) {
           DRAM offset for absolute (m, n):
             ((m / TM_PACK) * TILES_N + (n / TN)) * (TM_PACK * TN)
               + (m % TM_PACK) * TN + (n % TN)
-          Per-store box stays (SUBPASS_COLS × ROWS_PER_CTA) within one tile.
+          Per-store box is (SUBPASS_COLS × ROWS_PER_WARP): each epilogue warp
+          issues its own store for its 32-row slice (4× parallel TMA).
         */
         uint64_t dims[4]    = {(uint64_t)TN, (uint64_t)TM_PACK,
                                (uint64_t)TILES_N, (uint64_t)TILES_M};
@@ -1563,7 +1558,7 @@ int main(int argc, char** argv) {
             (uint64_t)TN * sizeof(__nv_bfloat16),
             (uint64_t)TM_PACK * TN * sizeof(__nv_bfloat16),
             (uint64_t)TILES_N * TM_PACK * TN * sizeof(__nv_bfloat16)};
-        uint32_t box[4]     = {SUBPASS_COLS, ROWS_PER_CTA, 1, 1};
+        uint32_t box[4]     = {SUBPASS_COLS, ROWS_PER_WARP, 1, 1};
         uint32_t estrides[4]= {1, 1, 1, 1};
         CU_CHECK(cuTensorMapEncodeTiled(&h_tma_c,
             CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, (void*)d_C,
