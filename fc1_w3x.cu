@@ -926,16 +926,11 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 }
 
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                /* lane==0 issues TMA for all 32 rows its warp just wrote via
-                   STSM/st.shared; __syncwarp orders every lane's shared write
-                   before lane 0's async-proxy read. Warp-scoped — the store is
-                   warp-local, so no cross-warp (full bar.sync) sync needed. */
-                __syncwarp();
                 PROF_END(e1, 1);
 
                 PROF_BEGIN(e3);
                 /* Per-warp TMA: each epilogue warp issues for its own 32-row slice.
-                   Eliminates per-subpass lead/trail bar.sync; parallel TMA from 4 warps. */
+                   Eliminates lead/trail bar.sync; parallel TMA dispatch from 4 warps. */
                 if (lane == 0) {
                     if (tt > 0 || sp >= NUM_EPI_STAGES) {
                         BULK_ASM(BULK_WAIT_GROUP(1));
@@ -953,11 +948,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             }
 
 #ifdef NO_PREFILL
-            /* Tile-boundary TMEM lifetime: all 4 epilogue warps must finish
-               their TMEM_LOADs before tid==0 signals this buffer consumed, or
-               W5 overwrites TMEM mid-read. One bar.sync per tile (was 16/tile
-               framing the serial tid==0 TMA store). */
-            asm volatile(EPI_BARSYNC_ASM ::: "memory");
             if (tid == 0) {
                 mbar_arrive(mbar_tmem_cons_peer_base + buf * 8);
             }
