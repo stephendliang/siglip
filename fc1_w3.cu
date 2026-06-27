@@ -91,14 +91,6 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define TILE_DISPATCH 0
 #endif
 
-#if TILE_DISPATCH == 4
-#undef NUM_WARPS
-#define NUM_WARPS (2 + NUM_EPI_WARPS + 1)   /* +1 scheduler warp */
-#undef THREADS
-#define THREADS (32 * NUM_WARPS)
-#define SCHED_WARP (2 + NUM_EPI_WARPS)      /* scheduler warp index */
-#endif
-
 #include "tile_dispatch.cuh"
 
 #if defined(STRIP_EPILOGUE) && defined(GEMM_ONLY)
@@ -125,24 +117,7 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define OFF_EPILOGUE_MBAR  (OFF_MAINLOOP_MBAR + 16)
 #define _MBAR_END          (OFF_EPILOGUE_MBAR + 16)
 
-#if TILE_DISPATCH == 4
-/* W_sched→W0 scheduler pipe: 2-deep FIFO + produce/consume mbarriers */
-#define OFF_SCHED_FIFO      _MBAR_END
-#define OFF_SCHED_PROD_MBAR (OFF_SCHED_FIFO + 8)
-#define OFF_SCHED_CONS_MBAR (OFF_SCHED_PROD_MBAR + 16)
-#define OFF_BCAST_TILE      (OFF_SCHED_CONS_MBAR + 16)
-#define OFF_TILE_READY_MBAR (OFF_BCAST_TILE + 8)
-#define OFF_SCHED_EPOCH     (OFF_TILE_READY_MBAR + 16)
-#ifdef BIAS_PRELOAD
-#define OFF_BIAS_MBAR       (OFF_SCHED_EPOCH + 8)   /* 2 mbarriers for W0→epi: TMA done */
-#define OFF_BIAS_DONE_MBAR  (OFF_BIAS_MBAR + 16)    /* 2 mbarriers for epi→W0: reads done */
-#define _LAYOUT_END         (OFF_BIAS_DONE_MBAR + 16)
-#else
-#define _LAYOUT_END         (OFF_SCHED_EPOCH + 8)
-#endif
-#else
-#define _LAYOUT_END        _MBAR_END
-#endif
+#define _LAYOUT_END _MBAR_END
 
 #define NUM_EPI_SUBITERS   4
 #define NUM_EPI_STAGES     2
@@ -156,11 +131,6 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
  *
  * BIAS_PER_TILE: compact per-tile SMEM when N_STAGES >= 6 (full bias exceeds 228KB).
  *   Group-3: 2 N-tiles loaded once at startup (snake order uses 2 N-tiles).
- *   TD=4: BIAS_BATCH N-tiles cached, reload on batch switch.
- *
- * BIAS_PRELOAD: W0 TMA-preloads bias batches during K-loop idle time.
- *   Double-buffered SMEM, epilogue warps never reload.  Requires TD=4.
- *   Max bb3 at NS6 (0 headroom), bb2 preferred (power-of-2 + 1KB headroom).
  */
 #ifdef LDG_BIAS
 /* No SMEM for bias — direct LDG from L1-cached global */
@@ -174,18 +144,7 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #endif
 
 #ifdef BIAS_PER_TILE
-#if TILE_DISPATCH == 4
-#ifndef BIAS_BATCH
-#define BIAS_BATCH         4                      /* N-tiles cached per batch (power-of-2) */
-#endif
-#ifdef BIAS_PRELOAD
-#define BIAS_SMEM_BYTES    (BIAS_BATCH * TN * 2 * 2)  /* double-buffered for W0 TMA */
-#else
-#define BIAS_SMEM_BYTES    (BIAS_BATCH * TN * 2)  /* 3072B — reload on batch switch */
-#endif
-#else
 #define BIAS_SMEM_BYTES    (TN * 2 * 2)          /* 1024B — 2 N-tiles for snake */
-#endif
 #else
 #define BIAS_SMEM_BYTES    (N_DIM * 2)            /* 6144B — all bias columns */
 #endif
@@ -423,10 +382,6 @@ static_assert(MMA_PER_KI == 4, "K_ITER_ACCUM hardcodes 4 sub-MMAs per K-iter");
 } while(0)
 
 
-#if TILE_DISPATCH == 4
-__device__ int g_tile_ctr;
-#endif
-
 /* ════════════════════════════════════════════════════════════════
    KERNEL
    ════════════════════════════════════════════════════════════════ */
@@ -465,32 +420,6 @@ fc1_w3_kernel(
                       NUM_EPI_WARPS * 2 * 32);
         }
 
-#if TILE_DISPATCH == 4
-        for (int i = 0; i < 2; i++) {
-            mbar_init(smem_to_uint(smem + OFF_SCHED_PROD_MBAR + i * 8), 32);
-            mbar_init(smem_to_uint(smem + OFF_SCHED_CONS_MBAR + i * 8), 32);
-#ifdef LEAN_DISPATCH
-            mbar_init(smem_to_uint(smem + OFF_TILE_READY_MBAR + i * 8), 1);    /* W0 lane 0 only */
-#else
-            mbar_init(smem_to_uint(smem + OFF_TILE_READY_MBAR + i * 8), 32);
-#endif
-        }
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH)));
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH + 4)));
-#ifdef LEAN_DISPATCH
-        /* Init bcast slots to 0 — W2-W5 read bcast[prev_buf] after mainloop_mbar
-           free pass at iter 0.  Uninitialized SMEM could be >= TOTAL_TILES, causing
-           premature _lean_done and deadlock on epilogue_mbar (NO_PREFILL). */
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_BCAST_TILE)));
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_BCAST_TILE + 4)));
-#endif
-#ifdef BIAS_PRELOAD
-        for (int i = 0; i < 2; i++) {
-            mbar_init(smem_to_uint(smem + OFF_BIAS_MBAR + i * 8), 1);
-            mbar_init(smem_to_uint(smem + OFF_BIAS_DONE_MBAR + i * 8), NUM_EPI_WARPS * 32);
-        }
-#endif
-#endif
 
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -517,23 +446,7 @@ fc1_w3_kernel(
     /* Clear bit 24: both CTAs arrive on CTA 0's mbar */
     const uint32_t epi_mbar_masked = epilogue_mbar_addr & 0xFEFFFFFF;
 
-#if TILE_DISPATCH == 4
-    const uint32_t sched_prod_mbar = smem_to_uint(smem + OFF_SCHED_PROD_MBAR);
-    const uint32_t sched_cons_mbar = smem_to_uint(smem + OFF_SCHED_CONS_MBAR);
-    const uint32_t tile_ready_mbar = smem_to_uint(smem + OFF_TILE_READY_MBAR);
-    const uint32_t bcast_addr      = smem_to_uint(smem + OFF_BCAST_TILE);
-    const uint32_t fifo_addr       = smem_to_uint(smem + OFF_SCHED_FIFO);
-    const uint32_t cta0_epoch = smem_to_uint(smem + OFF_SCHED_EPOCH) & 0xFEFFFFFFU;
-    const uint32_t cta0_fifo  = smem_to_uint(smem + OFF_SCHED_FIFO) & 0xFEFFFFFFU;
-    int sched_prod_phase[2] = {0, 0};
-    int sched_cons_phase[2] = {0, 0};
-    int tile_ready_phase[2] = {0, 0};
-#endif
-
-#if TILE_DISPATCH == 4
-    int _iter = 0;
-    int _prev_tile = -1;
-#elif TILE_DISPATCH >= 8
+#if TILE_DISPATCH >= 8
     /* Static swizzle: each cluster strides a linear index, static_swizzle() remaps. */
     const int tile_count = (TOTAL_TILES + num_clusters - 1) / num_clusters;
 #else
@@ -565,26 +478,6 @@ fc1_w3_kernel(
 #if !defined(STRIP_EPILOGUE) && !defined(GEMM_ONLY)
 #ifdef LDG_BIAS
     /* LDG_BIAS: no SMEM bias — direct LDG from L1-cached global in epilogue */
-#elif defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
-    /* BIAS_PRELOAD: W0 will TMA-preload batches during K-loop; load batch 0 at startup */
-    {
-        const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
-        for (int i = tid; i < BIAS_BATCH * TN / 2; i += THREADS) {
-            uint32_t val;
-            asm volatile("ld.global.b32 %0, [%1];" : "=r"(val) : "l"(bias + i * 2));
-            asm volatile("st.shared.b32 [%0], %1;" :: "r"(bias_saddr + i * 4), "r"(val));
-        }
-    }
-#elif defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
-    /* TD=4 mini-batch: load first batch (N-tiles 0..BIAS_BATCH-1) at startup */
-    {
-        const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
-        for (int i = tid; i < BIAS_BATCH * TN / 2; i += THREADS) {
-            uint32_t val;
-            asm volatile("ld.global.b32 %0, [%1];" : "=r"(val) : "l"(bias + i * 2));
-            asm volatile("st.shared.b32 [%0], %1;" :: "r"(bias_saddr + i * 4), "r"(val));
-        }
-    }
 #elif defined(BIAS_PER_TILE)
     /* Group-3: load 2 N-tiles' bias for snake ordering */
     {
@@ -611,112 +504,6 @@ fc1_w3_kernel(
     __syncthreads();
 #endif /* !STRIP_EPILOGUE && !GEMM_ONLY */
 
-#if TILE_DISPATCH == 4
-    /* ════════════════════════════════════════════
-       SCHEDULER WARP (TD=4): dispatch via atomicAdd, pipe to W0
-       ════════════════════════════════════════════ */
-    if (warp == SCHED_WARP) {
-        const uint32_t epoch_addr = smem_to_uint(smem + OFF_SCHED_EPOCH);
-        int _s_iter = 0;
-        int _s_buf = 0;
-#ifdef ROW_STEAL
-        int _rs_row = -1;
-        int _rs_tn = TILES_N;
-#endif
-        while (true) {
-            if (_s_iter >= 2) {
-                mbar_wait(sched_cons_mbar + _s_buf * 8, sched_cons_phase[_s_buf]);
-                sched_cons_phase[_s_buf] ^= 1;
-            }
-
-            int tile_idx;
-#ifdef ROW_STEAL
-            if (_rs_tn >= TILES_N) {
-                int _rs_tile0;
-                if (cta_rank == 0) {
-                    if (lane == 0) {
-                        asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
-                            : "=r"(_rs_row) : "l"(&g_tile_ctr));
-                        _rs_tile0 = (_rs_row < TILES_M)
-                            ? _rs_row * TILES_N : TOTAL_TILES;
-                        asm volatile("st.shared.b32 [%0], %1;"
-                            :: "r"(fifo_addr + _s_buf * 4), "r"(_rs_tile0));
-                        asm volatile("fence.acq_rel.cluster;");
-                        asm volatile("st.shared.b32 [%0], %1;"
-                            :: "r"(epoch_addr + _s_buf * 4), "r"(_s_iter + 1));
-                    }
-                } else {
-                    if (lane == 0) {
-                        int epoch;
-                        do {
-                            asm volatile("ld.acquire.cluster.shared::cluster.b32 %0, [%1];"
-                                : "=r"(epoch) : "r"(cta0_epoch + _s_buf * 4));
-                        } while (epoch != _s_iter + 1);
-                        asm volatile("ld.shared::cluster.b32 %0, [%1];"
-                            : "=r"(_rs_tile0) : "r"(cta0_fifo + _s_buf * 4));
-                    }
-                }
-                asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
-                    : "=r"(_rs_tile0) : "r"(_rs_tile0));
-                _rs_row = (_rs_tile0 >= TOTAL_TILES) ? TILES_M : _rs_tile0 / TILES_N;
-                _rs_tn = 0;
-            }
-            tile_idx = (_rs_row < TILES_M) ? _rs_row * TILES_N + _rs_tn : TOTAL_TILES;
-            _rs_tn++;
-            if (lane == 0) {
-                asm volatile("st.shared.b32 [%0], %1;"
-                    :: "r"(fifo_addr + _s_buf * 4), "r"(tile_idx));
-            }
-#else
-            if (cta_rank == 0) {
-                if (lane == 0) {
-                    asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
-                        : "=r"(tile_idx) : "l"(&g_tile_ctr));
-                    asm volatile("st.shared.b32 [%0], %1;"
-                        :: "r"(fifo_addr + _s_buf * 4), "r"(tile_idx));
-                    asm volatile("fence.acq_rel.cluster;");
-                    asm volatile("st.shared.b32 [%0], %1;"
-                        :: "r"(epoch_addr + _s_buf * 4), "r"(_s_iter + 1));
-                }
-            } else {
-                if (lane == 0) {
-                    int epoch;
-                    do {
-                        asm volatile("ld.acquire.cluster.shared::cluster.b32 %0, [%1];"
-                            : "=r"(epoch) : "r"(cta0_epoch + _s_buf * 4));
-                    } while (epoch != _s_iter + 1);
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];"
-                        : "=r"(tile_idx) : "r"(cta0_fifo + _s_buf * 4));
-                    asm volatile("st.shared.b32 [%0], %1;"
-                        :: "r"(fifo_addr + _s_buf * 4), "r"(tile_idx));
-                }
-            }
-#endif
-
-            mbar_arrive(sched_prod_mbar + _s_buf * 8);
-
-            asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
-                : "=r"(tile_idx) : "r"(tile_idx));
-            if (tile_idx >= TOTAL_TILES) break;
-
-            _s_buf ^= 1;
-            _s_iter++;
-        }
-        return;
-    }
-#endif
-
-#if !defined(LDG_BIAS) && defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
-#ifdef BIAS_PRELOAD
-    int bias_phase[2] = {0, 0};
-    int bias_done_phase[2] = {1, 1};
-    const uint32_t bias_mbar_addr = smem_to_uint(smem + OFF_BIAS_MBAR);
-    const uint32_t bias_done_mbar_addr = smem_to_uint(smem + OFF_BIAS_DONE_MBAR);
-    const int bias_buf_bytes = BIAS_BATCH * TN * 2;
-#else
-    int batch_start_tn = 0;   /* first N-tile index of current batch */
-#endif
-#endif
 
     /* ════════════════════════════════════════════
        MAIN TILE LOOP
@@ -726,63 +513,6 @@ fc1_w3_kernel(
     int prev_tm = 0, prev_tn = 0;
 #endif
 
-#if TILE_DISPATCH == 4
-    int _pf_tile = TOTAL_TILES;
-    int _pf_slot = 1;
-    if (warp == 0) {
-        mbar_wait(sched_prod_mbar, sched_prod_phase[0]);
-        sched_prod_phase[0] ^= 1;
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_pf_tile) : "r"(fifo_addr));
-        mbar_arrive(sched_cons_mbar);
-    }
-    while (true) {
-        int tile_idx;
-        {
-            const int _buf = _iter & 1;
-            if (warp == 0) {
-                tile_idx = _pf_tile;
-                asm volatile("st.shared.b32 [%0], %1;"
-                    :: "r"(bcast_addr + _buf * 4), "r"(tile_idx));
-#ifdef LEAN_DISPATCH
-                if (lane == 0) mbar_arrive(tile_ready_mbar + _buf * 8);
-#else
-                mbar_arrive(tile_ready_mbar + _buf * 8);
-#endif
-#ifdef LEAN_DISPATCH
-            } else if (warp == 1) {
-                /* W1 only: wait tile_ready_mbar for break check + K-loop sync */
-                mbar_wait(tile_ready_mbar + _buf * 8, tile_ready_phase[_buf]);
-                tile_ready_phase[_buf] ^= 1;
-                asm volatile("ld.shared.b32 %0, [%1];"
-                    : "=r"(tile_idx) : "r"(bcast_addr + _buf * 4));
-            } else {
-                /* W2-W5: skip tile_ready_mbar — read tile_idx from bcast SMEM
-                   after mainloop_mbar (release-acquire transitivity). */
-                tile_idx = 0;  /* placeholder: never triggers break at top */
-#else
-            } else {
-                mbar_wait(tile_ready_mbar + _buf * 8, tile_ready_phase[_buf]);
-                tile_ready_phase[_buf] ^= 1;
-                asm volatile("ld.shared.b32 %0, [%1];"
-                    : "=r"(tile_idx) : "r"(bcast_addr + _buf * 4));
-#endif
-            }
-        }
-#ifdef LEAN_DISPATCH
-        /* W0 and W1 break here. W2-W5 have tile_idx=0, continue to tile body. */
-        if (tile_idx >= TOTAL_TILES) {
-            if (warp == 1 && lane == 0) {
-                /* Arrive mainloop_mbar to unblock W2-W5 for last-tile epilogue */
-                asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                    :: "r"(mainloop_mbar_addr + (_iter & 1) * 8) : "memory");
-            }
-            break;
-        }
-#else
-        if (tile_idx >= TOTAL_TILES) break;
-#endif
-        const int buf = _iter & 1;
-#else
     for (int _ti = 0; _ti < tile_count; _ti++) {
 #if TILE_DISPATCH >= 8
 #ifdef N_STAGGER
@@ -802,7 +532,6 @@ fc1_w3_kernel(
         const int tile_idx = _tm * TILES_N + tn_fixed;
 #endif
         const int buf = _ti & 1;
-#endif
         int tm = tile_idx / TILES_N;
         int tn = tile_idx % TILES_N;
         if (SNAKE_ORDER && (tm & 1)) tn = TILES_N - 1 - tn;
@@ -813,11 +542,7 @@ fc1_w3_kernel(
         const int m_start = tm * TM * 2 + cta_rank * TM;
         const int n_start = tn * TN;
 #endif
-#if TILE_DISPATCH == 4
-        const bool has_prev = (_iter > 0);
-#else
         const bool has_prev = (_ti > 0);
-#endif
 
         if (warp == 0) {
             /* ── W0: TMA A/B loads ── */
@@ -867,47 +592,6 @@ fc1_w3_kernel(
                 }
             }
 
-#if TILE_DISPATCH == 4
-#ifdef BIAS_PRELOAD
-            /*
-             * W0 preloads bias batch for THIS tile's epilogue (runs next iteration).
-             * Double-buffered: current epilogue reads buf (_iter-1)&1, we write buf _iter&1.
-             * Wait for epilogue to finish reading from target buf before overwriting.
-             */
-            {
-                int w0_tn = tile_idx % TILES_N;
-                if (SNAKE_ORDER && ((tile_idx / TILES_N) & 1)) w0_tn = TILES_N - 1 - w0_tn;
-                const int need_batch = w0_tn / BIAS_BATCH;
-                const int new_buf = _iter & 1;
-                mbar_wait(bias_done_mbar_addr + new_buf * 8, bias_done_phase[new_buf]);
-                bias_done_phase[new_buf] ^= 1;
-                const uint32_t dst = smem_to_uint(smem + OFF_BIAS_SMEM)
-                    + new_buf * bias_buf_bytes;
-                if (lane == 0) {
-                    asm volatile(
-                        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-                        :: "r"(bias_mbar_addr + new_buf * 8),
-                           "r"(bias_buf_bytes)
-                        : "memory");
-                    asm volatile(
-                        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
-                        " [%0], [%1], %2, [%3];"
-                        :: "r"(dst),
-                           "l"(bias + need_batch * BIAS_BATCH * TN),
-                           "r"(bias_buf_bytes),
-                           "r"(bias_mbar_addr + new_buf * 8)
-                        : "memory");
-                }
-            }
-#endif
-            /* Prefetch next tile from scheduler FIFO */
-            mbar_wait(sched_prod_mbar + _pf_slot * 8, sched_prod_phase[_pf_slot]);
-            sched_prod_phase[_pf_slot] ^= 1;
-            asm volatile("ld.shared.b32 %0, [%1];"
-                : "=r"(_pf_tile) : "r"(fifo_addr + _pf_slot * 4));
-            mbar_arrive(sched_cons_mbar + _pf_slot * 8);
-            _pf_slot ^= 1;
-#endif
 
         } else if (warp == 1) {
             /* ── W1: MMA ── */
@@ -972,24 +656,6 @@ fc1_w3_kernel(
             const int prev_buf = buf ^ 1;
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             ml_phase[prev_buf] ^= 1;
-#ifdef LEAN_DISPATCH
-            /* Deferred read: mainloop_mbar[prev_buf] acquire guarantees W0's bcast
-               write for the PREVIOUS tile (bcast[prev_buf]) is visible. */
-            if (lane == 0)
-                asm volatile("ld.shared.b32 %0, [%1];"
-                    : "=r"(tile_idx) : "r"(bcast_addr + prev_buf * 4));
-            asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
-                : "=r"(tile_idx) : "r"(tile_idx));
-            _prev_tile = tile_idx;
-            /* Termination: W0 wrote TOTAL_TILES to bcast at the termination iter.
-               W1's termination arrive unblocked us. Skip epilogue, break.
-               Guard on has_prev: at iter 0 the free-pass mainloop_mbar gives no
-               ordering for bcast[prev_buf] — the slot may hold stale SMEM. */
-            if (has_prev && tile_idx >= TOTAL_TILES) {
-                mbar_arrive(epi_mbar_masked + prev_buf * 8);
-                goto _lean_done;
-            }
-#endif
 
 #ifdef STRIP_EPILOGUE
             if (has_prev)
@@ -1009,11 +675,7 @@ fc1_w3_kernel(
                 const int ptm = prev_tm;
                 const int ptn = prev_tn;
 #else
-#if TILE_DISPATCH == 4
-                const int prev_idx = _prev_tile;
-#else
                 const int prev_idx = (m_rank + (_ti - 1) * my_m_stride) * TILES_N + tn_fixed;
-#endif
                 int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
@@ -1118,11 +780,7 @@ fc1_w3_kernel(
                 const int ptm = prev_tm;
                 const int ptn = prev_tn;
 #else
-#if TILE_DISPATCH == 4
-                const int prev_idx = _prev_tile;
-#else
                 const int prev_idx = (m_rank + (_ti - 1) * my_m_stride) * TILES_N + tn_fixed;
-#endif
                 int ptm = prev_idx / TILES_N;
                 int ptn = prev_idx % TILES_N;
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
@@ -1135,32 +793,6 @@ fc1_w3_kernel(
                 const int prev_m = ptm * TM * 2 + cta_rank * TM;
                 const int prev_n = ptn * TN;
                 const int prev_n_bias = prev_n;
-#endif
-
-#if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
-                /* W0 already TMA-preloaded the bias batch; wait for it */
-                const int rd_buf = (_iter - 1) & 1;
-                {
-                    mbar_wait(bias_mbar_addr + rd_buf * 8, bias_phase[rd_buf]);
-                    bias_phase[rd_buf] ^= 1;
-                }
-#elif !defined(LDG_BIAS) && defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
-                /* Reload bias batch if needed (use batch_start_tn to avoid hot-path modulo) */
-                {
-                    if (ptn < batch_start_tn || ptn >= batch_start_tn + BIAS_BATCH) {
-                        batch_start_tn = (ptn / BIAS_BATCH) * BIAS_BATCH;
-                        const int epi_tid = (warp - 2) * 32 + lane;
-                        const int batch_col = batch_start_tn * TN;
-                        for (int i = epi_tid; i < BIAS_BATCH * TN / 2; i += NUM_EPI_WARPS * 32) {
-                            uint32_t val;
-                            asm volatile("ld.global.b32 %0, [%1];" : "=r"(val)
-                                : "l"(bias + batch_col + i * 2));
-                            asm volatile("st.shared.b32 [%0], %1;"
-                                :: "r"(bias_saddr + i * 4), "r"(val));
-                        }
-                        asm volatile(BAR_EPI_SYNC ::: "memory");
-                    }
-                }
 #endif
 
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
@@ -1208,14 +840,7 @@ fc1_w3_kernel(
                         asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "l"(bp + 24));
 #else
-#if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
-                        const uint32_t bs = bias_saddr
-                            + ((_iter - 1) & 1) * bias_buf_bytes
-                            + ((ptn & (BIAS_BATCH - 1)) * TN + nc) * 2;
-#elif defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
-                        const uint32_t bs = bias_saddr
-                            + ((ptn - batch_start_tn) * TN + nc) * 2;
-#elif defined(BIAS_PER_TILE)
+#if defined(BIAS_PER_TILE)
                         const uint32_t bs = bias_saddr
                             + ((ptn == tn_fixed) ? 0u : (unsigned)(TN * 2))
                             + nc * 2;
@@ -1252,12 +877,6 @@ fc1_w3_kernel(
                     }
                     } /* close row_group */
 
-#if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
-                    /* All bias LDS done — signal W0 it's safe to overwrite this buf */
-                    if (si == NUM_EPI_SUBITERS - 1)
-                        mbar_arrive(bias_done_mbar_addr + rd_buf * 8);
-#endif
-
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile(BAR_EPI_SYNC ::: "memory");
 
@@ -1287,32 +906,17 @@ fc1_w3_kernel(
             }
 #endif /* STRIP_EPILOGUE / GEMM_ONLY */
         }
-#if TILE_DISPATCH == 4
-        _prev_tile = tile_idx;
-        _iter++;
-#ifdef LEAN_DISPATCH
-        /* W2-W5 termination handled via goto _lean_done inside tile body
-           (after detecting bcast[prev_buf] >= TOTAL_TILES) */
-#endif
-#endif
 #if TILE_DISPATCH >= 8
         prev_tm = tm;
         prev_tn = tn;
 #endif
     }
 
-#ifdef LEAN_DISPATCH
-_lean_done:
-#endif
-
     /* ══════════════════════════════════════════════
        DRAIN: last tile epilogue
        ══════════════════════════════════════════════ */
     {
-#if TILE_DISPATCH == 4
-        const int last_idx = _prev_tile;
-        const int last_buf = (_iter - 1) & 1;
-#elif TILE_DISPATCH >= 8
+#if TILE_DISPATCH >= 8
         const int last_idx = static_swizzle((tile_count - 1) * num_clusters + cluster_id);
         const int last_buf = (tile_count - 1) & 1;
 #else
@@ -1335,10 +939,6 @@ _lean_done:
         if (warp == 0 || warp == 1) {
             /* W0/W1: nothing to do for drain */
         } else {
-#ifdef LEAN_DISPATCH
-            /* LEAN_DISPATCH: W2-W5 already did last-tile epilogue in the loop */
-            if (last_idx < TOTAL_TILES)
-#endif
             {
 #ifdef STRIP_EPILOGUE
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
@@ -1445,32 +1045,6 @@ _lean_done:
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             ml_phase[last_buf] ^= 1;
 
-#if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
-            /* W0 preloaded last tile's bias; wait for TMA to complete */
-            const int rd_buf = (_iter - 1) & 1;
-            {
-                mbar_wait(bias_mbar_addr + rd_buf * 8, bias_phase[rd_buf]);
-                bias_phase[rd_buf] ^= 1;
-            }
-#elif !defined(LDG_BIAS) && defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
-            /* Reload bias batch if needed */
-            {
-                if (ltn < batch_start_tn || ltn >= batch_start_tn + BIAS_BATCH) {
-                    batch_start_tn = (ltn / BIAS_BATCH) * BIAS_BATCH;
-                    const int epi_tid = (warp - 2) * 32 + lane;
-                    const int batch_col = batch_start_tn * TN;
-                    for (int i = epi_tid; i < BIAS_BATCH * TN / 2; i += NUM_EPI_WARPS * 32) {
-                        uint32_t val;
-                        asm volatile("ld.global.b32 %0, [%1];" : "=r"(val)
-                            : "l"(bias + batch_col + i * 2));
-                        asm volatile("st.shared.b32 [%0], %1;"
-                            :: "r"(bias_saddr + i * 4), "r"(val));
-                    }
-                    asm volatile(BAR_EPI_SYNC ::: "memory");
-                }
-            }
-#endif
-
             for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                 const int stage = si % NUM_EPI_STAGES;
                 const int nc_base = si * 64;
@@ -1513,14 +1087,7 @@ _lean_done:
                     asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "l"(bp + 24));
 #else
-#if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
-                    const uint32_t bs = bias_saddr
-                        + ((_iter - 1) & 1) * bias_buf_bytes
-                        + ((ltn & (BIAS_BATCH - 1)) * TN + nc) * 2;
-#elif defined(BIAS_PER_TILE) && TILE_DISPATCH == 4
-                    const uint32_t bs = bias_saddr
-                        + ((ltn - batch_start_tn) * TN + nc) * 2;
-#elif defined(BIAS_PER_TILE)
+#if defined(BIAS_PER_TILE)
                     const uint32_t bs = bias_saddr
                         + ((ltn == tn_fixed) ? 0u : (unsigned)(TN * 2))
                         + nc * 2;
@@ -1556,11 +1123,6 @@ _lean_done:
                 }
                 } /* close row_group */
 
-#if defined(BIAS_PRELOAD) && TILE_DISPATCH == 4
-                if (si == NUM_EPI_SUBITERS - 1)
-                    mbar_arrive(bias_done_mbar_addr + rd_buf * 8);
-#endif
-
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(BAR_EPI_SYNC ::: "memory");
 
@@ -1588,7 +1150,7 @@ _lean_done:
 
             mbar_arrive(epi_mbar_masked + last_buf * 8);
 #endif /* STRIP_EPILOGUE / GEMM_ONLY drain */
-            } /* LEAN_DISPATCH guard */
+            }
         }
     }
 
@@ -1785,19 +1347,9 @@ int main() {
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     printf("  TMA descriptors + func attr done (SMEM=%d B)\n", SMEM_BYTES);
 
-#if TILE_DISPATCH == 4
-    int* d_tile_ctr_ptr;
-    CUDA_CHECK(cudaGetSymbolAddress((void**)&d_tile_ctr_ptr, g_tile_ctr));
-#define LAUNCH_KERNEL() do { \
-    cudaMemsetAsync(d_tile_ctr_ptr, 0, sizeof(int)); \
-    fc1_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
-        h_tma_a, h_tma_b, h_tma_c, d_bias, d_C); \
-} while(0)
-#else
 #define LAUNCH_KERNEL() \
     fc1_w3_kernel<<<SM_COUNT, THREADS, SMEM_BYTES>>>( \
         h_tma_a, h_tma_b, h_tma_c, d_bias, d_C)
-#endif
 
     /* Warmup */
     printf("Launching warmup (2 iters)...\n");

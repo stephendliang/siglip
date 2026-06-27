@@ -556,7 +556,46 @@ Full chronological log + per-item memory files: `memory/MEMORY.md`. Headlines:
 - **Older dead variants:** TD=1/5/6/7, COL_LOCK, 4-CTA TMA multicast (deadlock),
   mbar→SMEM polling, L2 cache hints, dgphase/dgnrot, fc2_ldg, fc2_hybrid,
   N-batch / phase-offset / Group-3 (pre-PACKED_TILES — re-test before citing).
+- **Workstealing dispatch STRIPPED from fc1_w3.cu/fc2_w3.cu (2026-06-27):** all
+  dynamic-dispatch code removed — fc2: TD∈{1,2,3,4,6,7} (atomic + grid-nonpersistent);
+  fc1: TD=4 — plus helper flags ATOMIC_TILES / ROW_STEAL / TAIL_STEAL / COL_LOCK /
+  LEAN_DISPATCH and the dedicated scheduler warp (W7 fc2 / SCHED_WARP fc1) + g_tile_ctr.
+  Static-only now: TD=0 (Group-3 strided / BIDIR_SNAKE) + TD≥8 (swizzles in
+  tile_dispatch.cuh). fc2_w3.cu 4117→3426 lines, fc1_w3.cu 1888→1445.
+  **Provably SASS-identical** for production (TD=0/8/11): pp-diff + cubin SASS
+  byte-match (only dynamic branches removed, already `#if`-false at those TDs).
+  Workstealing always lost anyway (static > stealing ~30 µs; sched 1.101 / lean
+  1.107 / rowsteal 1.242 vs dgswizzle 1.065 — bottleneck is long_scoreboard, not
+  the warp). Removed Makefile targets fc2-w3-sched / fc2-w3-lean. The historical
+  perf tables above are retained as the *why*. Dispatch is now compile-time only.
 - **FC1 FORCE_PREFILL** — deadlocks at K_ITERS=6. NO_PREFILL guard mandatory.
+- **fc1_w3x PER_WARP_STORE** — per-warp TMA store (private double-buffers, drop
+  the cross-warp store bar.sync) to fix the 3.11 ms FC1 epilogue-exposed
+  regression. CONCLUSIVELY DEAD (B200, 2026-06, via Modal): barrier-free
+  (`__syncwarp` only) **crashes** — Xid 13 CGA "CTA Not Present", one
+  `cta_group::2` CTA drains its private buffers and exits the persistent loop
+  while its cluster peer still issues cluster ops. Adding back a full `bar.sync`
+  (`PW_STORE_BARSYNC`) is correct but **3.177 ms = +63 µs vs the 3.114 ms serial
+  default** — reintroduces the serialization it meant to remove. Hard proof the
+  tid==0 serial store was never the FC1 bottleneck; the regression is exposed
+  epilogue COMPUTE (K_ITERS=6 MMA shadow too short — identical store hides fine
+  in fc2_w3x at K_ITERS=24/1.001 ms). Reverted to HEAD. NOT the store path. See
+  `memory/project-fc1-w3x-epilogue-exposed.md`.
+- **fc1_w3x WIDE_SUBPASS** — 64-col subpasses (4 instead of 8) via a
+  `SUBPASS_CHUNKS` inner loop, grouping 2 of the fixed 32-col TMEM-load/STSM
+  units into one staging buffer + ONE bar.sync pair + ONE TMA store (halves
+  per-subpass sync/store-dispatch overhead). TESTED, NOT a production win (B200,
+  2026-06-26, Modal): GELU production 3.116→3.133 ms = **wash** (repeats span
+  3.114–3.137, ~23 µs run-noise > the gap); bias-only (`-DNO_GELU`) 2.317→2.270
+  = **−47 µs real**. So the per-subpass overhead IS a genuine cost, but GELU's
+  SFU-bound compute (808 µs, see below) masks it entirely at the production
+  point — and FC1 always needs GELU, so the bias-only win has no home. Macro
+  kept opt-in (default off, SUBPASS_CHUNKS=1 = byte-clean). **GELU/bias split
+  (NO_GELU switch):** strip 1.353 / bias-only 2.317 / full GELU 3.125 — GELU =
+  +808 µs but *cheaper* than cuBLASLt's 894 µs; the +797 µs deficit vs cuBLASLt
+  bias-only (1.520) is the exposed bias/CVT/STS structure, not GELU. **Real FC1
+  lever = GELU compute throughput (SFU/`MUFU.tanh` scheduling), not epilogue
+  structure.** See `memory/project-fc1-w3x-epilogue-exposed.md`.
 
 ## Build and run
 
@@ -593,6 +632,38 @@ bash tools/ncu_fc2_pipes.sh                 # dodges --set full deadlock
 ./tools/dim_sweep_fc1.py                    # fc1_w3 N×K grid (vs cuBLASLt GELU+BIAS, prod tune)
 ```
 
+## Remote B200 via Modal (timing runs, not ncu)
+
+`dummy_modal.py` builds one Makefile target on a Modal B200 and runs it —
+faster turnaround than spinning up vast/verda for `clock64` cycle-timing and
+`-DPROFILE_*` decomposition. **Replaces vast/verda for timing only; Modal's
+CUDA image has no Nsight Compute and shared GPUs block perf counters, so
+`ncu --set full` SASS-stall work still needs vast.ai.**
+
+```bash
+pip install modal && modal token new                                  # one-time
+modal run dummy_modal.py                                              # fc1-w3x default
+modal run dummy_modal.py --target fc2-w3x
+modal run dummy_modal.py --target fc1-w3x --dflags "-DPER_WARP_STORE"
+modal run dummy_modal.py --target fc1-w3x --dflags "-DPROFILE_CYCLES"
+modal run dummy_modal.py --target fc2-w3 \
+    --dflags "-DM_TOTAL=464128 -DN_DIM=1024 -DK_DIM=2048"
+```
+
+Mechanics: `nvidia/cuda:13.2.0-devel-ubuntu24.04` + `add_python="3.14"`
+(needed for `gen/bias_switch_inc_*.cuh` codegen) + `apt_install("make")`.
+Repo root mounted via `image.add_local_dir(".", "/root/src", ignore=[...])`
+— `data/`, `*.log`, `.git`, `.claude`, `third_party`, CSVs excluded so each
+run doesn't re-upload GB of benchmark artifacts. Binary name == target name
+(in `/root/src`). `--rebuild` (default True) forces `make -B` — mandatory
+because DFLAGS changes don't touch `.cu` mtime, same reason custom dims need
+`-B`. Output is line-streamed so `@@SAMPLE`/`@@RESULT` appear live. Build and
+run share one B200-attached container, so `-lcuda` links against the real
+driver. Aggregation (`aggregate_prof.py`, `anova_1way.py`) stays local
+against streamed stdout — don't ship it to the container. The deprecated
+pre-1.0 `modal.Mount` / `mounts=` API does NOT work; use image-folded
+`add_local_dir`.
+
 ## Key files
 
 ```
@@ -619,6 +690,7 @@ tools/ncu_*.sh, ncu_anova.py, aggregate_prof.py
 tools/analyze_swizzle.py, cluster_swizzle.py    structural metric + verdict
 tools/anova_1way.py        paired ANOVA + AUC + d + η² + rank/win%
 tools/sass_edit.py         SASS binary editor + CP-SAT scheduler
+dummy_modal.py             Remote B200 build+run on Modal (timing/PROFILE_*, not ncu)
 token_count.py             tiktoken budgeting
 bench/                     TMA / MMA / stmatrix / cublaslt_introspect
 data/                      Benchmark + ncu results

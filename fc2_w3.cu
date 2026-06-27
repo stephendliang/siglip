@@ -46,11 +46,8 @@ Compile-time flags:
   -DSELF_LOAD           Per-warp TMA residual load (no W2, no cross-warp sync in epilogue)
   -DSELF_STAGGER=N      With SELF_LOAD: warp ew sleeps ew*N nanoseconds before first sub-iter
                         (0=disabled, ~50=non-overlapping STS, ~200=full isolation)
-  -DTILE_DISPATCH=6     Inline atomic dispatch: W0 does atomicAdd at tile boundary, no W7, 7 warps.
-                        Ordered dispatch (1.00x DRAM) without wasting a scheduler warp.
-  -DCOL_LOCK            With TD=4: column-locked dynamic dispatch. Each cluster keeps fixed tn,
-                        dynamically grabs M-rows via per-column atomicAdd. Combines default's
-                        B-tile L2 reuse with TD=4's zero DRAM amplification.
+  -DTILE_DISPATCH=N     Static tile swizzle: 0=Group-3 strided (default), >=8 see tile_dispatch.cuh
+                        (8=dgswizzle, 11=zigzag, ...). Production fused = dgswizzle (TD=8).
   -DNO_PREFILL          Restore epilogue_mbar wait in W1 (default: skipped via PREFILL).
                         PREFILL relies on TMEM double-buffering — epilogue reads prev_buf
                         while MMA writes buf. Removing it re-adds tile-level pipeline bubble.
@@ -219,14 +216,6 @@ Compile-time flags:
 #define GROUPS_PER_WARP (4 / NUM_EPI_WARPS)  /* row groups each epi warp processes */
 static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 
-#if TILE_DISPATCH == 4
-/* TD=4: dedicated W7 scheduler warp (atomicAdd dispatch, decoupled from W0 TMA loads) */
-#undef NUM_WARPS
-#define NUM_WARPS 8   /* W0-W6 + W7 scheduler */
-#undef THREADS
-#define THREADS 256
-#endif
-
 /*
  * ptxas bug: `bar.sync 1, %0` with register operand gets constant-folded
  * to wrong immediate (128) regardless of actual value.  PTX immediate form
@@ -367,61 +356,19 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define _MBAR_END          (OFF_LOAD_CONSUMED + NUM_EPI_STAGES * 8)
 #endif
 
-/* TILE_DISPATCH: work-stealing tile dispatch mode.
-   0 = static contiguous (default)
-   1 = atomic + cluster barrier (heavy sync)
-   2 = atomic + flag spin (CTA0 writes, CTA1 spins ld.shared::cluster)
-   3 = grid-based non-persistent (blockIdx.y = tile, zero dispatch cost)
-   4 = dedicated W7 scheduler warp (atomicAdd, mbarrier pipe to W0)
-   7 = inline atomic in K-loop, epoch-based broadcast (no W7, no dispatch mbarriers)
-   8 = DeepGEMM-style 2D swizzle (static, group DG_GROUP_SIZE M-blocks, sweep all N)
-   9 = Z-order (Morton) curve (bit-interleave M/N coords, padded to power-of-2)
+/* TILE_DISPATCH: static tile dispatch mode.
+   0  = static contiguous / Group-3 strided (default)
+   8  = DeepGEMM-style 2D swizzle (group DG_GROUP_SIZE M-blocks, sweep all N)
+   9  = Z-order (Morton) curve (bit-interleave M/N coords, padded to power-of-2)
    10 = Hilbert curve (true space-filling, padded to power-of-2)
    11 = Zigzag-N (row-major, reverse N on odd M-rows)
-   12 = Column-first (all M-rows for each N-column before next) */
+   12 = Column-first (all M-rows for each N-column before next)
+   13+ = additional static swizzles (see tile_dispatch.cuh) */
 #ifndef TILE_DISPATCH
-#ifdef ATOMIC_TILES
-#define TILE_DISPATCH 1
-#else
 #define TILE_DISPATCH 0
 #endif
-#endif
 
-#if TILE_DISPATCH == 6
-/* TD=6: inline atomic in W0. CTA0 W0 atomicAdds, writes tile+epoch to SMEM.
-   CTA1 W0 spins on epoch via ld.shared::cluster. All other warps read broadcast. */
-#define OFF_TD6_TILE        _MBAR_END                              /* 2 × 4B tile_idx (double-buf) */
-#define OFF_TD6_EPOCH       (OFF_TD6_TILE + 8)                     /* 2 × 4B epoch */
-#define OFF_TD6_BCAST       (OFF_TD6_EPOCH + 8)                    /* 2 × 4B broadcast to W1-W6 */
-#define OFF_TD6_BCAST_MBAR  (OFF_TD6_BCAST + 8)                   /* 2 × 8B: W0 arrives → W1-W6 wait */
-#define _LAYOUT_END         (OFF_TD6_BCAST_MBAR + 16)
-#elif TILE_DISPATCH == 7
-/* TD=7: inline atomic in K-loop, lightweight mbarrier broadcast.
-   No W7 warp, no sched/cons mbarriers. CTA0 W0 issues atomicAdd at ki=0,
-   writes result to CTA1 FIFO mid-K-loop. W0 broadcasts to W1-W6 via
-   mbarrier (count=1, only W0 lane 0 arrives — lighter than TD=4's count=32). */
-#define OFF_TD7_FIFO       _MBAR_END                 /* 2 × 4B: CTA0→CTA1 tile FIFO */
-#define OFF_TD7_EPOCH      (OFF_TD7_FIFO + 8)        /* 2 × 4B: CTA0→CTA1 epoch */
-#define OFF_TD7_BCAST      (OFF_TD7_EPOCH + 8)       /* 2 × 4B: W0→W1-W6 tile broadcast */
-#define OFF_TD7_BCAST_MBAR (OFF_TD7_BCAST + 8)       /* 2 × 8B: W0 lane 0 arrives → W1-W6 wait */
-#define _LAYOUT_END        (OFF_TD7_BCAST_MBAR + 16)
-#elif TILE_DISPATCH == 1 || TILE_DISPATCH == 2
-#define OFF_TILE_SLOT      _MBAR_END
-#define _LAYOUT_END        (OFF_TILE_SLOT + 8)
-#elif TILE_DISPATCH == 4
-/* W7→W0 scheduler pipe: 2-deep FIFO + produce/consume mbarriers */
-#define OFF_SCHED_FIFO      _MBAR_END                             /* 2 × 4B tile_idx */
-#define OFF_SCHED_PROD_MBAR (OFF_SCHED_FIFO + 8)                 /* 2 × 8B: W7 arrives → W0 waits */
-#define OFF_SCHED_CONS_MBAR (OFF_SCHED_PROD_MBAR + 16)           /* 2 × 8B: W0 arrives → W7 waits */
-/* W0→W1-W6 broadcast: tile_idx + ready signal */
-#define OFF_BCAST_TILE      (OFF_SCHED_CONS_MBAR + 16)           /* 2 × 4B tile_idx */
-#define OFF_TILE_READY_MBAR (OFF_BCAST_TILE + 8)                 /* 2 × 8B: W0 arrives → W1-W6 wait */
-/* CTA0→CTA1 cross-cluster sync */
-#define OFF_SCHED_EPOCH     (OFF_TILE_READY_MBAR + 16)           /* 2 × 4B epoch */
-#define _LAYOUT_END         (OFF_SCHED_EPOCH + 8)
-#else
-#define _LAYOUT_END        _MBAR_END
-#endif
+#define _LAYOUT_END _MBAR_END
 
 /*
 EPI_REUSE_SMEM: borrow the last mainloop stage(s) for epilogue staging.
@@ -1082,19 +1029,6 @@ static_assert(MMA_PER_KI == 4, "K_ITER_ACCUM hardcodes 4 sub-MMAs per K-iter");
 } while(0)
 
 
-#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4 || TILE_DISPATCH == 6 || TILE_DISPATCH == 7
-__device__ int g_tile_ctr;
-#endif
-#ifdef COL_LOCK
-#if TILE_DISPATCH != 4
-#error "COL_LOCK requires TILE_DISPATCH=4"
-#endif
-#ifdef ROW_STEAL
-#error "COL_LOCK and ROW_STEAL are mutually exclusive"
-#endif
-__device__ int g_col_ctr[4]; /* per-tn-group M-row counter, padded */
-#endif
-
 #ifdef CLOCK_TIMING
 #define CT_MAX_TILES 80
 struct ClockData {
@@ -1143,10 +1077,7 @@ fc2_w3_kernel(
     const __grid_constant__ CUtensorMap tma_res
 ) {
     extern __shared__ __align__(128) char smem[];
-#if TILE_DISPATCH == 3
-    /* Grid-based: blockIdx.x = CTA rank (0..1), blockIdx.y = tile index */
-    const int cta_rank = blockIdx.x;
-#elif defined(C4_DUAL_PAIR)
+#if defined(C4_DUAL_PAIR)
     /* Grid (74,2,1), cluster (2,2,1).  Linear within-cluster rank is
        (bx&1) + 2*by.  Pair ranks {0,1} span M (bx axis), pair id = by.
        sm_id is remapped so that existing math (cluster_id = sm_id/2,
@@ -1220,37 +1151,6 @@ fc2_w3_kernel(
             mbar_init(smem_to_uint(smem + OFF_LOAD_CONSUMED + s * 8), NUM_EPI_WARPS * 32);
 #endif
 
-#if TILE_DISPATCH == 4
-        for (int i = 0; i < 2; i++) {
-            mbar_init(smem_to_uint(smem + OFF_SCHED_PROD_MBAR + i * 8), 32);   /* W7 warp arrives */
-            mbar_init(smem_to_uint(smem + OFF_SCHED_CONS_MBAR + i * 8), 32);   /* W0 warp arrives */
-#ifdef LEAN_DISPATCH
-            mbar_init(smem_to_uint(smem + OFF_TILE_READY_MBAR + i * 8), 1);    /* W0 lane 0 only */
-#else
-            mbar_init(smem_to_uint(smem + OFF_TILE_READY_MBAR + i * 8), 32);   /* W0 warp arrives */
-#endif
-        }
-        /* Clear epoch + bcast slots so CTA1 spin-wait works and
-           LEAN_DISPATCH doesn't read stale TOTAL_TILES from a prior launch */
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH)));
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_SCHED_EPOCH + 4)));
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_BCAST_TILE)));
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_BCAST_TILE + 4)));
-#elif TILE_DISPATCH == 6
-        for (int i = 0; i < 2; i++)
-            mbar_init(smem_to_uint(smem + OFF_TD6_BCAST_MBAR + i * 8), 32);   /* W0 arrives → W1-W6 wait */
-        /* Clear epoch+tile slots */
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_TD6_EPOCH)));
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_TD6_EPOCH + 4)));
-#elif TILE_DISPATCH == 7
-        /* W0→W1-W6 broadcast mbar: count=1, only W0 lane 0 arrives */
-        for (int i = 0; i < 2; i++)
-            mbar_init(smem_to_uint(smem + OFF_TD7_BCAST_MBAR + i * 8), 1);
-        /* Clear CTA0→CTA1 epoch slots */
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_TD7_EPOCH)));
-        asm volatile("st.shared.b32 [%0], 0;" :: "r"(smem_to_uint(smem + OFF_TD7_EPOCH + 4)));
-#endif
-
 #if EPI_REUSE_SMEM
         /* epi_done_mbar: epilogue warps arrive when staging SMEM is free.
            W0 waits on this before loading into the borrowed mainloop stage.
@@ -1295,48 +1195,6 @@ fc2_w3_kernel(
        arrive on CTA 0's epilogue mbar (W1 runs on CTA 0 only). */
     const uint32_t epi_mbar_masked = epilogue_mbar_addr & 0xFEFFFFFF;
 
-#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2
-    /* Tile slot address: CTA1 reads from CTA0's SMEM (clear bit 24) */
-    const uint32_t tile_slot_addr = (smem_to_uint(smem + OFF_TILE_SLOT)) & (cta_rank ? 0xFEFFFFFFU : 0xFFFFFFFFU);
-#endif
-#if TILE_DISPATCH == 4
-    /* Scheduler pipe addresses (CTA-local) */
-    const uint32_t sched_prod_mbar = smem_to_uint(smem + OFF_SCHED_PROD_MBAR);
-    const uint32_t sched_cons_mbar = smem_to_uint(smem + OFF_SCHED_CONS_MBAR);
-    const uint32_t tile_ready_mbar = smem_to_uint(smem + OFF_TILE_READY_MBAR);
-    const uint32_t bcast_addr      = smem_to_uint(smem + OFF_BCAST_TILE);
-    const uint32_t fifo_addr       = smem_to_uint(smem + OFF_SCHED_FIFO);
-    /* CTA0's epoch/fifo addresses for CTA1 to read via ld.shared::cluster */
-    const uint32_t cta0_epoch = smem_to_uint(smem + OFF_SCHED_EPOCH) & 0xFEFFFFFFU;
-    const uint32_t cta0_fifo  = smem_to_uint(smem + OFF_SCHED_FIFO) & 0xFEFFFFFFU;
-    int sched_prod_phase[2] = {0, 0};
-    int sched_cons_phase[2] = {0, 0};
-    int tile_ready_phase[2] = {0, 0};
-#endif
-#if TILE_DISPATCH == 6
-    /* TD=6: inline atomic addresses. CTA1 reads from CTA0's SMEM (clear bit 24). */
-    const uint32_t td6_tile_addr   = smem_to_uint(smem + OFF_TD6_TILE);
-    const uint32_t td6_epoch_addr  = smem_to_uint(smem + OFF_TD6_EPOCH);
-    const uint32_t td6_bcast_addr  = smem_to_uint(smem + OFF_TD6_BCAST);
-    const uint32_t td6_bcast_mbar  = smem_to_uint(smem + OFF_TD6_BCAST_MBAR);
-    const uint32_t td6_cta0_epoch  = smem_to_uint(smem + OFF_TD6_EPOCH) & 0xFEFFFFFFU;
-    const uint32_t td6_cta0_tile   = smem_to_uint(smem + OFF_TD6_TILE) & 0xFEFFFFFFU;
-    int td6_bcast_phase[2] = {0, 0};
-#endif
-#if TILE_DISPATCH == 7
-    /* TD=7: inline atomic addresses. CTA1 reads from CTA0's SMEM (clear bit 24). */
-    const uint32_t td7_fifo_addr   = smem_to_uint(smem + OFF_TD7_FIFO);
-    const uint32_t td7_epoch_addr  = smem_to_uint(smem + OFF_TD7_EPOCH);
-    const uint32_t td7_bcast_addr  = smem_to_uint(smem + OFF_TD7_BCAST);
-    const uint32_t td7_bcast_mbar  = smem_to_uint(smem + OFF_TD7_BCAST_MBAR);
-    const uint32_t td7_cta0_epoch  = td7_epoch_addr & 0xFEFFFFFFU;
-    const uint32_t td7_cta0_fifo   = td7_fifo_addr & 0xFEFFFFFFU;
-    int td7_bcast_phase[2] = {0, 0};
-#endif
-#if TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
-    int _iter = 0;
-    int _prev_tile = -1;
-#else
 #if TILE_DISPATCH >= 8
     /* Static swizzle (TD=8-12): each cluster strides through a linear index,
        static_swizzle() remaps to (tm, tn). */
@@ -1357,7 +1215,6 @@ fc2_w3_kernel(
     const int tile_count  = (TILES_M - m_rank + my_m_stride - 1) / my_m_stride;
 #endif
 #endif
-#endif
 
     int tma_phase[N_STAGES] = {0};
     int mma_phase[N_STAGES] = {0};
@@ -1372,11 +1229,7 @@ fc2_w3_kernel(
         desc_b_base[s] = make_smem_desc(smem_b[s]);
     }
 
-#if TILE_DISPATCH >= 1
     const int start_buf = 0;
-#else
-    const int start_buf = 0;
-#endif
     int epi_phase[2] = {1, 1};
     (void)epi_phase;  /* used only without PREFILL */
     int ml_phase[2]  = {start_buf, 1 - start_buf};
@@ -1413,11 +1266,7 @@ fc2_w3_kernel(
 #endif
 
 #ifdef CLOCK_TIMING
-#if TILE_DISPATCH == 3
-    const bool _ct = false;
-#else
     const bool _ct = (sm_id == 0);  /* cluster 0, CTA 0 */
-#endif
     int64_t _ct_start = 0, _ct_t = 0;
     int64_t _ct_a = 0, _ct_b = 0, _ct_c = 0;
     int _ct_n = 0;
@@ -1450,400 +1299,16 @@ fc2_w3_kernel(
     asm volatile("mov.u32 %0, 0;" : "=r"(drain_acc));
 #endif
 
-#if TILE_DISPATCH == 4
-    /* ════════════════════════════════════════════
-       W7 SCHEDULER (TD=4): dispatch via atomicAdd, pipe to W0
-       ════════════════════════════════════════════ */
-    if (warp == 7) {
-        const uint32_t epoch_addr = smem_to_uint(smem + OFF_SCHED_EPOCH);
-        int _s_iter = 0;
-        int _s_buf = 0;
-#ifdef ROW_STEAL
-        /*
-         * Row-granularity work stealing: atomicAdd counts M-rows,
-         * then dispatch TILES_N tiles from that row one at a time.
-         * Reduces atomic frequency by TILES_N and guarantees each
-         * cluster processes a complete A-row before moving on.
-         */
-        int _rs_row = -1;
-        int _rs_tn = TILES_N;   /* force row fetch on first iteration */
-#endif
-        while (true) {
-            /* Wait for W0 to consume this slot (skip first 2 prefills) */
-            if (_s_iter >= 2) {
-                mbar_wait(sched_cons_mbar + _s_buf * 8, sched_cons_phase[_s_buf]);
-                sched_cons_phase[_s_buf] ^= 1;
-            }
-
-            /* Dispatch: CTA0 atomicAdds, CTA1 reads via cluster SMEM */
-            int tile_idx;
-#ifdef ROW_STEAL
-            if (_rs_tn >= TILES_N) {
-                /*
-                 * Row boundary: fetch next row via atomicAdd.
-                 * Send first tile_idx (not _rs_row) through FIFO so the
-                 * value W0 needs is already there — no second write that
-                 * could race with CTA1's cross-cluster read.
-                 */
-                int _rs_tile0;
-                if (cta_rank == 0) {
-                    if (lane == 0) {
-                        asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
-                            : "=r"(_rs_row) : "l"(&g_tile_ctr));
-                        _rs_tile0 = (_rs_row < TILES_M)
-                            ? _rs_row * TILES_N : TOTAL_TILES;
-                        asm volatile("st.shared.b32 [%0], %1;"
-                            :: "r"(fifo_addr + _s_buf * 4), "r"(_rs_tile0));
-                        asm volatile("fence.acq_rel.cluster;");
-                        asm volatile("st.shared.b32 [%0], %1;"
-                            :: "r"(epoch_addr + _s_buf * 4), "r"(_s_iter + 1));
-                    }
-                } else {
-                    if (lane == 0) {
-                        int epoch;
-                        do {
-                            asm volatile("ld.acquire.cluster.shared::cluster.b32 %0, [%1];"
-                                : "=r"(epoch) : "r"(cta0_epoch + _s_buf * 4));
-                        } while (epoch != _s_iter + 1);
-                        asm volatile("ld.shared::cluster.b32 %0, [%1];"
-                            : "=r"(_rs_tile0) : "r"(cta0_fifo + _s_buf * 4));
-                    }
-                }
-                asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
-                    : "=r"(_rs_tile0) : "r"(_rs_tile0));
-                _rs_row = (_rs_tile0 >= TOTAL_TILES) ? TILES_M : _rs_tile0 / TILES_N;
-                _rs_tn = 0;
-            }
-            tile_idx = (_rs_row < TILES_M) ? _rs_row * TILES_N + _rs_tn : TOTAL_TILES;
-            _rs_tn++;
-            /* Write tile_idx to local FIFO for W0 */
-            if (lane == 0) {
-                asm volatile("st.shared.b32 [%0], %1;"
-                    :: "r"(fifo_addr + _s_buf * 4), "r"(tile_idx));
-            }
-#else
-            if (cta_rank == 0) {
-                if (lane == 0) {
-#ifdef COL_LOCK
-                    /*
-                     * Column-locked dispatch: each cluster keeps its tn,
-                     * dynamically grabs M-rows from per-column counter.
-                     * B stays warm in L2 (fixed tn), zero DRAM amplification
-                     * (dynamic M-row avoids wavefront edge effects).
-                     */
-                    int _cl_tn = (sm_id / 2) % TILES_N;
-                    int _cl_tm;
-                    asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
-                        : "=r"(_cl_tm) : "l"(&g_col_ctr[_cl_tn]));
-                    tile_idx = (_cl_tm < TILES_M)
-                        ? _cl_tm * TILES_N + _cl_tn : TOTAL_TILES;
-#elif defined(TAIL_STEAL)
-                    /*
-                     * Tail-steal: static linear-stride prefix + atomic tail.
-                     * Prefix: cluster cid processes tiles {cid + i*num_clusters}
-                     * for i in [0, STATIC_PER_CLUSTER). No atomic, no contention.
-                     * Tail: at most (TOTAL_TILES - STATIC_TOTAL) leftover tiles
-                     * raced by whichever cluster finishes static first. Drops
-                     * atomic count from 5439 → ~37 at K=3072.
-                     */
-                    {
-                        constexpr int NUM_CLUSTERS       = SM_COUNT / 2;
-                        constexpr int STATIC_PER_CLUSTER = TOTAL_TILES / NUM_CLUSTERS;
-                        constexpr int STATIC_TOTAL       = STATIC_PER_CLUSTER * NUM_CLUSTERS;
-                        if (_s_iter < STATIC_PER_CLUSTER) {
-                            tile_idx = (sm_id / 2) + _s_iter * NUM_CLUSTERS;
-                        } else {
-                            int _t;
-                            asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
-                                : "=r"(_t) : "l"(&g_tile_ctr));
-                            _t += STATIC_TOTAL;
-                            tile_idx = (_t < TOTAL_TILES) ? _t : TOTAL_TILES;
-                        }
-                    }
-#else
-                    asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
-                        : "=r"(tile_idx) : "l"(&g_tile_ctr));
-#endif
-                    asm volatile("st.shared.b32 [%0], %1;"
-                        :: "r"(fifo_addr + _s_buf * 4), "r"(tile_idx));
-                    asm volatile("fence.acq_rel.cluster;");
-                    asm volatile("st.shared.b32 [%0], %1;"
-                        :: "r"(epoch_addr + _s_buf * 4), "r"(_s_iter + 1));
-                }
-            } else {
-                if (lane == 0) {
-                    int epoch;
-                    do {
-                        asm volatile("ld.acquire.cluster.shared::cluster.b32 %0, [%1];"
-                            : "=r"(epoch) : "r"(cta0_epoch + _s_buf * 4));
-                    } while (epoch != _s_iter + 1);
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];"
-                        : "=r"(tile_idx) : "r"(cta0_fifo + _s_buf * 4));
-                    asm volatile("st.shared.b32 [%0], %1;"
-                        :: "r"(fifo_addr + _s_buf * 4), "r"(tile_idx));
-                }
-            }
-#endif
-
-            /* Signal W0: tile ready in sched_fifo[buf] */
-            mbar_arrive(sched_prod_mbar + _s_buf * 8);
-
-            /* Broadcast tile_idx from lane 0 to check termination */
-            asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
-                : "=r"(tile_idx) : "r"(tile_idx));
-            if (tile_idx >= TOTAL_TILES) break;
-
-            _s_buf ^= 1;
-            _s_iter++;
-        }
-        return;  /* W7 done — does not enter main tile loop */
-    }
-#endif
 
     /* ════════════════════════════════════════════
        MAIN TILE LOOP
        ════════════════════════════════════════════ */
 
     /*
-     * Tile dispatch modes:
-     *   0: Static contiguous — each cluster gets [start, end) range
-     *   1: Atomic + cluster barrier — CTA0 atomicAdds, barrier broadcasts
-     *   2: Atomic + flag spin — CTA0 atomicAdds + st, CTA1 spins ld.shared::cluster
-     *   3: Grid-based — blockIdx.y = tile_idx, non-persistent, zero dispatch cost
+     * Static tile dispatch: each cluster strides through its own linear index
+     * set.  TD>=8 remaps via static_swizzle(); TD==0 uses Group-3 strided
+     * (fixed tn per cluster) or BIDIR_SNAKE.  No atomics, no scheduler warp.
      */
-#if TILE_DISPATCH == 3
-    /* Non-persistent: one tile per cluster, blockIdx.y = tile index */
-    {
-        const int tile_idx = (int)blockIdx.y;
-        const int buf = 0;
-        const bool has_prev = false;
-#elif TILE_DISPATCH == 4
-    /* Software-pipelined dispatch: prefetch next tile from W7's FIFO at
-       end of K-loop so mbar_wait is hidden behind mainloop latency.
-       At loop top W0 already has tile_idx in registers — zero stall. */
-    int _pf_tile = TOTAL_TILES;
-    int _pf_slot = 1;
-    int _pf_prod_phase[2] = {0, 0};
-    int _pf_cons_phase[2] = {0, 0};
-    if (warp == 0) {
-        /* First prefill: wait for W7 to produce slot 0, then read fifo[0]. */
-        mbar_wait(sched_prod_mbar, _pf_prod_phase[0]);
-        _pf_prod_phase[0] ^= 1;
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_pf_tile) : "r"(fifo_addr));
-        mbar_arrive(sched_cons_mbar);
-    }
-    while (true) {
-        int tile_idx;
-        {
-            const int _buf = _iter & 1;
-            if (warp == 0) {
-                tile_idx = _pf_tile;
-                asm volatile("st.shared.b32 [%0], %1;"
-                    :: "r"(bcast_addr + _buf * 4), "r"(tile_idx));
-#ifdef LEAN_DISPATCH
-                if (lane == 0) mbar_arrive(tile_ready_mbar + _buf * 8);
-#else
-                mbar_arrive(tile_ready_mbar + _buf * 8);
-#endif
-#ifdef LEAN_DISPATCH
-            } else if (warp == 1) {
-                /* W1 only: wait tile_ready_mbar for break check + K-loop sync */
-#ifdef CLOCK_TIMING
-                int64_t _ct_ds; if (_ct) CT_READ(_ct_ds);
-#endif
-                mbar_wait(tile_ready_mbar + _buf * 8, tile_ready_phase[_buf]);
-#ifdef CLOCK_TIMING
-                if (_ct) { int64_t _ct_de; CT_READ(_ct_de); _ct_b += _ct_de - _ct_ds; }
-#endif
-                tile_ready_phase[_buf] ^= 1;
-                asm volatile("ld.shared.b32 %0, [%1];"
-                    : "=r"(tile_idx) : "r"(bcast_addr + _buf * 4));
-            } else {
-                /* W2-W6: skip tile_ready_mbar — read tile_idx from bcast SMEM
-                   after mainloop_mbar (release-acquire transitivity). */
-                tile_idx = 0;  /* placeholder: never triggers break at top */
-#else
-            } else {
-#ifdef CLOCK_TIMING
-                int64_t _ct_ds; if (_ct) CT_READ(_ct_ds);
-#endif
-                mbar_wait(tile_ready_mbar + _buf * 8, tile_ready_phase[_buf]);
-#ifdef CLOCK_TIMING
-                if (_ct && warp == 1) { int64_t _ct_de; CT_READ(_ct_de); _ct_b += _ct_de - _ct_ds; }
-#endif
-                tile_ready_phase[_buf] ^= 1;
-                asm volatile("ld.shared.b32 %0, [%1];"
-                    : "=r"(tile_idx) : "r"(bcast_addr + _buf * 4));
-#endif
-            }
-        }
-#ifdef LEAN_DISPATCH
-        /* W0 and W1 break here. W2-W6 have tile_idx=0, continue to tile body. */
-        if (tile_idx >= TOTAL_TILES) {
-            if (warp == 1 && lane == 0) {
-                /* Arrive mainloop_mbar to unblock W2-W6 for last-tile epilogue */
-                asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                    :: "r"(mainloop_mbar_addr + (_iter & 1) * 8) : "memory");
-            }
-            break;
-        }
-#else
-        if (tile_idx >= TOTAL_TILES) break;
-#endif
-        const int buf = _iter & 1;
-#elif TILE_DISPATCH == 6
-    while (true) {
-        int tile_idx;
-        {
-            /* TD=6: W0 does atomicAdd inline at tile boundary, broadcasts to W1-W6.
-               CTA0 W0 lane 0: atomicAdd → st tile+epoch to SMEM.
-               CTA1 W0 lane 0: spin on epoch via ld.shared::cluster, read tile.
-               All W0 lanes: shfl to get tile_idx, then mbar signal W1-W6.
-               W1-W6: mbar wait, read broadcast slot. */
-            const int _buf = _iter & 1;
-            if (warp == 0) {
-                if (cta_rank == 0) {
-                    if (lane == 0) {
-                        asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
-                            : "=r"(tile_idx) : "l"(&g_tile_ctr));
-                        asm volatile("st.shared.b32 [%0], %1;"
-                            :: "r"(td6_tile_addr + _buf * 4), "r"(tile_idx));
-                        asm volatile("fence.acq_rel.cluster;");
-                        asm volatile("st.shared.b32 [%0], %1;"
-                            :: "r"(td6_epoch_addr + _buf * 4), "r"(_iter + 1));
-                    }
-                } else {
-                    if (lane == 0) {
-                        int epoch;
-                        do {
-                            asm volatile("ld.acquire.cluster.shared::cluster.b32 %0, [%1];"
-                                : "=r"(epoch) : "r"(td6_cta0_epoch + _buf * 4));
-                        } while (epoch != _iter + 1);
-                        asm volatile("ld.shared::cluster.b32 %0, [%1];"
-                            : "=r"(tile_idx) : "r"(td6_cta0_tile + _buf * 4));
-                    }
-                }
-                /* Broadcast tile_idx from lane 0 to all W0 lanes */
-                asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
-                    : "=r"(tile_idx) : "r"(tile_idx));
-                /* Write broadcast slot and signal W1-W6 */
-                if (lane == 0) {
-                    asm volatile("st.shared.b32 [%0], %1;"
-                        :: "r"(td6_bcast_addr + _buf * 4), "r"(tile_idx));
-                }
-                mbar_arrive(td6_bcast_mbar + _buf * 8);
-            } else {
-                /* W1-W6: wait for W0's broadcast */
-                mbar_wait(td6_bcast_mbar + _buf * 8, td6_bcast_phase[_buf]);
-                td6_bcast_phase[_buf] ^= 1;
-                asm volatile("ld.shared.b32 %0, [%1];"
-                    : "=r"(tile_idx) : "r"(td6_bcast_addr + _buf * 4));
-            }
-        }
-        if (tile_idx >= TOTAL_TILES) break;
-        const int buf = _iter & 1;
-#elif TILE_DISPATCH == 7
-    /* TD=7: inline atomic in K-loop. W0 prefetches next tile during K-loop,
-       broadcasts to W1-W6 via epoch poll at loop top. No W7, no mbarriers. */
-    int _pf_tile = TOTAL_TILES;
-    int _pf_slot = 1;
-    int _pf_next = TOTAL_TILES;
-    if (warp == 0) {
-        /* Pre-fetch tile 0: CTA0 atomicAdds, CTA1 reads via cluster epoch poll */
-        if (cta_rank == 0 && lane == 0) {
-            asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
-                : "=r"(_pf_tile) : "l"(&g_tile_ctr));
-            asm volatile("st.shared.b32 [%0], %1;"
-                :: "r"(td7_fifo_addr), "r"(_pf_tile));
-            asm volatile("fence.acq_rel.cluster;");
-            asm volatile("st.shared.b32 [%0], %1;"
-                :: "r"(td7_epoch_addr), "r"(1));
-        } else if (cta_rank == 1 && lane == 0) {
-            int epoch;
-            do {
-                asm volatile("ld.acquire.cluster.shared::cluster.b32 %0, [%1];"
-                    : "=r"(epoch) : "r"(td7_cta0_epoch));
-            } while (epoch != 1);
-            asm volatile("ld.shared::cluster.b32 %0, [%1];"
-                : "=r"(_pf_tile) : "r"(td7_cta0_fifo));
-        }
-        asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
-            : "=r"(_pf_tile) : "r"(_pf_tile));
-    }
-    while (true) {
-        int tile_idx;
-        {
-            const int _buf = _iter & 1;
-            if (warp == 0) {
-                tile_idx = _pf_tile;
-                /* Broadcast to W1-W6 via mbar: write tile, then arrive */
-                if (lane == 0) {
-                    asm volatile("st.shared.b32 [%0], %1;"
-                        :: "r"(td7_bcast_addr + _buf * 4), "r"(tile_idx));
-                    mbar_arrive(td7_bcast_mbar + _buf * 8);
-                }
-            } else {
-                /* W1-W6: wait on broadcast mbar, then read tile_idx */
-#ifdef CLOCK_TIMING
-                int64_t _ct_ds; if (_ct) CT_READ(_ct_ds);
-#endif
-                mbar_wait(td7_bcast_mbar + _buf * 8, td7_bcast_phase[_buf]);
-                td7_bcast_phase[_buf] ^= 1;
-                if (lane == 0) {
-                    asm volatile("ld.shared.b32 %0, [%1];"
-                        : "=r"(tile_idx) : "r"(td7_bcast_addr + _buf * 4));
-                }
-                asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
-                    : "=r"(tile_idx) : "r"(tile_idx));
-#ifdef CLOCK_TIMING
-                if (_ct && warp == 1) { int64_t _ct_de; CT_READ(_ct_de); _ct_b += _ct_de - _ct_ds; }
-#endif
-            }
-        }
-        if (tile_idx >= TOTAL_TILES) break;
-        const int buf = _iter & 1;
-#elif TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
-    while (true) {
-        int tile_idx;
-#if TILE_DISPATCH == 1
-        /* Cluster barrier: CTA0 atomicAdds, stores to SMEM, full barrier broadcasts */
-        if (cta_rank == 0 && tid == 0) {
-            int t = atomicAdd(&g_tile_ctr, 1);
-            asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_to_uint(smem + OFF_TILE_SLOT)), "r"(t));
-        }
-        asm volatile("barrier.cluster.arrive.relaxed.aligned;");
-        asm volatile("barrier.cluster.wait.acquire.aligned;");
-        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(tile_idx) : "r"(tile_slot_addr));
-#elif TILE_DISPATCH == 2
-        /* Flag spin: CTA0 atomicAdds + writes tile_idx with epoch to SMEM.
-           CTA1 thread 0 spins via ld.shared::cluster until epoch matches.
-           Epoch = _iter+1 (never 0, so initial SMEM zero means "not ready"). */
-        if (cta_rank == 0 && tid == 0) {
-            int t = atomicAdd(&g_tile_ctr, 1);
-            asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_to_uint(smem + OFF_TILE_SLOT)), "r"(t));
-            /* Write epoch AFTER tile_idx so CTA1 sees consistent data.
-               fence ensures st ordering within CTA0's SMEM. */
-            asm volatile("fence.acq_rel.cluster;");
-            asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_to_uint(smem + OFF_TILE_SLOT + 4)), "r"(_iter + 1));
-        }
-        if (cta_rank == 1 && tid == 0) {
-            /* Spin until epoch matches — typically resolves in ~20-30 cycles */
-            int epoch;
-            do {
-                asm volatile("ld.acquire.cluster.shared::cluster.b32 %0, [%1];"
-                    : "=r"(epoch) : "r"(tile_slot_addr + 4));
-            } while (epoch != _iter + 1);
-        }
-        __syncthreads();
-        if (cta_rank == 0) {
-            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(tile_idx) : "r"(smem_to_uint(smem + OFF_TILE_SLOT)));
-        } else {
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(tile_idx) : "r"(tile_slot_addr));
-        }
-#endif
-        if (tile_idx >= TOTAL_TILES) break;
-        const int buf = _iter & 1;
-#else
     for (int _ti = 0; _ti < tile_count; _ti++) {
 #if TILE_DISPATCH >= 8
 #ifdef N_STAGGER
@@ -1867,7 +1332,6 @@ fc2_w3_kernel(
         const int tile_idx = _tm * TILES_N + tn_fixed;
 #endif
         const int buf = _ti & 1;
-#endif
         int tm = tile_idx / TILES_N;
         int tn = tile_idx % TILES_N;
         M_SNAKE_REMAP(tm);
@@ -1883,12 +1347,7 @@ fc2_w3_kernel(
         const int m_start = tm * TM * 2 + cta_rank * TM;
         const int n_start = tn * TN;
 #endif
-#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4 || TILE_DISPATCH == 6 || TILE_DISPATCH == 7
-        const bool has_prev = (_iter > 0);
-#elif TILE_DISPATCH == 0 || TILE_DISPATCH >= 8
         const bool has_prev = (_ti > 0);
-#endif
-        /* TILE_DISPATCH==3: has_prev already set to false above */
 
         if (warp == 0) {
             /* ── W0: TMA A/B loads ── */
@@ -1919,14 +1378,6 @@ fc2_w3_kernel(
 #endif
                 const uint32_t mma_mbar_s = smem_base + OFF_MMA_MBAR + s * 8;
                 const uint32_t tma_mbar_s = (smem_base + OFF_TMA_MBAR + s * 8) & 0xFEFFFFFF;
-#if TILE_DISPATCH == 7
-                /* Issue atomicAdd for NEXT tile at ki=0. Result lands in _pf_next
-                   after ~1000 cyc, well before we read it at ki=3. */
-                if (ki == 0 && cta_rank == 0 && lane == 0) {
-                    asm volatile("atom.global.relaxed.gpu.add.s32 %0, [%1], 1;"
-                        : "=r"(_pf_next) : "l"(&g_tile_ctr));
-                }
-#endif
 
                 if (has_prev || ki >= N_STAGES) {
 #ifdef CLOCK_TIMING
@@ -2048,58 +1499,9 @@ fc2_w3_kernel(
                         : "memory");
 #endif
                 }
-#if TILE_DISPATCH == 7
-                /* At ki=3, atomic result is ready (~1500 cyc since issue).
-                   Write to CTA1 FIFO so CTA1 can read after K-loop. */
-                if (ki == 3 && cta_rank == 0 && lane == 0) {
-                    asm volatile("st.shared.b32 [%0], %1;"
-                        :: "r"(td7_fifo_addr + _pf_slot * 4), "r"(_pf_next));
-                    asm volatile("fence.acq_rel.cluster;");
-                    asm volatile("st.shared.b32 [%0], %1;"
-                        :: "r"(td7_epoch_addr + _pf_slot * 4), "r"(_iter + 2));
-                }
-#endif
             }
 #ifdef CLOCK_TIMING
             if (_ct) { int64_t _ct_ke; CT_READ(_ct_ke); _ct_c += _ct_ke - _ct_kl; }
-#endif
-
-#if TILE_DISPATCH == 4
-            /* Prefetch next tile from scheduler FIFO.
-               mbar_wait overlaps with W1's MMA / W2-W6's epilogue. */
-#ifdef CLOCK_TIMING
-            int64_t _ct_pf; if (_ct) CT_READ(_ct_pf);
-#endif
-            mbar_wait(sched_prod_mbar + _pf_slot * 8, _pf_prod_phase[_pf_slot]);
-            _pf_prod_phase[_pf_slot] ^= 1;
-#ifdef CLOCK_TIMING
-            if (_ct) { int64_t _ct_pe; CT_READ(_ct_pe); _ct_b += _ct_pe - _ct_pf; }
-#endif
-            asm volatile("ld.shared.b32 %0, [%1];"
-                : "=r"(_pf_tile) : "r"(fifo_addr + _pf_slot * 4));
-            mbar_arrive(sched_cons_mbar + _pf_slot * 8);
-            _pf_slot ^= 1;
-#elif TILE_DISPATCH == 7
-            /* CTA1 reads prefetched tile from CTA0's FIFO (written at ki=3).
-               CTA0 already has result in _pf_next register. */
-#ifdef CLOCK_TIMING
-            int64_t _ct_pf; if (_ct) CT_READ(_ct_pf);
-#endif
-            if (lane == 0 && cta_rank == 1) {
-                int epoch;
-                do {
-                    asm volatile("ld.acquire.cluster.shared::cluster.b32 %0, [%1];"
-                        : "=r"(epoch) : "r"(td7_cta0_epoch + _pf_slot * 4));
-                } while (epoch != _iter + 2);
-                asm volatile("ld.shared::cluster.b32 %0, [%1];"
-                    : "=r"(_pf_next) : "r"(td7_cta0_fifo + _pf_slot * 4));
-            }
-            asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
-                : "=r"(_pf_tile) : "r"(_pf_next));
-            _pf_slot ^= 1;
-#ifdef CLOCK_TIMING
-            if (_ct) { int64_t _ct_pe; CT_READ(_ct_pe); _ct_b += _ct_pe - _ct_pf; }
-#endif
 #endif
 
         } else if (warp == 1) {
@@ -2196,23 +1598,6 @@ fc2_w3_kernel(
             const int prev_buf = buf ^ 1;
             mbar_wait(mainloop_mbar_addr + prev_buf * 8, ml_phase[prev_buf]);
             ml_phase[prev_buf] ^= 1;
-#ifdef LEAN_DISPATCH
-            /* Deferred read: mainloop_mbar[prev_buf] acquire guarantees W0's bcast
-               write for the PREVIOUS tile (bcast[prev_buf]) is visible. Read it to
-               get the correct prev_tile value for this iteration's epilogue. */
-            if (lane == 0)
-                asm volatile("ld.shared.b32 %0, [%1];"
-                    : "=r"(tile_idx) : "r"(bcast_addr + prev_buf * 4));
-            asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
-                : "=r"(tile_idx) : "r"(tile_idx));
-            _prev_tile = tile_idx;
-            /* Termination: W0 wrote TOTAL_TILES to bcast at the termination iter.
-               W1's termination arrive unblocked us. Skip epilogue, break. */
-            if (tile_idx >= TOTAL_TILES) {
-                mbar_arrive(epi_mbar_masked + prev_buf * 8);
-                goto _lean_done;
-            }
-#endif
 #if defined(STRIP_EPILOGUE) || defined(SELF_LOAD) || defined(GEMM_ONLY) || defined(BIAS_ONLY)
             if (has_prev)
                 mbar_arrive(epi_mbar_masked + prev_buf * 8);
@@ -2220,9 +1605,7 @@ fc2_w3_kernel(
             /* ── W2: EpilogueLoad — circular producer for PREVIOUS tile ──
                Stream four 64-col slices through a 2-stage shared pipe. */
             if (has_prev) {
-#if TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
-                const int prev_idx = _prev_tile;
-#elif TILE_DISPATCH >= 8
+#if TILE_DISPATCH >= 8
                 const int prev_idx = static_swizzle((_ti - 1) * num_clusters + cluster_id);
 #elif defined(BIDIR_SNAKE)
                 const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
@@ -2281,20 +1664,6 @@ fc2_w3_kernel(
             if (_ct && warp == 3) { int64_t _ct_me; CT_READ(_ct_me); _ct_a += _ct_me - _ct_ms; }
 #endif
             ml_phase[prev_buf] ^= 1;
-#ifdef LEAN_DISPATCH
-            /* Deferred read: mainloop_mbar[prev_buf] acquire guarantees bcast[prev_buf]
-               visible. This is the PREVIOUS tile's tile_idx — correct prev_tile. */
-            if (lane == 0)
-                asm volatile("ld.shared.b32 %0, [%1];"
-                    : "=r"(tile_idx) : "r"(bcast_addr + prev_buf * 4));
-            asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
-                : "=r"(tile_idx) : "r"(tile_idx));
-            _prev_tile = tile_idx;
-            if (tile_idx >= TOTAL_TILES) {
-                mbar_arrive(epi_mbar_masked + prev_buf * 8);
-                goto _lean_done;
-            }
-#endif
 #ifdef CLOCK_TIMING
             if (_ct && warp == 3) CT_READ(_ct_t);
 #endif
@@ -2320,9 +1689,7 @@ fc2_w3_kernel(
             const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
 
             if (has_prev) {
-#if TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
-                const int prev_idx = _prev_tile;
-#elif TILE_DISPATCH >= 8
+#if TILE_DISPATCH >= 8
                 const int prev_idx = static_swizzle((_ti - 1) * num_clusters + cluster_id);
 #elif defined(BIDIR_SNAKE)
                 const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
@@ -2449,9 +1816,7 @@ fc2_w3_kernel(
             const uint32_t sw6 = 96 ^ xor_val, sw7 = 112 ^ xor_val;
 
             if (has_prev) {
-#if TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
-                const int prev_idx = _prev_tile;
-#elif TILE_DISPATCH >= 8
+#if TILE_DISPATCH >= 8
                 const int prev_idx = static_swizzle((_ti - 1) * num_clusters + cluster_id);
 #elif defined(BIDIR_SNAKE)
                 const int prev_fwd = fwd_id + (_ti - 1) * tile_stride;
@@ -2873,29 +2238,10 @@ fc2_w3_kernel(
         }
         if (_ct) _ct_n++;
 #endif
-#if TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
-        _prev_tile = tile_idx;
-        _iter++;
-#ifdef LEAN_DISPATCH
-        /* W2-W6 termination handled via goto _lean_done inside tile body
-           (after detecting bcast[prev_buf] >= TOTAL_TILES) */
-#endif
-#endif
     }
-
-#ifdef LEAN_DISPATCH
-_lean_done:
-#endif
 
     /* ── Drain: last tile epilogue ── */
     {
-#if TILE_DISPATCH == 3
-        const int last_idx = (int)blockIdx.y;
-        const int last_buf = 0;
-#elif TILE_DISPATCH >= 1 && TILE_DISPATCH < 8
-        const int last_idx = _prev_tile;
-        const int last_buf = (_iter - 1) & 1;
-#else
 #if TILE_DISPATCH >= 8
         const int last_idx = static_swizzle((tile_count - 1) * num_clusters + cluster_id);
 #elif defined(BIDIR_SNAKE)
@@ -2905,7 +2251,6 @@ _lean_done:
         const int last_idx = (m_rank + (tile_count - 1) * my_m_stride) * TILES_N + tn_fixed;
 #endif
         const int last_buf = (tile_count - 1) & 1;
-#endif
         int ltm = last_idx / TILES_N;
         int ltn = last_idx % TILES_N;
         M_SNAKE_REMAP(ltm);
@@ -2925,10 +2270,6 @@ _lean_done:
         } else if (warp == 1) {
             /* W1: nothing — already committed mainloop_mbar */
         } else if (warp == 2) {
-#ifdef LEAN_DISPATCH
-            /* LEAN_DISPATCH: W2 already did last-tile epilogue in the loop */
-            if (last_idx < TOTAL_TILES)
-#endif
             {
 #if defined(STRIP_EPILOGUE) || defined(SELF_LOAD) || defined(GEMM_ONLY) || defined(BIAS_ONLY)
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
@@ -2960,13 +2301,9 @@ _lean_done:
 
             mbar_arrive(epi_mbar_masked + last_buf * 8);
 #endif /* STRIP_EPILOGUE/SELF_LOAD drain W2 */
-            } /* LEAN_DISPATCH guard */
+            }
 
         } else {
-#ifdef LEAN_DISPATCH
-            /* LEAN_DISPATCH: W3-W6 already did last-tile epilogue in the loop */
-            if (last_idx < TOTAL_TILES)
-#endif
             {
 #if NUM_IDLE_WARPS > 0 && !defined(STRIP_EPILOGUE)
             if (warp >= 3 + NUM_EPI_WARPS) {
@@ -3441,7 +2778,7 @@ _lean_done:
 #endif
 #endif /* STRIP_EPILOGUE drain W3-W6 */
             } /* close brace for idle-warp else */
-            } /* LEAN_DISPATCH guard */
+            }
         }
     }
 
@@ -3826,37 +3163,9 @@ int main() {
 #else
     dim3 w3_grid(SM_COUNT, 1, 1);
 #endif
-#if TILE_DISPATCH == 1 || TILE_DISPATCH == 2 || TILE_DISPATCH == 4 || TILE_DISPATCH == 6 || TILE_DISPATCH == 7
-    int* d_tile_ctr_ptr;
-    CUDA_CHECK(cudaGetSymbolAddress((void**)&d_tile_ctr_ptr, g_tile_ctr));
-#ifdef COL_LOCK
-    int* d_col_ctr_ptr;
-    CUDA_CHECK(cudaGetSymbolAddress((void**)&d_col_ctr_ptr, g_col_ctr));
-#define LAUNCH_KERNEL() do { \
-    cudaMemsetAsync(d_tile_ctr_ptr, 0, sizeof(int)); \
-    cudaMemsetAsync(d_col_ctr_ptr, 0, 4 * sizeof(int)); \
-    fc2_w3_kernel<<<w3_grid, THREADS, SMEM_BYTES>>>( \
-        _KERN_AB_ARGS, h_tma_c, d_bias, d_C, d_residual, h_tma_res); \
-} while(0)
-#else
-#define LAUNCH_KERNEL() do { \
-    cudaMemsetAsync(d_tile_ctr_ptr, 0, sizeof(int)); \
-    fc2_w3_kernel<<<w3_grid, THREADS, SMEM_BYTES>>>( \
-        _KERN_AB_ARGS, h_tma_c, d_bias, d_C, d_residual, h_tma_res); \
-} while(0)
-#endif
-#elif TILE_DISPATCH == 3
-    /* Grid-based: x=CTA rank (0..1), y=tile index. cluster_dims(2,1,1)
-       pairs CTAs 0,1 per tile into a cluster. */
-    dim3 grid_dim(2, TOTAL_TILES, 1);
-#define LAUNCH_KERNEL() \
-    fc2_w3_kernel<<<grid_dim, THREADS, SMEM_BYTES>>>( \
-        _KERN_AB_ARGS, h_tma_c, d_bias, d_C, d_residual, h_tma_res)
-#else
 #define LAUNCH_KERNEL() \
     fc2_w3_kernel<<<w3_grid, THREADS, SMEM_BYTES>>>( \
         _KERN_AB_ARGS, h_tma_c, d_bias, d_C, d_residual, h_tma_res)
-#endif
 
     /* Warmup */
     printf("Launching warmup (2 iters)...\n");

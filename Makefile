@@ -300,12 +300,6 @@ fc2-w3-bias: fc2_w3.cu
 fc2-w3-noprefill: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PREFILL $< -o $@ $(LDFLAGS)
 
-fc2-w3-sched: fc2_w3.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 $< -o $@ $(LDFLAGS)
-
-fc2-w3-lean: fc2_w3.cu
-	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=4 -DLEAN_DISPATCH $< -o $@ $(LDFLAGS)
-
 fc2-w3-dgswizzle: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=8 $< -o $@ $(LDFLAGS)
 
