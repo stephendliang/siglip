@@ -41,25 +41,25 @@ gen/bias_switch_inc_%.cuh: tools/gen_bias_switch.py
 	python3 $< $* -o $@
 
 # ── FC2 W3X kernel (6-warp bias-only rank-1-shaped, persistent, PACKED+dgswizzle only) ──
-fc2-w3x: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
 
-fc2-w3x-noprefill: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-noprefill: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PREFILL $< -o $@ $(LDFLAGS)
 
-fc2-w3x-strip: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-strip: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
 
-fc2-w3x-gemm: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-gemm: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY $< -o $@ $(LDFLAGS)
 
-fc2-w3x-ncu: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-ncu: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNCU_PROFILE $< -o $@ $(LDFLAGS)
 
-fc2-w3x-ncu-strip: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-ncu-strip: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNCU_PROFILE -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
 
-fc2-w3x-ncu-gemm: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-ncu-gemm: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNCU_PROFILE -DGEMM_ONLY $< -o $@ $(LDFLAGS)
 
 # ── fc2_w3x PTX port — hand-authored .ptx + driver-API host harness ──
@@ -86,13 +86,13 @@ fc2-w3x-ptx: fc2_w3x_host.o fc2_w3x_cubin.o
 # tn=0 surplus (project_w3x_tn0_in_g_structural.md) + W4 53%-idle
 # (W5-bound, PROFILE_W4 retired).  Expected: all likely 0-delta given
 # prior dgphase / DG_ROT / dgnrot 0-deltas — but cheap to measure and rule out.
-fc2-w3x-dg4: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-dg4: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DDG_GROUP_SIZE=4 $< -o $@ $(LDFLAGS)
 
-fc2-w3x-dg16: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-dg16: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DDG_GROUP_SIZE=16 $< -o $@ $(LDFLAGS)
 
-fc2-w3x-dg32: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-dg32: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DDG_GROUP_SIZE=32 $< -o $@ $(LDFLAGS)
 
 fc2-w3x-dg-sweep: fc2-w3x fc2-w3x-dg4 fc2-w3x-dg16 fc2-w3x-dg32
@@ -103,37 +103,37 @@ fc2-w3x-dg-sweep: fc2-w3x fc2-w3x-dg4 fc2-w3x-dg16 fc2-w3x-dg32
 # measurement.  nlock (TD=17) exposes column-locked dispatch (cluster bound to
 # one tn, sweeps M).  checkered (TD=18) is a 2D M×N block.  dg-snake (TD=19) is
 # zigzag-within-dgswizzle-band.
-fc2-w3x-tile-zorder:    fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-zorder:    fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=9  $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-hilbert:   fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-hilbert:   fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=10 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-zigzag:    fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-zigzag:    fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=11 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-rowmajor:  fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-rowmajor:  fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=13 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-ncycle:    fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-ncycle:    fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=14 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-nflat:     fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-nflat:     fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=15 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-nsnake:    fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-nsnake:    fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=16 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-nlock:     fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-nlock:     fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=17 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-checkered: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-checkered: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=18 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-dgsnake:   fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-dgsnake:   fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=19 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-ncyrot:    fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-ncyrot:    fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=21 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-chet:      fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-chet:      fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=30 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-pmix:      fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-pmix:      fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=31 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-ingh:      fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-ingh:      fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=32 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-gflip:     fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-gflip:     fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=33 $< -o $@ $(LDFLAGS)
-fc2-w3x-tile-tn2br:     fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-tile-tn2br:     fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=34 $< -o $@ $(LDFLAGS)
 
 fc2-w3x-tile-sweep: fc2-w3x \
@@ -147,26 +147,26 @@ fc2-w3x-tile-sweep: fc2-w3x \
 # Sync/fence experiments (DROP_TRAIL_BARSYNC × WAIT_GROUP_READ).  Driver:
 # tools/sweep_sync_experiments.sh.  Each binary is the baseline dgswizzle
 # kernel + the macro guards from fc2_w3x.cu's top-of-file comment.
-fc2-w3x-base: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-base: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
 
-fc2-w3x-trail: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-trail: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DDROP_TRAIL_BARSYNC $< -o $@ $(LDFLAGS)
 
-fc2-w3x-wgread: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-wgread: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DWAIT_GROUP_READ $< -o $@ $(LDFLAGS)
 
-fc2-w3x-wgread-trail: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-wgread-trail: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DWAIT_GROUP_READ -DDROP_TRAIL_BARSYNC $< -o $@ $(LDFLAGS)
 
 fc2-w3x-sync-sweep: fc2-w3x-base fc2-w3x-trail fc2-w3x-wgread fc2-w3x-wgread-trail
 
 # W5 critical-path profiler.  Combine with PROFILE_TILE if you want the
 # tma_wait_sum breakdown alongside W5's tile_total / mma_asm / commit.
-fc2-w3x-prof-w5: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-prof-w5: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DPROFILE_W5 $< -o $@ $(LDFLAGS)
 
-fc2-w3x-prof-w5-full: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-prof-w5-full: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DPROFILE_W5 -DPROFILE_TILE $< -o $@ $(LDFLAGS)
 
 # Warpgroup-asymmetric regs: default LO=48 in fc2_w3x.cu, HI set via target name.
@@ -174,25 +174,25 @@ fc2-w3x-prof-w5-full: fc2_w3x.cu gen/bias_switch_inc_12.cuh
 # valid range 24..256).  LO override via DFLAGS='-DSETMAXNREG_LO=N'.
 # Pool ceiling at 192 threads: HI*128 + LO*64 <= 65536 -> HI <= (65536-LO*64)/128
 # (with LO=48 -> HI<=488; never binds at sane values).
-fc2-w3x-regs: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-regs: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SETMAXNREG --maxrregcount=120 $< -o $@ $(LDFLAGS)
 
-fc2-w3x-regs-strip: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-regs-strip: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SETMAXNREG -DSTRIP_EPILOGUE --maxrregcount=120 $< -o $@ $(LDFLAGS)
 
-fc2-w3x-regs-gemm: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-regs-gemm: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SETMAXNREG -DGEMM_ONLY --maxrregcount=120 $< -o $@ $(LDFLAGS)
 
 # fc2-w3x-r<HI>: build w/ USE_SETMAXNREG and SETMAXNREG_HI=<HI>.
 # Example: make -B fc2-w3x-r192  ->  HI=192, LO=default(48).
 # Override LO:  make -B fc2-w3x-r192 DFLAGS='-DSETMAXNREG_LO=40'
-fc2-w3x-r%: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-r%: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SETMAXNREG -DSETMAXNREG_HI=$* --maxrregcount=120 $< -o $@ $(LDFLAGS)
 
-fc2-w3x-r%-strip: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-r%-strip: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SETMAXNREG -DSETMAXNREG_HI=$* -DSTRIP_EPILOGUE --maxrregcount=120 $< -o $@ $(LDFLAGS)
 
-fc2-w3x-r%-gemm: fc2_w3x.cu gen/bias_switch_inc_12.cuh
+fc2-w3x-r%-gemm: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SETMAXNREG -DSETMAXNREG_HI=$* -DGEMM_ONLY --maxrregcount=120 $< -o $@ $(LDFLAGS)
 
 # Full HI sweep (24..240 in 8-reg steps covers the interesting range).
@@ -202,35 +202,35 @@ fc2-w3x-r-sweep: fc2-w3x-r120 fc2-w3x-r136 fc2-w3x-r152 fc2-w3x-r160 fc2-w3x-r16
 # 6-warp rank-1-shaped persistent (W0-W3 epi / W4 TMA / W5 MMA-CTA0-only),
 # register-cached bias preload (BIAS_REG_COUNT=48 for N=3072), 4D packed-tile
 # output, K_STAGGER default=1, NO_PREFILL auto-fires at K_ITERS=6, N_STAGES=5.
-fc1-w3x: fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x: fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
 
-fc1-w3x-strip: fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-strip: fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
 
-fc1-w3x-gemm: fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-gemm: fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DGEMM_ONLY $< -o $@ $(LDFLAGS)
 
-fc1-w3x-noprefill: fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-noprefill: fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNO_PREFILL $< -o $@ $(LDFLAGS)
 
-fc1-w3x-ncu: fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-ncu: fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNCU_PROFILE $< -o $@ $(LDFLAGS)
 
-fc1-w3x-prof-w5: fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-prof-w5: fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DPROFILE_W5 $< -o $@ $(LDFLAGS)
 
-fc1-w3x-prof-w5-full: fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-prof-w5-full: fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DPROFILE_W5 -DPROFILE_TILE $< -o $@ $(LDFLAGS)
 
 # K_STAGGER sweep (FC1 production tuning lever; odd values decorrelate).
-fc1-w3x-ks0: fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-ks0: fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DK_STAGGER=0 $< -o $@ $(LDFLAGS)
-fc1-w3x-ks2: fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-ks2: fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DK_STAGGER=2 $< -o $@ $(LDFLAGS)
-fc1-w3x-ks3: fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-ks3: fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DK_STAGGER=3 $< -o $@ $(LDFLAGS)
-fc1-w3x-ks5: fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-ks5: fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DK_STAGGER=5 $< -o $@ $(LDFLAGS)
 
 fc1-w3x-ks-sweep: fc1-w3x-ks0 fc1-w3x fc1-w3x-ks2 fc1-w3x-ks3 fc1-w3x-ks5
@@ -238,37 +238,37 @@ fc1-w3x-ks-sweep: fc1-w3x-ks0 fc1-w3x fc1-w3x-ks2 fc1-w3x-ks3 fc1-w3x-ks5
 # Tile-dispatch variants (mirror fc2_w3x-tile-*; same TD ids → same swizzles).
 # Re-tune at FC1 dims; prior FC1 winner (fc1_w3) is zigzag (TD=11) + ks=1, but
 # fc1_w3x's basin may differ. gflip_blkswap (TD=54) is fc2_w3x's default.
-fc1-w3x-tile-zorder:    fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-zorder:    fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=9  $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-hilbert:   fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-hilbert:   fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=10 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-zigzag:    fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-zigzag:    fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=11 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-rowmajor:  fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-rowmajor:  fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=13 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-ncycle:    fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-ncycle:    fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=14 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-nflat:     fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-nflat:     fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=15 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-nsnake:    fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-nsnake:    fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=16 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-nlock:     fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-nlock:     fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=17 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-checkered: fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-checkered: fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=18 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-dgsnake:   fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-dgsnake:   fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=19 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-ncyrot:    fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-ncyrot:    fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=21 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-chet:      fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-chet:      fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=30 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-pmix:      fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-pmix:      fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=31 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-ingh:      fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-ingh:      fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=32 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-gflip:     fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-gflip:     fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=33 $< -o $@ $(LDFLAGS)
-fc1-w3x-tile-blkswap:   fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-tile-blkswap:   fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DTILE_DISPATCH=54 $< -o $@ $(LDFLAGS)
 
 fc1-w3x-tile-sweep: fc1-w3x \
@@ -279,7 +279,7 @@ fc1-w3x-tile-sweep: fc1-w3x \
     fc1-w3x-tile-chet fc1-w3x-tile-pmix fc1-w3x-tile-ingh \
     fc1-w3x-tile-gflip fc1-w3x-tile-blkswap
 
-fc1-w3x-r%: fc1_w3x.cu gen/bias_switch_inc_48.cuh
+fc1-w3x-r%: fc1_w3x.cu gen/bias_switch_inc_48.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DUSE_SETMAXNREG -DSETMAXNREG_HI=$* --maxrregcount=120 $< -o $@ $(LDFLAGS)
 
 fc1-w3x-r-sweep: fc1-w3x-r120 fc1-w3x-r136 fc1-w3x-r152 fc1-w3x-r160 fc1-w3x-r168 fc1-w3x-r176 fc1-w3x-r184 fc1-w3x-r192 fc1-w3x-r200 fc1-w3x-r208 fc1-w3x-r216 fc1-w3x-r224 fc1-w3x-r232 fc1-w3x-r240
