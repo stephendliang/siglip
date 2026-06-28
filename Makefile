@@ -62,12 +62,6 @@ fc2-w3x-ncu-strip: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 fc2-w3x-ncu-gemm: fc2_w3x.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DNCU_PROFILE -DGEMM_ONLY $< -o $@ $(LDFLAGS)
 
-# ── FC2 W3Y kernel (fc2_w3x + fused residual; resadd Round 3, W4-does-both) ──
-# Shares gemm_w3x_body.cuh; residual path gated on HAS_RESIDUAL (set in the .cu).
-# Build WITHOUT HAS_RESIDUAL is byte-identical to fc2-w3x (pp-diff gate).
-fc2-w3y: fc2_w3y.cu gen/bias_switch_inc_12.cuh gemm_w3x_body.cuh epilogue_ops.cuh
-	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
-
 # ── fc2_w3x PTX port — hand-authored .ptx + driver-API host harness ──
 # fc2_w3x.ptx is the hand-authored PTX deliverable (see docs/PTX_BUILD_NOTES.md
 # for design notes).  Build pipeline:
@@ -475,7 +469,7 @@ compare-fast:
 	python3 tools/compare_all.py --runs 5 --layer patch_embed --csv data/compare.csv
 
 clean:
-	rm -f $(TARGET) fc1-w3 fc1-w3-* fc2-w3 fc2-w3-* fc2-w3x fc2-w3x-* fc2-w3y fc2-w3y-* fc1-w3x fc1-w3x-* \
+	rm -f $(TARGET) fc1-w3 fc1-w3-* fc2-w3 fc2-w3-* fc2-w3x fc2-w3x-* fc1-w3x fc1-w3x-* \
 	      fc2-cutlass fc2-cutlass-* cutlass-bench cutlass-bench-* cublas-bench cublas-bench-* \
 	      cublaslt-* tma-bench mma-bench stmatrix-bench tma-swizzle-probe* \
 	      bulk-vs-tensor relay-mbar calibration calib-tput calib-lat calib-conflict calib-warp \

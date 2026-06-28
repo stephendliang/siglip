@@ -519,12 +519,27 @@ Histories: `memory/project_w3x_bias_preload_win.md`, `project_w3x_packed_c_abi.m
 **Realistic remaining headroom ~1-3 µs** — largest single target by past-win
 standards (bias-preload 1.7 µs, STSM 0.4 µs); probably needs new lever class.
 
-**Next:** port `fc2_w3x` from bias-only to fused-residual.
+**Next:** open. The fused-residual port (`fc2_w3y`) is a DEAD END — see Dead
+ends below. Residual's home stays `fc2_w3` (NS=6, 1.063 ms).
 
 ## Dead ends — do NOT retry
 
 Full chronological log + per-item memory files: `memory/MEMORY.md`. Headlines:
 
+- **fc2_w3y (residual on fc2_w3x) — DEAD END (2026-06-28).** w3x's 1.001 floor is
+  a *zero-slack* MMA: under PREFILL it free-runs with NO consumer back-pressure
+  (`MBAR_TMEM_CONSUMED` is `#ifdef NO_PREFILL` only), so correctness is pure
+  rate-ordering on the 2-deep TMEM. Residual slows the consumer → the marginless
+  MMA laps the TMEM. Severity scales with NS: **NS=6 deadlock / NS=5 sparse
+  accumulator corruption (2/32) / NS=4 valid but 1.243 ms** (regression). The
+  1.001 floor and a fused residual are mutually exclusive in one kernel —
+  residual needs the slack the floor removed. Tried across Rounds 4-6: dedicated
+  residual ring + decoupled handshake; LDSM gather (NS=5 valid 1.134, still >
+  legacy 1.063); X32+uint4 "cheap" read (bank-conflicted, no win). bias-only
+  `LDTM_X32` PASSES at NS=6 1.004 → proves the wedge is consumer cost, not the
+  store. **Residual stays in `fc2_w3` (NS=6, 1.063, full-tile prefetch +
+  xor-swizzled uint4 read).** Reverted to f8b70b5, fc2_w3y.cu deleted.
+  `memory/project-fc2-resadd-port.md`.
 - **Source-level epi tuning** — ptxas owns STS layout. CUTLASS_LOOP, FP32_EPILOGUE,
   cvta.shared, NUM_EPI_STAGES, stmatrix variants — identical SASS.
 - **Cross-warp STS clustering (intra-warp)** — SELF_LOAD/STAGGER, SASS reorder
@@ -657,7 +672,10 @@ Repo root mounted via `image.add_local_dir(".", "/root/src", ignore=[...])`
 run doesn't re-upload GB of benchmark artifacts. Binary name == target name
 (in `/root/src`). `--rebuild` (default True) forces `make -B` — mandatory
 because DFLAGS changes don't touch `.cu` mtime, same reason custom dims need
-`-B`. Output is line-streamed so `@@SAMPLE`/`@@RESULT` appear live. Build and
+`-B`. Output is line-streamed so `@@SAMPLE`/`@@RESULT` appear live. **Never pipe
+a Modal run through `tail`/`grep`/`head` — block-buffering swallows the
+`@@RESULT`/`PASS`/Xid lines you actually need; redirect the FULL output to a log
+(`modal run ... > run.log 2>&1`) and read the log.** Build and
 run share one B200-attached container, so `-lcuda` links against the real
 driver. Aggregation (`aggregate_prof.py`, `anova_1way.py`) stays local
 against streamed stdout — don't ship it to the container. The deprecated

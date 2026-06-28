@@ -44,23 +44,6 @@ Include AFTER the geometry header (TM_PACK / TILES_N / TN must be defined).
         : "=r"(p_out) \
         : "f"(a_lo), "f"(a_hi), "r"(b_in))
 
-#ifdef HAS_RESIDUAL
-/*
-  CVT_ADD_RES_BF16X2 — bias + residual epilogue math (fc2_w3y fused path).
-  Same as CVT_ADD_BF16X2 but folds a per-element bf16x2 residual into the
-  fp32 accumulators BEFORE the round-to-bf16, so the residual add keeps
-  fp32 precision (matches rank-1's fp32-add-then-convert more closely than
-  the bias-only path's bf16 round). r_in is a bf16x2 pack of the two
-  residual elements aligned to (a_lo, a_hi); b_in is the bf16x2 bias pack.
-    out = bf16( (a_lo + res_lo) , (a_hi + res_hi) ) + bias
-*/
-#define CVT_ADD_RES_BF16X2(p_out, a_lo, a_hi, b_in, r_in) do {             \
-    const float _r_lo = __uint_as_float((uint32_t)(r_in) << 16);          \
-    const float _r_hi = __uint_as_float((uint32_t)(r_in) & 0xFFFF0000u);  \
-    CVT_ADD_BF16X2((p_out), (a_lo) + _r_lo, (a_hi) + _r_hi, (b_in));       \
-} while (0)
-#endif
-
 /*
   GELU approximation, fp32. tanh(0.7979 * (x + 0.04472 * x^3)) form,
   rearranged to GELU(x) = 0.5 * (x + x * tanh(x * (0.7979 + 0.03568 * x^2))).
@@ -75,7 +58,7 @@ static __device__ __forceinline__ float gelu_approx(float acc, float bias_f32) {
     return 0.5f * (x + x * t);
 }
 
-// Host-side reference for golden validation.
+/* Host-side reference for golden validation. */
 static __host__ __forceinline__ float gelu_fwd(float x) {
     const float k = 0.7978845608f;
     return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
