@@ -240,7 +240,21 @@ static_assert((TN / 2) % B_BOX_N == 0,
 #define MBAR_TMA_EMPTY      (MBAR_TMA_FULL + N_STAGES * 8)
 #define MBAR_TMEM_READY     (MBAR_TMA_EMPTY + N_STAGES * 8)
 #define MBAR_TMEM_CONSUMED  (MBAR_TMEM_READY + 2 * 8)
+#ifdef HAS_RESIDUAL
+/*
+  Residual handshake on the shared OUT_STAGING double-buffer (W4 ⇄ epilogue):
+    MBAR_RES_FULL[es]     W4 → epilogue: residual slice loaded into out_smem[es]
+    MBAR_RES_CONSUMED[es] epilogue → W4: out_smem[es] free to refill (signalled
+                          after the OUTPUT TMA store of that stage has drained,
+                          since residual and output time-share the same bytes).
+  Gated so MBARS_END / SMEM_BYTES are unchanged when HAS_RESIDUAL is off.
+*/
+#define MBAR_RES_FULL       (MBAR_TMEM_CONSUMED + 2 * 8)
+#define MBAR_RES_CONSUMED   (MBAR_RES_FULL + NUM_EPI_STAGES * 8)
+#define MBARS_END           (MBAR_RES_CONSUMED + NUM_EPI_STAGES * 8)
+#else
 #define MBARS_END           (MBAR_TMEM_CONSUMED + 2 * 8)
+#endif
 
 #define OFF_TMEM       ((MBARS_END + 15) & ~15)
 #define OFF_SWIZZLE_LUT ((OFF_TMEM + 8 + 15) & ~15)
@@ -256,7 +270,7 @@ static_assert((TN / 2) % B_BOX_N == 0,
 #else
 #define SMEM_BYTES     ((OFF_SWIZZLE_LUT + SWIZZLE_LUT_BYTES + 127) & ~127)
 #endif
-/* PROFILE_TILE uses only a register + one global write per tile — no SMEM. */
+// PROFILE_TILE uses only a register + one global write per tile — no SMEM.
 
 #define TMEM_COLS    512
 /* CUTLASS UMMA::InstrDescriptor: c_format_=F32 (bit 4), n_dim_=TN>>3=32
@@ -351,6 +365,26 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc,
            "r"(smem_src) : "memory");
 }
 
+#ifdef HAS_RESIDUAL
+/*
+  Per-CTA residual TMA load (global → out_smem[es]) for one (tile, subpass)
+  slice.  Same 4D packed coords as tma_store (each CTA loads only its own
+  ROWS_PER_CTA rows), but g2s with mbarrier::complete_tx so the epilogue can
+  wait on MBAR_RES_FULL[es].  Not a cluster multicast — residual rows are
+  CTA-private, so .shared::cta (no cta_group::2).
+*/
+static __device__ __forceinline__
+void tma_load_res(uint32_t smem_dst, const CUtensorMap* tma_desc, uint32_t mbar,
+                  int32_t c0, int32_t c1, int32_t c2, int32_t c3) {
+    asm volatile(
+        "cp.async.bulk.tensor.4d.shared::cta.global.tile"
+        ".mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%2, %3, %4, %5}], [%6];"
+        :: "r"(smem_dst), "l"(tma_desc), "r"(c0), "r"(c1), "r"(c2), "r"(c3),
+           "r"(mbar) : "memory");
+}
+#endif
+
 #define TMEM_LOAD_X32(r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,r20,r21,r22,r23,r24,r25,r26,r27,r28,r29,r30,r31, TADDR) \
     asm volatile( \
         "tcgen05.ld.sync.aligned.32x32b.x32.b32 " \
@@ -417,6 +451,16 @@ void tma_store(uint32_t smem_src, const CUtensorMap* tma_desc,
         :: "r"(SADDR), "r"(r0), "r"(r1), "r"(r2), "r"(r3))
 
 #include "epilogue_ops.cuh"
+
+#if defined(HAS_RESIDUAL) && defined(W3X_FC1)
+#error "HAS_RESIDUAL is FC2-only (fc2_w3y); FC1 has no residual path"
+#endif
+#if defined(HAS_RESIDUAL) && defined(LDTM_X32)
+#error "HAS_RESIDUAL residual gather is implemented for the default STSM/LDTM_16X256 epilogue only, not LDTM_X32"
+#endif
+#if defined(HAS_RESIDUAL) && (defined(STRIP_EPILOGUE) || defined(GEMM_ONLY))
+#error "HAS_RESIDUAL needs the epilogue (the residual consumer); STRIP_EPILOGUE/GEMM_ONLY would deadlock W4 on RES_CONSUMED"
+#endif
 #ifdef W3X_FC1
 
 /*
@@ -602,8 +646,14 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                uint64_t* __restrict__ d_dbg_prof_ki,
                uint64_t* __restrict__ d_dbg_prof_tile,
                uint64_t* __restrict__ d_dbg_prof_w5,
+#ifdef HAS_RESIDUAL
+               uint64_t* __restrict__ d_wall_cyc,
+               const __grid_constant__ CUtensorMap tma_res)
+{
+#else
                uint64_t* __restrict__ d_wall_cyc)
 {
+#endif
     (void)d_C;
     (void)d_dbg_prof;
     (void)d_dbg_prof_ki;
@@ -664,6 +714,14 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             mbar_init(smem_to_uint(smem + MBAR_TMEM_CONSUMED + b * 8), 2);
 #endif
         }
+#ifdef HAS_RESIDUAL
+        for (int es = 0; es < NUM_EPI_STAGES; es++) {
+            /* RES_FULL: satisfied by W4's single expect_tx arrive + the TMA tx.
+               RES_CONSUMED: one arrive from the epilogue (tid==0) per stage. */
+            mbar_init(smem_to_uint(smem + MBAR_RES_FULL + es * 8), 1);
+            mbar_init(smem_to_uint(smem + MBAR_RES_CONSUMED + es * 8), 1);
+        }
+#endif
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp_id == 0) {
@@ -671,7 +729,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
             :: "r"(smem_to_uint(smem + OFF_TMEM)), "n"(TMEM_COLS));
     }
 
-    /* WARP_TMA: bias LDG+STS, all 32 lanes cooperate, pre-cluster-barrier. */
+    // WARP_TMA: bias LDG+STS, all 32 lanes cooperate, pre-cluster-barrier.
     if (warp_id == WARP_TMA) {
         for (int i = lane; i < N_DIM; i += 32) {
             __nv_bfloat16 v = d_bias[i];
@@ -709,7 +767,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
-    /* WARP_MMA on CTA 1 is dead — only CTA 0 issues MMA. */
+    // WARP_MMA on CTA 1 is dead — only CTA 0 issues MMA.
     if (warp_id == WARP_MMA && cta_rank != 0) return;
 
     const uint32_t taddr_base = *reinterpret_cast<uint32_t*>(smem + OFF_TMEM);
@@ -746,7 +804,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
     const int tiles_per_cluster = (TOTAL_TILES + num_clusters - 1) / num_clusters;
 
     if (warp_id < N_EPI_WARPS) {
-        /* =============== Epilogue warpgroup (W0..W_{N_EPI_WARPS-1}) =============== */
+        // Epilogue warpgroup (W0..W_{N_EPI_WARPS-1})
         const int row_group = warp_id;
 
         uint32_t mma_phase_0 = 0, mma_phase_1 = 0;
@@ -780,6 +838,14 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 : "r"(smem_bias + pair_idx * 4));
         }
 
+#ifdef HAS_RESIDUAL
+        /* Residual consumer state: wait W4's MBAR_RES_FULL before reading the
+           residual slice out of out_smem, signal MBAR_RES_CONSUMED once the
+           slot's output store has drained. Phase per epi-stage. */
+        const uint32_t mbar_res_full_base     = smem_to_uint(smem + MBAR_RES_FULL);
+        const uint32_t mbar_res_consumed_base = smem_to_uint(smem + MBAR_RES_CONSUMED);
+        uint32_t res_full_phase[NUM_EPI_STAGES] = {0};
+#endif
         const uint32_t lut_smem_epi = smem_to_uint(smem + OFF_SWIZZLE_LUT);
         for (int tt = 0; tt < tiles_per_cluster; tt++) {
             const int lin_tile = cluster_id + tt * num_clusters;
@@ -814,6 +880,28 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 const int sp_col = sp * SUBPASS_COLS;
 #else
                 const int nc = sp * SUBPASS_COLS;
+#endif
+#ifdef HAS_RESIDUAL
+                /*
+                  Residual handshake, at subpass START (order is load-bearing):
+                    1. confirm the same-es output store from 2 subpasses back
+                       has drained (wait_group 1), then arrive RES_CONSUMED so
+                       W4 may reload residual into that slot;
+                    2. THEN wait RES_FULL for THIS subpass's residual.
+                  Arrive-before-wait is mandatory: if this warp blocked on
+                  RES_FULL first while W4 blocked on RES_CONSUMED, they'd
+                  deadlock (the cycle fc2_w3 breaks with DELAY_TMA_STORE; here
+                  the start-of-subpass drain check gives the same separation
+                  over 2 physical stages without delaying the store).
+                  NOTE(B200): drain timing vs reload overlap is the Round-3
+                  tuning knob — verify no clobber / no deadlock first.
+                */
+                if (tid == 0 && (tt > 0 || sp >= NUM_EPI_STAGES)) {
+                    BULK_ASM(BULK_WAIT_GROUP(1));
+                    mbar_arrive(smem_to_uint(smem + MBAR_RES_CONSUMED + es * 8));
+                }
+                mbar_wait<NS_CYC>(mbar_res_full_base + es * 8, res_full_phase[es]);
+                res_full_phase[es] ^= 1;
 #endif
 
                 PROF_BEGIN(e1);
@@ -919,7 +1007,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                                         taddr_tile + nc + (16u << 16));
                     TMEM_WAIT();
 
-                    /* bl0..bl3 already computed at subpass scope via shfl. */
+                    // bl0..bl3 already computed at subpass scope via shfl.
                     const int lane_c = lane >> 3;
                     const int lane_r = lane & 7;
 
@@ -931,55 +1019,101 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                       row bands within a rh.
                     */
                     uint32_t p[16];
-                    /* STSM #1: rows row_local_32+0..7  (LDTM#1, r_hi=0, j) */
+#ifdef HAS_RESIDUAL
+                    /*
+                      Gather the residual slice from out_smem[es] in the SAME
+                      register pairing the CVT consumes.  Each CVT pair
+                      (a[2m], a[2m+1]) maps to two adjacent cols of one row,
+                      so each maps to exactly one aligned bf16x2 (b32) in the
+                      row-major residual that W4 TMA'd into out_smem.
+                      For lane t (i=t&3, j=t>>2), p[g*4+m] reads:
+                        row = row_local_32 + {j, j+8, 16+j, 24+j}[g]
+                        col = 2i + 8m   (the pair's low column)
+                      (Derived from the LDTM 16dp256 a[k]/b[k] layout above;
+                       VERIFY ON B200 — first-pass residual correctness check.)
+                    */
+                    uint32_t res_pk[16];
+                    {
+                        const int ii = lane & 3;
+                        const int jj = lane >> 2;
+                        const uint32_t rb = (es == 0) ? out_smem_0 : out_smem_1;
+                        #pragma unroll
+                        for (int g = 0; g < 4; g++) {
+                            const int brow = (g == 0) ? jj
+                                           : (g == 1) ? jj + 8
+                                           : (g == 2) ? 16 + jj
+                                                      : 24 + jj;
+                            #pragma unroll
+                            for (int m = 0; m < 4; m++) {
+                                const uint32_t ra = rb
+                                    + (uint32_t)((row_local_32 + brow) * (SUBPASS_COLS * 2)
+                                                 + (2 * ii + 8 * m) * 2);
+                                asm volatile("ld.shared.b32 %0, [%1];"
+                                    : "=r"(res_pk[g * 4 + m]) : "r"(ra));
+                            }
+                        }
+                    }
+                    #define EPI_FC2_CVT(po, alo, ahi, b, idx) \
+                        CVT_ADD_RES_BF16X2(po, alo, ahi, b, res_pk[idx])
+#else
+                    #define EPI_FC2_CVT(po, alo, ahi, b, idx) \
+                        CVT_ADD_BF16X2(po, alo, ahi, b)
+#endif
+                    // STSM #1: rows row_local_32+0..7  (LDTM#1, r_hi=0, j)
 #ifdef W3X_FC1
                     CVT_EPI_BF16X2(p[ 0], a0,  a1,  bl0);
                     CVT_EPI_BF16X2(p[ 1], a4,  a5,  bl1);
                     CVT_EPI_BF16X2(p[ 2], a8,  a9,  bl2);
                     CVT_EPI_BF16X2(p[ 3], a12, a13, bl3);
 #else
-                    CVT_ADD_BF16X2(p[ 0], a0,  a1,  bl0);
-                    CVT_ADD_BF16X2(p[ 1], a4,  a5,  bl1);
-                    CVT_ADD_BF16X2(p[ 2], a8,  a9,  bl2);
-                    CVT_ADD_BF16X2(p[ 3], a12, a13, bl3);
+                    EPI_FC2_CVT(p[ 0], a0,  a1,  bl0,  0);
+                    EPI_FC2_CVT(p[ 1], a4,  a5,  bl1,  1);
+                    EPI_FC2_CVT(p[ 2], a8,  a9,  bl2,  2);
+                    EPI_FC2_CVT(p[ 3], a12, a13, bl3,  3);
 #endif
-                    /* STSM #2: rows +8..15  (LDTM#1, r_hi=1, j+8) */
+                    // STSM #2: rows +8..15  (LDTM#1, r_hi=1, j+8)
 #ifdef W3X_FC1
                     CVT_EPI_BF16X2(p[ 4], a2,  a3,  bl0);
                     CVT_EPI_BF16X2(p[ 5], a6,  a7,  bl1);
                     CVT_EPI_BF16X2(p[ 6], a10, a11, bl2);
                     CVT_EPI_BF16X2(p[ 7], a14, a15, bl3);
 #else
-                    CVT_ADD_BF16X2(p[ 4], a2,  a3,  bl0);
-                    CVT_ADD_BF16X2(p[ 5], a6,  a7,  bl1);
-                    CVT_ADD_BF16X2(p[ 6], a10, a11, bl2);
-                    CVT_ADD_BF16X2(p[ 7], a14, a15, bl3);
+                    EPI_FC2_CVT(p[ 4], a2,  a3,  bl0,  4);
+                    EPI_FC2_CVT(p[ 5], a6,  a7,  bl1,  5);
+                    EPI_FC2_CVT(p[ 6], a10, a11, bl2,  6);
+                    EPI_FC2_CVT(p[ 7], a14, a15, bl3,  7);
 #endif
-                    /* STSM #3: rows +16..23  (LDTM#2, r_hi=0, 16+j) */
+                    // STSM #3: rows +16..23  (LDTM#2, r_hi=0, 16+j)
 #ifdef W3X_FC1
                     CVT_EPI_BF16X2(p[ 8], b0,  b1,  bl0);
                     CVT_EPI_BF16X2(p[ 9], b4,  b5,  bl1);
                     CVT_EPI_BF16X2(p[10], b8,  b9,  bl2);
                     CVT_EPI_BF16X2(p[11], b12, b13, bl3);
 #else
-                    CVT_ADD_BF16X2(p[ 8], b0,  b1,  bl0);
-                    CVT_ADD_BF16X2(p[ 9], b4,  b5,  bl1);
-                    CVT_ADD_BF16X2(p[10], b8,  b9,  bl2);
-                    CVT_ADD_BF16X2(p[11], b12, b13, bl3);
+                    EPI_FC2_CVT(p[ 8], b0,  b1,  bl0,  8);
+                    EPI_FC2_CVT(p[ 9], b4,  b5,  bl1,  9);
+                    EPI_FC2_CVT(p[10], b8,  b9,  bl2, 10);
+                    EPI_FC2_CVT(p[11], b12, b13, bl3, 11);
 #endif
-                    /* STSM #4: rows +24..31  (LDTM#2, r_hi=1, 24+j) */
+                    // STSM #4: rows +24..31  (LDTM#2, r_hi=1, 24+j)
 #ifdef W3X_FC1
                     CVT_EPI_BF16X2(p[12], b2,  b3,  bl0);
                     CVT_EPI_BF16X2(p[13], b6,  b7,  bl1);
                     CVT_EPI_BF16X2(p[14], b10, b11, bl2);
                     CVT_EPI_BF16X2(p[15], b14, b15, bl3);
 #else
-                    CVT_ADD_BF16X2(p[12], b2,  b3,  bl0);
-                    CVT_ADD_BF16X2(p[13], b6,  b7,  bl1);
-                    CVT_ADD_BF16X2(p[14], b10, b11, bl2);
-                    CVT_ADD_BF16X2(p[15], b14, b15, bl3);
+                    EPI_FC2_CVT(p[12], b2,  b3,  bl0, 12);
+                    EPI_FC2_CVT(p[13], b6,  b7,  bl1, 13);
+                    EPI_FC2_CVT(p[14], b10, b11, bl2, 14);
+                    EPI_FC2_CVT(p[15], b14, b15, bl3, 15);
 #endif
-
+                    #undef EPI_FC2_CVT
+#ifdef HAS_RESIDUAL
+                    /* All lanes' residual reads from out_smem[es] must finish
+                       before any STSM overwrites it (STSM scatters across
+                       lanes within the warp). */
+                    __syncwarp();
+#endif
                     /*
                       STSM address per-lane: lane t=8m+r supplies addr for
                       matrix m row r.  Row-major 32-col output with row
@@ -1030,7 +1164,6 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                         CVT_ADD_BF16X2(p[k], a[2*k], a[2*k + 1], bk[k]);
 #endif
                     }
-
                     const uint32_t out_base = (es == 0) ? out_smem_0 : out_smem_1;
                     const uint32_t base_row = out_base
 #ifdef W3X_FC1
@@ -1089,7 +1222,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                 mbar_arrive(mbar_tmem_cons_peer_base + buf * 8);
             }
 #endif
-#endif /* STRIP_EPILOGUE */
+#endif // STRIP_EPILOGUE
         }
         if (tid == 0) {
             BULK_ASM(BULK_WAIT_GROUP(0));
@@ -1098,9 +1231,24 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         PROF_WRITEOUT();
     }
     else if (warp_id == WARP_TMA) {
-        /* =============== WARP_TMA: TMA A+B loader ============= */
+        // WARP_TMA: TMA A+B loader  (+ residual loader when HAS_RESIDUAL — "W4-does-both")
         uint32_t tma_empty_phase[N_STAGES] = {0};
         const bool elect = (lane == 0);
+#ifdef HAS_RESIDUAL
+        /*
+          Residual production state.  out_smem is the SAME double-buffer the
+          epilogue stores output from, so residual issue is paced by the
+          epilogue via MBAR_RES_CONSUMED.  res_consumed_phase tracks the
+          consumer handshake per stage; res_issued counts loads so the first
+          NUM_EPI_STAGES skip the consumed-wait (buffers start free).
+          NOTE(B200): this couples W4's A+B issue for tile tt+1 behind the
+          epilogue-paced residual issue for tile tt — the exact mainloop-TMA
+          perturbation this kernel exists to measure.  If it stalls A+B,
+          switch to RESIDUAL_DEDICATED_WARP (a 7th warp; not yet wired).
+        */
+        uint32_t res_consumed_phase[NUM_EPI_STAGES] = {0};
+        int res_issued = 0;
+#endif
 
 #ifdef PROFILE_CYCLES
         uint64_t prof[PROF_N_PHASES] = {0};
@@ -1187,12 +1335,44 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
                     PROF_END(t1, 1);
                 }
             }
+#ifdef HAS_RESIDUAL
+            /*
+              Residual for THIS tile, issued after its A+B mainloop loads.
+              One per-CTA TMA per subpass into out_smem[es], same 4D packed
+              coords the epilogue stores from (each CTA loads its own
+              ROWS_PER_CTA rows).  Paced by the epilogue through
+              MBAR_RES_CONSUMED so out_smem isn't clobbered mid-store.
+              Global subpass order matches the epilogue's (tt outer, sp inner),
+              and NUM_SUBPASSES is even so es = sp & 1 aligns producer/consumer.
+            */
+            if (elect) {
+                #pragma unroll 1
+                for (int sp = 0; sp < NUM_SUBPASSES; sp++) {
+                    const int es = sp & (NUM_EPI_STAGES - 1);
+                    if (res_issued >= NUM_EPI_STAGES) {
+                        mbar_wait<NS_CYC>(smem_to_uint(smem + MBAR_RES_CONSUMED + es * 8),
+                                          res_consumed_phase[es]);
+                        res_consumed_phase[es] ^= 1;
+                    }
+                    const uint32_t res_dst = smem_to_uint(smem + OFF_OUT + es * SUBPASS_BYTES);
+                    const uint32_t res_full = smem_to_uint(smem + MBAR_RES_FULL + es * 8);
+                    tma_load_res(res_dst, &tma_res, res_full,
+                                 sp * SUBPASS_COLS, (int)cta_rank * ROWS_PER_CTA, tn, tm);
+                    asm volatile(
+                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64"
+                        " _, [%0], %1;"
+                        :: "r"(res_full), "r"(SUBPASS_BYTES)
+                        : "memory");
+                    res_issued++;
+                }
+            }
+#endif
         }
         PROF_WALL_END();
         PROF_WRITEOUT();
     }
     else /* warp_id == WARP_MMA, cta_rank == 0 */ {
-        /* =============== WARP_MMA: MMA issuer (CTA 0 only) =============== */
+        // WARP_MMA: MMA issuer (CTA 0 only)
         uint32_t tma_full_phase[N_STAGES] = {0};
 #ifdef NO_PREFILL
         uint32_t tmem_cons_phase[2] = {0, 0};
@@ -1220,7 +1400,7 @@ fc2_w3x_kernel(const __grid_constant__ CUtensorMap tma_a,
         }
 
 #ifdef NO_PREFILL
-        /* Prime both consumed slots (count=2) so tiles 0, 1 don't block. */
+        // Prime both consumed slots (count=2) so tiles 0, 1 don't block.
         if (lane == 0) {
             mbar_arrive(mbar_tmem_consumed_base + 0);
             mbar_arrive(mbar_tmem_consumed_base + 0);
@@ -1443,7 +1623,11 @@ struct VariantCfg {
     void (*launch)(dim3, int,
                    const CUtensorMap&, const CUtensorMap&, const CUtensorMap&,
                    const __nv_bfloat16*, __nv_bfloat16*,
-                   uint64_t*, uint64_t*, uint64_t*, uint64_t*, uint64_t*);
+                   uint64_t*, uint64_t*, uint64_t*, uint64_t*, uint64_t*
+#ifdef HAS_RESIDUAL
+                   , const CUtensorMap&
+#endif
+                   );
     void (*set_attr)(int);
 };
 
@@ -1452,9 +1636,17 @@ static void launch_kern(dim3 grid, int smem,
                         const CUtensorMap& a, const CUtensorMap& b, const CUtensorMap& c,
                         const __nv_bfloat16* d_bias, __nv_bfloat16* d_C,
                         uint64_t* p, uint64_t* pki, uint64_t* pt, uint64_t* pw5,
-                        uint64_t* pwc) {
+                        uint64_t* pwc
+#ifdef HAS_RESIDUAL
+                        , const CUtensorMap& res
+#endif
+                        ) {
     fc2_w3x_kernel<TD, DGG, NS_CYC><<<grid, THREADS, smem>>>(
-        a, b, c, d_bias, d_C, p, pki, pt, pw5, pwc);
+        a, b, c, d_bias, d_C, p, pki, pt, pw5, pwc
+#ifdef HAS_RESIDUAL
+        , res
+#endif
+        );
 }
 
 template<int TD, int DGG, int NS_CYC = NANOSLEEP_CYC>
@@ -1508,7 +1700,7 @@ static const VariantCfg VARIANTS[] = {
     VCFG("gflip_blklmrev",56, 8),
     VCFG("gflip_blkmul3", 57, 8),
     VCFG("gflip_quartswap",58, 8),
-    /* BEGIN COORD_DESCEND table */
+    // BEGIN COORD_DESCEND table
     VCFG("gflip_xk2_blkswap", 80, 8),
     VCFG("gflip_xk3_blkswap", 81, 8),
     VCFG("gflip_xk5_blkswap", 82, 8),
@@ -1529,7 +1721,7 @@ static const VariantCfg VARIANTS[] = {
     VCFG("gflip_bitrev_xor1_alt1", 97, 8),
     VCFG("gflip_bitrev_xor2_alt1", 98, 8),
     VCFG("gflip_mul3_xor4_alt1", 99, 8),
-    /* END COORD_DESCEND table */
+    // END COORD_DESCEND table
 
     /* NANOSLEEP grid: gflip_blkswap (TD=54, DGG=8) basin-floor pinned, NS_CYC swept.
        ns20 = current production default (NANOSLEEP_CYC).  Existing variants above
@@ -1598,6 +1790,13 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_B, sB));
     CUDA_CHECK(cudaMalloc(&d_bias, (size_t)N_DIM * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&d_C, sC * sizeof(__nv_bfloat16)));
+#ifdef HAS_RESIDUAL
+    /* Residual lives in the SAME 4D packed-tile layout as C (chain stays
+       packed). res(row,col) = 0.25 * ((row+col) & 3) — small, bf16-exact. */
+    __nv_bfloat16 *d_res = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_res, sC * sizeof(__nv_bfloat16)));
+    #define RES_VAL(row, col) (0.25f * (float)(((long long)(row) + (int)(col)) & 3))
+#endif
 
     __nv_fp8_e4m3 *hA = nullptr;
     __nv_fp8_e4m3 *hB = nullptr;
@@ -1617,6 +1816,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemset(d_A, 0x3c, sA));
     CUDA_CHECK(cudaMemset(d_B, 0x3c, sB));
     CUDA_CHECK(cudaMemset(d_bias, 0, (size_t)N_DIM * sizeof(__nv_bfloat16)));
+#ifdef HAS_RESIDUAL
+    CUDA_CHECK(cudaMemset(d_res, 0, sC * sizeof(__nv_bfloat16)));
+#endif
 #else
     hA = (__nv_fp8_e4m3*)malloc(sA);
     hB = (__nv_fp8_e4m3*)malloc(sB);
@@ -1658,6 +1860,16 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(d_A, hA, sA, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_B, hB, sB, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_bias, hbias, (size_t)N_DIM * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+#ifdef HAS_RESIDUAL
+    {
+        __nv_bfloat16* h_res = (__nv_bfloat16*)malloc(sC * sizeof(__nv_bfloat16));
+        for (long long row = 0; row < M_TOTAL; row++)
+            for (int col = 0; col < N_DIM; col++)
+                h_res[pack_idx_C(row, col)] = __float2bfloat16(RES_VAL(row, col));
+        CUDA_CHECK(cudaMemcpy(d_res, h_res, sC * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+        free(h_res);
+    }
+#endif
 #endif
     CUDA_CHECK(cudaMemset(d_C, 0, sC * sizeof(__nv_bfloat16)));
     printf("  Alloc + init + pack done\n");
@@ -1717,6 +1929,28 @@ int main(int argc, char** argv) {
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }
+#ifdef HAS_RESIDUAL
+    CUtensorMap h_tma_res;
+    {
+        /* Same 4D packed-tile layout as C, on d_res. W4 loads one
+           (SUBPASS_COLS × ROWS_PER_CTA) box per (tile, subpass, CTA). */
+        uint64_t dims[4]    = {(uint64_t)TN, (uint64_t)TM_PACK,
+                               (uint64_t)TILES_N, (uint64_t)TILES_M};
+        uint64_t strides[3] = {
+            (uint64_t)TN * sizeof(__nv_bfloat16),
+            (uint64_t)TM_PACK * TN * sizeof(__nv_bfloat16),
+            (uint64_t)TILES_N * TM_PACK * TN * sizeof(__nv_bfloat16)};
+        uint32_t box[4]     = {SUBPASS_COLS, ROWS_PER_CTA, 1, 1};
+        uint32_t estrides[4]= {1, 1, 1, 1};
+        CU_CHECK(cuTensorMapEncodeTiled(&h_tma_res,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, (void*)d_res,
+            dims, strides, box, estrides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    }
+#endif
 
     /*
       Active config selection (env-driven):
@@ -1767,10 +2001,17 @@ int main(int argc, char** argv) {
                SMEM_BYTES, sweep_mode ? "SWEEP" : "VARIANT",
                n_active, n_active == 1 ? "" : "s");
     }
+#ifdef HAS_RESIDUAL
+#define LAUNCH_VARIANT(slot) \
+    active_cfg(slot).launch(grid, SMEM_BYTES, h_tma_a, h_tma_b, h_tma_c, \
+        d_bias, d_C, d_dbg_prof, d_dbg_prof_ki, d_dbg_prof_tile, d_dbg_prof_w5, \
+        d_dbg_wall_cyc, h_tma_res)
+#else
 #define LAUNCH_VARIANT(slot) \
     active_cfg(slot).launch(grid, SMEM_BYTES, h_tma_a, h_tma_b, h_tma_c, \
         d_bias, d_C, d_dbg_prof, d_dbg_prof_ki, d_dbg_prof_tile, d_dbg_prof_w5, \
         d_dbg_wall_cyc)
+#endif
 
     uint64_t* d_dbg_prof = nullptr;
     uint64_t* d_dbg_prof_ki = nullptr;
@@ -1884,7 +2125,7 @@ int main(int argc, char** argv) {
             const uint64_t cyc_p95 = sorted_cyc[(nc - 1 < (nc * 95) / 100)
                                                 ? nc - 1 : (nc * 95) / 100] / scale;
             const uint64_t cyc_max = sorted_cyc.back()                      / scale;
-            const uint64_t cyc_per_launch = cyc_max;  /* legacy: max-over-CTAs */
+            const uint64_t cyc_per_launch = cyc_max;  // legacy: max-over-CTAs
             if (sweep_mode || active_idx.size() > 1) {
                 printf("@@SAMPLE pass=%d variant=%s ms=%.5f cyc=%llu "
                        "cyc_min=%llu cyc_p50=%llu cyc_p95=%llu cyc_max=%llu\n",
@@ -1971,7 +2212,7 @@ int main(int argc, char** argv) {
 
 #if defined(PROFILE_CYCLES) || defined(PROFILE_KI) || defined(PROFILE_TILE) || defined(PROFILE_W5)
     const double tile_cyc = (double)ms * 1e-3 * 1.813e9 / tiles_per_cluster_host;
-    (void)tile_cyc; /* Kept for PROFILE_KI/_TILE/_W5 host-side scaling. */
+    (void)tile_cyc; // Kept for PROFILE_KI/_TILE/_W5 host-side scaling.
 #endif
 
 #ifdef PROFILE_CYCLES
@@ -2460,6 +2701,9 @@ int main(int argc, char** argv) {
 #else
 #if defined(GEMM_ONLY)
         float expected = expected_ab;
+#elif defined(HAS_RESIDUAL)
+        float expected = expected_ab + __bfloat162float(hbias[col])
+                       + __bfloat162float(__float2bfloat16(RES_VAL(row, col)));
 #else
         float expected = expected_ab + __bfloat162float(hbias[col]);
 #endif
@@ -2488,6 +2732,10 @@ int main(int argc, char** argv) {
     free(h_C);
 #endif
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_bias); cudaFree(d_C);
+#ifdef HAS_RESIDUAL
+    cudaFree(d_res);
+    #undef RES_VAL
+#endif
 #ifdef PROFILE_CYCLES
     if (d_dbg_prof) cudaFree(d_dbg_prof);
 #endif
