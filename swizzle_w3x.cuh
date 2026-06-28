@@ -409,9 +409,9 @@ int dg_lmsn_swizzle_t(int lin) {
 template<int DGG>
 static __device__ __forceinline__
 int dg_phasesh3_swizzle_t(int lin) {
-    const int c = lin - (lin / NUM_CLUSTERS) * NUM_CLUSTERS;  /* lin % NC */
+    const int c = lin - (lin / NUM_CLUSTERS) * NUM_CLUSTERS;  // lin % NC
     const int tt = lin / NUM_CLUSTERS;
-    const int phase = c - (c / 3) * 3;  /* c % 3 */
+    const int phase = c - (c / 3) * 3;  // c % 3
     int eff_tt = tt + phase * 4;
     if (eff_tt >= TILES_PER_CLUSTER) eff_tt -= TILES_PER_CLUSTER;
     const int eff_lin = c + eff_tt * NUM_CLUSTERS;
@@ -611,7 +611,7 @@ int gflip_blkswap_swizzle_t(int lin) {
 template<int DGG>
 static __device__ __forceinline__
 int gflip_cidperm_swizzle_t(int lin) {
-    const int c   = lin - (lin / NUM_CLUSTERS) * NUM_CLUSTERS;  /* lin % NC */
+    const int c   = lin - (lin / NUM_CLUSTERS) * NUM_CLUSTERS;  // lin % NC
     const int tt  = lin / NUM_CLUSTERS;
     const int cp_full = c * 15;
     const int cp  = cp_full - (cp_full / NUM_CLUSTERS) * NUM_CLUSTERS;
@@ -670,7 +670,7 @@ int gflip_blkmul3_swizzle_t(int lin) {
     const int lm_raw  = in_group - (in_group / nig) * nig;
     const int ln      = in_group / nig;
     int lm = lm_raw;
-    if (nig == 8 && (group_idx & 1)) lm = (lm_raw * 3) & 7;  /* mod 8 */
+    if (nig == 8 && (group_idx & 1)) lm = (lm_raw * 3) & 7;  // mod 8
     int tm = first_m + lm;
     if (tm >= TILES_M) tm = TILES_M - 1;
     return tm * TILES_N + ln;
@@ -704,7 +704,7 @@ int gflip_quartswap_swizzle_t(int lin) {
     return tm * TILES_N + ln;
 }
 
-/* BEGIN COORD_DESCEND */
+// BEGIN COORD_DESCEND
 
 /* TD=80: gflip_xk2_blkswap.  XK=2 pairing × blkswap-^4 alt1 (vs gflip's XK=1)
             XK=2, p_u=id, alt=xor4, dens=alt1.  Bijection-checked. */
@@ -1189,9 +1189,9 @@ int gflip_mul3_xor4_alt1_swizzle_t(int lin) {
     return tm * TILES_N + ln;
 }
 
-/* END COORD_DESCEND */
+// END COORD_DESCEND
 
-/* Single entry point — dispatched at compile time per kernel instantiation. */
+// Single entry point — dispatched at compile time per kernel instantiation.
 template<int TD, int DGG>
 static __device__ __forceinline__
 int tile_swizzle_t(int lin) {
@@ -1225,7 +1225,7 @@ int tile_swizzle_t(int lin) {
     else if constexpr (TD == 56) return gflip_blklmrev_swizzle_t<DGG>(lin);
     else if constexpr (TD == 57) return gflip_blkmul3_swizzle_t<DGG>(lin);
     else if constexpr (TD == 58) return gflip_quartswap_swizzle_t<DGG>(lin);
-    /* BEGIN COORD_DESCEND dispatch */
+    // BEGIN COORD_DESCEND dispatch
     else if constexpr (TD == 80) return gflip_xk2_blkswap_swizzle_t<DGG>(lin);
     else if constexpr (TD == 81) return gflip_xk3_blkswap_swizzle_t<DGG>(lin);
     else if constexpr (TD == 82) return gflip_xk5_blkswap_swizzle_t<DGG>(lin);
@@ -1246,7 +1246,7 @@ int tile_swizzle_t(int lin) {
     else if constexpr (TD == 97) return gflip_bitrev_xor1_alt1_swizzle_t<DGG>(lin);
     else if constexpr (TD == 98) return gflip_bitrev_xor2_alt1_swizzle_t<DGG>(lin);
     else if constexpr (TD == 99) return gflip_mul3_xor4_alt1_swizzle_t<DGG>(lin);
-    /* END COORD_DESCEND dispatch */
+    // END COORD_DESCEND dispatch
     else return dgswizzle_t<DGG>(lin);
 }
 
