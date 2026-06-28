@@ -1029,6 +1029,15 @@ static_assert(MMA_PER_KI == 4, "K_ITER_ACCUM hardcodes 4 sub-MMAs per K-iter");
 } while(0)
 
 
+/*
+  FC2_W3_RESIDUAL_ADD_TIMING — isolates legacy fc2_w3's residual read (the 4×
+  uint4 LDS.128 from swizzled staging, warp 3) so its cyc/tile is directly
+  comparable to fc2_w3x/y's FC2_W3X_TIMING (phase 5, the ldmatrix gather).
+  Implies CLOCK_TIMING; reported as the w3_resadd row.
+*/
+#if defined(FC2_W3_RESIDUAL_ADD_TIMING) && !defined(CLOCK_TIMING)
+#define CLOCK_TIMING
+#endif
 #ifdef CLOCK_TIMING
 #define CT_MAX_TILES 80
 struct ClockData {
@@ -1042,6 +1051,7 @@ struct ClockData {
     int64_t w3_total;      /* W3 wall time */
     int64_t w3_ml_stall;   /* W3 mainloop_mbar wait */
     int64_t w3_epi;        /* W3 epilogue compute+store */
+    int64_t w3_resadd;     /* W3 residual read (4x uint4 LDS.128) — FC2_W3_RESIDUAL_ADD_TIMING */
     int tiles;
     int pad;
     int64_t w0_tile[CT_MAX_TILES];
@@ -1050,6 +1060,25 @@ struct ClockData {
 __device__ ClockData g_clock;
 
 #define CT_READ(var) asm volatile("mov.u64 %0, %%clock64;" : "=l"(var))
+#endif
+
+/* ── Clean total-cycle ticker ──
+   Independent of the per-tile CLOCK_TIMING profile above: each CTA reads
+   clock64 at entry/exit and atomicMaxes its full-kernel delta into a
+   per-CTA global. Host reduces max over CTAs. Clock-frequency-invariant —
+   immune to Modal's shared-HBM wall-ms jitter (see CLAUDE.md cycles-not-ms). */
+#ifdef CLOCK_TOTAL
+__device__ unsigned long long g_w3_cyc[SM_COUNT];
+#endif
+
+/* ── Bias register-preload (preload-load only, gather OFF) ──
+   Mirrors w3x's lane_bias[] load but keeps the per-tile broadcast-LDS
+   consumption (the full register gather is a known race on fc2_w3's
+   ReuseSmemC residual pipeline — see CLAUDE.md dead ends). lane L reg k
+   holds bf16x2 pair (k*32 + L); volatile LDS so ptxas keeps the loads.
+   Opt-in; OFF path is byte-identical. */
+#ifdef BIAS_PRELOAD
+#define BIAS_REG_COUNT (N_DIM / 64)
 #endif
 
 /* ════════════════════════════════════════════════════════════════
@@ -1268,9 +1297,26 @@ fc2_w3_kernel(
 #ifdef CLOCK_TIMING
     const bool _ct = (sm_id == 0);  /* cluster 0, CTA 0 */
     int64_t _ct_start = 0, _ct_t = 0;
-    int64_t _ct_a = 0, _ct_b = 0, _ct_c = 0;
+    int64_t _ct_a = 0, _ct_b = 0, _ct_c = 0, _ct_r = 0;
     int _ct_n = 0;
     if (_ct) CT_READ(_ct_start);
+#endif
+
+#ifdef CLOCK_TOTAL
+    long long _tot_s = 0;
+    if (lane == 0) asm volatile("mov.u64 %0, %%clock64;" : "=l"(_tot_s));
+#endif
+
+#ifdef BIAS_PRELOAD
+    uint32_t lane_bias[BIAS_REG_COUNT];
+    {
+        const uint32_t _bp_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
+        #pragma unroll
+        for (int k = 0; k < BIAS_REG_COUNT; k++) {
+            asm volatile("ld.volatile.shared.b32 %0, [%1];"
+                : "=r"(lane_bias[k]) : "r"(_bp_saddr + (k * 32 + lane) * 4));
+        }
+    }
 #endif
 
 #ifdef WARP_STAGGER
@@ -1982,10 +2028,16 @@ fc2_w3_kernel(
                             uint4 bv3 = *(const uint4*)(bp + 48);
 
                             /* C++ reads: residual from swizzled staging SMEM */
+#ifdef CLOCK_TIMING
+                            int64_t _ct_rs; if (_ct && warp == 3) CT_READ(_ct_rs);
+#endif
                             uint4 rv0 = *(const uint4*)(sptr + rsw0);
                             uint4 rv1 = *(const uint4*)(sptr + rsw1);
                             uint4 rv2 = *(const uint4*)(sptr + rsw2);
                             uint4 rv3 = *(const uint4*)(sptr + rsw3);
+#ifdef CLOCK_TIMING
+                            if (_ct && warp == 3) { int64_t _ct_re; CT_READ(_ct_re); _ct_r += _ct_re - _ct_rs; }
+#endif
 
                             TMEM_WAIT();
 
@@ -2023,6 +2075,9 @@ fc2_w3_kernel(
                         const uint4 rv2 = {0,0,0,0}, rv3 = {0,0,0,0};
 #else
                         uint4 rv0, rv1, rv2, rv3;
+#ifdef CLOCK_TIMING
+                        int64_t _ct_rs; if (_ct && warp == 3) CT_READ(_ct_rs);
+#endif
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(rv0.x),"=r"(rv0.y),"=r"(rv0.z),"=r"(rv0.w) : "r"(stage_base + rsw0));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -2031,6 +2086,9 @@ fc2_w3_kernel(
                             : "=r"(rv2.x),"=r"(rv2.y),"=r"(rv2.z),"=r"(rv2.w) : "r"(stage_base + rsw2));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(rv3.x),"=r"(rv3.y),"=r"(rv3.z),"=r"(rv3.w) : "r"(stage_base + rsw3));
+#ifdef CLOCK_TIMING
+                        if (_ct && warp == 3) { int64_t _ct_re; CT_READ(_ct_re); _ct_r += _ct_re - _ct_rs; }
+#endif
 #endif
 
 #ifdef CUTLASS_EPILOGUE
@@ -2782,6 +2840,14 @@ fc2_w3_kernel(
         }
     }
 
+#ifdef CLOCK_TOTAL
+    if (lane == 0) {
+        long long _tot_e;
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(_tot_e));
+        atomicMax(&g_w3_cyc[sm_id], (unsigned long long)(_tot_e - _tot_s));
+    }
+#endif
+
 #ifdef CLOCK_TIMING
     /* Write timing results from cluster 0 CTA 0 */
     if (_ct && lane == 0) {
@@ -2801,6 +2867,7 @@ fc2_w3_kernel(
             g_clock.w3_total = total;
             g_clock.w3_ml_stall = _ct_a;
             g_clock.w3_epi = _ct_b;
+            g_clock.w3_resadd = _ct_r;
         }
     }
 #endif
@@ -3177,6 +3244,12 @@ int main() {
 
     /* Timed: 10 iterations */
     printf("Timing: 10 iterations...\n");
+#ifdef CLOCK_TOTAL
+    {
+        unsigned long long h_zero[SM_COUNT] = {0};
+        CUDA_CHECK(cudaMemcpyToSymbol(g_w3_cyc, h_zero, sizeof(h_zero)));
+    }
+#endif
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0);
     cudaEventCreate(&t1);
@@ -3193,6 +3266,17 @@ int main() {
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9);
     cudaEventDestroy(t0);
     cudaEventDestroy(t1);
+
+#ifdef CLOCK_TOTAL
+    {
+        unsigned long long h_cyc[SM_COUNT];
+        CUDA_CHECK(cudaMemcpyFromSymbol(h_cyc, g_w3_cyc, sizeof(h_cyc)));
+        unsigned long long cmax = 0;
+        for (int i = 0; i < SM_COUNT; i++) if (h_cyc[i] > cmax) cmax = h_cyc[i];
+        printf("FC2-W3 clock64: %llu cyc  (max over %d CTAs, %d timed launches)\n",
+               cmax, SM_COUNT, 10);
+    }
+#endif
 
     /* Checksum run */
     LAUNCH_KERNEL();
@@ -3379,6 +3463,10 @@ int main() {
         row("  epilogue",         ct.w3_epi,       ct.w3_total);
         int64_t w3_other = ct.w3_total - ct.w3_ml_stall - ct.w3_epi;
         row("  other",            w3_other,        ct.w3_total);
+        row("  resid read (subset of epi)", ct.w3_resadd, ct.w3_total);
+        printf("@@RESADD_TIMING kernel=fc2_w3 cyc_per_tile=%.2f wall_pct=%.3f\n",
+               n > 0 ? (double)ct.w3_resadd / n : 0.0,
+               ct.w3_total > 0 ? 100.0 * (double)ct.w3_resadd / ct.w3_total : 0.0);
 
         /* Per-tile analysis */
         int ntile = n < CT_MAX_TILES ? n : CT_MAX_TILES;
