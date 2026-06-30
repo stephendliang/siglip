@@ -27,6 +27,20 @@ siglip_x32
 siglip_x64
 cutlass-256x256x64
 
+# w3/w3x kernel + bench binaries (dash-named at root; sources use underscores,
+# so these never shadow a .cu/.cuh). Root-anchored to stay clear of subdirs.
+/fc1-*
+/fc2-*
+/cublaslt-*
+/cublas-bench-*
+/calib-*
+/tma-bench
+/tma-swizzle-probe*
+/mma-bench
+/stmatrix-bench
+/relay-mbar
+/warp-scaling
+
 # Build intermediates (nvcc keep files, dlink, etc.)
 *.o
 *.cubin
