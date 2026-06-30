@@ -288,6 +288,14 @@ fc1-w3x-r-sweep: fc1-w3x-r120 fc1-w3x-r136 fc1-w3x-r152 fc1-w3x-r160 fc1-w3x-r16
 fc2-w3: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
 
+# Single-binary swizzle basin sweep (ported gflip basin + dgsw/zigzag/stride
+# baselines). Run: ./fc2-w3-swizzle-sweep SWEEP=front REPS=200  (or env vars).
+# Reports frequency-invariant cyc via CLOCK_TOTAL — fc2_w3's HBM-noise-immune
+# metric. Drive with tools/sweep_fc2_w3_swizzle.sh, or:
+# modal run dummy_modal.py --target fc2-w3-swizzle-sweep --run-args "SWEEP=front REPS=200"
+fc2-w3-swizzle-sweep: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DCOMBO_QUICK $< -o $@ $(LDFLAGS)
+
 fc2-w3-strip: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $< -o $@ $(LDFLAGS)
 

@@ -10,7 +10,11 @@
 
 #pragma once
 
-#if TILE_DISPATCH >= 8
+/* Legacy macro-selected swizzle for fc1_w3 / fc2_w3 TD=8..32. The gflip basin
+   (TD=33..99) lives only in the templated static_swizzle_t below, so this
+   ladder is bounded to <=32; an out-of-range TD (e.g. the new fc2_w3 default
+   TD=54) skips it entirely and dispatches through static_swizzle_t instead. */
+#if TILE_DISPATCH >= 8 && TILE_DISPATCH <= 32
 
 #ifndef DG_GROUP_SIZE
 #define DG_GROUP_SIZE 8
@@ -745,4 +749,218 @@ static __device__ __forceinline__ int static_swizzle(int block_idx) {
 #endif
 }
 
-#endif /* TILE_DISPATCH >= 8 */
+#endif /* TILE_DISPATCH 8..32 */
+
+/*
+   Templated tile swizzle for the single-binary basin sweep (COMBO_QUICK).
+
+   Always compiled (independent of the TILE_DISPATCH macro), only instantiated
+   for the (TD, DGG) pairs the templated fc2_w3_kernel actually references.
+   Bodies for TD=8/11/13/19 are copied verbatim from the legacy static_swizzle
+   ladder above (DG_GROUP_SIZE -> DGG); for DGG==DG_GROUP_SIZE the expressions
+   are identical, so static_swizzle_t<8,8> compiles byte-identical SASS to the
+   production static_swizzle at TILE_DISPATCH=8.  The gflip basin (TD=33..58)
+   is ported from swizzle_w3x.cuh's tile_swizzle_t — pure (TILES_M, TILES_N,
+   DGG) index math, transparent to the fused residual path (residual is keyed
+   on the output (tm,tn), so any bijective remap stays correct).
+*/
+template<int TD, int DGG>
+static __device__ __forceinline__ int static_swizzle_t(int block_idx) {
+    if constexpr (TD == 8) {
+        const int group_tiles = TILES_N * DGG;
+        const int group_idx = block_idx / group_tiles;
+        const int first_m = group_idx * DGG;
+        const int in_group = block_idx % group_tiles;
+        if (first_m + DGG <= TILES_M) {
+            return (first_m + in_group % DGG) * TILES_N
+                 + in_group / DGG;
+        }
+        const int tail = TILES_M - first_m;
+        return (first_m + in_group % tail) * TILES_N + in_group / tail;
+
+    } else if constexpr (TD == 11) {
+        int tm = block_idx / TILES_N;
+        int tn = block_idx % TILES_N;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        if (tm & 1) tn = TILES_N - 1 - tn;
+        return tm * TILES_N + tn;
+
+    } else if constexpr (TD == 13) {
+        int tm = block_idx / TILES_N;
+        int tn = block_idx % TILES_N;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + tn;
+
+    } else if constexpr (TD == 19) {
+        const int group_tiles = TILES_N * DGG;
+        const int group_idx = block_idx / group_tiles;
+        const int first_m = group_idx * DGG;
+        const int in_group = block_idx - group_idx * group_tiles;
+        const int num_in_group = min(DGG, TILES_M - first_m);
+        const int local_m = in_group % num_in_group;
+        int local_n = in_group / num_in_group;
+        if (local_m & 1) local_n = TILES_N - 1 - local_n;
+        int tm = first_m + local_m;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + local_n;
+
+    } else if constexpr (TD == 33) {
+        const int group_tiles = TILES_N * DGG;
+        const int num_groups  = (TILES_M + DGG - 1) / DGG;
+        int group_idx         = block_idx / group_tiles;
+        const int in_group    = block_idx - group_idx * group_tiles;
+        const int paired      = group_idx ^ 1;
+        if (paired < num_groups) group_idx = paired;
+        const int first_m  = group_idx * DGG;
+        const int nig      = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+        const int tm_local = in_group - (in_group / nig) * nig;
+        const int tn       = in_group / nig;
+        int tm = first_m + tm_local;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + tn;
+
+    } else if constexpr (TD == 39) {
+        const int group_tiles = TILES_N * DGG;
+        const int group_idx   = block_idx / group_tiles;
+        const int first_m     = group_idx * DGG;
+        const int in_group    = block_idx - group_idx * group_tiles;
+        const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+        const int lm_raw      = in_group - (in_group / nig) * nig;
+        const int ln          = in_group / nig;
+        int lm = lm_raw;
+        if (nig == 8) {
+            lm = ((lm_raw & 1) << 2) | (lm_raw & 2) | ((lm_raw >> 2) & 1);
+        }
+        const int tn = ln;
+        int tm = first_m + lm;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + tn;
+
+    } else if constexpr (TD == 44) {
+        const int group_tiles = TILES_N * DGG;
+        const int group_idx   = block_idx / group_tiles;
+        const int first_m     = group_idx * DGG;
+        const int in_group    = block_idx - group_idx * group_tiles;
+        const int nig         = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+        const int lm          = in_group - (in_group / nig) * nig;
+        const int ln          = in_group / nig;
+        int tn = (lm & 1) ? (ln + 2) : ln;
+        if (tn >= TILES_N) tn -= TILES_N;
+        int tm = first_m + lm;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + tn;
+
+    } else if constexpr (TD == 52) {
+        const int group_tiles = TILES_N * DGG;
+        const int num_groups  = (TILES_M + DGG - 1) / DGG;
+        int group_idx         = block_idx / group_tiles;
+        const int in_group    = block_idx - group_idx * group_tiles;
+        const int paired      = group_idx ^ 1;
+        if (paired < num_groups) group_idx = paired;
+        const int first_m = group_idx * DGG;
+        const int nig     = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+        const int lm_raw  = in_group - (in_group / nig) * nig;
+        const int ln      = in_group / nig;
+        int lm = lm_raw;
+        if (nig == 8) {
+            lm = ((lm_raw & 1) << 2) | (lm_raw & 2) | ((lm_raw >> 2) & 1);
+        }
+        int tm = first_m + lm;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + ln;
+
+    } else if constexpr (TD == 53) {
+        const int group_tiles = TILES_N * DGG;
+        const int num_groups  = (TILES_M + DGG - 1) / DGG;
+        int group_idx         = block_idx / group_tiles;
+        const int in_group    = block_idx - group_idx * group_tiles;
+        const int paired      = group_idx ^ 1;
+        if (paired < num_groups) group_idx = paired;
+        const int first_m = group_idx * DGG;
+        const int nig     = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+        const int lm      = in_group - (in_group / nig) * nig;
+        const int ln      = in_group / nig;
+        int tn = ln;
+        if (nig == DGG && ln < TILES_N && (lm & 1)) {
+            tn = ln + 2;
+            if (tn >= TILES_N) tn -= TILES_N;
+        }
+        int tm = first_m + lm;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + tn;
+
+    } else if constexpr (TD == 54) {
+        const int group_tiles = TILES_N * DGG;
+        const int num_groups  = (TILES_M + DGG - 1) / DGG;
+        int group_idx         = block_idx / group_tiles;
+        const int in_group    = block_idx - group_idx * group_tiles;
+        const int paired      = group_idx ^ 1;
+        if (paired < num_groups) group_idx = paired;
+        const int first_m = group_idx * DGG;
+        const int nig     = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+        const int lm_raw  = in_group - (in_group / nig) * nig;
+        const int ln      = in_group / nig;
+        int lm = lm_raw;
+        if (nig == 8 && (group_idx & 1)) lm = lm_raw ^ 4;
+        int tm = first_m + lm;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + ln;
+
+    } else if constexpr (TD == 56) {
+        const int group_tiles = TILES_N * DGG;
+        const int num_groups  = (TILES_M + DGG - 1) / DGG;
+        int group_idx         = block_idx / group_tiles;
+        const int in_group    = block_idx - group_idx * group_tiles;
+        const int paired      = group_idx ^ 1;
+        if (paired < num_groups) group_idx = paired;
+        const int first_m = group_idx * DGG;
+        const int nig     = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+        const int lm_raw  = in_group - (in_group / nig) * nig;
+        const int ln      = in_group / nig;
+        int lm = lm_raw;
+        if (nig == 8) {
+            lm = ((lm_raw & 1) << 2) | (lm_raw & 2) | ((lm_raw >> 2) & 1);
+            if (group_idx & 1) lm ^= 4;
+        }
+        int tm = first_m + lm;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + ln;
+
+    } else if constexpr (TD == 57) {
+        const int group_tiles = TILES_N * DGG;
+        const int num_groups  = (TILES_M + DGG - 1) / DGG;
+        int group_idx         = block_idx / group_tiles;
+        const int in_group    = block_idx - group_idx * group_tiles;
+        const int paired      = group_idx ^ 1;
+        if (paired < num_groups) group_idx = paired;
+        const int first_m = group_idx * DGG;
+        const int nig     = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+        const int lm_raw  = in_group - (in_group / nig) * nig;
+        const int ln      = in_group / nig;
+        int lm = lm_raw;
+        if (nig == 8 && (group_idx & 1)) lm = (lm_raw * 3) & 7;
+        int tm = first_m + lm;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + ln;
+
+    } else if constexpr (TD == 58) {
+        const int group_tiles = TILES_N * DGG;
+        const int num_groups  = (TILES_M + DGG - 1) / DGG;
+        int group_idx         = block_idx / group_tiles;
+        const int in_group    = block_idx - group_idx * group_tiles;
+        const int paired      = group_idx ^ 1;
+        if (paired < num_groups) group_idx = paired;
+        const int first_m = group_idx * DGG;
+        const int nig     = (first_m + DGG <= TILES_M) ? DGG : TILES_M - first_m;
+        const int lm_raw  = in_group - (in_group / nig) * nig;
+        const int ln      = in_group / nig;
+        int lm = lm_raw;
+        if (nig == 8 && (group_idx & 3) == 1) lm = lm_raw ^ 4;
+        int tm = first_m + lm;
+        if (tm >= TILES_M) tm = TILES_M - 1;
+        return tm * TILES_N + ln;
+
+    } else {
+        return block_idx;
+    }
+}

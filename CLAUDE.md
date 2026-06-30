@@ -11,7 +11,7 @@ on CPU VPS, runs B200 (148 SMs, 74 clusters). PE kernel done — see
 |---|---|---|---|---|
 | FC2 K=3072 BIAS_ONLY (strip floor) | 0.98502 | `fc2_w3x` `-DSTRIP_EPILOGUE` | n/a | NS=6+PREFILL structural floor (1814685 cyc) |
 | **FC2 K=3072 BIAS_ONLY (full)** | **1.00092** | `fc2_w3x` (bias-preload, STSM-only) | basin floor (default `gflip_blkswap` TD=54) | **−27 µs** vs 1.028 PerTensor / **−116 µs** vs 1.117 MXFP8; +16 µs exposed epi vs strip |
-| FC2 K=3072 fused (+residual) | 1.063 | `fc2_w3` | dgswizzle TD=8 PACKED | (no apples-to-apples ref) |
+| FC2 K=3072 fused (+residual) | ~1.060 | `fc2_w3` | **gflip_blkswap TD=54** PACKED (now default) | (no apples-to-apples ref) |
 | FC1 K=768 fused (+GELU+bias) | 1.998 | `fc1_w3` | zigzag TD=11 + K_STAGGER=1 | **−416 µs** vs 2.414 PerTensor / **+47 µs** vs 1.951 MXFP8 |
 
 `fc2_w3x` = clean-sheet 6-warp persistent bias-only, beats per-tensor and
@@ -51,7 +51,7 @@ mirrors cublas-bench-fc1/fc2 and reproduces the rank-1 references above.
 |---|---|---|
 | N_STAGES | auto: `min(NS_BY_N, max(2, K_ITERS−3))`; NS_BY_N = 6/5/4/3 for N≤1536/2048/4096/larger | SMEM ceiling (228 KB; 32 KB A+B FP8/stage; NS7 too big). Pipeline-fill margin gap≥3 (gap=2 FAILs at K=1024 NS=6). |
 | PREFILL | auto: K_ITERS≥20 → on, else NO_PREFILL | Short K-loop deadlocks (parity wrap). NO_PREFILL caps eff ~0.77; PREFILL ~0.91. fc2_w3 auto-guards via `#if K_DIM/128 < 20`; fc2_w3x kernel-side macro guard (3d6c1cb). |
-| Dispatch | FC2 fused: zigzag (TD=11) or dgswizzle (TD=8). FC2 bias-only: any `gflip_*` basin-floor — `gflip_blkswap` (TD=54) default. FC1: zigzag + K_STAGGER=1. | PACKED_TILES + odd ks helps FC1; FC2 wash on ks. |
+| Dispatch | FC2 fused: `gflip_blkswap` (TD=54) **default** (−6018 cyc/−3.4 µs vs dgsw TD=8, STRONG d=−1.33 — basin transfers from bias-only; `make fc2-w3` now builds TD=54). FC2 bias-only: any `gflip_*` basin-floor — `gflip_blkswap` (TD=54) default. FC1: zigzag + K_STAGGER=1. | PACKED_TILES + odd ks helps FC1; FC2 wash on ks. |
 
 PREFILL overlaps prev tile's epi drain with first 6 K-iters of next tile's MMA;
 W1 skips epilogue_mbar check for first 6 iters. 6-stage pipeline = 227 KB / 228 KB SMEM.
@@ -72,6 +72,22 @@ W1 skips epilogue_mbar check for first 6 iters. 6-stage pipeline = 227 KB / 228 
 Static swizzles > work-stealing (~30 µs). Strip ~0.988 ms.
 `fused = strip + (g-s) + (f-g)`. g-s: store contention, cluster-wavefront N-column
 diversity. f-g: epi/next-tile-mainloop overlap, K_ITERS-limited.
+
+**gflip basin sweep on fused fc2_w3 (2026-06-30, cyc, n=134 trimmed passes, η²=0.99).**
+fc2_w3 is now templated `<TD,DGG>` like fc2_w3x; the whole gflip basin compiles
+into one `-DCOMBO_QUICK` binary (`make fc2-w3-swizzle-sweep`, cyc via CLOCK_TOTAL).
+**The bias-only basin floor transfers: `gflip_blkswap` (TD=54) wins the fused path
+too — −6018 cyc (−3.4 µs/−0.32%) vs dgsw TD=8, STRONG (d=−1.33, 34% win).** Top
+tier blkswap/dgsnake/snrot2/gflip_snrot/gflip all STRONG faster than dgsw (−4.2 to
+−6.0k cyc). **But the lmrev family DECISIVELY *hurts* fused (+12 to +14k cyc) —
+opposite of bias-only, where lmrev tied for first; the residual consumer is
+m-axis-traversal sensitive in a way bias-only isn't.** `stride` (old TD=0 default)
+is +156k cyc (+8.4%) — never ship it; TD=54 is now the `make fc2-w3` default.
+**Caveat:** fc2_w3 has pre-existing run-to-run output nondeterminism (~0.04%,
+sparse — `dgsw` vs `dgsw` checksums differ; 32-spot analytic check still errors=0);
+kernel SASS byte-identical to pre-template HEAD, so not from the refactor. Doesn't
+affect cyc (same work issued). Sweep: `tools/sweep_fc2_w3_swizzle.sh` /
+`modal run dummy_modal.py --target fc2-w3-swizzle-sweep --run-args "SWEEP=front REPS=200"`.
 
 ## FC1 fused status (PACKED_TILES, M=928256, K=768, N=3072)
 
@@ -630,7 +646,8 @@ make fc2-w3x DFLAGS='-DPROFILE_CYCLES'      # |-DPROFILE_KI|-DPROFILE_TILE|-DPRO
 make fc1-w3x && ./fc1-w3x                   # FC1 GELU+BIAS (clean-sheet, target ~2.025 ms ± basin)
 make fc1-w3x-tile-sweep                     # TILE_DISPATCH variants for FC1
 make fc1-w3x-ks-sweep                       # K_STAGGER sweep (default ks=1)
-make fc2-w3 && ./fc2-w3                     # fused 1.063 (dgswizzle TD=8)
+make fc2-w3 && ./fc2-w3                     # fused ~1.060 (gflip_blkswap TD=54 default)
+make fc2-w3-swizzle-sweep && ./fc2-w3-swizzle-sweep SWEEP=front REPS=200  # basin sweep (cyc)
 make fc1-w3 && ./fc1-w3                     # FC1 legacy 1.998 (zigzag+ks=1) — fc1_w3x supersedes for non-residual
 
 make -B fc2-w3 DFLAGS='-DM_TOTAL=464128 -DN_DIM=1024 -DK_DIM=2048'  # custom dims need -B
