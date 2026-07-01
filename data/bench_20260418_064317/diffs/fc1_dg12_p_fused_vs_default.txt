@@ -1,7 +1,0 @@
-Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
------------------------------------------------------------------------------------------------------------------------------
-smsp__warps_issue_stalled_mio_throttle.avg                             |         433.6 |       1,956.3 |    351.2% | warp
-dram__sectors_read.sum                                                 |    77,578,608 |    44,609,384 |    -42.5% | sector
-smsp__warps_issue_stalled_math_pipe_throttle.avg                       |      39,129.6 |      29,602.3 |    -24.3% | warp
-smsp__warps_issue_stalled_wait.avg                                     |     1,126,193 |     1,201,798 |      6.7% | warp
-smsp__warps_issue_stalled_not_selected.avg                             |     124,124.5 |     130,424.3 |      5.1% | warp

@@ -1,6 +1,0 @@
-nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DBENCH_N=768 -DBENCH_K=3072 -DBENCH_EPILOGUE=3 -Ithird_party/cutlass/include -Ithird_party/cutlass/tools/util/include -std=c++17 --expt-relaxed-constexpr bench/cutlass_bench.cu -o cutlass-bench-fc2 -lcurand_static -lculibos -lcuda
-bench/cutlass_bench.cu:24:10: fatal error: cutlass/cutlass.h: No such file or directory
-   24 | #include "cutlass/cutlass.h"
-      |          ^~~~~~~~~~~~~~~~~~~
-compilation terminated.
-make: *** [Makefile:41: cutlass-bench-fc2] Error 1

@@ -1,7 +1,0 @@
-Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
------------------------------------------------------------------------------------------------------------------------------
-dram__sectors_read.sum                                                 |   144,592,520 |   109,376,288 |    -24.4% | sector
-smsp__warps_issue_stalled_short_scoreboard.avg                         |      26,196.1 |      30,678.1 |     17.1% | warp
-smsp__warps_issue_stalled_math_pipe_throttle.avg                       |       2,519.0 |       2,328.0 |     -7.6% | warp
-smsp__warps_issue_stalled_sleeping.avg                                 |      21,996.3 |      20,423.6 |     -7.1% | warp
-smsp__inst_executed.sum                                                |    70,747,322 |    74,367,261 |      5.1% | inst

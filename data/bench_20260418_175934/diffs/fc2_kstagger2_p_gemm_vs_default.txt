@@ -1,3 +1,0 @@
-Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
------------------------------------------------------------------------------------------------------------------------------
-launch__registers_per_thread                                           |         163.0 |         186.0 |     14.1% | register/thread

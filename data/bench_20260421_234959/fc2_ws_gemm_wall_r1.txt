@@ -1,9 +1,0 @@
-FC2 WS kernel — mimics rank-1 (256 thr, 8 warps, flat regs)
-  [928256,3072] x [768,3072]^T  NS=6  SMEM=231168 B  (cap 228KB)
-  Alloc + init + pack done
-  TMA descriptors + func attr done (SMEM=231168 B)
-Warmup (2 iters)...
-Timing 10 iters...
-FC2-WS kernel: 1.436 ms  3050.29 TFLOPS
-PASS  errors=0/32
-@@RESULT ms=1.4359 tflops=3050.29 checksum=0.000000 valid=1 c0=4608.0

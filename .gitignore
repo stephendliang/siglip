@@ -46,10 +46,7 @@ cutlass-256x256x64
 *.cubin
 *.fatbin
 *.fatbin.c
-# hand-authored PTX source is a deliverable, not a build artifact
-!fc2_w3x.ptx
 *.ptx
-!fc2_w3x.ptx
 *.ii
 *.module_id
 *.reg.c
@@ -62,8 +59,17 @@ cutlass-256x256x64
 *.so
 *.so.*
 
-# SASS dumps (large, regenerable)
+# SASS dumps (large, regenerable) — sass/ holds all disassembly incl. root_dumps/;
+# /sass*.txt catches any freshly re-dumped root file before it's moved in.
 sass/
+/sass*.txt
+
+# Benchmark artifacts — derived, reproducible on the B200, never hand-edited.
+# Kept off disk entirely (modal-first); conclusions live in CLAUDE.md / memory/*.md.
+/data/
+
+# SASS epilogue templates — regenerable via `tools/template_emitter.py --variant both`.
+/templates/
 
 # Test/scratch
 tests.txt

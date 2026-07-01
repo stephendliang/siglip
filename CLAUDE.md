@@ -2,8 +2,7 @@
 
 Hand-tuned SM100a persistent GEMM for FC1/FC2 of `google/siglip2-base-patch16-224`.
 FP8 (E4M3) → BF16, tcgen05 MMA, TMA, `cta_group::2`, 2-CTA clusters. Cross-compiled
-on CPU VPS, runs B200 (148 SMs, 74 clusters). PE kernel done — see
-`CLAUDE.md.mothballed`.
+on CPU VPS, runs B200 (148 SMs, 74 clusters). PE (patch-embed) kernel done.
 
 ## Current best (B200, 2026-05-06)
 
@@ -205,7 +204,7 @@ is real headroom.
 
 **Realistic recoverable: ~1-3 µs.**
 
-Per-SASS stall hotspots (`docs/fc2_w3x_ncu_sass.txt`): mbar spin-wait dominates
+Per-SASS stall hotspots (regen `tools/ncu_fc2_w3x.sh`): mbar spin-wait dominates
 at 5.0M samples, 7× next category (epi compute body ~696K each); TMA store
 scaffolding ~174K each. TC pipe 98.49% → strip IS the MMA-staging structural
 floor. **Final-tile drain FALSE** (per-tt PROFILE_W5: tt=146 = 11872 cyc
@@ -582,8 +581,8 @@ Full chronological log + per-item memory files: `memory/MEMORY.md`. Headlines:
 - **Cross-warp STS clustering (intra-warp)** — SELF_LOAD/STAGGER, SASS reorder
   zero effect (wrong axis). *Inter-cluster* arrival into STS/TMA-store IS
   ordering-controlled (g-s).
-- **Hand-written PTX `fc2_w3x.ptx`** — byte-identical SASS. PTX has no UR type;
-  ptxas owns R-vs-UR. Frozen at `fc2-w3x-ptx`.
+- **Hand-written PTX** (tried, artifact removed) — byte-identical SASS, no perf
+  delta. PTX has no UR type; ptxas owns R-vs-UR, so PTX source form can't steer it.
 - **K_UNROLL** — u1/u2/u3/u4/u8 regress 87–197 µs (UR datapath collapses on
   non-N_STAGES-multiples). u6/u12/u24 tie default; `K_UNROLL=24` shrinks SASS
   39% — free cleanup. `memory/project_k_unroll_sweep.md`.
@@ -654,7 +653,6 @@ Full chronological log + per-item memory files: `memory/MEMORY.md`. Headlines:
 ```bash
 make fc2-w3x && ./fc2-w3x                   # ~1.001 ms (BEST, beats cuBLASLt fused rank-1 PerTensor 1.028 / MXFP8 1.117)
 make fc2-w3x-strip && ./fc2-w3x-strip       # NS=6+PREFILL floor (~0.985 ms)
-make fc2-w3x-ptx                            # hand-written PTX, byte-identical SASS
 
 make fc2-w3x-tile-sweep                     # TILE_DISPATCH variants
 ./tools/sweep_fc2_w3x_swizzle.sh            # SWEEP=front for top tier
@@ -725,7 +723,6 @@ pre-1.0 `modal.Mount` / `mounts=` API does NOT work; use image-folded
 ```
 fc2_w3x.cu         FC2 bias-only (ACTIVE — beats cuBLASLt fused PerTensor & MXFP8 rank-1)
 fc1_w3x.cu         FC1 GELU+BIAS (ACTIVE — clean-sheet port of fc2_w3x architecture)
-fc2_w3x.ptx        Hand-written PTX, byte-identical SASS (frozen)
 fc2_w3.cu          FC2 fused-residual (legacy, retained for residual path)
 fc1_w3.cu          FC1 (legacy; superseded by fc1_w3x for non-residual)
 swizzle_w3x.cuh    Shared 48 swizzle templates (TD=11..99) for fc1_w3x/fc2_w3x
@@ -734,10 +731,7 @@ gen/bias_switch_inc_<N>.cuh  Build-time codegen — see tools/gen_bias_switch.py
 tile_dispatch.cuh  Legacy TD=8..58 used by fc1_w3 / fc2_w3 (NOT w3x family)
 fc2_cutlass.cu     CUTLASS reference
 kernel_common.cuh, kernel_body.cuh  Legacy w3 infra (NOT used by w3x family)
-docs/STSM_STATUS.md, PURE_PTX_REWRITE_STRATEGY.md, BENCHMARKING.md
-docs/fc2_w3x_ncu_sass.txt    ncu --set full per-SASS stalls (mbar 7×)
-docs/fc2_w3x_ncu_details.txt 98.5% TC pipe (ignore STSM bank-conflict warns)
-rank1.sass         Dumped cuBLASLt FP8 BIAS_ONLY kernel (real algoId=66 tile=128x256; SASS opcodes apply, but its 1.046 ms timing was on transposed [M,N] geometry — see "cuBLASLt reference" for correct [N,M] numbers)
+sass/root_dumps/rank1.sass  Dumped cuBLASLt FP8 BIAS_ONLY kernel (real algoId=66 tile=128x256; SASS opcodes apply, but its 1.046 ms timing was on transposed [M,N] geometry — see "cuBLASLt reference" for correct [N,M] numbers)
 bench/fc_problem.cuh       Shared cuBLASLt FP8 problem definition (BF16 bias [N,M]) — single source of truth for cublas_bench + cublaslt_introspect
 tools/bench.sh, probe_cublaslt.sh, dim_sweep.sh, dim_sweep_w3x.py, dim_sweep_fc1.py
 tools/gen_bias_switch.py   Codegen for bias-load switch chain (avoids local-mem spill)
@@ -775,16 +769,23 @@ data/                      Benchmark + ncu results
 
 ## Benchmarking
 
-`docs/BENCHMARKING.md`. TL;DR:
-
 - **Cycles, not ms.** `clock64()` per-CTA, `max_over_CTAs / N_TIMED`. Clock-freq
-  invariant — required on vast.ai (no locked clocks).
+  invariant — required on vast.ai (no locked clocks). Wall ms lies: B200 boost→base
+  is ~8%, thermal ramp 1–10% over ~30 s, cold-L2 inflates the first launches.
 - **Pass-major** (randomized block): outer pass p, inner variant v.
-  `@@SAMPLE pass=p variant=v cyc=Y` per launch.
+  `@@SAMPLE pass=p variant=v cyc=Y` per launch — within-pass contrast cancels drift.
+  Never batch ("100 of A then 100 of B").
 - **Trim** first 33–50% of passes (cold L2 + thermal ramp).
-- **Paired analysis** by pass; report **AUC**, **Cohen's d**, **η²**, **mean
-  rank**, **win%**. **No p-values** at large n.
-- `tools/anova_1way.py --metric cyc --paired rep --trim 0.33` is canonical.
+- **Paired analysis** by pass (residual = sample − per-pass mean); report **AUC**,
+  **Cohen's d**, **η²**, **mean rank**, **win%**. **No p-values** at large n (t∝√n
+  → everything "significant"; ask "large enough to care," not "any effect").
+- **Verdict bands:** AUC (folded [0.5,1]) <0.55 TIE · <0.65 WEAK · <0.75 MOD ·
+  <0.85 STRONG · ≥0.85 DECISIVE. η² <0.01 negligible · <0.06 small · <0.14 medium ·
+  ≥0.14 large. |d| <0.2 trivial · <0.5 small · <0.8 medium · ≥0.8 large. Kendall
+  |τ| ≥0.7 strong · ≥0.5 moderate · <0.3 weak (cross-metric rank agreement — low
+  cyc-vs-ms τ on one run ⇒ the ms is clock-noise, not signal).
+- `tools/anova_1way.py --metric cyc --paired rep --trim 0.33` is canonical (emits
+  per-cell + residual stats, ANOVA η², mean-rank/win%, pairwise d+AUC vs fastest).
 - **n thresholds (σ_residual ~1400 cyc):** n<5000 unreliable for sub-σ effects
   (Stage 1 lmrev DECISIVE n=2048 → Stage 2 mid-pack n=29420). MOD-band ~600 cyc:
   n≥10978; TIE-band ~150 cyc: n≥43910 — within-basin may be sub-resolution.
@@ -797,6 +798,15 @@ decorated block comments. Bare `/*`, undecorated lines, `*/`.
 
 Don't narrate tool calls; don't echo file contents; parallelize independent
 tool calls; offset/limit for large files.
+
+**Token terseness** (kernel/profiler dumps blow the budget — `fc2_w3.cu` alone is
+~56 K tokens): locate with grep/Explore then `Read` offset/limit, never whole;
+`nvcc -E` to collapse `#ifdef` before reading (also the SASS-identity gate);
+`cuobjdump -symbols` first, full `-sass` to disk (`sass/`, gitignored) never into
+context; ncu with `--metrics … --csv`, never `--set full` into context; `git
+show`/`log -p` over re-reading; delegate multi-file fan-out to the Explore agent.
+Local bench output is ~3 lines — `tail` it; **but never `tail`/`grep` a Modal
+stream** (block-buffering eats `@@RESULT`) — redirect FULL output to a log, Read that.
 
 **w3x shared-header structure (2026-05-07):** fc1_w3x.cu and fc2_w3x.cu share
 three pieces of infrastructure — edit once, both kernels rebuild:

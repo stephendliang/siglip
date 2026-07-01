@@ -1,5 +1,0 @@
-LABEL                           MS TFLOPS  REGS  DFLAGS
-------------------------- -------- ------ -----  ------
-wlimit_1                     1.280 3421.73   186  -DEPI_WARP_LIMIT=1 INVALID
-wlimit_2                     1.396 3137.70   186  -DEPI_WARP_LIMIT=2 INVALID
-wlimit_3                     1.517 2886.77   186  -DEPI_WARP_LIMIT=3 INVALID

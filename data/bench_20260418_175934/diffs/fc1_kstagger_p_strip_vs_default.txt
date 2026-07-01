@@ -1,9 +1,0 @@
-Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
------------------------------------------------------------------------------------------------------------------------------
-smsp__warps_issue_stalled_short_scoreboard.avg                         |         526.5 |         970.2 |     84.3% | warp
-smsp__warps_issue_stalled_math_pipe_throttle.avg                       |         188.5 |         260.0 |     38.0% | warp
-dram__bytes_read.sum                                                   |         898.7 |         823.7 |     -8.3% | Mbyte
-dram__sectors_read.sum                                                 |    28,083,664 |    25,740,712 |     -8.3% | sector
-dram__sectors_write.sum                                                |     102,072.0 |     109,680.0 |      7.5% | sector
-lts__t_sectors_op_read.sum                                             |   524,407,493 |   552,162,582 |      5.3% | sector
-lts__t_sectors.sum                                                     |   526,644,545 |   554,364,355 |      5.3% | sector

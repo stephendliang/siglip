@@ -1,7 +1,0 @@
-nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static  fc2_ws.cu -o fc2-ws -lcurand_static -lculibos -lcuda
-ptxas info    : 0 bytes gmem
-ptxas info    : Compiling entry function '_Z13fc2_ws_kernel14CUtensorMap_stS_S_S_PK13__nv_bfloat16PS0_S2_' for 'sm_100a'
-ptxas info    : Function properties for _Z13fc2_ws_kernel14CUtensorMap_stS_S_S_PK13__nv_bfloat16PS0_S2_
-    40 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 72 registers, used 1 barriers, 40 bytes cumulative stack size
-ptxas info    : Compile time = 238.833 ms

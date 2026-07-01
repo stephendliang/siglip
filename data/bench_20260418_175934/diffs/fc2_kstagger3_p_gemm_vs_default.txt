@@ -1,4 +1,0 @@
-Metric                                                                 | Baseline        | Experiment      | Rel Diff   | Unit
------------------------------------------------------------------------------------------------------------------------------
-launch__registers_per_thread                                           |         163.0 |         187.0 |     14.7% | register/thread
-dram__sectors_read.sum                                                 |   144,592,520 |   153,540,160 |      6.2% | sector
