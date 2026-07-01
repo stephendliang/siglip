@@ -83,10 +83,18 @@ tier blkswap/dgsnake/snrot2/gflip_snrot/gflip all STRONG faster than dgsw (−4.
 opposite of bias-only, where lmrev tied for first; the residual consumer is
 m-axis-traversal sensitive in a way bias-only isn't.** `stride` (old TD=0 default)
 is +156k cyc (+8.4%) — never ship it; TD=54 is now the `make fc2-w3` default.
-**Caveat:** fc2_w3 has pre-existing run-to-run output nondeterminism (~0.04%,
-sparse — `dgsw` vs `dgsw` checksums differ; 32-spot analytic check still errors=0);
-kernel SASS byte-identical to pre-template HEAD, so not from the refactor. Doesn't
-affect cyc (same work issued). Sweep: `tools/sweep_fc2_w3_swizzle.sh` /
+**Caveat:** fc2_w3 has a **confirmed sparse output RACE** (~0.04%, the
+run-to-run nondeterminism). Root cause PROVEN 2026-06-30 (Modal B200,
+barrier-knockout + depth battery, 20×/cfg) = **epilogue-staging recycle DEPTH**
+(`NUM_EPI_STAGES`), NOT the MMA/TMEM handshake and NOT the store barriers:
+BIAS_ONLY ES1→ES2 fixes both the race AND the deterministic +64 (20/20 valid, 1
+checksum); removing wait_group/bar.sync/proxy-fence does NOT worsen FULL.
+Production FULL already runs ES2 so the severe ES1 collision doesn't apply; its
+remaining 1/20 spot collapse (e.g. 290080,470 → 780) is the W2-residual-ring ↔
+consumed_mbar handshake, still marginal at depth 2. Deeper ring needs NS6→5
+(= resadd-port path, +71 µs). Kernel SASS byte-identical to pre-template HEAD →
+not the swizzle refactor; doesn't affect cyc so the basin sweep stands. Full
+analysis: `memory/project-fc2-w3-epilogue-race.md`. Sweep: `tools/sweep_fc2_w3_swizzle.sh` /
 `modal run dummy_modal.py --target fc2-w3-swizzle-sweep --run-args "SWEEP=front REPS=200"`.
 
 ## FC1 fused status (PACKED_TILES, M=928256, K=768, N=3072)
@@ -535,8 +543,21 @@ Histories: `memory/project_w3x_bias_preload_win.md`, `project_w3x_packed_c_abi.m
 **Realistic remaining headroom ~1-3 µs** — largest single target by past-win
 standards (bias-preload 1.7 µs, STSM 0.4 µs); probably needs new lever class.
 
-**Next:** open. The fused-residual port (`fc2_w3y`) is a DEAD END — see Dead
-ends below. Residual's home stays `fc2_w3` (NS=6, 1.063 ms).
+**OPEN GOAL (2026-06-30): a 100%-valid residual-carrying NS=6 kernel.**
+fc2_w3's fused residual path at NS=6/ES2 is NOT race-free — ~0.04% sparse output
+corruption (~1/20 spot-check fail), root-caused to the epilogue-staging recycle
+(W2-residual-ring ↔ `consumed_mbar` handshake, marginal at ES depth 2). Proven
+2026-06-30: GEMM_ONLY (NS6/ES1) and BIAS_ONLY (NS6/ES2) are both 20/20 valid +
+deterministic, but **no residual-carrying config is provably clean at NS=6**.
+This is now a correctness REQUIREMENT, not a perf nicety — residual is the
+production path. Constraint: must hold NS=6 (the 1.063 ms floor); dropping to
+NS=5 for a deeper ring is the `fc2_w3y` path (+71 µs) and does NOT meet this goal.
+Full analysis + fix paths: `memory/project-fc2-w3-epilogue-race.md`.
+
+**Next:** close the residual NS=6 race. The fused-residual *port* to fc2_w3x
+(`fc2_w3y`) is a DEAD END — see Dead ends below — but the race lives in the
+legacy `fc2_w3` residual path itself and must be fixed there. Residual's home
+stays `fc2_w3` (NS=6, 1.063 ms) — but it must become bit-exact across launches.
 
 ## Dead ends — do NOT retry
 
