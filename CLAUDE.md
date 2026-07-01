@@ -95,7 +95,7 @@ consumed_mbar handshake, still marginal at depth 2. Deeper ring needs NS6→5
 (= resadd-port path, +71 µs). Kernel SASS byte-identical to pre-template HEAD →
 not the swizzle refactor; doesn't affect cyc so the basin sweep stands. Full
 analysis: `memory/project-fc2-w3-epilogue-race.md`. Sweep: `tools/sweep_fc2_w3_swizzle.sh` /
-`modal run dummy_modal.py --target fc2-w3-swizzle-sweep --run-args "SWEEP=front REPS=200"`.
+`modal run gpu_interface/modal.py --target fc2-w3-swizzle-sweep --run-args "SWEEP=front REPS=200"`.
 
 ## FC1 fused status (PACKED_TILES, M=928256, K=768, N=3072)
 
@@ -687,7 +687,7 @@ bash tools/ncu_fc2_pipes.sh                 # dodges --set full deadlock
 
 ## Remote B200 via Modal (timing runs, not ncu)
 
-`dummy_modal.py` builds one Makefile target on a Modal B200 and runs it —
+`gpu_interface/modal.py` builds one Makefile target on a Modal B200 and runs it —
 faster turnaround than spinning up vast/verda for `clock64` cycle-timing and
 `-DPROFILE_*` decomposition. **Replaces vast/verda for timing only; Modal's
 CUDA image has no Nsight Compute and shared GPUs block perf counters, so
@@ -695,11 +695,11 @@ CUDA image has no Nsight Compute and shared GPUs block perf counters, so
 
 ```bash
 pip install modal && modal token new                                  # one-time
-modal run dummy_modal.py                                              # fc1-w3x default
-modal run dummy_modal.py --target fc2-w3x
-modal run dummy_modal.py --target fc1-w3x --dflags "-DPER_WARP_STORE"
-modal run dummy_modal.py --target fc1-w3x --dflags "-DPROFILE_CYCLES"
-modal run dummy_modal.py --target fc2-w3 \
+modal run gpu_interface/modal.py                                              # fc1-w3x default
+modal run gpu_interface/modal.py --target fc2-w3x
+modal run gpu_interface/modal.py --target fc1-w3x --dflags "-DPER_WARP_STORE"
+modal run gpu_interface/modal.py --target fc1-w3x --dflags "-DPROFILE_CYCLES"
+modal run gpu_interface/modal.py --target fc2-w3 \
     --dflags "-DM_TOTAL=464128 -DN_DIM=1024 -DK_DIM=2048"
 ```
 
@@ -746,7 +746,7 @@ tools/ncu_*.sh, ncu_anova.py, aggregate_prof.py
 tools/analyze_swizzle.py, cluster_swizzle.py    structural metric + verdict
 tools/anova_1way.py        paired ANOVA + AUC + d + η² + rank/win%
 tools/sass_edit.py         SASS binary editor + CP-SAT scheduler
-dummy_modal.py             Remote B200 build+run on Modal (timing/PROFILE_*, not ncu)
+gpu_interface/modal.py             Remote B200 build+run on Modal (timing/PROFILE_*, not ncu)
 token_count.py             tiktoken budgeting
 bench/                     TMA / MMA / stmatrix / cublaslt_introspect
 data/                      Benchmark + ncu results
