@@ -26,14 +26,6 @@ Compile-time flags:
                         3-slot cp.async ring (default-on, −133 kcyc); TD<8:
                         two fixed columns at startup (auto at N_STAGES>=6)
   -DNO_BIAS_PER_TILE    Restore the full 6KB SMEM bias (TD>=8, N_STAGES<6)
-  -DGELU_F32X2          Packed-pair GELU math (SASS FADD2/FMUL2/FFMA2);
-                        tested +31 kcyc — epi is not FP-issue-bound
-  -DSTSM_STORE[=1|2]    TIMING-ONLY: stmatrix instead of st.shared.v4 in the
-                        epi store (1=straight, 2=.trans — vendor STSM.16.MT88).
-                        Our 32x32b TMEM load is lane-per-row, stmatrix expects
-                        4-rows-per-lane: bytes land permuted (valid=0 expected;
-                        uniform-A may mask it). Correct port needs a 16x256b
-                        TMEM-load rewrite — probe the unit before paying that
   -DSTAGING_PAD=N       Pad bytes between bias and staging (default 0).
                         4608 restores the pre-ring OFF_STAGING=171008 —
                         isolates ring-win mechanism (slots vs staging address)
@@ -41,11 +33,6 @@ Compile-time flags:
                         pacing (restores per-wait CCTL.IVALL L1 invalidates;
                         pre-WGREAD SASS). -DWGREAD=2 keeps only the
                         tile-last drain full — tested +8.6, do not ship
-  -DRING_CARRY          Carry the staging-ring phase across tiles
-                        (stage=(t*4+si)%ES) so tile-boundary reuse stays at
-                        distance ES; drops the per-tile wait_group 0 drain
-  -DLATE_WAIT           Ring wait moves inside the subiter, after LDTM+bias
-                        issue and before the first STS (implies RING_CARRY)
 */
 
 #include <cuda.h>
@@ -54,13 +41,6 @@ Compile-time flags:
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
-
-/* PACKED_TILES is default-on. Opt out with -DNO_PACKED_TILES. */
-#ifndef NO_PACKED_TILES
-#ifndef PACKED_TILES
-#define PACKED_TILES
-#endif
-#endif
 
 /* ── Hardware ── */
 #define SM_COUNT       148
@@ -158,15 +138,6 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define NUM_EPI_STAGES     3
 #endif
 
-#if defined(LATE_WAIT) && !defined(RING_CARRY)
-/* The relocated wait runs at uniform NONLAST depth in every subiter; only
-   the carried ring keeps tile-boundary reuse at that distance. */
-#define RING_CARRY
-#endif
-#if defined(LATE_WAIT) && defined(NO_EPI_DECOUPLE)
-#error "LATE_WAIT empties the subiter-tail EPI_WAIT that carries the lockstep barrier"
-#endif
-
 /*
 Non-last store pacing tracks the staging ring: ES-1 bulk groups in flight
 keeps the oldest slot drained before its STS reuse one subiter later.
@@ -200,14 +171,7 @@ Production default (paired 2026-07-02: −13.9 kcyc, wins 5/5 rounds);
 tile's si=0 reuse at distance 1 — hence the full wait_group 0 at every
 tile's last subiter, an exposed store drain the vendor kernel never pays
 (its pacing is one UTMACMDFLUSH per subpass on a 2-slot ping-pong).
-RING_CARRY keeps the ring phase running across tiles so every reuse sits
-at distance ES and the tile-last wait drops to NONLAST depth; only the
-kernel-final drain still waits to zero.
 */
-#ifdef RING_CARRY
-#define EPI_WG_TILE_LAST EPI_WG_NONLAST
-#define EPI_STAGE_OF(T, SI) (((T) * NUM_EPI_SUBITERS + (SI)) % NUM_EPI_STAGES)
-#else
 #if defined(WGREAD) && WGREAD == 2
 /* WGREAD=2: read-paced subiter waits, but the tile-last drain stays a full
    wait_group 0 — keeps the write-completion back-pressure the ring-carry
@@ -217,7 +181,6 @@ kernel-final drain still waits to zero.
 #define EPI_WG_TILE_LAST _EPI_WG "0;"
 #endif
 #define EPI_STAGE_OF(T, SI) ((SI) % NUM_EPI_STAGES)
-#endif
 
 /*
 EPI_DECOUPLE: each epi warp's STS and TMA store touch only its own
@@ -424,62 +387,6 @@ static __host__ __forceinline__ float gelu_fwd(float x) {
     return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
 }
 
-#ifdef GELU_F32X2
-/*
-Packed-pair GELU + CVT: gelu_approx's op chain on f32x2 register pairs so
-ptxas emits FADD2/FMUL2/FFMA2 (it never auto-packs scalars; probe-verified
-2026-07-02). MUFU.TANH has no 2-wide form and stays scalar per element.
-Vendor nvjet runs ~5.5 issue-slots/element with this shape vs ~7.5 scalar.
-Poly association differs from gelu_approx ((k2*x)*x vs k2*(x*x)) — few-ULP
-FP32 drift, absorbed by BF16 rounding and the validation tolerance.
-Bias pair arrives as one BF16x2 word; result returns as one BF16x2 word.
-*/
-static __device__ __forceinline__ uint32_t gelu2_bf16x2(float a_lo, float a_hi,
-                                                        uint32_t bias_pair) {
-    uint32_t o;
-    asm("{\n\t"
-        ".reg .b32 blo, bhi;\n\t"
-        ".reg .f32 i0, i1, t0, t1;\n\t"
-        ".reg .b64 bx, x, s, u, t, k1, k2, hf;\n\t"
-        "shl.b32 blo, %3, 16;\n\t"
-        "and.b32 bhi, %3, 0xFFFF0000;\n\t"
-        "mov.b64 bx, {blo, bhi};\n\t"
-        "mov.b64 x, {%1, %2};\n\t"
-        "add.rn.f32x2 x, x, bx;\n\t"
-        "mul.rn.f32x2 s, x, x;\n\t"
-        "mov.b64 k2, {0x3d12220c, 0x3d12220c};\n\t"
-        "mov.b64 k1, {0x3f4c422a, 0x3f4c422a};\n\t"
-        "fma.rn.f32x2 u, s, k2, k1;\n\t"
-        "mul.rn.f32x2 u, u, x;\n\t"
-        "mov.b64 {i0, i1}, u;\n\t"
-        "tanh.approx.f32 t0, i0;\n\t"
-        "tanh.approx.f32 t1, i1;\n\t"
-        "mov.b64 t, {t0, t1};\n\t"
-        "fma.rn.f32x2 u, x, t, x;\n\t"
-        "mov.b64 hf, {0x3f000000, 0x3f000000};\n\t"
-        "mul.rn.f32x2 u, u, hf;\n\t"
-        "mov.b64 {i0, i1}, u;\n\t"
-        "cvt.rn.bf16x2.f32 %0, i1, i0;\n\t"
-        "}"
-        : "=r"(o)
-        : "f"(a_lo), "f"(a_hi), "r"(bias_pair));
-    return o;
-}
-#endif
-
-/*
-Epi store instruction: st.shared.v4 (production) or stmatrix (STSM_STORE
-timing probe — same 16 B/lane footprint at the same addresses, data gathered
-across lanes by the stmatrix unit, so bytes land permuted; see header).
-*/
-#if defined(STSM_STORE) && STSM_STORE == 2
-#define _CVT_STORE_ASM "stmatrix.sync.aligned.x4.trans.m8n8.shared.b16 [%8], {o0,o1,o2,o3};\n\t"
-#elif defined(STSM_STORE)
-#define _CVT_STORE_ASM "stmatrix.sync.aligned.x4.m8n8.shared.b16 [%8], {o0,o1,o2,o3};\n\t"
-#else
-#define _CVT_STORE_ASM "st.shared.v4.b32 [%8], {o0,o1,o2,o3};\n\t"
-#endif
-
 /* CVT FP32→BF16 + STS.128 */
 #define CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, SADDR) \
     asm volatile( \
@@ -489,7 +396,7 @@ across lanes by the stmatrix unit, so bytes land permuted; see header).
         "cvt.rn.bf16x2.f32 o1, %3, %2;\n\t" \
         "cvt.rn.bf16x2.f32 o2, %5, %4;\n\t" \
         "cvt.rn.bf16x2.f32 o3, %7, %6;\n\t" \
-        _CVT_STORE_ASM \
+        "st.shared.v4.b32 [%8], {o0,o1,o2,o3};\n\t" \
         "}" \
         :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
            "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
@@ -498,18 +405,6 @@ across lanes by the stmatrix unit, so bytes land permuted; see header).
 
 /* GELU + CVT + STS: 8 FP32 acc + 4 BF16x2 bias → GELU → BF16 → STS.128
    Unpacks BF16 bias to FP32 inline (SHL+AND → reinterpret as FP32). */
-#ifdef GELU_F32X2
-#define GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, b0,b1,b2,b3, SADDR) \
-    do { \
-        const uint32_t _o0 = gelu2_bf16x2(a0, a1, b0); \
-        const uint32_t _o1 = gelu2_bf16x2(a2, a3, b1); \
-        const uint32_t _o2 = gelu2_bf16x2(a4, a5, b2); \
-        const uint32_t _o3 = gelu2_bf16x2(a6, a7, b3); \
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" \
-            :: "r"(SADDR), "r"(_o0), "r"(_o1), "r"(_o2), "r"(_o3) \
-            : "memory"); \
-    } while(0)
-#else
 #define GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, b0,b1,b2,b3, SADDR) \
     CVT_STS_V4( \
         gelu_approx(a0, __uint_as_float((b0) << 16)),  \
@@ -521,7 +416,6 @@ across lanes by the stmatrix unit, so bytes land permuted; see header).
         gelu_approx(a6, __uint_as_float((b3) << 16)),  \
         gelu_approx(a7, __uint_as_float((b3) & 0xFFFF0000u)), \
         SADDR)
-#endif /* GELU_F32X2 */
 
 /* GEMM_ONLY: CVT + STS, no bias, no GELU */
 #define GEMM_CVT_STS(f0,f1,f2,f3,f4,f5,f6,f7, SADDR) \
@@ -541,24 +435,6 @@ across lanes by the stmatrix unit, so bytes land permuted; see header).
     } \
 } while(0)
 
-#ifdef LATE_WAIT
-#define EPI_WAIT(LAST)
-/* Relocated ring wait: after the subiter's LDTM + bias issue, before its
-   first STS — the DEPBAR overlaps the load latency instead of tailing the
-   store. Uniform NONLAST depth (RING_CARRY implied). */
-#define EPI_WAIT_PRE_STS() do { \
-    if (lane == 0) \
-        asm volatile(EPI_WG_NONLAST ::: "memory"); \
-    __syncwarp(); \
-} while(0)
-#define EPI_WAIT_DRAIN(LAST) do { \
-    if (LAST) { \
-        if (lane == 0) \
-            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory"); \
-        __syncwarp(); \
-    } \
-} while(0)
-#else
 #define EPI_WAIT(LAST) do { \
     if (lane == 0) { \
         if (LAST) \
@@ -581,7 +457,6 @@ across lanes by the stmatrix unit, so bytes land permuted; see header).
     __syncwarp(); \
     EPI_SUBITER_BAR(); \
 } while(0)
-#endif
 
 /* K-iteration macro (accumulating, ki >= 1). Single asm block emits all 4
    MMAs back-to-back so ptxas emits one elect+R2UR.BROADCAST wrapper for the
@@ -784,13 +659,8 @@ fc1_w3_kernel(
         int tm = tile_idx / TILES_N;
         int tn = tile_idx % TILES_N;
         if (SNAKE_ORDER && (tm & 1)) tn = TILES_N - 1 - tn;
-#ifdef PACKED_TILES
         const int a_m_tile = tm * 2 + cta_rank;
         const int b_n_half = tn * 2 + cta_rank;
-#else
-        const int m_start = tm * TM * 2 + cta_rank * TM;
-        const int n_start = tn * TN;
-#endif
         const bool has_prev = (_ti > 0);
 
         if (warp == 0) {
@@ -807,15 +677,9 @@ fc1_w3_kernel(
 #else
                 const int k_block = ki;
 #endif
-#ifdef PACKED_TILES
                 const int tma_c0   = 0;
                 const int tma_a_c1 = (a_m_tile * K_ITERS + k_block) * TM;
                 const int tma_b_c1 = (b_n_half * K_ITERS + k_block) * (TN/2);
-#else
-                const int tma_c0   = k_block * TK;
-                const int tma_a_c1 = m_start;
-                const int tma_b_c1 = n_start + cta_rank * (TN/2);
-#endif
                 const uint32_t mma_mbar_s = smem_base + OFF_MMA_MBAR + s * 8;
                 const uint32_t tma_mbar_s = (smem_base + OFF_TMA_MBAR + s * 8) & 0xFEFFFFFF;
 
@@ -929,13 +793,8 @@ fc1_w3_kernel(
                 int ptn = prev_idx % TILES_N;
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
 #endif
-#ifdef PACKED_TILES
                 const int prev_m = ((ptm * 2 + cta_rank) * TILES_N + ptn) * TM;
                 const int prev_n = 0;
-#else
-                const int prev_m = ptm * TM * 2 + cta_rank * TM;
-                const int prev_n = ptn * TN;
-#endif
 
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
@@ -974,9 +833,6 @@ fc1_w3_kernel(
                         const uint32_t rsw2 = chunk ? sw6 : sw2;
                         const uint32_t rsw3 = chunk ? sw7 : sw3;
 
-#ifdef LATE_WAIT
-                        if (_ci == 0) EPI_WAIT_PRE_STS();
-#endif
                         TMEM_WAIT();
 
                         GEMM_CVT_STS(a0,a1,a2,a3,a4,a5,a6,a7, stage_base + rsw0);
@@ -1052,15 +908,9 @@ fc1_w3_kernel(
                 int ptn = prev_idx % TILES_N;
                 if (SNAKE_ORDER && (ptm & 1)) ptn = TILES_N - 1 - ptn;
 #endif
-#ifdef PACKED_TILES
                 const int prev_m = ((ptm * 2 + cta_rank) * TILES_N + ptn) * TM;
                 const int prev_n = 0;
                 const int prev_n_bias = ptn * TN;
-#else
-                const int prev_m = ptm * TM * 2 + cta_rank * TM;
-                const int prev_n = ptn * TN;
-                const int prev_n_bias = prev_n;
-#endif
 
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 #if defined(BIAS_PER_TILE) && TILE_DISPATCH >= 8 && !defined(LDG_BIAS)
@@ -1142,9 +992,6 @@ fc1_w3_kernel(
                         const uint32_t rsw2 = chunk ? sw6 : sw2;
                         const uint32_t rsw3 = chunk ? sw7 : sw3;
 
-#ifdef LATE_WAIT
-                        if (_ci == 0) EPI_WAIT_PRE_STS();
-#endif
                         TMEM_WAIT();
 
                         GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
@@ -1207,15 +1054,9 @@ fc1_w3_kernel(
         int ltm = last_idx / TILES_N;
         int ltn = last_idx % TILES_N;
         if (SNAKE_ORDER && (ltm & 1)) ltn = TILES_N - 1 - ltn;
-#ifdef PACKED_TILES
         const int last_m = ((ltm * 2 + cta_rank) * TILES_N + ltn) * TM;
         const int last_n = 0;
         const int last_n_bias = ltn * TN;
-#else
-        const int last_m = ltm * TM * 2 + cta_rank * TM;
-        const int last_n = ltn * TN;
-        const int last_n_bias = last_n;
-#endif
 
         if (warp == 0 || warp == 1) {
             /* W0/W1: nothing to do for drain */
@@ -1274,9 +1115,6 @@ fc1_w3_kernel(
                     const uint32_t rsw2 = chunk ? sw6 : sw2;
                     const uint32_t rsw3 = chunk ? sw7 : sw3;
 
-#ifdef LATE_WAIT
-                    if (_ci == 0) EPI_WAIT_PRE_STS();
-#endif
                     TMEM_WAIT();
 
                     GEMM_CVT_STS(a0,a1,a2,a3,a4,a5,a6,a7, stage_base + rsw0);
@@ -1404,9 +1242,6 @@ fc1_w3_kernel(
                     const uint32_t rsw2 = chunk ? sw6 : sw2;
                     const uint32_t rsw3 = chunk ? sw7 : sw3;
 
-#ifdef LATE_WAIT
-                    if (_ci == 0) EPI_WAIT_PRE_STS();
-#endif
                     TMEM_WAIT();
 
                     GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
@@ -1502,7 +1337,6 @@ __global__ void count_mismatch(const __nv_bfloat16* __restrict__ a,
 }
 #endif
 
-#ifdef PACKED_TILES
 __global__ void pack_u8(uint8_t* __restrict__ dst, const uint8_t* __restrict__ src,
                         int M, int K, int tile_m, int tile_k) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1518,7 +1352,6 @@ __global__ void pack_u8(uint8_t* __restrict__ dst, const uint8_t* __restrict__ s
                      + (long long)local_m * tile_k + local_k;
     dst[packed] = src[idx];
 }
-#endif
 
 int main() {
     setbuf(stdout, NULL);
@@ -1557,7 +1390,6 @@ int main() {
         CUDA_CHECK(cudaMemcpy(d_bias, h_bias, (size_t)N_DIM * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
         free(h_bias);
     }
-#ifdef PACKED_TILES
     {
         printf("  Packing tiles...\n");
         int tpb = 256;
@@ -1582,12 +1414,10 @@ int main() {
         CUDA_CHECK(cudaDeviceSynchronize());
         printf("  Packing done\n");
     }
-#endif
     printf("  Alloc + init done\n");
 
     /* TMA descriptors */
     CUtensorMap h_tma_a, h_tma_b;
-#ifdef PACKED_TILES
     {
         uint64_t a_total_rows = (uint64_t)(M_TOTAL / TM) * K_ITERS * TM;
         uint64_t dims[2]    = {(uint64_t)TK, a_total_rows};
@@ -1616,37 +1446,8 @@ int main() {
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }
-#else
-    {
-        uint64_t dims[2]    = {(uint64_t)K_DIM, (uint64_t)M_TOTAL};
-        uint64_t strides[1] = {(uint64_t)K_DIM};
-        uint32_t box[2]     = {TK, TM};
-        uint32_t estrides[2]= {1, 1};
-        CU_CHECK(cuTensorMapEncodeTiled(&h_tma_a,
-            CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (void*)d_A,
-            dims, strides, box, estrides,
-            CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CU_TENSOR_MAP_SWIZZLE_128B,
-            CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-    }
-    {
-        uint64_t dims[2]    = {(uint64_t)K_DIM, (uint64_t)N_DIM};
-        uint64_t strides[1] = {(uint64_t)K_DIM};
-        uint32_t box[2]     = {TK, TN/2};
-        uint32_t estrides[2]= {1, 1};
-        CU_CHECK(cuTensorMapEncodeTiled(&h_tma_b,
-            CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (void*)d_B,
-            dims, strides, box, estrides,
-            CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CU_TENSOR_MAP_SWIZZLE_128B,
-            CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-    }
-#endif
 
     CUtensorMap h_tma_c;
-#ifdef PACKED_TILES
     {
         uint64_t c_total_rows = (uint64_t)(M_TOTAL / TM) * TILES_N * TM;
         uint64_t dims[2]    = {(uint64_t)TN, c_total_rows};
@@ -1661,21 +1462,6 @@ int main() {
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     }
-#else
-    {
-        uint64_t dims[2]    = {(uint64_t)N_DIM, (uint64_t)M_TOTAL};
-        uint64_t strides[1] = {(uint64_t)N_DIM * sizeof(__nv_bfloat16)};
-        uint32_t box[2]     = {64, 32};
-        uint32_t estrides[2]= {1, 1};
-        CU_CHECK(cuTensorMapEncodeTiled(&h_tma_c,
-            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)d_C,
-            dims, strides, box, estrides,
-            CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CU_TENSOR_MAP_SWIZZLE_128B,
-            CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-    }
-#endif
 
     CUDA_CHECK(cudaFuncSetAttribute(fc1_w3_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
@@ -1754,13 +1540,9 @@ int main() {
         float gelu_val = gelu_fwd(gemm + bias_f);
         __nv_bfloat16 expected = __float2bfloat16(gelu_val);
 #endif
-#ifdef PACKED_TILES
         long long packed_idx = (long long)((int)(row / TM) * TILES_N + col / TN) * TM * TN
                              + (long long)((int)(row % TM)) * TN + (col % TN);
         __nv_bfloat16 actual = h_C[packed_idx];
-#else
-        __nv_bfloat16 actual = h_C[row * N_DIM + col];
-#endif
         float ef = __bfloat162float(expected);
         float af = __bfloat162float(actual);
         if (ef != af) {

@@ -37,7 +37,7 @@ top) vs our GEMM_ONLY 3227.3 (5.49/tile — our GELU-on-top +0.44/tile is
 CHEAPER than theirs); packed f32x2 GELU (4.5 slots/elem, denser than vendor
 5.5) REGRESSED +31 — not FP-issue-bound; STSM stores REGRESSED +45..52
 GELU / TIE GEMM_ONLY even at vendor's exact STSM.16.MT88.4
-(`-DSTSM_STORE[=1|2]` timing-only probe — 16x256b LDTM rewrite not worth
+(timing-only probe; flag stripped — 16x256b LDTM rewrite not worth
 it). **Pacing SETTLED 2026-07-02 night:** RING_CARRY (continuous ring, no
 per-tile full drain) +64, LATE_WAIT +295, WGREAD=2 +8.6 — the tile-last
 wait_group 0 is load-bearing back-pressure (fc2-race physics: free-running
@@ -222,18 +222,20 @@ Per-item files: `memory/MEMORY.md`. One-liners:
 - **FC1 RING_CARRY / LATE_WAIT / WGREAD=2 (store-pacing variants):** +64 /
   +295 / +8.6 kcyc — the per-tile wait_group 0 drain is load-bearing
   back-pressure; freeing the store queue deepens TMA latency more than the
-  drain cost. Flags kept opt-in. `memory/project-fc1-store-pacing.md`.
+  drain cost. WGREAD=2 kept opt-in; RING_CARRY/LATE_WAIT code stripped
+  2026-07-02 (revive via git). `memory/project-fc1-store-pacing.md`.
 - **FC1 FORCE_PREFILL:** deadlocks at K_ITERS=6. NO_PREFILL guard mandatory.
 - **FC1 LDG_BIAS:** +2.0 Mcyc (+54%) — L1 bias in the epi hot loop is dead;
   SMEM bias mandatory (only layout-parity use in no-bias builds).
 - **FC1 GELU_F32X2 (packed f32x2 GELU):** perfect FADD2/FMUL2/FFMA2 packing
   (4.5 slots/elem < vendor 5.5, zero scalar residue) is +31 kcyc alone and
-  +200–340 in combos — epi is not FP-issue-bound; kept opt-in only.
-  `memory/project-fc1-gelu-x2-bias-ring.md`.
+  +200–340 in combos — epi is not FP-issue-bound; code stripped 2026-07-02
+  (revive via git). `memory/project-fc1-gelu-x2-bias-ring.md`.
 - **FC1 STSM_STORE (stmatrix epi store):** +45..52 kcyc GELU / TIE
   GEMM_ONLY, incl. vendor's exact STSM.16.MT88.4 — warp-wide gather stalls
   on GELU lane skew. Timing-only probe (our LDTM is lane-per-row → bytes
-  permuted, valid=0); do NOT build the 16x256b LDTM rewrite to feed it.
+  permuted, valid=0); code stripped 2026-07-02. Do NOT build the 16x256b
+  LDTM rewrite to feed it.
 - **fc1_w3x PER_WARP_STORE:** barrier-free crashes (Xid 13 CGA "CTA Not
   Present" — one CTA exits persistent loop while cluster peer issues cluster
   ops); with bar.sync back, +63 µs. Serial tid==0 store was never the FC1
