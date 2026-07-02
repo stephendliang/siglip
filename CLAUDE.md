@@ -11,30 +11,32 @@ K=768 (GELU+bias).
 | FC2 bias-only strip floor | 0.98502 ms | `fc2_w3x -DSTRIP_EPILOGUE` | NS=6+PREFILL structural floor |
 | **FC2 bias-only** | **1.00092 ms** | `fc2_w3x` (gflip_blkswap TD=54) | **−27 µs** vs cuBLASLt PT 1.028 / −116 µs vs MXFP8 1.117 |
 | **FC2 fused +residual** | **1902.5 kcyc** (wall 1.06–1.13, clock-dep) | `fc2_w3` (TD=54, back-pressured NS=6) | **−14.8%** vs CUTLASS 2232.0k / −16.7% vs cuBLASLt beta=1 2283.6k |
-| FC1 GELU+bias | 3619.4 kcyc (wall 1.96) | `fc1_w3` (TD=11+ks=1, EPI_DECOUPLE+ES=3 defaults) | **+6.7%** vs cuBLASLt 13.3 PT 3391.2k / +4.1% vs MXFP8 3476.7k / −15.6% vs CUTLASS 4288.1k |
+| FC1 GELU+bias | 3487.7 kcyc (wall 1.89; matrix cell, base anchor 3620.8) | `fc1_w3` (TD=11+ks=1, EPI_DECOUPLE+ES=3+BIAS_PER_TILE ring defaults) | **+2.8%** vs cuBLASLt 13.3 PT 3391.2k / +0.3% vs MXFP8 3476.7k / −18.7% vs CUTLASS 4288.1k |
 
 `fc2_w3x` = clean-sheet 6-warp bias-only. `fc2_w3` = legacy 7-warp, production
 residual path. `fc1_w3` = FC1 production (legacy family); `fc1_w3x` (clean-sheet
 port) sits at ~3.11 ms — exposed-epilogue problem, does NOT supersede fc1_w3 yet.
 
 **FC1 is the open front.** libcublasLt 13.3.0.5 (algoId=66 family, GELU
-verified via epi_ok witness) beats us by 228.2 kcyc (~123 µs) at our exact
-geometry. fc1_w3 is **epilogue-RATE-bound** (1-tile overlap already exists;
-E = 6.16 kcyc/tile vs vendor 5.77, loader 4.64@NS5 / 3.09@NS6, MMA 3.15 —
-MMA-side levers can't move the wall). 2026-07-02 win (−336.2 kcyc):
-EPI_DECOUPLE + ES=3 — per-subiter cross-warp barriers dropped (staging is
-warp-private; warps self-pace) + 3-deep store ring; now in-file defaults,
-`-DNO_EPI_DECOUPLE -DNUM_EPI_STAGES=2` reverts SASS-identically. Remaining
-lever = packed GELU: vendor dump
-(`nvjet..._128x256_128x6_2x1_2cta_v_bz_gelubias_TNT`) uses MUFU.TANH +
-packed FMUL2/FFMA2 ≈5.5 issue-slots/element vs our all-scalar ≈7.5; PTX
-`add/mul/fma.rn.f32x2` → FADD2/FMUL2/FFMA2 probe-verified on sm_100a; est
-~300 kcyc ≥ the whole remaining gap. `memory/project-nvjet-cubin-dump.md`.
-NS=6 matrix 2026-07-02: TIE at production (epi wall confirmed directly),
-but strip NS=6 hits the MMA floor (3.09 kcyc/tile, −33% — NS=5's "loader
-floor" was the within-tile stage-0 recycle). Epi-rate wins have runway to
-~1.85 Mcyc; when E < ~4.6, port BIAS_PER_TILE to static dispatch
-(Group-3-only today) → NS6+ES2 or NS5+ES4 fit at 231424 B.
+verified via epi_ok witness) beats us by 96.5 kcyc at our exact geometry.
+fc1_w3 is **epilogue-RATE-bound** (1-tile overlap exists; E = 5.93 kcyc/tile
+vs vendor 5.77, loader 4.64@NS5 / 3.09@NS6, MMA 3.15 — MMA-side levers can't
+move the wall). Shipped in-file defaults: EPI_DECOUPLE+ES=3 (2026-07-02,
+−336.2 kcyc — per-subiter cross-warp barriers dropped, warps self-pace +
+3-deep store ring; `-DNO_EPI_DECOUPLE -DNUM_EPI_STAGES=2` reverts
+SASS-identically) and BIAS_PER_TILE cp.async 3-slot ring at TD≥8
+(2026-07-02 evening, −133.1 kcyc; `-DNO_BIAS_PER_TILE` reverts; win
+mechanism unproven — compact 512 B slots, OFF_STAGING 171008→165888).
+**Remaining gap is STORE structure, not math:** vendor GEMM-only rank-1 =
+2510.4 kcyc (4.27 kcyc/tile bare store, full GELU only +1.5/tile on top) and
+perfectly-packed f32x2 GELU (4.5 slots/elem, denser than vendor 5.5)
+REGRESSED +31 — epi is not FP-issue-bound. Next levers: STSM.16 stores
+(vendor MT88), staging↔bias LDS bank probe, GEMM_ONLY re-measure
+post-decouple. `memory/project-fc1-gelu-x2-bias-ring.md`.
+NS=6 matrix 2026-07-02: TIE at production (and pays the ES=2 tax vs ring);
+strip NS=6 hits the MMA floor (3.09 kcyc/tile, −33% — NS=5's "loader floor"
+was the within-tile stage-0 recycle). Epi-rate runway to ~1.85 Mcyc; ring
+makes NS6+ES2 / NS5+ES4 fit at 231424 B (ES=4 tested: +169 at normal rate).
 `memory/project-fc1-ns6-matrix.md`.
 
 ## Kernel structure
@@ -139,9 +141,11 @@ logs `data/residual_introspect_20260701/`.
 
 | impl | kcyc/launch | wall ms |
 |---|---|---|
+| cuBLASLt GEMM-only rank-1 (epi=0, context) | 2510.4 | 1.360 |
 | cuBLASLt PT rank-1 (algoId=66 t23 cl 2x1x1) | **3391.2** (±0.3k) | 1.838 |
+| **fc1_w3** (production; matrix cell, base anchor 3620.8) | **3487.7** | 1.891 |
 | cuBLASLt MXFP8 rank-1 (same identity) | 3476.7 (±0.4k) | 1.885 |
-| **fc1_w3** (TD=11+ks=1, EPI_DECOUPLE+ES=3, production) | **3619.4** (±1.8k) | 1.961 |
+| fc1_w3 pre-ring (EPI_DECOUPLE+ES=3, paired) | 3619.4 (±1.8k) | 1.961 |
 | fc1_cutlass (GELU_taylor) | 4288.1 (±0.1k) | 2.324 |
 
 EPI_DECOUPLE+ES=3 = −336.2 kcyc (−8.5%) vs the 2026-07-01 lockstep build
@@ -151,6 +155,9 @@ split: decouple −310, ES=3 −123, combined −326) + 3-deep store ring.
 SELF_DIFF dirty=0/100 ×4 runs; `-DNUM_EPI_STAGES=2 -DNO_EPI_DECOUPLE`
 reproduces the old build SASS byte-identically. No differential throttle at
 FC1 (~1.85 GHz all impls). Logs `data/fc1_epi_decouple_20260702/`.
+BIAS_PER_TILE ring = −133.1 further (2026-07-02 evening 9-cell matrix, all
+valid=1 + dirty=0/100; ES=4 +169, NS=6 +120 vs ring; paired rerun pending).
+Logs `data/fc1_x2_ring_20260702/`.
 
 ### Dim/K sweep conclusions (full tables: `memory/project-perf-table-archive.md`)
 
@@ -197,6 +204,10 @@ Per-item files: `memory/MEMORY.md`. One-liners:
 - **FC1 FORCE_PREFILL:** deadlocks at K_ITERS=6. NO_PREFILL guard mandatory.
 - **FC1 LDG_BIAS:** +2.0 Mcyc (+54%) — L1 bias in the epi hot loop is dead;
   SMEM bias mandatory (only layout-parity use in no-bias builds).
+- **FC1 GELU_F32X2 (packed f32x2 GELU):** perfect FADD2/FMUL2/FFMA2 packing
+  (4.5 slots/elem < vendor 5.5, zero scalar residue) is +31 kcyc alone and
+  +200–340 in combos — epi is not FP-issue-bound; kept opt-in only.
+  `memory/project-fc1-gelu-x2-bias-ring.md`.
 - **fc1_w3x PER_WARP_STORE:** barrier-free crashes (Xid 13 CGA "CTA Not
   Present" — one CTA exits persistent loop while cluster peer issues cluster
   ops); with bar.sync back, +63 µs. Serial tid==0 store was never the FC1
@@ -216,7 +227,7 @@ Per-item files: `memory/MEMORY.md`. One-liners:
 make fc2-w3x && ./fc2-w3x                   # 1.001 ms production bias-only
 make fc2-w3x-strip && ./fc2-w3x-strip       # 0.985 floor
 make fc2-w3 && ./fc2-w3                     # fused residual (TD=54 default)
-make fc1-w3 && ./fc1-w3                     # FC1 production (TD=11+ks=1, EPI_DECOUPLE+ES=3)
+make fc1-w3 && ./fc1-w3                     # FC1 production (TD=11+ks=1, ES=3, BIAS_PER_TILE ring)
 make fc1-w3x && ./fc1-w3x                   # FC1 clean-sheet (~3.11 ms, WIP)
 make fc1-cutlass && ./fc1-cutlass           # FC1 CUTLASS reference
 make fc2-cutlass && ./fc2-cutlass           # FC2 CUTLASS reference

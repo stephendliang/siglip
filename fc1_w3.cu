@@ -19,8 +19,15 @@ Compile-time flags:
                         tile_dispatch.cuh (default 11 = zigzag)
   -DK_STAGGER=N         Per-cluster K-phase shift (default 1; 0 disables)
   -DNUM_EPI_WARPS=N     Epilogue warp count (1, 2, or 4; default 4)
-  -DNUM_EPI_STAGES=N    Epilogue staging ring depth (2-4; default 3; 4 needs LDG_BIAS headroom)
+  -DNUM_EPI_STAGES=N    Epilogue staging ring depth (2-4; default 3; 4 needs
+                        BIAS_PER_TILE or LDG_BIAS headroom)
   -DNO_EPI_DECOUPLE     Restore per-subiter cross-warp barriers (lockstep epi)
+  -DBIAS_PER_TILE       Per-tile SMEM bias instead of the full 6KB. TD>=8:
+                        3-slot cp.async ring (default-on, −133 kcyc); TD<8:
+                        two fixed columns at startup (auto at N_STAGES>=6)
+  -DNO_BIAS_PER_TILE    Restore the full 6KB SMEM bias (TD>=8, N_STAGES<6)
+  -DGELU_F32X2          Packed-pair GELU math (SASS FADD2/FMUL2/FFMA2);
+                        tested +31 kcyc — epi is not FP-issue-bound
 */
 
 #include <cuda.h>
@@ -177,20 +184,35 @@ lockstep ES=2 = −336.2 kcyc); -DNO_EPI_DECOUPLE opts out.
  *
  * BIAS_PER_TILE: compact per-tile SMEM when N_STAGES >= 6 (full bias exceeds 228KB).
  *   Group-3: 2 N-tiles loaded once at startup (snake order uses 2 N-tiles).
+ *   TD>=8: tn changes tile-to-tile, so a 3-slot ring (slot = tile % 3) is
+ *   filled by an epi-warp cp.async prefetch each tile. 3 slots, not 2: under
+ *   EPI_DECOUPLE warps skew up to a full tile, and slot reuse at distance 2
+ *   races a slow reader. Distance 3 is safe by the NO_PREFILL back-pressure
+ *   chain: MMA(t+2) waits epilogue_mbar[t&1] = all epi warps done with tile t,
+ *   and any warp's tile-(t+3) prefetch is gated on MMA(t+2)'s mainloop arrive.
  */
 #ifdef LDG_BIAS
 /* No SMEM for bias — direct LDG from L1-cached global */
 #define BIAS_SMEM_BYTES    0
 #else /* !LDG_BIAS */
 
+/*
+Ring default-on at TD>=8 (2026-07-02: −133 kcyc vs the full 6KB SMEM bias at
+production NS5/ES3). NO_BIAS_PER_TILE restores full bias but N_STAGES>=6
+overrides back on — full bias can never fit at NS=6.
+*/
 #ifndef BIAS_PER_TILE
-#if N_STAGES >= 6
+#if (!defined(NO_BIAS_PER_TILE) && TILE_DISPATCH >= 8) || N_STAGES >= 6
 #define BIAS_PER_TILE 1
 #endif
 #endif
 
 #ifdef BIAS_PER_TILE
+#if TILE_DISPATCH >= 8
+#define BIAS_SMEM_BYTES    (TN * 2 * 3)          /* 1536B — 3-slot per-tile ring */
+#else
 #define BIAS_SMEM_BYTES    (TN * 2 * 2)          /* 1024B — 2 N-tiles for snake */
+#endif
 #else
 #define BIAS_SMEM_BYTES    (N_DIM * 2)            /* 6144B — all bias columns */
 #endif
@@ -206,8 +228,9 @@ lockstep ES=2 = −336.2 kcyc); -DNO_EPI_DECOUPLE opts out.
 
 /*
 sm_100a max dynamic SMEM opt-in is 227 KB per block. Infeasible knob combos
-(N_STAGES=6 with full SMEM bias or NUM_EPI_STAGES>=3; ES=4 without LDG_BIAS)
-must die here, not at cudaFuncSetAttribute.
+(N_STAGES=6 with full SMEM bias or NUM_EPI_STAGES>=3; ES=4 with full SMEM
+bias — both fit with BIAS_PER_TILE at 231424B) must die here, not at
+cudaFuncSetAttribute.
 */
 static_assert(SMEM_BYTES <= 232448, "SMEM layout exceeds 227 KB block ceiling");
 
@@ -333,6 +356,49 @@ static __host__ __forceinline__ float gelu_fwd(float x) {
     return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
 }
 
+#ifdef GELU_F32X2
+/*
+Packed-pair GELU + CVT: gelu_approx's op chain on f32x2 register pairs so
+ptxas emits FADD2/FMUL2/FFMA2 (it never auto-packs scalars; probe-verified
+2026-07-02). MUFU.TANH has no 2-wide form and stays scalar per element.
+Vendor nvjet runs ~5.5 issue-slots/element with this shape vs ~7.5 scalar.
+Poly association differs from gelu_approx ((k2*x)*x vs k2*(x*x)) — few-ULP
+FP32 drift, absorbed by BF16 rounding and the validation tolerance.
+Bias pair arrives as one BF16x2 word; result returns as one BF16x2 word.
+*/
+static __device__ __forceinline__ uint32_t gelu2_bf16x2(float a_lo, float a_hi,
+                                                        uint32_t bias_pair) {
+    uint32_t o;
+    asm("{\n\t"
+        ".reg .b32 blo, bhi;\n\t"
+        ".reg .f32 i0, i1, t0, t1;\n\t"
+        ".reg .b64 bx, x, s, u, t, k1, k2, hf;\n\t"
+        "shl.b32 blo, %3, 16;\n\t"
+        "and.b32 bhi, %3, 0xFFFF0000;\n\t"
+        "mov.b64 bx, {blo, bhi};\n\t"
+        "mov.b64 x, {%1, %2};\n\t"
+        "add.rn.f32x2 x, x, bx;\n\t"
+        "mul.rn.f32x2 s, x, x;\n\t"
+        "mov.b64 k2, {0x3d12220c, 0x3d12220c};\n\t"
+        "mov.b64 k1, {0x3f4c422a, 0x3f4c422a};\n\t"
+        "fma.rn.f32x2 u, s, k2, k1;\n\t"
+        "mul.rn.f32x2 u, u, x;\n\t"
+        "mov.b64 {i0, i1}, u;\n\t"
+        "tanh.approx.f32 t0, i0;\n\t"
+        "tanh.approx.f32 t1, i1;\n\t"
+        "mov.b64 t, {t0, t1};\n\t"
+        "fma.rn.f32x2 u, x, t, x;\n\t"
+        "mov.b64 hf, {0x3f000000, 0x3f000000};\n\t"
+        "mul.rn.f32x2 u, u, hf;\n\t"
+        "mov.b64 {i0, i1}, u;\n\t"
+        "cvt.rn.bf16x2.f32 %0, i1, i0;\n\t"
+        "}"
+        : "=r"(o)
+        : "f"(a_lo), "f"(a_hi), "r"(bias_pair));
+    return o;
+}
+#endif
+
 /* CVT FP32→BF16 + STS.128 */
 #define CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, SADDR) \
     asm volatile( \
@@ -351,6 +417,18 @@ static __host__ __forceinline__ float gelu_fwd(float x) {
 
 /* GELU + CVT + STS: 8 FP32 acc + 4 BF16x2 bias → GELU → BF16 → STS.128
    Unpacks BF16 bias to FP32 inline (SHL+AND → reinterpret as FP32). */
+#ifdef GELU_F32X2
+#define GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, b0,b1,b2,b3, SADDR) \
+    do { \
+        const uint32_t _o0 = gelu2_bf16x2(a0, a1, b0); \
+        const uint32_t _o1 = gelu2_bf16x2(a2, a3, b1); \
+        const uint32_t _o2 = gelu2_bf16x2(a4, a5, b2); \
+        const uint32_t _o3 = gelu2_bf16x2(a6, a7, b3); \
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" \
+            :: "r"(SADDR), "r"(_o0), "r"(_o1), "r"(_o2), "r"(_o3) \
+            : "memory"); \
+    } while(0)
+#else
 #define GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7, b0,b1,b2,b3, SADDR) \
     CVT_STS_V4( \
         gelu_approx(a0, __uint_as_float((b0) << 16)),  \
@@ -362,6 +440,7 @@ static __host__ __forceinline__ float gelu_fwd(float x) {
         gelu_approx(a6, __uint_as_float((b3) << 16)),  \
         gelu_approx(a7, __uint_as_float((b3) & 0xFFFF0000u)), \
         SADDR)
+#endif /* GELU_F32X2 */
 
 /* GEMM_ONLY: CVT + STS, no bias, no GELU */
 #define GEMM_CVT_STS(f0,f1,f2,f3,f4,f5,f6,f7, SADDR) \
@@ -532,6 +611,10 @@ fc1_w3_kernel(
 #ifdef LDG_BIAS
     /* LDG_BIAS: no SMEM bias — direct LDG from L1-cached global in epilogue */
 #elif defined(BIAS_PER_TILE)
+#if TILE_DISPATCH >= 8
+    /* TD>=8: ring slots are filled per-tile by the epi warps' cp.async
+       prefetch — nothing to preload */
+#else
     /* Group-3: load 2 N-tiles' bias for snake ordering */
     {
         const int tn_b = TILES_N - 1 - tn_fixed;
@@ -544,6 +627,7 @@ fc1_w3_kernel(
             asm volatile("st.shared.b32 [%0], %1;" :: "r"(bias_saddr + TN * 2 + i * 4), "r"(vb));
         }
     }
+#endif /* TILE_DISPATCH >= 8 */
 #else
     {
         const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
@@ -821,6 +905,21 @@ fc1_w3_kernel(
 #ifndef LDG_BIAS
             const uint32_t bias_saddr = smem_to_uint(smem + OFF_BIAS_SMEM);
 #endif
+#if defined(BIAS_PER_TILE) && TILE_DISPATCH >= 8 && !defined(LDG_BIAS)
+            /* Ring prefetch: this tile's 512B bias slice, consumed next
+               iteration (or in the drain) — a full epi drain of shadow. Each
+               epi warp redundantly fills the whole slot (16B/lane); identical
+               bytes make the cross-warp overlap benign and keep warps
+               decoupled (no election, no barrier). */
+            {
+                const uint32_t dst = bias_saddr
+                    + (uint32_t)((_ti % 3) * (TN * 2)) + lane * 16;
+                const __nv_bfloat16* src = bias + tn * TN + lane * 8;
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                    :: "r"(dst), "l"(src));
+                asm volatile("cp.async.commit_group;" ::: "memory");
+            }
+#endif
 
             const uint32_t xor_val = (lane & 7) << 4;
             const uint32_t sw0 = 0 ^ xor_val, sw1 = 16 ^ xor_val;
@@ -849,6 +948,11 @@ fc1_w3_kernel(
 #endif
 
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+#if defined(BIAS_PER_TILE) && TILE_DISPATCH >= 8 && !defined(LDG_BIAS)
+                /* Prev tile's prefetch must have landed; this tile's own
+                   (just issued) may still fly → depth 1, not 0. */
+                asm volatile("cp.async.wait_group 1;" ::: "memory");
+#endif
 
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                     const int stage = si % NUM_EPI_STAGES;
@@ -894,9 +998,15 @@ fc1_w3_kernel(
                             : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "l"(bp + 24));
 #else
 #if defined(BIAS_PER_TILE)
+#if TILE_DISPATCH >= 8
+                        const uint32_t bs = bias_saddr
+                            + (uint32_t)(((_ti - 1) % 3) * (TN * 2))
+                            + nc * 2;
+#else
                         const uint32_t bs = bias_saddr
                             + ((ptn == tn_fixed) ? 0u : (unsigned)(TN * 2))
                             + nc * 2;
+#endif
 #else
                         /* LDS bias from SMEM (linear, not swizzled) */
                         const uint32_t bs = bias_saddr + (prev_n_bias + nc) * 2;
@@ -1097,6 +1207,10 @@ fc1_w3_kernel(
             mbar_wait(mainloop_mbar_addr + last_buf * 8, ml_phase[last_buf]);
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             ml_phase[last_buf] ^= 1;
+#if defined(BIAS_PER_TILE) && TILE_DISPATCH >= 8 && !defined(LDG_BIAS)
+            /* Last tile's prefetch (issued in its own loop iteration) */
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+#endif
 
             for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
                 const int stage = si % NUM_EPI_STAGES;
@@ -1141,9 +1255,15 @@ fc1_w3_kernel(
                         : "=r"(bv3.x),"=r"(bv3.y),"=r"(bv3.z),"=r"(bv3.w) : "l"(bp + 24));
 #else
 #if defined(BIAS_PER_TILE)
+#if TILE_DISPATCH >= 8
+                    const uint32_t bs = bias_saddr
+                        + (uint32_t)(((tile_count - 1) % 3) * (TN * 2))
+                        + nc * 2;
+#else
                     const uint32_t bs = bias_saddr
                         + ((ltn == tn_fixed) ? 0u : (unsigned)(TN * 2))
                         + nc * 2;
+#endif
 #else
                     const uint32_t bs = bias_saddr + (last_n_bias + nc) * 2;
 #endif
