@@ -1,0 +1,1127 @@
+✓ Initialized. View run at 
+https://modal.com/apps/stephenliang/main/ap-6zkls4ZB5SKSTaxNt4Vn3X
+✓ Created objects.
+├── 🔨 Created mount /home/sdl/net/sm100_sm103_tests/gpu_interface/ns_matrix.py
+├── 🔨 Created mount /home/sdl/net/sm100_sm103_tests
+└── 🔨 Created function run_matrix.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.2.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+
+@@CELL name=base flags=-DSELF_DIFF=100
+$ make -B fc1-w3 DFLAGS=-DSELF_DIFF=100
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DSELF_DIFF=100 fc1_w3.cu -o fc1-w3 -lcurand_static -lculibos -lcuda
+fc1_w3.cu(968): warning #177-D: variable "prev_n_bias" was declared but never referenced
+                  const int prev_n_bias = ptn * 256;
+                            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc1_w3.cu(1120): warning #177-D: variable "last_n_bias" was declared but never referenced
+          const int last_n_bias = ltn * 256;
+                    ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 7.382 ms
+ptxas info    : Compiling entry function '_Z14count_mismatchPK13__nv_bfloat16S1_xPy' for 'sm_100a'
+ptxas info    : Function properties for _Z14count_mismatchPK13__nv_bfloat16S1_xPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 11.816 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 0.547 ms
+ptxas info    : Compiling entry function '_Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_
+    16 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 118 registers, used 1 barriers, 16 bytes cumulative stack size
+ptxas info    : Compile time = 37.735 ms
+$ timeout -k 5 120 stdbuf -oL -eL /root/src/fc1-w3
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 215040 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=215040 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 1.887 ms  2321.14 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=3484487 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 3207168.000000
+C[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=1.887 tflops=2321.14 checksum=3207168.000000 valid=1 c0=1728.0
+@@SELFDIFF_BEGIN launches=100
+@@SELFDIFF iter=0 mismatches=0
+@@SELFDIFF iter=1 mismatches=0
+@@SELFDIFF iter=2 mismatches=0
+@@SELFDIFF iter=3 mismatches=0
+@@SELFDIFF iter=4 mismatches=0
+@@SELFDIFF iter=5 mismatches=0
+@@SELFDIFF iter=6 mismatches=0
+@@SELFDIFF iter=7 mismatches=0
+@@SELFDIFF iter=8 mismatches=0
+@@SELFDIFF iter=9 mismatches=0
+@@SELFDIFF iter=10 mismatches=0
+@@SELFDIFF iter=11 mismatches=0
+@@SELFDIFF iter=12 mismatches=0
+@@SELFDIFF iter=13 mismatches=0
+@@SELFDIFF iter=14 mismatches=0
+@@SELFDIFF iter=15 mismatches=0
+@@SELFDIFF iter=16 mismatches=0
+@@SELFDIFF iter=17 mismatches=0
+@@SELFDIFF iter=18 mismatches=0
+@@SELFDIFF iter=19 mismatches=0
+@@SELFDIFF iter=20 mismatches=0
+@@SELFDIFF iter=21 mismatches=0
+@@SELFDIFF iter=22 mismatches=0
+@@SELFDIFF iter=23 mismatches=0
+@@SELFDIFF iter=24 mismatches=0
+@@SELFDIFF iter=25 mismatches=0
+@@SELFDIFF iter=26 mismatches=0
+@@SELFDIFF iter=27 mismatches=0
+@@SELFDIFF iter=28 mismatches=0
+@@SELFDIFF iter=29 mismatches=0
+@@SELFDIFF iter=30 mismatches=0
+@@SELFDIFF iter=31 mismatches=0
+@@SELFDIFF iter=32 mismatches=0
+@@SELFDIFF iter=33 mismatches=0
+@@SELFDIFF iter=34 mismatches=0
+@@SELFDIFF iter=35 mismatches=0
+@@SELFDIFF iter=36 mismatches=0
+@@SELFDIFF iter=37 mismatches=0
+@@SELFDIFF iter=38 mismatches=0
+@@SELFDIFF iter=39 mismatches=0
+@@SELFDIFF iter=40 mismatches=0
+@@SELFDIFF iter=41 mismatches=0
+@@SELFDIFF iter=42 mismatches=0
+@@SELFDIFF iter=43 mismatches=0
+@@SELFDIFF iter=44 mismatches=0
+@@SELFDIFF iter=45 mismatches=0
+@@SELFDIFF iter=46 mismatches=0
+@@SELFDIFF iter=47 mismatches=0
+@@SELFDIFF iter=48 mismatches=0
+@@SELFDIFF iter=49 mismatches=0
+@@SELFDIFF iter=50 mismatches=0
+@@SELFDIFF iter=51 mismatches=0
+@@SELFDIFF iter=52 mismatches=0
+@@SELFDIFF iter=53 mismatches=0
+@@SELFDIFF iter=54 mismatches=0
+@@SELFDIFF iter=55 mismatches=0
+@@SELFDIFF iter=56 mismatches=0
+@@SELFDIFF iter=57 mismatches=0
+@@SELFDIFF iter=58 mismatches=0
+@@SELFDIFF iter=59 mismatches=0
+@@SELFDIFF iter=60 mismatches=0
+@@SELFDIFF iter=61 mismatches=0
+@@SELFDIFF iter=62 mismatches=0
+@@SELFDIFF iter=63 mismatches=0
+@@SELFDIFF iter=64 mismatches=0
+@@SELFDIFF iter=65 mismatches=0
+@@SELFDIFF iter=66 mismatches=0
+@@SELFDIFF iter=67 mismatches=0
+@@SELFDIFF iter=68 mismatches=0
+@@SELFDIFF iter=69 mismatches=0
+@@SELFDIFF iter=70 mismatches=0
+@@SELFDIFF iter=71 mismatches=0
+@@SELFDIFF iter=72 mismatches=0
+@@SELFDIFF iter=73 mismatches=0
+@@SELFDIFF iter=74 mismatches=0
+@@SELFDIFF iter=75 mismatches=0
+@@SELFDIFF iter=76 mismatches=0
+@@SELFDIFF iter=77 mismatches=0
+@@SELFDIFF iter=78 mismatches=0
+@@SELFDIFF iter=79 mismatches=0
+@@SELFDIFF iter=80 mismatches=0
+@@SELFDIFF iter=81 mismatches=0
+@@SELFDIFF iter=82 mismatches=0
+@@SELFDIFF iter=83 mismatches=0
+@@SELFDIFF iter=84 mismatches=0
+@@SELFDIFF iter=85 mismatches=0
+@@SELFDIFF iter=86 mismatches=0
+@@SELFDIFF iter=87 mismatches=0
+@@SELFDIFF iter=88 mismatches=0
+@@SELFDIFF iter=89 mismatches=0
+@@SELFDIFF iter=90 mismatches=0
+@@SELFDIFF iter=91 mismatches=0
+@@SELFDIFF iter=92 mismatches=0
+@@SELFDIFF iter=93 mismatches=0
+@@SELFDIFF iter=94 mismatches=0
+@@SELFDIFF iter=95 mismatches=0
+@@SELFDIFF iter=96 mismatches=0
+@@SELFDIFF iter=97 mismatches=0
+@@SELFDIFF iter=98 mismatches=0
+@@SELFDIFF iter=99 mismatches=0
+@@SELFDIFF_SUMMARY launches=100 dirty=0 worst=0
+@@CELL_EXIT name=base rc=0
+
+@@CELL name=gemm_only flags=-DSELF_DIFF=100 -DGEMM_ONLY
+$ make -B fc1-w3 'DFLAGS=-DSELF_DIFF=100 -DGEMM_ONLY'
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DSELF_DIFF=100 -DGEMM_ONLY fc1_w3.cu -o fc1-w3 -lcurand_static -lculibos -lcuda
+fc1_w3.cu(1120): warning #177-D: variable "last_n_bias" was declared but never referenced
+          const int last_n_bias = ltn * 256;
+                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc1_w3.cu(357): warning #177-D: function "gelu_approx" was declared but never referenced
+  static __attribute__((device)) __inline__ __attribute__((always_inline)) float gelu_approx(float acc, float bias_f32) {
+                                                                                 ^
+
+fc1_w3.cu(366): warning #177-D: function "gelu_fwd" was declared but never referenced
+  static __attribute__((host)) __inline__ __attribute__((always_inline)) float gelu_fwd(float x) {
+                                                                               ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 6.779 ms
+ptxas info    : Compiling entry function '_Z14count_mismatchPK13__nv_bfloat16S1_xPy' for 'sm_100a'
+ptxas info    : Function properties for _Z14count_mismatchPK13__nv_bfloat16S1_xPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 11.856 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 0.580 ms
+ptxas info    : Compiling entry function '_Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_
+    8 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 117 registers, used 0 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 39.788 ms
+$ timeout -k 5 120 stdbuf -oL -eL /root/src/fc1-w3
+FC1 W3 kernel — 6 warps, GEMM_ONLY (D=BF16(A*B), no bias/GELU)
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 215040 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=215040 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 1.748 ms  2505.34 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=3227341 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 1769472.000000
+C[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=1.748 tflops=2505.34 checksum=1769472.000000 valid=1 c0=1728.0
+@@SELFDIFF_BEGIN launches=100
+@@SELFDIFF iter=0 mismatches=0
+@@SELFDIFF iter=1 mismatches=0
+@@SELFDIFF iter=2 mismatches=0
+@@SELFDIFF iter=3 mismatches=0
+@@SELFDIFF iter=4 mismatches=0
+@@SELFDIFF iter=5 mismatches=0
+@@SELFDIFF iter=6 mismatches=0
+@@SELFDIFF iter=7 mismatches=0
+@@SELFDIFF iter=8 mismatches=0
+@@SELFDIFF iter=9 mismatches=0
+@@SELFDIFF iter=10 mismatches=0
+@@SELFDIFF iter=11 mismatches=0
+@@SELFDIFF iter=12 mismatches=0
+@@SELFDIFF iter=13 mismatches=0
+@@SELFDIFF iter=14 mismatches=0
+@@SELFDIFF iter=15 mismatches=0
+@@SELFDIFF iter=16 mismatches=0
+@@SELFDIFF iter=17 mismatches=0
+@@SELFDIFF iter=18 mismatches=0
+@@SELFDIFF iter=19 mismatches=0
+@@SELFDIFF iter=20 mismatches=0
+@@SELFDIFF iter=21 mismatches=0
+@@SELFDIFF iter=22 mismatches=0
+@@SELFDIFF iter=23 mismatches=0
+@@SELFDIFF iter=24 mismatches=0
+@@SELFDIFF iter=25 mismatches=0
+@@SELFDIFF iter=26 mismatches=0
+@@SELFDIFF iter=27 mismatches=0
+@@SELFDIFF iter=28 mismatches=0
+@@SELFDIFF iter=29 mismatches=0
+@@SELFDIFF iter=30 mismatches=0
+@@SELFDIFF iter=31 mismatches=0
+@@SELFDIFF iter=32 mismatches=0
+@@SELFDIFF iter=33 mismatches=0
+@@SELFDIFF iter=34 mismatches=0
+@@SELFDIFF iter=35 mismatches=0
+@@SELFDIFF iter=36 mismatches=0
+@@SELFDIFF iter=37 mismatches=0
+@@SELFDIFF iter=38 mismatches=0
+@@SELFDIFF iter=39 mismatches=0
+@@SELFDIFF iter=40 mismatches=0
+@@SELFDIFF iter=41 mismatches=0
+@@SELFDIFF iter=42 mismatches=0
+@@SELFDIFF iter=43 mismatches=0
+@@SELFDIFF iter=44 mismatches=0
+@@SELFDIFF iter=45 mismatches=0
+@@SELFDIFF iter=46 mismatches=0
+@@SELFDIFF iter=47 mismatches=0
+@@SELFDIFF iter=48 mismatches=0
+@@SELFDIFF iter=49 mismatches=0
+@@SELFDIFF iter=50 mismatches=0
+@@SELFDIFF iter=51 mismatches=0
+@@SELFDIFF iter=52 mismatches=0
+@@SELFDIFF iter=53 mismatches=0
+@@SELFDIFF iter=54 mismatches=0
+@@SELFDIFF iter=55 mismatches=0
+@@SELFDIFF iter=56 mismatches=0
+@@SELFDIFF iter=57 mismatches=0
+@@SELFDIFF iter=58 mismatches=0
+@@SELFDIFF iter=59 mismatches=0
+@@SELFDIFF iter=60 mismatches=0
+@@SELFDIFF iter=61 mismatches=0
+@@SELFDIFF iter=62 mismatches=0
+@@SELFDIFF iter=63 mismatches=0
+@@SELFDIFF iter=64 mismatches=0
+@@SELFDIFF iter=65 mismatches=0
+@@SELFDIFF iter=66 mismatches=0
+@@SELFDIFF iter=67 mismatches=0
+@@SELFDIFF iter=68 mismatches=0
+@@SELFDIFF iter=69 mismatches=0
+@@SELFDIFF iter=70 mismatches=0
+@@SELFDIFF iter=71 mismatches=0
+@@SELFDIFF iter=72 mismatches=0
+@@SELFDIFF iter=73 mismatches=0
+@@SELFDIFF iter=74 mismatches=0
+@@SELFDIFF iter=75 mismatches=0
+@@SELFDIFF iter=76 mismatches=0
+@@SELFDIFF iter=77 mismatches=0
+@@SELFDIFF iter=78 mismatches=0
+@@SELFDIFF iter=79 mismatches=0
+@@SELFDIFF iter=80 mismatches=0
+@@SELFDIFF iter=81 mismatches=0
+@@SELFDIFF iter=82 mismatches=0
+@@SELFDIFF iter=83 mismatches=0
+@@SELFDIFF iter=84 mismatches=0
+@@SELFDIFF iter=85 mismatches=0
+@@SELFDIFF iter=86 mismatches=0
+@@SELFDIFF iter=87 mismatches=0
+@@SELFDIFF iter=88 mismatches=0
+@@SELFDIFF iter=89 mismatches=0
+@@SELFDIFF iter=90 mismatches=0
+@@SELFDIFF iter=91 mismatches=0
+@@SELFDIFF iter=92 mismatches=0
+@@SELFDIFF iter=93 mismatches=0
+@@SELFDIFF iter=94 mismatches=0
+@@SELFDIFF iter=95 mismatches=0
+@@SELFDIFF iter=96 mismatches=0
+@@SELFDIFF iter=97 mismatches=0
+@@SELFDIFF iter=98 mismatches=0
+@@SELFDIFF iter=99 mismatches=0
+@@SELFDIFF_SUMMARY launches=100 dirty=0 worst=0
+@@CELL_EXIT name=gemm_only rc=0
+
+@@CELL name=stsm flags=-DSELF_DIFF=100 -DSTSM_STORE
+$ make -B fc1-w3 'DFLAGS=-DSELF_DIFF=100 -DSTSM_STORE'
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DSELF_DIFF=100 -DSTSM_STORE fc1_w3.cu -o fc1-w3 -lcurand_static -lculibos -lcuda
+fc1_w3.cu(968): warning #177-D: variable "prev_n_bias" was declared but never referenced
+                  const int prev_n_bias = ptn * 256;
+                            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc1_w3.cu(1120): warning #177-D: variable "last_n_bias" was declared but never referenced
+          const int last_n_bias = ltn * 256;
+                    ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 7.166 ms
+ptxas info    : Compiling entry function '_Z14count_mismatchPK13__nv_bfloat16S1_xPy' for 'sm_100a'
+ptxas info    : Function properties for _Z14count_mismatchPK13__nv_bfloat16S1_xPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 12.332 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 0.972 ms
+ptxas info    : Compiling entry function '_Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_
+    16 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 118 registers, used 1 barriers, 16 bytes cumulative stack size
+ptxas info    : Compile time = 43.857 ms
+$ timeout -k 5 120 stdbuf -oL -eL /root/src/fc1-w3
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 215040 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=215040 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 1.910 ms  2293.07 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=3529864 launches=10
+  MISMATCH at (58016,94): expected 1824.0 got 1816.0 (gemm=1728.0 bias=95.0)
+  MISMATCH at (116032,188): expected 1920.0 got 1912.0 (gemm=1728.0 bias=189.0)
+  MISMATCH at (174048,282): expected 2016.0 got 2008.0 (gemm=1728.0 bias=284.0)
+  MISMATCH at (203056,329): expected 1480.0 got 1488.0 (gemm=1152.0 bias=330.0)
+  MISMATCH at (290080,470): expected 2208.0 got 2192.0 (gemm=1728.0 bias=472.0)
+Validation: 21/32 spot checks passed — FAILED
+Checksum (1024 strided): 3207680.000000
+C[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=1.910 tflops=2293.07 checksum=3207680.000000 valid=0 c0=1728.0
+@@SELFDIFF_BEGIN launches=100
+@@SELFDIFF iter=0 mismatches=0
+@@SELFDIFF iter=1 mismatches=0
+@@SELFDIFF iter=2 mismatches=0
+@@SELFDIFF iter=3 mismatches=0
+@@SELFDIFF iter=4 mismatches=0
+@@SELFDIFF iter=5 mismatches=0
+@@SELFDIFF iter=6 mismatches=0
+@@SELFDIFF iter=7 mismatches=0
+@@SELFDIFF iter=8 mismatches=0
+@@SELFDIFF iter=9 mismatches=0
+@@SELFDIFF iter=10 mismatches=0
+@@SELFDIFF iter=11 mismatches=0
+@@SELFDIFF iter=12 mismatches=0
+@@SELFDIFF iter=13 mismatches=0
+@@SELFDIFF iter=14 mismatches=0
+@@SELFDIFF iter=15 mismatches=0
+@@SELFDIFF iter=16 mismatches=0
+@@SELFDIFF iter=17 mismatches=0
+@@SELFDIFF iter=18 mismatches=0
+@@SELFDIFF iter=19 mismatches=0
+@@SELFDIFF iter=20 mismatches=0
+@@SELFDIFF iter=21 mismatches=0
+@@SELFDIFF iter=22 mismatches=0
+@@SELFDIFF iter=23 mismatches=0
+@@SELFDIFF iter=24 mismatches=0
+@@SELFDIFF iter=25 mismatches=0
+@@SELFDIFF iter=26 mismatches=0
+@@SELFDIFF iter=27 mismatches=0
+@@SELFDIFF iter=28 mismatches=0
+@@SELFDIFF iter=29 mismatches=0
+@@SELFDIFF iter=30 mismatches=0
+@@SELFDIFF iter=31 mismatches=0
+@@SELFDIFF iter=32 mismatches=0
+@@SELFDIFF iter=33 mismatches=0
+@@SELFDIFF iter=34 mismatches=0
+@@SELFDIFF iter=35 mismatches=0
+@@SELFDIFF iter=36 mismatches=0
+@@SELFDIFF iter=37 mismatches=0
+@@SELFDIFF iter=38 mismatches=0
+@@SELFDIFF iter=39 mismatches=0
+@@SELFDIFF iter=40 mismatches=0
+@@SELFDIFF iter=41 mismatches=0
+@@SELFDIFF iter=42 mismatches=0
+@@SELFDIFF iter=43 mismatches=0
+@@SELFDIFF iter=44 mismatches=0
+@@SELFDIFF iter=45 mismatches=0
+@@SELFDIFF iter=46 mismatches=0
+@@SELFDIFF iter=47 mismatches=0
+@@SELFDIFF iter=48 mismatches=0
+@@SELFDIFF iter=49 mismatches=0
+@@SELFDIFF iter=50 mismatches=0
+@@SELFDIFF iter=51 mismatches=0
+@@SELFDIFF iter=52 mismatches=0
+@@SELFDIFF iter=53 mismatches=0
+@@SELFDIFF iter=54 mismatches=0
+@@SELFDIFF iter=55 mismatches=0
+@@SELFDIFF iter=56 mismatches=0
+@@SELFDIFF iter=57 mismatches=0
+@@SELFDIFF iter=58 mismatches=0
+@@SELFDIFF iter=59 mismatches=0
+@@SELFDIFF iter=60 mismatches=0
+@@SELFDIFF iter=61 mismatches=0
+@@SELFDIFF iter=62 mismatches=0
+@@SELFDIFF iter=63 mismatches=0
+@@SELFDIFF iter=64 mismatches=0
+@@SELFDIFF iter=65 mismatches=0
+@@SELFDIFF iter=66 mismatches=0
+@@SELFDIFF iter=67 mismatches=0
+@@SELFDIFF iter=68 mismatches=0
+@@SELFDIFF iter=69 mismatches=0
+@@SELFDIFF iter=70 mismatches=0
+@@SELFDIFF iter=71 mismatches=0
+@@SELFDIFF iter=72 mismatches=0
+@@SELFDIFF iter=73 mismatches=0
+@@SELFDIFF iter=74 mismatches=0
+@@SELFDIFF iter=75 mismatches=0
+@@SELFDIFF iter=76 mismatches=0
+@@SELFDIFF iter=77 mismatches=0
+@@SELFDIFF iter=78 mismatches=0
+@@SELFDIFF iter=79 mismatches=0
+@@SELFDIFF iter=80 mismatches=0
+@@SELFDIFF iter=81 mismatches=0
+@@SELFDIFF iter=82 mismatches=0
+@@SELFDIFF iter=83 mismatches=0
+@@SELFDIFF iter=84 mismatches=0
+@@SELFDIFF iter=85 mismatches=0
+@@SELFDIFF iter=86 mismatches=0
+@@SELFDIFF iter=87 mismatches=0
+@@SELFDIFF iter=88 mismatches=0
+@@SELFDIFF iter=89 mismatches=0
+@@SELFDIFF iter=90 mismatches=0
+@@SELFDIFF iter=91 mismatches=0
+@@SELFDIFF iter=92 mismatches=0
+@@SELFDIFF iter=93 mismatches=0
+@@SELFDIFF iter=94 mismatches=0
+@@SELFDIFF iter=95 mismatches=0
+@@SELFDIFF iter=96 mismatches=0
+@@SELFDIFF iter=97 mismatches=0
+@@SELFDIFF iter=98 mismatches=0
+@@SELFDIFF iter=99 mismatches=0
+@@SELFDIFF_SUMMARY launches=100 dirty=0 worst=0
+@@CELL_EXIT name=stsm rc=0
+
+@@CELL name=stsm_t flags=-DSELF_DIFF=100 -DSTSM_STORE=2
+$ make -B fc1-w3 'DFLAGS=-DSELF_DIFF=100 -DSTSM_STORE=2'
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DSELF_DIFF=100 -DSTSM_STORE=2 fc1_w3.cu -o fc1-w3 -lcurand_static -lculibos -lcuda
+fc1_w3.cu(968): warning #177-D: variable "prev_n_bias" was declared but never referenced
+                  const int prev_n_bias = ptn * 256;
+                            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc1_w3.cu(1120): warning #177-D: variable "last_n_bias" was declared but never referenced
+          const int last_n_bias = ltn * 256;
+                    ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 7.051 ms
+ptxas info    : Compiling entry function '_Z14count_mismatchPK13__nv_bfloat16S1_xPy' for 'sm_100a'
+ptxas info    : Function properties for _Z14count_mismatchPK13__nv_bfloat16S1_xPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 12.848 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 0.603 ms
+ptxas info    : Compiling entry function '_Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_
+    16 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 118 registers, used 1 barriers, 16 bytes cumulative stack size
+ptxas info    : Compile time = 39.690 ms
+$ timeout -k 5 120 stdbuf -oL -eL /root/src/fc1-w3
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 215040 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=215040 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 1.914 ms  2288.49 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=3536564 launches=10
+  MISMATCH at (29008,47): expected 1200.0 got 1776.0 (gemm=1152.0 bias=48.0)
+  MISMATCH at (58016,94): expected 1824.0 got 1816.0 (gemm=1728.0 bias=95.0)
+  MISMATCH at (87024,141): expected 1296.0 got 1872.0 (gemm=1152.0 bias=142.0)
+  MISMATCH at (116032,188): expected 1920.0 got 1912.0 (gemm=1728.0 bias=189.0)
+  MISMATCH at (145040,235): expected 1392.0 got 1968.0 (gemm=1152.0 bias=236.0)
+Validation: 10/32 spot checks passed — FAILED
+Checksum (1024 strided): 3207680.000000
+C[0,0..3] = 1728.0 1728.0 1728.0 1728.0
+@@RESULT ms=1.914 tflops=2288.49 checksum=3207680.000000 valid=0 c0=1728.0
+@@SELFDIFF_BEGIN launches=100
+@@SELFDIFF iter=0 mismatches=0
+@@SELFDIFF iter=1 mismatches=0
+@@SELFDIFF iter=2 mismatches=0
+@@SELFDIFF iter=3 mismatches=0
+@@SELFDIFF iter=4 mismatches=0
+@@SELFDIFF iter=5 mismatches=0
+@@SELFDIFF iter=6 mismatches=0
+@@SELFDIFF iter=7 mismatches=0
+@@SELFDIFF iter=8 mismatches=0
+@@SELFDIFF iter=9 mismatches=0
+@@SELFDIFF iter=10 mismatches=0
+@@SELFDIFF iter=11 mismatches=0
+@@SELFDIFF iter=12 mismatches=0
+@@SELFDIFF iter=13 mismatches=0
+@@SELFDIFF iter=14 mismatches=0
+@@SELFDIFF iter=15 mismatches=0
+@@SELFDIFF iter=16 mismatches=0
+@@SELFDIFF iter=17 mismatches=0
+@@SELFDIFF iter=18 mismatches=0
+@@SELFDIFF iter=19 mismatches=0
+@@SELFDIFF iter=20 mismatches=0
+@@SELFDIFF iter=21 mismatches=0
+@@SELFDIFF iter=22 mismatches=0
+@@SELFDIFF iter=23 mismatches=0
+@@SELFDIFF iter=24 mismatches=0
+@@SELFDIFF iter=25 mismatches=0
+@@SELFDIFF iter=26 mismatches=0
+@@SELFDIFF iter=27 mismatches=0
+@@SELFDIFF iter=28 mismatches=0
+@@SELFDIFF iter=29 mismatches=0
+@@SELFDIFF iter=30 mismatches=0
+@@SELFDIFF iter=31 mismatches=0
+@@SELFDIFF iter=32 mismatches=0
+@@SELFDIFF iter=33 mismatches=0
+@@SELFDIFF iter=34 mismatches=0
+@@SELFDIFF iter=35 mismatches=0
+@@SELFDIFF iter=36 mismatches=0
+@@SELFDIFF iter=37 mismatches=0
+@@SELFDIFF iter=38 mismatches=0
+@@SELFDIFF iter=39 mismatches=0
+@@SELFDIFF iter=40 mismatches=0
+@@SELFDIFF iter=41 mismatches=0
+@@SELFDIFF iter=42 mismatches=0
+@@SELFDIFF iter=43 mismatches=0
+@@SELFDIFF iter=44 mismatches=0
+@@SELFDIFF iter=45 mismatches=0
+@@SELFDIFF iter=46 mismatches=0
+@@SELFDIFF iter=47 mismatches=0
+@@SELFDIFF iter=48 mismatches=0
+@@SELFDIFF iter=49 mismatches=0
+@@SELFDIFF iter=50 mismatches=0
+@@SELFDIFF iter=51 mismatches=0
+@@SELFDIFF iter=52 mismatches=0
+@@SELFDIFF iter=53 mismatches=0
+@@SELFDIFF iter=54 mismatches=0
+@@SELFDIFF iter=55 mismatches=0
+@@SELFDIFF iter=56 mismatches=0
+@@SELFDIFF iter=57 mismatches=0
+@@SELFDIFF iter=58 mismatches=0
+@@SELFDIFF iter=59 mismatches=0
+@@SELFDIFF iter=60 mismatches=0
+@@SELFDIFF iter=61 mismatches=0
+@@SELFDIFF iter=62 mismatches=0
+@@SELFDIFF iter=63 mismatches=0
+@@SELFDIFF iter=64 mismatches=0
+@@SELFDIFF iter=65 mismatches=0
+@@SELFDIFF iter=66 mismatches=0
+@@SELFDIFF iter=67 mismatches=0
+@@SELFDIFF iter=68 mismatches=0
+@@SELFDIFF iter=69 mismatches=0
+@@SELFDIFF iter=70 mismatches=0
+@@SELFDIFF iter=71 mismatches=0
+@@SELFDIFF iter=72 mismatches=0
+@@SELFDIFF iter=73 mismatches=0
+@@SELFDIFF iter=74 mismatches=0
+@@SELFDIFF iter=75 mismatches=0
+@@SELFDIFF iter=76 mismatches=0
+@@SELFDIFF iter=77 mismatches=0
+@@SELFDIFF iter=78 mismatches=0
+@@SELFDIFF iter=79 mismatches=0
+@@SELFDIFF iter=80 mismatches=0
+@@SELFDIFF iter=81 mismatches=0
+@@SELFDIFF iter=82 mismatches=0
+@@SELFDIFF iter=83 mismatches=0
+@@SELFDIFF iter=84 mismatches=0
+@@SELFDIFF iter=85 mismatches=0
+@@SELFDIFF iter=86 mismatches=0
+@@SELFDIFF iter=87 mismatches=0
+@@SELFDIFF iter=88 mismatches=0
+@@SELFDIFF iter=89 mismatches=0
+@@SELFDIFF iter=90 mismatches=0
+@@SELFDIFF iter=91 mismatches=0
+@@SELFDIFF iter=92 mismatches=0
+@@SELFDIFF iter=93 mismatches=0
+@@SELFDIFF iter=94 mismatches=0
+@@SELFDIFF iter=95 mismatches=0
+@@SELFDIFF iter=96 mismatches=0
+@@SELFDIFF iter=97 mismatches=0
+@@SELFDIFF iter=98 mismatches=0
+@@SELFDIFF iter=99 mismatches=0
+@@SELFDIFF_SUMMARY launches=100 dirty=0 worst=0
+@@CELL_EXIT name=stsm_t rc=0
+
+@@CELL name=gemm_stsm flags=-DSELF_DIFF=100 -DGEMM_ONLY -DSTSM_STORE
+$ make -B fc1-w3 'DFLAGS=-DSELF_DIFF=100 -DGEMM_ONLY -DSTSM_STORE'
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DSELF_DIFF=100 -DGEMM_ONLY -DSTSM_STORE fc1_w3.cu -o fc1-w3 -lcurand_static -lculibos -lcuda
+fc1_w3.cu(1120): warning #177-D: variable "last_n_bias" was declared but never referenced
+          const int last_n_bias = ltn * 256;
+                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc1_w3.cu(357): warning #177-D: function "gelu_approx" was declared but never referenced
+  static __attribute__((device)) __inline__ __attribute__((always_inline)) float gelu_approx(float acc, float bias_f32) {
+                                                                                 ^
+
+fc1_w3.cu(366): warning #177-D: function "gelu_fwd" was declared but never referenced
+  static __attribute__((host)) __inline__ __attribute__((always_inline)) float gelu_fwd(float x) {
+                                                                               ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 8.194 ms
+ptxas info    : Compiling entry function '_Z14count_mismatchPK13__nv_bfloat16S1_xPy' for 'sm_100a'
+ptxas info    : Function properties for _Z14count_mismatchPK13__nv_bfloat16S1_xPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 12.047 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 0.544 ms
+ptxas info    : Compiling entry function '_Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_
+    8 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 117 registers, used 0 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 48.107 ms
+$ timeout -k 5 120 stdbuf -oL -eL /root/src/fc1-w3
+FC1 W3 kernel — 6 warps, GEMM_ONLY (D=BF16(A*B), no bias/GELU)
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 215040 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=215040 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 1.748 ms  2506.33 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=3226041 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 1769472.000000
+C[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=1.748 tflops=2506.33 checksum=1769472.000000 valid=1 c0=1728.0
+@@SELFDIFF_BEGIN launches=100
+@@SELFDIFF iter=0 mismatches=0
+@@SELFDIFF iter=1 mismatches=0
+@@SELFDIFF iter=2 mismatches=0
+@@SELFDIFF iter=3 mismatches=0
+@@SELFDIFF iter=4 mismatches=0
+@@SELFDIFF iter=5 mismatches=0
+@@SELFDIFF iter=6 mismatches=0
+@@SELFDIFF iter=7 mismatches=0
+@@SELFDIFF iter=8 mismatches=0
+@@SELFDIFF iter=9 mismatches=0
+@@SELFDIFF iter=10 mismatches=0
+@@SELFDIFF iter=11 mismatches=0
+@@SELFDIFF iter=12 mismatches=0
+@@SELFDIFF iter=13 mismatches=0
+@@SELFDIFF iter=14 mismatches=0
+@@SELFDIFF iter=15 mismatches=0
+@@SELFDIFF iter=16 mismatches=0
+@@SELFDIFF iter=17 mismatches=0
+@@SELFDIFF iter=18 mismatches=0
+@@SELFDIFF iter=19 mismatches=0
+@@SELFDIFF iter=20 mismatches=0
+@@SELFDIFF iter=21 mismatches=0
+@@SELFDIFF iter=22 mismatches=0
+@@SELFDIFF iter=23 mismatches=0
+@@SELFDIFF iter=24 mismatches=0
+@@SELFDIFF iter=25 mismatches=0
+@@SELFDIFF iter=26 mismatches=0
+@@SELFDIFF iter=27 mismatches=0
+@@SELFDIFF iter=28 mismatches=0
+@@SELFDIFF iter=29 mismatches=0
+@@SELFDIFF iter=30 mismatches=0
+@@SELFDIFF iter=31 mismatches=0
+@@SELFDIFF iter=32 mismatches=0
+@@SELFDIFF iter=33 mismatches=0
+@@SELFDIFF iter=34 mismatches=0
+@@SELFDIFF iter=35 mismatches=0
+@@SELFDIFF iter=36 mismatches=0
+@@SELFDIFF iter=37 mismatches=0
+@@SELFDIFF iter=38 mismatches=0
+@@SELFDIFF iter=39 mismatches=0
+@@SELFDIFF iter=40 mismatches=0
+@@SELFDIFF iter=41 mismatches=0
+@@SELFDIFF iter=42 mismatches=0
+@@SELFDIFF iter=43 mismatches=0
+@@SELFDIFF iter=44 mismatches=0
+@@SELFDIFF iter=45 mismatches=0
+@@SELFDIFF iter=46 mismatches=0
+@@SELFDIFF iter=47 mismatches=0
+@@SELFDIFF iter=48 mismatches=0
+@@SELFDIFF iter=49 mismatches=0
+@@SELFDIFF iter=50 mismatches=0
+@@SELFDIFF iter=51 mismatches=0
+@@SELFDIFF iter=52 mismatches=0
+@@SELFDIFF iter=53 mismatches=0
+@@SELFDIFF iter=54 mismatches=0
+@@SELFDIFF iter=55 mismatches=0
+@@SELFDIFF iter=56 mismatches=0
+@@SELFDIFF iter=57 mismatches=0
+@@SELFDIFF iter=58 mismatches=0
+@@SELFDIFF iter=59 mismatches=0
+@@SELFDIFF iter=60 mismatches=0
+@@SELFDIFF iter=61 mismatches=0
+@@SELFDIFF iter=62 mismatches=0
+@@SELFDIFF iter=63 mismatches=0
+@@SELFDIFF iter=64 mismatches=0
+@@SELFDIFF iter=65 mismatches=0
+@@SELFDIFF iter=66 mismatches=0
+@@SELFDIFF iter=67 mismatches=0
+@@SELFDIFF iter=68 mismatches=0
+@@SELFDIFF iter=69 mismatches=0
+@@SELFDIFF iter=70 mismatches=0
+@@SELFDIFF iter=71 mismatches=0
+@@SELFDIFF iter=72 mismatches=0
+@@SELFDIFF iter=73 mismatches=0
+@@SELFDIFF iter=74 mismatches=0
+@@SELFDIFF iter=75 mismatches=0
+@@SELFDIFF iter=76 mismatches=0
+@@SELFDIFF iter=77 mismatches=0
+@@SELFDIFF iter=78 mismatches=0
+@@SELFDIFF iter=79 mismatches=0
+@@SELFDIFF iter=80 mismatches=0
+@@SELFDIFF iter=81 mismatches=0
+@@SELFDIFF iter=82 mismatches=0
+@@SELFDIFF iter=83 mismatches=0
+@@SELFDIFF iter=84 mismatches=0
+@@SELFDIFF iter=85 mismatches=0
+@@SELFDIFF iter=86 mismatches=0
+@@SELFDIFF iter=87 mismatches=0
+@@SELFDIFF iter=88 mismatches=0
+@@SELFDIFF iter=89 mismatches=0
+@@SELFDIFF iter=90 mismatches=0
+@@SELFDIFF iter=91 mismatches=0
+@@SELFDIFF iter=92 mismatches=0
+@@SELFDIFF iter=93 mismatches=0
+@@SELFDIFF iter=94 mismatches=0
+@@SELFDIFF iter=95 mismatches=0
+@@SELFDIFF iter=96 mismatches=0
+@@SELFDIFF iter=97 mismatches=0
+@@SELFDIFF iter=98 mismatches=0
+@@SELFDIFF iter=99 mismatches=0
+@@SELFDIFF_SUMMARY launches=100 dirty=0 worst=0
+@@CELL_EXIT name=gemm_stsm rc=0
+
+@@CELL name=pad flags=-DSELF_DIFF=100 -DSTAGING_PAD=4608
+$ make -B fc1-w3 'DFLAGS=-DSELF_DIFF=100 -DSTAGING_PAD=4608'
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DSELF_DIFF=100 -DSTAGING_PAD=4608 fc1_w3.cu -o fc1-w3 -lcurand_static -lculibos -lcuda
+fc1_w3.cu(968): warning #177-D: variable "prev_n_bias" was declared but never referenced
+                  const int prev_n_bias = ptn * 256;
+                            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc1_w3.cu(1120): warning #177-D: variable "last_n_bias" was declared but never referenced
+          const int last_n_bias = ltn * 256;
+                    ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 7.000 ms
+ptxas info    : Compiling entry function '_Z14count_mismatchPK13__nv_bfloat16S1_xPy' for 'sm_100a'
+ptxas info    : Function properties for _Z14count_mismatchPK13__nv_bfloat16S1_xPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 11.771 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 0.537 ms
+ptxas info    : Compiling entry function '_Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_
+    16 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 118 registers, used 1 barriers, 16 bytes cumulative stack size
+ptxas info    : Compile time = 39.878 ms
+$ timeout -k 5 120 stdbuf -oL -eL /root/src/fc1-w3
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 220160 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=220160 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 1.887 ms  2320.68 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=3485884 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 3207168.000000
+C[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=1.887 tflops=2320.68 checksum=3207168.000000 valid=1 c0=1728.0
+@@SELFDIFF_BEGIN launches=100
+@@SELFDIFF iter=0 mismatches=0
+@@SELFDIFF iter=1 mismatches=0
+@@SELFDIFF iter=2 mismatches=0
+@@SELFDIFF iter=3 mismatches=0
+@@SELFDIFF iter=4 mismatches=0
+@@SELFDIFF iter=5 mismatches=0
+@@SELFDIFF iter=6 mismatches=0
+@@SELFDIFF iter=7 mismatches=0
+@@SELFDIFF iter=8 mismatches=0
+@@SELFDIFF iter=9 mismatches=0
+@@SELFDIFF iter=10 mismatches=0
+@@SELFDIFF iter=11 mismatches=0
+@@SELFDIFF iter=12 mismatches=0
+@@SELFDIFF iter=13 mismatches=0
+@@SELFDIFF iter=14 mismatches=0
+@@SELFDIFF iter=15 mismatches=0
+@@SELFDIFF iter=16 mismatches=0
+@@SELFDIFF iter=17 mismatches=0
+@@SELFDIFF iter=18 mismatches=0
+@@SELFDIFF iter=19 mismatches=0
+@@SELFDIFF iter=20 mismatches=0
+@@SELFDIFF iter=21 mismatches=0
+@@SELFDIFF iter=22 mismatches=0
+@@SELFDIFF iter=23 mismatches=0
+@@SELFDIFF iter=24 mismatches=0
+@@SELFDIFF iter=25 mismatches=0
+@@SELFDIFF iter=26 mismatches=0
+@@SELFDIFF iter=27 mismatches=0
+@@SELFDIFF iter=28 mismatches=0
+@@SELFDIFF iter=29 mismatches=0
+@@SELFDIFF iter=30 mismatches=0
+@@SELFDIFF iter=31 mismatches=0
+@@SELFDIFF iter=32 mismatches=0
+@@SELFDIFF iter=33 mismatches=0
+@@SELFDIFF iter=34 mismatches=0
+@@SELFDIFF iter=35 mismatches=0
+@@SELFDIFF iter=36 mismatches=0
+@@SELFDIFF iter=37 mismatches=0
+@@SELFDIFF iter=38 mismatches=0
+@@SELFDIFF iter=39 mismatches=0
+@@SELFDIFF iter=40 mismatches=0
+@@SELFDIFF iter=41 mismatches=0
+@@SELFDIFF iter=42 mismatches=0
+@@SELFDIFF iter=43 mismatches=0
+@@SELFDIFF iter=44 mismatches=0
+@@SELFDIFF iter=45 mismatches=0
+@@SELFDIFF iter=46 mismatches=0
+@@SELFDIFF iter=47 mismatches=0
+@@SELFDIFF iter=48 mismatches=0
+@@SELFDIFF iter=49 mismatches=0
+@@SELFDIFF iter=50 mismatches=0
+@@SELFDIFF iter=51 mismatches=0
+@@SELFDIFF iter=52 mismatches=0
+@@SELFDIFF iter=53 mismatches=0
+@@SELFDIFF iter=54 mismatches=0
+@@SELFDIFF iter=55 mismatches=0
+@@SELFDIFF iter=56 mismatches=0
+@@SELFDIFF iter=57 mismatches=0
+@@SELFDIFF iter=58 mismatches=0
+@@SELFDIFF iter=59 mismatches=0
+@@SELFDIFF iter=60 mismatches=0
+@@SELFDIFF iter=61 mismatches=0
+@@SELFDIFF iter=62 mismatches=0
+@@SELFDIFF iter=63 mismatches=0
+@@SELFDIFF iter=64 mismatches=0
+@@SELFDIFF iter=65 mismatches=0
+@@SELFDIFF iter=66 mismatches=0
+@@SELFDIFF iter=67 mismatches=0
+@@SELFDIFF iter=68 mismatches=0
+@@SELFDIFF iter=69 mismatches=0
+@@SELFDIFF iter=70 mismatches=0
+@@SELFDIFF iter=71 mismatches=0
+@@SELFDIFF iter=72 mismatches=0
+@@SELFDIFF iter=73 mismatches=0
+@@SELFDIFF iter=74 mismatches=0
+@@SELFDIFF iter=75 mismatches=0
+@@SELFDIFF iter=76 mismatches=0
+@@SELFDIFF iter=77 mismatches=0
+@@SELFDIFF iter=78 mismatches=0
+@@SELFDIFF iter=79 mismatches=0
+@@SELFDIFF iter=80 mismatches=0
+@@SELFDIFF iter=81 mismatches=0
+@@SELFDIFF iter=82 mismatches=0
+@@SELFDIFF iter=83 mismatches=0
+@@SELFDIFF iter=84 mismatches=0
+@@SELFDIFF iter=85 mismatches=0
+@@SELFDIFF iter=86 mismatches=0
+@@SELFDIFF iter=87 mismatches=0
+@@SELFDIFF iter=88 mismatches=0
+@@SELFDIFF iter=89 mismatches=0
+@@SELFDIFF iter=90 mismatches=0
+@@SELFDIFF iter=91 mismatches=0
+@@SELFDIFF iter=92 mismatches=0
+@@SELFDIFF iter=93 mismatches=0
+@@SELFDIFF iter=94 mismatches=0
+@@SELFDIFF iter=95 mismatches=0
+@@SELFDIFF iter=96 mismatches=0
+@@SELFDIFF iter=97 mismatches=0
+@@SELFDIFF iter=98 mismatches=0
+@@SELFDIFF iter=99 mismatches=0
+@@SELFDIFF_SUMMARY launches=100 dirty=0 worst=0
+@@CELL_EXIT name=pad rc=0
+
+@@CELL name=base2 flags=-DSELF_DIFF=100
+$ make -B fc1-w3 DFLAGS=-DSELF_DIFF=100
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DSELF_DIFF=100 fc1_w3.cu -o fc1-w3 -lcurand_static -lculibos -lcuda
+fc1_w3.cu(968): warning #177-D: variable "prev_n_bias" was declared but never referenced
+                  const int prev_n_bias = ptn * 256;
+                            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc1_w3.cu(1120): warning #177-D: variable "last_n_bias" was declared but never referenced
+          const int last_n_bias = ltn * 256;
+                    ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 6.908 ms
+ptxas info    : Compiling entry function '_Z14count_mismatchPK13__nv_bfloat16S1_xPy' for 'sm_100a'
+ptxas info    : Function properties for _Z14count_mismatchPK13__nv_bfloat16S1_xPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 12.018 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 0.538 ms
+ptxas info    : Compiling entry function '_Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_
+    16 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 118 registers, used 1 barriers, 16 bytes cumulative stack size
+ptxas info    : Compile time = 38.174 ms
+$ timeout -k 5 120 stdbuf -oL -eL /root/src/fc1-w3
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 215040 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=215040 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 1.894 ms  2312.89 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=3497648 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 3207168.000000
+C[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=1.894 tflops=2312.89 checksum=3207168.000000 valid=1 c0=1728.0
+@@SELFDIFF_BEGIN launches=100
+@@SELFDIFF iter=0 mismatches=0
+@@SELFDIFF iter=1 mismatches=0
+@@SELFDIFF iter=2 mismatches=0
+@@SELFDIFF iter=3 mismatches=0
+@@SELFDIFF iter=4 mismatches=0
+@@SELFDIFF iter=5 mismatches=0
+@@SELFDIFF iter=6 mismatches=0
+@@SELFDIFF iter=7 mismatches=0
+@@SELFDIFF iter=8 mismatches=0
+@@SELFDIFF iter=9 mismatches=0
+@@SELFDIFF iter=10 mismatches=0
+@@SELFDIFF iter=11 mismatches=0
+@@SELFDIFF iter=12 mismatches=0
+@@SELFDIFF iter=13 mismatches=0
+@@SELFDIFF iter=14 mismatches=0
+@@SELFDIFF iter=15 mismatches=0
+@@SELFDIFF iter=16 mismatches=0
+@@SELFDIFF iter=17 mismatches=0
+@@SELFDIFF iter=18 mismatches=0
+@@SELFDIFF iter=19 mismatches=0
+@@SELFDIFF iter=20 mismatches=0
+@@SELFDIFF iter=21 mismatches=0
+@@SELFDIFF iter=22 mismatches=0
+@@SELFDIFF iter=23 mismatches=0
+@@SELFDIFF iter=24 mismatches=0
+@@SELFDIFF iter=25 mismatches=0
+@@SELFDIFF iter=26 mismatches=0
+@@SELFDIFF iter=27 mismatches=0
+@@SELFDIFF iter=28 mismatches=0
+@@SELFDIFF iter=29 mismatches=0
+@@SELFDIFF iter=30 mismatches=0
+@@SELFDIFF iter=31 mismatches=0
+@@SELFDIFF iter=32 mismatches=0
+@@SELFDIFF iter=33 mismatches=0
+@@SELFDIFF iter=34 mismatches=0
+@@SELFDIFF iter=35 mismatches=0
+@@SELFDIFF iter=36 mismatches=0
+@@SELFDIFF iter=37 mismatches=0
+@@SELFDIFF iter=38 mismatches=0
+@@SELFDIFF iter=39 mismatches=0
+@@SELFDIFF iter=40 mismatches=0
+@@SELFDIFF iter=41 mismatches=0
+@@SELFDIFF iter=42 mismatches=0
+@@SELFDIFF iter=43 mismatches=0
+@@SELFDIFF iter=44 mismatches=0
+@@SELFDIFF iter=45 mismatches=0
+@@SELFDIFF iter=46 mismatches=0
+@@SELFDIFF iter=47 mismatches=0
+@@SELFDIFF iter=48 mismatches=0
+@@SELFDIFF iter=49 mismatches=0
+@@SELFDIFF iter=50 mismatches=0
+@@SELFDIFF iter=51 mismatches=0
+@@SELFDIFF iter=52 mismatches=0
+@@SELFDIFF iter=53 mismatches=0
+@@SELFDIFF iter=54 mismatches=0
+@@SELFDIFF iter=55 mismatches=0
+@@SELFDIFF iter=56 mismatches=0
+@@SELFDIFF iter=57 mismatches=0
+@@SELFDIFF iter=58 mismatches=0
+@@SELFDIFF iter=59 mismatches=0
+@@SELFDIFF iter=60 mismatches=0
+@@SELFDIFF iter=61 mismatches=0
+@@SELFDIFF iter=62 mismatches=0
+@@SELFDIFF iter=63 mismatches=0
+@@SELFDIFF iter=64 mismatches=0
+@@SELFDIFF iter=65 mismatches=0
+@@SELFDIFF iter=66 mismatches=0
+@@SELFDIFF iter=67 mismatches=0
+@@SELFDIFF iter=68 mismatches=0
+@@SELFDIFF iter=69 mismatches=0
+@@SELFDIFF iter=70 mismatches=0
+@@SELFDIFF iter=71 mismatches=0
+@@SELFDIFF iter=72 mismatches=0
+@@SELFDIFF iter=73 mismatches=0
+@@SELFDIFF iter=74 mismatches=0
+@@SELFDIFF iter=75 mismatches=0
+@@SELFDIFF iter=76 mismatches=0
+@@SELFDIFF iter=77 mismatches=0
+@@SELFDIFF iter=78 mismatches=0
+@@SELFDIFF iter=79 mismatches=0
+@@SELFDIFF iter=80 mismatches=0
+@@SELFDIFF iter=81 mismatches=0
+@@SELFDIFF iter=82 mismatches=0
+@@SELFDIFF iter=83 mismatches=0
+@@SELFDIFF iter=84 mismatches=0
+@@SELFDIFF iter=85 mismatches=0
+@@SELFDIFF iter=86 mismatches=0
+@@SELFDIFF iter=87 mismatches=0
+@@SELFDIFF iter=88 mismatches=0
+@@SELFDIFF iter=89 mismatches=0
+@@SELFDIFF iter=90 mismatches=0
+@@SELFDIFF iter=91 mismatches=0
+@@SELFDIFF iter=92 mismatches=0
+@@SELFDIFF iter=93 mismatches=0
+@@SELFDIFF iter=94 mismatches=0
+@@SELFDIFF iter=95 mismatches=0
+@@SELFDIFF iter=96 mismatches=0
+@@SELFDIFF iter=97 mismatches=0
+@@SELFDIFF iter=98 mismatches=0
+@@SELFDIFF iter=99 mismatches=0
+@@SELFDIFF_SUMMARY launches=100 dirty=0 worst=0
+Stopping app - local entrypoint completed.
+@@CELL_EXIT name=base2 rc=0
+✓ App completed. View run at 
+https://modal.com/apps/stephenliang/main/ap-6zkls4ZB5SKSTaxNt4Vn3X

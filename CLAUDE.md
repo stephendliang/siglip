@@ -25,14 +25,18 @@ move the wall). Shipped in-file defaults: EPI_DECOUPLE+ES=3 (2026-07-02,
 −336.2 kcyc — per-subiter cross-warp barriers dropped, warps self-pace +
 3-deep store ring; `-DNO_EPI_DECOUPLE -DNUM_EPI_STAGES=2` reverts
 SASS-identically) and BIAS_PER_TILE cp.async 3-slot ring at TD≥8
-(2026-07-02 evening, −133.1 kcyc; `-DNO_BIAS_PER_TILE` reverts; win
-mechanism unproven — compact 512 B slots, OFF_STAGING 171008→165888).
-**Remaining gap is STORE structure, not math:** vendor GEMM-only rank-1 =
-2510.4 kcyc (4.27 kcyc/tile bare store, full GELU only +1.5/tile on top) and
-perfectly-packed f32x2 GELU (4.5 slots/elem, denser than vendor 5.5)
-REGRESSED +31 — epi is not FP-issue-bound. Next levers: STSM.16 stores
-(vendor MT88), staging↔bias LDS bank probe, GEMM_ONLY re-measure
-post-decouple. `memory/project-fc1-gelu-x2-bias-ring.md`.
+(2026-07-02 evening, −133.1 kcyc; `-DNO_BIAS_PER_TILE` reverts; mechanism
+PROVEN = compact 512 B slots: `-DSTAGING_PAD=4608` restores the old
+OFF_STAGING=171008 and the win survives).
+**Remaining gap is bare store RATE, not math or opcode:** vendor GEMM-only
+rank-1 = 2510.4 kcyc (4.27 kcyc/tile bare store, full GELU only +1.5/tile on
+top) vs our GEMM_ONLY 3227.3 (5.49/tile — our GELU-on-top +0.44/tile is
+CHEAPER than theirs); packed f32x2 GELU (4.5 slots/elem, denser than vendor
+5.5) REGRESSED +31 — not FP-issue-bound; STSM stores REGRESSED +45..52
+GELU / TIE GEMM_ONLY even at vendor's exact STSM.16.MT88.4
+(`-DSTSM_STORE[=1|2]` timing-only probe — 16x256b LDTM rewrite not worth
+it). Left: wait_group→UTMACMDFLUSH-style pacing, LDTM width, subpass shape.
+`memory/project-fc1-gelu-x2-bias-ring.md`.
 NS=6 matrix 2026-07-02: TIE at production (and pays the ES=2 tax vs ring);
 strip NS=6 hits the MMA floor (3.09 kcyc/tile, −33% — NS=5's "loader floor"
 was the within-tile stage-0 recycle). Epi-rate runway to ~1.85 Mcyc; ring
@@ -142,6 +146,7 @@ logs `data/residual_introspect_20260701/`.
 | impl | kcyc/launch | wall ms |
 |---|---|---|
 | cuBLASLt GEMM-only rank-1 (epi=0, context) | 2510.4 | 1.360 |
+| fc1_w3 GEMM_ONLY (store-only, context) | 3227.3 | 1.748 |
 | cuBLASLt PT rank-1 (algoId=66 t23 cl 2x1x1) | **3391.2** (±0.3k) | 1.838 |
 | **fc1_w3** (production; matrix cell, base anchor 3620.8) | **3487.7** | 1.891 |
 | cuBLASLt MXFP8 rank-1 (same identity) | 3476.7 (±0.4k) | 1.885 |
@@ -157,7 +162,9 @@ reproduces the old build SASS byte-identically. No differential throttle at
 FC1 (~1.85 GHz all impls). Logs `data/fc1_epi_decouple_20260702/`.
 BIAS_PER_TILE ring = −133.1 further (2026-07-02 evening 9-cell matrix, all
 valid=1 + dirty=0/100; ES=4 +169, NS=6 +120 vs ring; paired rerun pending).
-Logs `data/fc1_x2_ring_20260702/`.
+Logs `data/fc1_x2_ring_20260702/`. Store probe (same day, logs
+`data/fc1_store_probe_20260702/`): base 3484.5 reproduced ring cross-container
+(+13.2 base2 drift); STSM/pad/GEMM_ONLY verdicts in the open-front paragraph.
 
 ### Dim/K sweep conclusions (full tables: `memory/project-perf-table-archive.md`)
 
@@ -208,6 +215,10 @@ Per-item files: `memory/MEMORY.md`. One-liners:
   (4.5 slots/elem < vendor 5.5, zero scalar residue) is +31 kcyc alone and
   +200–340 in combos — epi is not FP-issue-bound; kept opt-in only.
   `memory/project-fc1-gelu-x2-bias-ring.md`.
+- **FC1 STSM_STORE (stmatrix epi store):** +45..52 kcyc GELU / TIE
+  GEMM_ONLY, incl. vendor's exact STSM.16.MT88.4 — warp-wide gather stalls
+  on GELU lane skew. Timing-only probe (our LDTM is lane-per-row → bytes
+  permuted, valid=0); do NOT build the 16x256b LDTM rewrite to feed it.
 - **fc1_w3x PER_WARP_STORE:** barrier-free crashes (Xid 13 CGA "CTA Not
   Present" — one CTA exits persistent loop while cluster peer issues cluster
   ops); with bar.sync back, +63 µs. Serial tid==0 store was never the FC1

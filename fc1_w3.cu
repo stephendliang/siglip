@@ -28,6 +28,15 @@ Compile-time flags:
   -DNO_BIAS_PER_TILE    Restore the full 6KB SMEM bias (TD>=8, N_STAGES<6)
   -DGELU_F32X2          Packed-pair GELU math (SASS FADD2/FMUL2/FFMA2);
                         tested +31 kcyc — epi is not FP-issue-bound
+  -DSTSM_STORE[=1|2]    TIMING-ONLY: stmatrix instead of st.shared.v4 in the
+                        epi store (1=straight, 2=.trans — vendor STSM.16.MT88).
+                        Our 32x32b TMEM load is lane-per-row, stmatrix expects
+                        4-rows-per-lane: bytes land permuted (valid=0 expected;
+                        uniform-A may mask it). Correct port needs a 16x256b
+                        TMEM-load rewrite — probe the unit before paying that
+  -DSTAGING_PAD=N       Pad bytes between bias and staging (default 0).
+                        4608 restores the pre-ring OFF_STAGING=171008 —
+                        isolates ring-win mechanism (slots vs staging address)
 */
 
 #include <cuda.h>
@@ -221,9 +230,12 @@ overrides back on — full bias can never fit at NS=6.
 #define OFF_BIAS_SMEM      ((_LAYOUT_END + 15) & ~15)
 
 /* Epilogue staging: 2-stage double-buffer for STS → TMA store */
+#ifndef STAGING_PAD
+#define STAGING_PAD 0
+#endif
 #define STAGING_REGION_BYTES  (32 * 128)
 #define EPI_STAGE_BYTES       (4 * STAGING_REGION_BYTES)
-#define OFF_STAGING           ((OFF_BIAS_SMEM + BIAS_SMEM_BYTES + 1023) & ~1023)
+#define OFF_STAGING           ((OFF_BIAS_SMEM + BIAS_SMEM_BYTES + STAGING_PAD + 1023) & ~1023)
 #define SMEM_BYTES            ((OFF_STAGING + NUM_EPI_STAGES * EPI_STAGE_BYTES + 127) & ~127)
 
 /*
@@ -399,6 +411,19 @@ static __device__ __forceinline__ uint32_t gelu2_bf16x2(float a_lo, float a_hi,
 }
 #endif
 
+/*
+Epi store instruction: st.shared.v4 (production) or stmatrix (STSM_STORE
+timing probe — same 16 B/lane footprint at the same addresses, data gathered
+across lanes by the stmatrix unit, so bytes land permuted; see header).
+*/
+#if defined(STSM_STORE) && STSM_STORE == 2
+#define _CVT_STORE_ASM "stmatrix.sync.aligned.x4.trans.m8n8.shared.b16 [%8], {o0,o1,o2,o3};\n\t"
+#elif defined(STSM_STORE)
+#define _CVT_STORE_ASM "stmatrix.sync.aligned.x4.m8n8.shared.b16 [%8], {o0,o1,o2,o3};\n\t"
+#else
+#define _CVT_STORE_ASM "st.shared.v4.b32 [%8], {o0,o1,o2,o3};\n\t"
+#endif
+
 /* CVT FP32→BF16 + STS.128 */
 #define CVT_STS_V4(f0,f1,f2,f3,f4,f5,f6,f7, SADDR) \
     asm volatile( \
@@ -408,7 +433,7 @@ static __device__ __forceinline__ uint32_t gelu2_bf16x2(float a_lo, float a_hi,
         "cvt.rn.bf16x2.f32 o1, %3, %2;\n\t" \
         "cvt.rn.bf16x2.f32 o2, %5, %4;\n\t" \
         "cvt.rn.bf16x2.f32 o3, %7, %6;\n\t" \
-        "st.shared.v4.b32 [%8], {o0,o1,o2,o3};\n\t" \
+        _CVT_STORE_ASM \
         "}" \
         :: "f"(f0),"f"(f1),"f"(f2),"f"(f3), \
            "f"(f4),"f"(f5),"f"(f6),"f"(f7), \
