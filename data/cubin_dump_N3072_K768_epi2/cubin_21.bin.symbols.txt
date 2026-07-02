@@ -1,0 +1,5 @@
+
+symbols:
+STT_FUNC         STB_LOCAL  STO_ENTRY      _ZN6cublas8internal23nopClusterDiscoveryToolEv
+STT_OBJECT       STB_WEAK   STV_DEFAULT  U .nv.reservedSmem.offset0
+STT_?            STB_WEAK   STO_RESERVED_SHARED   __nv_reservedSMEM_offset_0_alias

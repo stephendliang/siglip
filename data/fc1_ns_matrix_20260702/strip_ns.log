@@ -1,0 +1,162 @@
+✓ Initialized. View run at 
+https://modal.com/apps/stephenliang/main/ap-M7bgDF2ZgMzitCTF84yQzf
+✓ Created objects.
+├── 🔨 Created mount /home/sdl/net/sm100_sm103_tests/gpu_interface/ns_matrix.py
+├── 🔨 Created mount /home/sdl/net/sm100_sm103_tests
+└── 🔨 Created function run_matrix.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.2.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+
+@@CELL name=strip_ns5 flags=-DSTRIP_EPILOGUE -DNUM_EPI_STAGES=2 -DLDG_BIAS
+$ make -B fc1-w3 'DFLAGS=-DSTRIP_EPILOGUE -DNUM_EPI_STAGES=2 -DLDG_BIAS'
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DSTRIP_EPILOGUE -DNUM_EPI_STAGES=2 -DLDG_BIAS fc1_w3.cu -o fc1-w3 -lcurand_static -lculibos -lcuda
+fc1_w3.cu(983): warning #177-D: variable "last_m" was declared but never referenced
+          const int last_m = ((ltm * 2 + cta_rank) * (3072 / 256) + ltn) * 128;
+                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc1_w3.cu(984): warning #177-D: variable "last_n" was declared but never referenced
+          const int last_n = 0;
+                    ^
+
+fc1_w3.cu(985): warning #177-D: variable "last_n_bias" was declared but never referenced
+          const int last_n_bias = ltn * 256;
+                    ^
+
+fc1_w3.cu(566): warning #550-D: variable "prev_tm" was set but never used
+      int prev_tm = 0, prev_tn = 0;
+          ^
+
+fc1_w3.cu(566): warning #550-D: variable "prev_tn" was set but never used
+      int prev_tm = 0, prev_tn = 0;
+                       ^
+
+fc1_w3.cu(322): warning #177-D: function "gelu_approx" was declared but never referenced
+  static __attribute__((device)) __inline__ __attribute__((always_inline)) float gelu_approx(float acc, float bias_f32) {
+                                                                                 ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 12.637 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 1.954 ms
+ptxas info    : Compiling entry function '_Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_
+    8 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 57 registers, used 0 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 36.730 ms
+$ timeout -k 5 120 stdbuf -oL -eL /root/src/fc1-w3
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 197632 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=197632 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 1.478 ms  2962.72 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=2728465 launches=10
+  MISMATCH at (0,0): expected 1728.0 got 0.0 (gemm=1728.0 bias=1.0)
+  MISMATCH at (29008,47): expected 1200.0 got 0.0 (gemm=1152.0 bias=48.0)
+  MISMATCH at (58016,94): expected 1824.0 got 0.0 (gemm=1728.0 bias=95.0)
+  MISMATCH at (87024,141): expected 1296.0 got 0.0 (gemm=1152.0 bias=142.0)
+  MISMATCH at (116032,188): expected 1920.0 got 0.0 (gemm=1728.0 bias=189.0)
+Validation: 0/32 spot checks passed — FAILED
+Checksum (1024 strided): 0.000000
+C[0,0..3] = 0.0 0.0 0.0 0.0
+@@RESULT ms=1.478 tflops=2962.72 checksum=0.000000 valid=0 c0=0.0
+@@CELL_EXIT name=strip_ns5 rc=0
+
+@@CELL name=strip_ns6 flags=-DSTRIP_EPILOGUE -DNUM_EPI_STAGES=2 -DLDG_BIAS -DN_STAGES=6
+$ make -B fc1-w3 'DFLAGS=-DSTRIP_EPILOGUE -DNUM_EPI_STAGES=2 -DLDG_BIAS -DN_STAGES=6'
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DSTRIP_EPILOGUE -DNUM_EPI_STAGES=2 -DLDG_BIAS -DN_STAGES=6 fc1_w3.cu -o fc1-w3 -lcurand_static -lculibos -lcuda
+fc1_w3.cu(983): warning #177-D: variable "last_m" was declared but never referenced
+          const int last_m = ((ltm * 2 + cta_rank) * (3072 / 256) + ltn) * 128;
+                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc1_w3.cu(984): warning #177-D: variable "last_n" was declared but never referenced
+          const int last_n = 0;
+                    ^
+
+fc1_w3.cu(985): warning #177-D: variable "last_n_bias" was declared but never referenced
+          const int last_n_bias = ltn * 256;
+                    ^
+
+fc1_w3.cu(566): warning #550-D: variable "prev_tm" was set but never used
+      int prev_tm = 0, prev_tn = 0;
+          ^
+
+fc1_w3.cu(566): warning #550-D: variable "prev_tn" was set but never used
+      int prev_tm = 0, prev_tn = 0;
+                       ^
+
+fc1_w3.cu(322): warning #177-D: function "gelu_approx" was declared but never referenced
+  static __attribute__((device)) __inline__ __attribute__((always_inline)) float gelu_approx(float acc, float bias_f32) {
+                                                                                 ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 12.966 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 1.404 ms
+ptxas info    : Compiling entry function '_Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_
+    8 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 46 registers, used 0 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 37.295 ms
+$ timeout -k 5 120 stdbuf -oL -eL /root/src/fc1-w3
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  6-stage pipeline  SMEM: 230400 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=230400 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 0.988 ms  4431.24 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=1819663 launches=10
+  MISMATCH at (0,0): expected 1728.0 got 0.0 (gemm=1728.0 bias=1.0)
+  MISMATCH at (29008,47): expected 1200.0 got 0.0 (gemm=1152.0 bias=48.0)
+  MISMATCH at (58016,94): expected 1824.0 got 0.0 (gemm=1728.0 bias=95.0)
+  MISMATCH at (87024,141): expected 1296.0 got 0.0 (gemm=1152.0 bias=142.0)
+  MISMATCH at (116032,188): expected 1920.0 got 0.0 (gemm=1728.0 bias=189.0)
+Validation: 0/32 spot checks passed — FAILED
+Checksum (1024 strided): 0.000000
+C[0,0..3] = 0.0 0.0 0.0 0.0
+@@RESULT ms=0.988 tflops=4431.24 checksum=0.000000 valid=0 c0=0.0
+@@CELL_EXIT name=strip_ns6 rc=0
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/stephenliang/main/ap-M7bgDF2ZgMzitCTF84yQzf

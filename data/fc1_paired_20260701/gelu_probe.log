@@ -1,0 +1,159 @@
+✓ Initialized. View run at 
+https://modal.com/apps/stephenliang/main/ap-QbHAIIAGjRNE5121AjFOV4
+✓ Created objects.
+├── 🔨 Created mount 
+│   /tmp/claude-1000/-home-sdl-net-sm100-sm103-tests/d67a712f-3e22-4363-b38b-aec
+│   e9851ad6b/scratchpad/gelu_probe.py
+├── 🔨 Created mount /home/sdl/net/sm100_sm103_tests
+└── 🔨 Created function probe.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.2.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+=== VERSIONS ===
+$ bash -c 'ls /usr/local/cuda/lib64/libcublasLt.so.* ; nvcc --version | tail -2 ; nvidia-smi --query-gpu=driver_version --format=csv'
+/usr/local/cuda/lib64/libcublasLt.so.13
+/usr/local/cuda/lib64/libcublasLt.so.13.3.0.5
+Cuda compilation tools, release 13.2, V13.2.51
+Build cuda_13.2.r13.2/compiler.37434383_0
+driver_version
+580.95.05
+=== BUILD ===
+$ make -B cublaslt-fc1
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -std=c++17 -DDEFAULT_M=928256 -DDEFAULT_N=3072 -DDEFAULT_K=768 -DDEFAULT_EPI=2 bench/cublaslt_introspect.cu -o cublaslt-fc1 -lcublasLt -lcublas
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z9fill_bf16P13__nv_bfloat16mf' for 'sm_100a'
+ptxas info    : Function properties for _Z9fill_bf16P13__nv_bfloat16mf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 10 registers, used 0 barriers
+ptxas info    : Compile time = 30.265 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPm' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPm
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 1.075 ms
+
+=== RUN PT ===
+$ timeout -k 5 300 stdbuf -oL -eL /root/src/cublaslt-fc1 928256 3072 768 2 0 0
+### CUBLASLT INTROSPECT M=928256 N=3072 K=768 epi=gelu_bias scale=per_tensor beta=0.0
+### Heuristics returned: 8
+
+# TSV
+rank    heur    ms      cyc     algoId  tile    stages  cluster inner   splitk  redux   swizzle custom  waves   ws_MB   res_ok  epi_ok
+1       0       1.8377  3390027 66      23      36      3       -1      1       0       0       1       588.00  0.0     1       1
+2       2       1.9371  3572932 66      32      36      3       -1      1       0       0       1       784.05  0.0     1       1
+3       1       1.9698  3634967 66      24      36      5       -1      1       0       0       3       588.00  0.0     1       1
+4       4       2.0596  3799082 66      29      36      3       -1      1       0       0       1       940.86  0.0     1       1
+5       3       2.0850  3846892 66      31      36      3       -1      1       0       0       1       784.00  0.0     1       1
+6       5       2.1275  3924822 66      495     36      5       -1      1       0       0       3       784.05  0.0     1       1
+7       6       2.7784  5125507 66      201     36      5       -1      1       0       0       2       882.00  0.0     1       1
+8       7       2.8910  5333886 66      197     36      5       -1      1       0       0       2       931.00  0.0     1       1
+
+# Top-3 caps:
+
+## rank=1  algoId=66  tile=23  stages=36  cluster=3  inner=-1  ms=1.8377
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=2  algoId=66  tile=32  stages=36  cluster=3  inner=-1  ms=1.9371
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=3  algoId=66  tile=24  stages=36  cluster=5  inner=-1  ms=1.9698
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=5
+
+# Winner:  rank=1  tile=23  stages=36  cluster=3  inner=-1  splitk=1  swizzle=0  ms=1.8377  cyc=3390027  res_ok=1  epi_ok=1
+
+@@RESULT ms=1.8377 cyc=3390027 tflops=2383.48 checksum=0.000000 valid=1 c0=0.0
+
+=== RUN MXFP8 ===
+$ timeout -k 5 300 stdbuf -oL -eL /root/src/cublaslt-fc1 928256 3072 768 2 1 0
+### CUBLASLT INTROSPECT M=928256 N=3072 K=768 epi=gelu_bias scale=mxfp8 beta=0.0
+### Heuristics returned: 3
+
+# TSV
+rank    heur    ms      cyc     algoId  tile    stages  cluster inner   splitk  redux   swizzle custom  waves   ws_MB   res_ok  epi_ok
+1       0       1.8843  3473678 66      23      36      3       -1      1       0       0       1       588.00  0.0     1       1
+2       1       2.0302  3745731 66      24      36      5       -1      1       0       0       3       588.00  0.0     1       1
+3       2       2.1710  4003892 66      20      36      3       -1      1       0       0       1       1176.00 0.0     1       1
+
+# Top-3 caps:
+
+## rank=1  algoId=66  tile=23  stages=36  cluster=3  inner=-1  ms=1.8843
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=2  algoId=66  tile=24  stages=36  cluster=5  inner=-1  ms=2.0302
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=5
+
+## rank=3  algoId=66  tile=20  stages=36  cluster=3  inner=-1  ms=2.1710
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+# Winner:  rank=1  tile=23  stages=36  cluster=3  inner=-1  splitk=1  swizzle=0  ms=1.8843  cyc=3473678  res_ok=1  epi_ok=1
+
+@@RESULT ms=1.8843 cyc=3473678 tflops=2324.52 checksum=0.000000 valid=1 c0=0.0
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/stephenliang/main/ap-QbHAIIAGjRNE5121AjFOV4

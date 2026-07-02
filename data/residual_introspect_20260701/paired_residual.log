@@ -1,0 +1,418 @@
+✓ Initialized. View run at 
+https://modal.com/apps/stephenliang/main/ap-24v1SXciz36JwcwJiMkhr7
+✓ Created objects.
+├── 🔨 Created mount 
+│   /tmp/claude-1000/-home-sdl-net-sm100-sm103-tests/d67a712f-3e22-4363-b38b-aec
+│   e9851ad6b/scratchpad/paired_residual.py
+├── 🔨 Created mount /home/sdl/net/sm100_sm103_tests
+└── 🔨 Created function bench.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.2.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+=== BUILD ===
+$ make -B fc2-w3 DFLAGS=-DCLOCK_TOTAL
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DCLOCK_TOTAL fc2_w3.cu -o fc2-w3 -lcurand_static -lculibos -lcuda
+fc2_w3.cu(1723): warning #177-D: variable "prev_n_bias" was declared but never referenced
+                  const int prev_n_bias = ptn * 256;
+                            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+fc2_w3.cu(1442): warning #177-D: variable "n_global" was declared but never referenced
+          const int n_global = tn * 256;
+                    ^
+
+fc2_w3.cu(553): warning #177-D: function "tma_load_2d" was declared but never referenced
+  void tma_load_2d(uint32_t smem_dst, const void* tma_desc,
+       ^
+
+fc2_w3.cu(581): warning #177-D: function "tma_prefetch_2d" was declared but never referenced
+  void tma_prefetch_2d(const void* tma_desc, int32_t c0, int32_t c1) {
+       ^
+
+ptxas info    : 1184 bytes gmem
+ptxas info    : Compiling entry function '_Z13fc2_w3_kernelILi54ELi8EEv14CUtensorMap_stS0_S0_PK13__nv_bfloat16PS1_S3_S0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc2_w3_kernelILi54ELi8EEv14CUtensorMap_stS0_S0_PK13__nv_bfloat16PS1_S3_S0_
+    16 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 121 registers, used 2 barriers, 16 bytes cumulative stack size
+ptxas info    : Compile time = 109.112 ms
+ptxas info    : Compiling entry function '_Z9pack_bf16P13__nv_bfloat16PKS_iiii' for 'sm_100a'
+ptxas info    : Function properties for _Z9pack_bf16P13__nv_bfloat16PKS_iiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 5.531 ms
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 5.235 ms
+ptxas info    : Compiling entry function '_Z18init_A_row_varyingPhii' for 'sm_100a'
+ptxas info    : Function properties for _Z18init_A_row_varyingPhii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 0 barriers
+ptxas info    : Compile time = 3.218 ms
+ptxas info    : Compiling entry function '_Z13init_residualP13__nv_bfloat16ix' for 'sm_100a'
+ptxas info    : Function properties for _Z13init_residualP13__nv_bfloat16ix
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 0 barriers
+ptxas info    : Compile time = 3.716 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 0.541 ms
+$ make -B fc2-cutlass
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static  -Ithird_party/cutlass/include -Ithird_party/cutlass/tools/util/include -std=c++17 --expt-relaxed-constexpr fc2_cutlass.cu -o fc2-cutlass -lcurand_static -lculibos -lcuda
+ptxas info    : 1327 bytes gmem
+ptxas info    : Compiling entry function '_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_35MainloopSm100TmaUmmaWarpSpecializedILi5ELi2ELi2ENS5_IJNS4_1CILi2EEENSA_ILi1EEESC_EEEEENS5_IJNSA_ILi256EEESF_NSA_ILi128EEEEEENS_12float_e4m3_tENS5_IJlSC_lEEESI_SJ_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_10MMA_TraitsINS4_25SM100_MMA_F8F6F4_2x1SM_SSEJSI_SI_fSF_SF_NS4_17integral_constantINS4_4UMMA5MajorELSQ_0EEESR_NSO_INSP_7ScaleInELSS_0EEEST_EEEEEENS4_6LayoutINS5_IJSC_SC_SC_EEENS5_IJNSA_ILi0EEESY_SY_EEEEENS5_IJNS4_10UnderscoreES11_S11_EEEEENS4_18SM100_TMA_2SM_LOADENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSW_INS5_IJNSA_ILi8EEESG_EEENS5_IJSG_SC_EEEEEEEvNS4_8identityES14_S1E_vS1F_EENS_8epilogue10collective18CollectiveEpilogueINS1H_23Sm100TmaWarpSpecializedILi4ELi2ELi64ELb1ELb0EEEJNS5_IJSG_SF_SG_EEENS5_IJNSW_ISG_SC_EENSW_INSA_ILi64EEESC_EEEEENS_10bfloat16_tESJ_S1R_SJ_NS1H_6fusion15FusionCallbacksIS1L_NS1S_23LinCombPerColBiasEltActINS1H_6thread8IdentityES1R_ffS1R_fLi4ELNS_15FloatRoundStyleE2EEES1M_S1Q_JEEENS4_5SM1004TMEM4LOAD26SM100_TMEM_LOAD_32dp32b64xENS4_13SM90_TMA_LOADENS15_IS17_NS18_ILi16EEENSW_INS5_IJS1A_S1O_EEENS5_IJS1O_SC_EEEEEEENS4_39AutoVectorizingCopyWithAssumedAlignmentILi128EEENS4_14SM90_TMA_STOREES29_S2B_S2B_EEEvvEEEEvNT_6ParamsE' for 'sm_100a'
+ptxas info    : Function properties for _ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_35MainloopSm100TmaUmmaWarpSpecializedILi5ELi2ELi2ENS5_IJNS4_1CILi2EEENSA_ILi1EEESC_EEEEENS5_IJNSA_ILi256EEESF_NSA_ILi128EEEEEENS_12float_e4m3_tENS5_IJlSC_lEEESI_SJ_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_10MMA_TraitsINS4_25SM100_MMA_F8F6F4_2x1SM_SSEJSI_SI_fSF_SF_NS4_17integral_constantINS4_4UMMA5MajorELSQ_0EEESR_NSO_INSP_7ScaleInELSS_0EEEST_EEEEEENS4_6LayoutINS5_IJSC_SC_SC_EEENS5_IJNSA_ILi0EEESY_SY_EEEEENS5_IJNS4_10UnderscoreES11_S11_EEEEENS4_18SM100_TMA_2SM_LOADENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSW_INS5_IJNSA_ILi8EEESG_EEENS5_IJSG_SC_EEEEEEEvNS4_8identityES14_S1E_vS1F_EENS_8epilogue10collective18CollectiveEpilogueINS1H_23Sm100TmaWarpSpecializedILi4ELi2ELi64ELb1ELb0EEEJNS5_IJSG_SF_SG_EEENS5_IJNSW_ISG_SC_EENSW_INSA_ILi64EEESC_EEEEENS_10bfloat16_tESJ_S1R_SJ_NS1H_6fusion15FusionCallbacksIS1L_NS1S_23LinCombPerColBiasEltActINS1H_6thread8IdentityES1R_ffS1R_fLi4ELNS_15FloatRoundStyleE2EEES1M_S1Q_JEEENS4_5SM1004TMEM4LOAD26SM100_TMEM_LOAD_32dp32b64xENS4_13SM90_TMA_LOADENS15_IS17_NS18_ILi16EEENSW_INS5_IJS1A_S1O_EEENS5_IJS1O_SC_EEEEEEENS4_39AutoVectorizingCopyWithAssumedAlignmentILi128EEENS4_14SM90_TMA_STOREES29_S2B_S2B_EEEvvEEEEvNT_6ParamsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 7 barriers
+ptxas info    : Compile time = 178.718 ms
+ptxas info    : Compiling entry function '_Z13init_residualP13__nv_bfloat16ix' for 'sm_100a'
+ptxas info    : Function properties for _Z13init_residualP13__nv_bfloat16ix
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 0 barriers
+ptxas info    : Compile time = 4.846 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 0.892 ms
+$ make -B cublaslt-fc2
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -std=c++17 -DDEFAULT_M=928256 -DDEFAULT_N=768 -DDEFAULT_K=3072 -DDEFAULT_EPI=3 bench/cublaslt_introspect.cu -o cublaslt-fc2 -lcublasLt -lcublas
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z9fill_bf16P13__nv_bfloat16mf' for 'sm_100a'
+ptxas info    : Function properties for _Z9fill_bf16P13__nv_bfloat16mf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 10 registers, used 0 barriers
+ptxas info    : Compile time = 2.795 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPm' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPm
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 1.525 ms
+
+=== ROUND 0 RUN fc2-w3 ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/fc2-w3
+FC2 W3 kernel — 7 warps (0 idle), shared-SMEM epilogue
+  GEMM: [928256,3072] x [768,3072]^T  6-stage pipeline  SMEM: 231424 bytes  EPI_REUSE=0
+  LOAD: PACKED=1  PRESWIZZLE=0
+  EPI: stages=2  SWS=0  DTS=0  FP32=0  CPP=0
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=231424 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC2-W3 kernel: 1.130 ms  3877.80 TFLOPS
+@@CYC name=fc2_w3 cyc_avg=1904044 launches=10
+FC2-W3 clock64: 1921699 cyc  (max over 148 CTAs, 10 timed launches)
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 7155360.000000
+C[0,0..3] = 4608.0 3072.0 4608.0 3072.0
+@@RESULT ms=1.130 tflops=3877.80 checksum=7155360.000000 valid=1 c0=4608.0
+=== ROUND 0 fc2-w3 exit 0 ===
+
+=== ROUND 0 RUN fc2-cutlass ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/fc2-cutlass
+FC2 CUTLASS — GemmUniversal with SM100 TMA warp-specialized epilogue
+  MODE: Fused (bias + residual)
+  [928256, 3072] x [3072, 768]^T  FP8E4M3 -> BF16
+  Tile: 256x256x128, Cluster: 2x1, Schedule: 2SM
+  SMEM: 231424 bytes, Epilogue SMEM: 67584 bytes
+  Device: NVIDIA B200 (SM 10.0, SMs=148)
+
+  Alloc + init done
+  CUTLASS initialized (workspace=0)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC2-CUTLASS: 1.210 ms  3619.49 TFLOPS
+@@CYC name=fc2_cutlass cyc_avg=2233457 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 7316096.000000
+D[0,0..3] = 6912.0 4608.0 6912.0 4608.0
+@@RESULT ms=1.210 tflops=3619.49 checksum=7316096.000000 valid=1 c0=6912.0
+=== ROUND 0 fc2-cutlass exit 0 ===
+
+=== ROUND 0 RUN cublaslt-fc2 ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/cublaslt-fc2 928256 768 3072 3 0 1
+### CUBLASLT INTROSPECT M=928256 N=768 K=3072 epi=bias_only scale=per_tensor beta=1.0 (fused residual, out-of-place C)
+### Heuristics returned: 8
+
+# TSV
+rank    heur    ms      cyc     algoId  tile    stages  cluster inner   splitk  redux   swizzle custom  waves   ws_MB   res_ok
+1       0       1.2367  2283127 66      23      36      3       -1      1       0       0       1       147.00  0.0     1
+2       3       1.2943  2388334 66      32      36      6       -1      1       0       0       3       196.01  0.0     1
+3       4       1.3169  2367753 66      29      36      3       -1      1       0       0       1       235.22  0.0     1
+4       6       1.3658  2455108 66      447     36      3       -1      1       0       0       1       73.50   0.0     1
+5       2       1.4212  2622420 66      31      36      3       -1      1       0       0       1       196.00  0.0     1
+6       5       1.4261  2529681 66      513     36      5       -1      1       0       0       3       73.50   0.0     1
+7       7       1.4425  2612607 66      20      36      3       -1      1       0       0       1       294.00  0.0     1
+8       1       1.5456  2851201 66      24      36      5       -1      1       0       0       3       147.00  0.0     1
+
+# Top-3 caps:
+
+## rank=1  algoId=66  tile=23  stages=36  cluster=3  inner=-1  ms=1.2367
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=2  algoId=66  tile=32  stages=36  cluster=6  inner=-1  ms=1.2943
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=6
+
+## rank=3  algoId=66  tile=29  stages=36  cluster=3  inner=-1  ms=1.3169
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+# Winner:  rank=1  tile=23  stages=36  cluster=3  inner=-1  splitk=1  swizzle=0  ms=1.2367  cyc=2283127  res_ok=1
+
+@@RESULT ms=1.2367 cyc=2283127 tflops=3541.60 checksum=0.000000 valid=1 c0=0.0
+=== ROUND 0 cublaslt-fc2 exit 0 ===
+
+=== ROUND 1 RUN fc2-w3 ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/fc2-w3
+FC2 W3 kernel — 7 warps (0 idle), shared-SMEM epilogue
+  GEMM: [928256,3072] x [768,3072]^T  6-stage pipeline  SMEM: 231424 bytes  EPI_REUSE=0
+  LOAD: PACKED=1  PRESWIZZLE=0
+  EPI: stages=2  SWS=0  DTS=0  FP32=0  CPP=0
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=231424 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC2-W3 kernel: 1.131 ms  3872.99 TFLOPS
+@@CYC name=fc2_w3 cyc_avg=1901311 launches=10
+FC2-W3 clock64: 1923508 cyc  (max over 148 CTAs, 10 timed launches)
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 7155360.000000
+C[0,0..3] = 4608.0 3072.0 4608.0 3072.0
+@@RESULT ms=1.131 tflops=3872.99 checksum=7155360.000000 valid=1 c0=4608.0
+=== ROUND 1 fc2-w3 exit 0 ===
+
+=== ROUND 1 RUN fc2-cutlass ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/fc2-cutlass
+FC2 CUTLASS — GemmUniversal with SM100 TMA warp-specialized epilogue
+  MODE: Fused (bias + residual)
+  [928256, 3072] x [3072, 768]^T  FP8E4M3 -> BF16
+  Tile: 256x256x128, Cluster: 2x1, Schedule: 2SM
+  SMEM: 231424 bytes, Epilogue SMEM: 67584 bytes
+  Device: NVIDIA B200 (SM 10.0, SMs=148)
+
+  Alloc + init done
+  CUTLASS initialized (workspace=0)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC2-CUTLASS: 1.209 ms  3623.79 TFLOPS
+@@CYC name=fc2_cutlass cyc_avg=2230943 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 7316096.000000
+D[0,0..3] = 6912.0 4608.0 6912.0 4608.0
+@@RESULT ms=1.209 tflops=3623.79 checksum=7316096.000000 valid=1 c0=6912.0
+=== ROUND 1 fc2-cutlass exit 0 ===
+
+=== ROUND 1 RUN cublaslt-fc2 ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/cublaslt-fc2 928256 768 3072 3 0 1
+### CUBLASLT INTROSPECT M=928256 N=768 K=3072 epi=bias_only scale=per_tensor beta=1.0 (fused residual, out-of-place C)
+### Heuristics returned: 8
+
+# TSV
+rank    heur    ms      cyc     algoId  tile    stages  cluster inner   splitk  redux   swizzle custom  waves   ws_MB   res_ok
+1       0       1.2371  2283970 66      23      36      3       -1      1       0       0       1       147.00  0.0     1
+2       4       1.2882  2377185 66      29      36      3       -1      1       0       0       1       235.22  0.0     1
+3       3       1.2943  2388584 66      32      36      6       -1      1       0       0       3       196.01  0.0     1
+4       6       1.3289  2452778 66      447     36      3       -1      1       0       0       1       73.50   0.0     1
+5       5       1.3892  2563954 66      513     36      5       -1      1       0       0       3       73.50   0.0     1
+6       7       1.4179  2616400 66      20      36      3       -1      1       0       0       1       294.00  0.0     1
+7       2       1.4216  2623432 66      31      36      3       -1      1       0       0       1       196.00  0.0     1
+8       1       1.5452  2851148 66      24      36      5       -1      1       0       0       3       147.00  0.0     1
+
+# Top-3 caps:
+
+## rank=1  algoId=66  tile=23  stages=36  cluster=3  inner=-1  ms=1.2371
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=2  algoId=66  tile=29  stages=36  cluster=3  inner=-1  ms=1.2882
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=3  algoId=66  tile=32  stages=36  cluster=6  inner=-1  ms=1.2943
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=6
+
+# Winner:  rank=1  tile=23  stages=36  cluster=3  inner=-1  splitk=1  swizzle=0  ms=1.2371  cyc=2283970  res_ok=1
+
+@@RESULT ms=1.2371 cyc=2283970 tflops=3540.62 checksum=0.000000 valid=1 c0=0.0
+=== ROUND 1 cublaslt-fc2 exit 0 ===
+
+=== ROUND 2 RUN fc2-w3 ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/fc2-w3
+FC2 W3 kernel — 7 warps (0 idle), shared-SMEM epilogue
+  GEMM: [928256,3072] x [768,3072]^T  6-stage pipeline  SMEM: 231424 bytes  EPI_REUSE=0
+  LOAD: PACKED=1  PRESWIZZLE=0
+  EPI: stages=2  SWS=0  DTS=0  FP32=0  CPP=0
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=231424 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC2-W3 kernel: 1.131 ms  3874.11 TFLOPS
+@@CYC name=fc2_w3 cyc_avg=1902149 launches=10
+FC2-W3 clock64: 1922357 cyc  (max over 148 CTAs, 10 timed launches)
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 7155360.000000
+C[0,0..3] = 4608.0 3072.0 4608.0 3072.0
+@@RESULT ms=1.131 tflops=3874.11 checksum=7155360.000000 valid=1 c0=4608.0
+=== ROUND 2 fc2-w3 exit 0 ===
+
+=== ROUND 2 RUN fc2-cutlass ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/fc2-cutlass
+FC2 CUTLASS — GemmUniversal with SM100 TMA warp-specialized epilogue
+  MODE: Fused (bias + residual)
+  [928256, 3072] x [3072, 768]^T  FP8E4M3 -> BF16
+  Tile: 256x256x128, Cluster: 2x1, Schedule: 2SM
+  SMEM: 231424 bytes, Epilogue SMEM: 67584 bytes
+  Device: NVIDIA B200 (SM 10.0, SMs=148)
+
+  Alloc + init done
+  CUTLASS initialized (workspace=0)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC2-CUTLASS: 1.209 ms  3622.56 TFLOPS
+@@CYC name=fc2_cutlass cyc_avg=2231702 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 7316096.000000
+D[0,0..3] = 6912.0 4608.0 6912.0 4608.0
+@@RESULT ms=1.209 tflops=3622.56 checksum=7316096.000000 valid=1 c0=6912.0
+=== ROUND 2 fc2-cutlass exit 0 ===
+
+=== ROUND 2 RUN cublaslt-fc2 ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/cublaslt-fc2 928256 768 3072 3 0 1
+### CUBLASLT INTROSPECT M=928256 N=768 K=3072 epi=bias_only scale=per_tensor beta=1.0 (fused residual, out-of-place C)
+### Heuristics returned: 8
+
+# TSV
+rank    heur    ms      cyc     algoId  tile    stages  cluster inner   splitk  redux   swizzle custom  waves   ws_MB   res_ok
+1       0       1.2370  2283753 66      23      36      3       -1      1       0       0       1       147.00  0.0     1
+2       3       1.2951  2390513 66      32      36      6       -1      1       0       0       3       196.01  0.0     1
+3       4       1.3165  2367372 66      29      36      3       -1      1       0       0       1       235.22  0.0     1
+4       6       1.3438  2452468 66      447     36      3       -1      1       0       0       1       73.50   0.0     1
+5       5       1.4111  2545540 66      513     36      5       -1      1       0       0       3       73.50   0.0     1
+6       2       1.4213  2623277 66      31      36      3       -1      1       0       0       1       196.00  0.0     1
+7       7       1.4219  2612911 66      20      36      3       -1      1       0       0       1       294.00  0.0     1
+8       1       1.5462  2852622 66      24      36      5       -1      1       0       0       3       147.00  0.0     1
+
+# Top-3 caps:
+
+## rank=1  algoId=66  tile=23  stages=36  cluster=3  inner=-1  ms=1.2370
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=2  algoId=66  tile=32  stages=36  cluster=6  inner=-1  ms=1.2951
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=6
+
+## rank=3  algoId=66  tile=29  stages=36  cluster=3  inner=-1  ms=1.3165
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+Stopping app - local entrypoint completed.
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+# Winner:  rank=1  tile=23  stages=36  cluster=3  inner=-1  splitk=1  swizzle=0  ms=1.2370  cyc=2283753  res_ok=1
+
+@@RESULT ms=1.2370 cyc=2283753 tflops=3541.00 checksum=0.000000 valid=1 c0=0.0
+=== ROUND 2 cublaslt-fc2 exit 0 ===
+✓ App completed. View run at 
+https://modal.com/apps/stephenliang/main/ap-24v1SXciz36JwcwJiMkhr7

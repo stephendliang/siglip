@@ -1,0 +1,577 @@
+✓ Initialized. View run at 
+https://modal.com/apps/stephenliang/main/ap-JULUD3IaVcaoYr7VcLrLhe
+✓ Created objects.
+├── 🔨 Created mount 
+│   /tmp/claude-1000/-home-sdl-net-sm100-sm103-tests/d67a712f-3e22-4363-b38b-aec
+│   e9851ad6b/scratchpad/throttle_probe.py
+├── 🔨 Created mount /home/sdl/net/sm100_sm103_tests
+└── 🔨 Created function probe.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.2.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+=== GPU ===
+$ nvidia-smi --query-gpu=name,driver_version,power.limit,power.max_limit,power.default_limit,clocks.max.sm --format=csv
+name, driver_version, power.limit [W], power.max_limit [W], power.default_limit [W], clocks.max.sm [MHz]
+NVIDIA B200, 580.95.05, 1000.00 W, 1000.00 W, 1000.00 W, 1965 MHz
+rc=0
+
+=== PERMISSION PROBES (persistence / lock-clock / power-limit) ===
+$ nvidia-smi -pm 1
+Persistence mode is already Enabled for GPU 00000000:93:00.0.
+All done.
+rc=0
+$ nvidia-smi -lgc 1830,1830
+The current user does not have permission to change clocks for GPU 00000000:93:00.0.
+Terminating early due to previous errors.
+rc=4
+$ nvidia-smi -pl 1000
+Failed to set power management limit for GPU 00000000:93:00.0: Insufficient Permissions
+Terminating early due to previous errors.
+rc=4
+
+=== BUILD fc2-w3 (-DCLOCK_TOTAL -DSELF_DIFF=1500) ===
+build rc=0
+
+=== RUN + SAMPLE ===
+binary rc=0 wall=7.6s
+FC2-W3 kernel: 1.106 ms  3961.15 TFLOPS
+@@CYC name=fc2_w3 cyc_avg=1930320 launches=10
+FC2-W3 clock64: 1945980 cyc  (max over 148 CTAs, 10 timed launches)
+@@RESULT ms=1.106 tflops=3961.15 checksum=7155360.000000 valid=1 c0=4608.0
+@@SELFDIFF_BEGIN launches=1500
+@@SELFDIFF iter=0 mismatches=0
+@@SELFDIFF iter=1 mismatches=0
+@@SELFDIFF iter=2 mismatches=0
+@@SELFDIFF iter=3 mismatches=0
+@@SELFDIFF iter=4 mismatches=0
+@@SELFDIFF iter=5 mismatches=0
+@@SELFDIFF iter=6 mismatches=0
+@@SELFDIFF iter=7 mismatches=0
+@@SELFDIFF iter=8 mismatches=0
+@@SELFDIFF iter=9 mismatches=0
+@@SELFDIFF iter=10 mismatches=0
+@@SELFDIFF iter=11 mismatches=0
+@@SELFDIFF iter=12 mismatches=0
+@@SELFDIFF iter=13 mismatches=0
+@@SELFDIFF iter=14 mismatches=0
+@@SELFDIFF iter=15 mismatches=0
+@@SELFDIFF iter=16 mismatches=0
+@@SELFDIFF iter=17 mismatches=0
+@@SELFDIFF iter=18 mismatches=0
+@@SELFDIFF iter=19 mismatches=0
+@@SELFDIFF iter=20 mismatches=0
+@@SELFDIFF iter=21 mismatches=0
+@@SELFDIFF iter=22 mismatches=0
+@@SELFDIFF iter=23 mismatches=0
+@@SELFDIFF iter=24 mismatches=0
+@@SELFDIFF iter=25 mismatches=0
+@@SELFDIFF iter=26 mismatches=0
+@@SELFDIFF iter=27 mismatches=0
+@@SELFDIFF iter=28 mismatches=0
+@@SELFDIFF iter=29 mismatches=0
+@@SELFDIFF iter=30 mismatches=0
+@@SELFDIFF iter=31 mismatches=0
+@@SELFDIFF iter=32 mismatches=0
+@@SELFDIFF iter=33 mismatches=0
+@@SELFDIFF iter=34 mismatches=0
+@@SELFDIFF iter=35 mismatches=0
+@@SELFDIFF iter=36 mismatches=0
+@@SELFDIFF iter=37 mismatches=0
+@@SELFDIFF iter=38 mismatches=0
+@@SELFDIFF iter=39 mismatches=0
+@@SELFDIFF iter=40 mismatches=0
+@@SELFDIFF iter=41 mismatches=0
+@@SELFDIFF iter=42 mismatches=0
+@@SELFDIFF iter=43 mismatches=0
+@@SELFDIFF iter=44 mismatches=0
+@@SELFDIFF iter=45 mismatches=0
+@@SELFDIFF iter=46 mismatches=0
+@@SELFDIFF iter=47 mismatches=0
+@@SELFDIFF iter=48 mismatches=0
+@@SELFDIFF iter=49 mismatches=0
+@@SELFDIFF iter=50 mismatches=0
+@@SELFDIFF iter=51 mismatches=0
+@@SELFDIFF iter=52 mismatches=0
+@@SELFDIFF iter=53 mismatches=0
+@@SELFDIFF iter=54 mismatches=0
+@@SELFDIFF iter=55 mismatches=0
+@@SELFDIFF iter=56 mismatches=0
+@@SELFDIFF iter=57 mismatches=0
+@@SELFDIFF iter=58 mismatches=0
+@@SELFDIFF iter=59 mismatches=0
+@@SELFDIFF iter=60 mismatches=0
+@@SELFDIFF iter=61 mismatches=0
+@@SELFDIFF iter=62 mismatches=0
+@@SELFDIFF iter=63 mismatches=0
+@@SELFDIFF iter=64 mismatches=0
+@@SELFDIFF iter=65 mismatches=0
+@@SELFDIFF iter=66 mismatches=0
+@@SELFDIFF iter=67 mismatches=0
+@@SELFDIFF iter=68 mismatches=0
+@@SELFDIFF iter=69 mismatches=0
+Stopping app - local entrypoint completed.
+@@SELFDIFF iter=70 mismatches=0
+@@SELFDIFF iter=71 mismatches=0
+@@SELFDIFF iter=72 mismatches=0
+@@SELFDIFF iter=73 mismatches=0
+@@SELFDIFF iter=74 mismatches=0
+@@SELFDIFF iter=75 mismatches=0
+@@SELFDIFF iter=76 mismatches=0
+@@SELFDIFF iter=77 mismatches=0
+@@SELFDIFF iter=78 mismatches=0
+@@SELFDIFF iter=79 mismatches=0
+@@SELFDIFF iter=80 mismatches=0
+@@SELFDIFF iter=81 mismatches=0
+@@SELFDIFF iter=82 mismatches=0
+@@SELFDIFF iter=83 mismatches=0
+@@SELFDIFF iter=84 mismatches=0
+@@SELFDIFF iter=85 mismatches=0
+@@SELFDIFF iter=86 mismatches=0
+@@SELFDIFF iter=87 mismatches=0
+@@SELFDIFF iter=88 mismatches=0
+@@SELFDIFF iter=89 mismatches=0
+@@SELFDIFF iter=90 mismatches=0
+@@SELFDIFF iter=91 mismatches=0
+@@SELFDIFF iter=92 mismatches=0
+@@SELFDIFF iter=93 mismatches=0
+@@SELFDIFF iter=94 mismatches=0
+@@SELFDIFF iter=95 mismatches=0
+@@SELFDIFF iter=96 mismatches=0
+@@SELFDIFF iter=97 mismatches=0
+@@SELFDIFF iter=98 mismatches=0
+@@SELFDIFF iter=99 mismatches=0
+@@SELFDIFF iter=100 mismatches=0
+@@SELFDIFF iter=101 mismatches=0
+@@SELFDIFF iter=102 mismatches=0
+@@SELFDIFF iter=103 mismatches=0
+@@SELFDIFF iter=104 mismatches=0
+@@SELFDIFF iter=105 mismatches=0
+@@SELFDIFF iter=106 mismatches=0
+@@SELFDIFF iter=107 mismatches=0
+@@SELFDIFF iter=108 mismatches=0
+@@SELFDIFF iter=109 mismatches=0
+@@SELFDIFF iter=110 mismatches=0
+@@SELFDIFF iter=111 mismatches=0
+@@SELFDIFF iter=112 mismatches=0
+@@SELFDIFF iter=113 mismatches=0
+@@SELFDIFF iter=114 mismatches=0
+@@SELFDIFF iter=115 mismatches=0
+@@SELFDIFF iter=116 mismatches=0
+@@SELFDIFF iter=117 mismatches=0
+@@SELFDIFF iter=118 mismatches=0
+@@SELFDIFF iter=119 mismatches=0
+@@SELFDIFF iter=120 mismatches=0
+@@SELFDIFF iter=121 mismatches=0
+@@SELFDIFF iter=122 mismatches=0
+@@SELFDIFF iter=123 mismatches=0
+@@SELFDIFF iter=124 mismatches=0
+@@SELFDIFF iter=125 mismatches=0
+@@SELFDIFF iter=126 mismatches=0
+@@SELFDIFF iter=127 mismatches=0
+@@SELFDIFF iter=128 mismatches=0
+@@SELFDIFF iter=129 mismatches=0
+@@SELFDIFF iter=130 mismatches=0
+@@SELFDIFF iter=131 mismatches=0
+@@SELFDIFF iter=132 mismatches=0
+@@SELFDIFF iter=133 mismatches=0
+@@SELFDIFF iter=134 mismatches=0
+@@SELFDIFF iter=135 mismatches=0
+@@SELFDIFF iter=136 mismatches=0
+@@SELFDIFF iter=137 mismatches=0
+@@SELFDIFF iter=138 mismatches=0
+@@SELFDIFF iter=139 mismatches=0
+@@SELFDIFF iter=140 mismatches=0
+@@SELFDIFF iter=141 mismatches=0
+@@SELFDIFF iter=142 mismatches=0
+@@SELFDIFF iter=143 mismatches=0
+@@SELFDIFF iter=144 mismatches=0
+@@SELFDIFF iter=145 mismatches=0
+@@SELFDIFF iter=146 mismatches=0
+@@SELFDIFF iter=147 mismatches=0
+@@SELFDIFF iter=148 mismatches=0
+@@SELFDIFF iter=149 mismatches=0
+@@SELFDIFF iter=150 mismatches=0
+@@SELFDIFF iter=151 mismatches=0
+@@SELFDIFF iter=152 mismatches=0
+@@SELFDIFF iter=153 mismatches=0
+@@SELFDIFF iter=154 mismatches=0
+@@SELFDIFF iter=155 mismatches=0
+@@SELFDIFF iter=156 mismatches=0
+@@SELFDIFF iter=157 mismatches=0
+@@SELFDIFF iter=158 mismatches=0
+@@SELFDIFF iter=159 mismatches=0
+@@SELFDIFF iter=160 mismatches=0
+@@SELFDIFF iter=161 mismatches=0
+@@SELFDIFF iter=162 mismatches=0
+@@SELFDIFF iter=163 mismatches=0
+@@SELFDIFF iter=164 mismatches=0
+@@SELFDIFF iter=165 mismatches=0
+@@SELFDIFF iter=166 mismatches=0
+@@SELFDIFF iter=167 mismatches=0
+@@SELFDIFF iter=168 mismatches=0
+@@SELFDIFF iter=169 mismatches=0
+@@SELFDIFF iter=170 mismatches=0
+@@SELFDIFF iter=171 mismatches=0
+@@SELFDIFF iter=172 mismatches=0
+@@SELFDIFF iter=173 mismatches=0
+@@SELFDIFF iter=174 mismatches=0
+@@SELFDIFF iter=175 mismatches=0
+@@SELFDIFF iter=176 mismatches=0
+@@SELFDIFF iter=177 mismatches=0
+@@SELFDIFF iter=178 mismatches=0
+@@SELFDIFF iter=179 mismatches=0
+@@SELFDIFF iter=180 mismatches=0
+@@SELFDIFF iter=181 mismatches=0
+@@SELFDIFF iter=182 mismatches=0
+@@SELFDIFF iter=183 mismatches=0
+
+@@SELFDIFF iter=185 mismatches=0
+@@SELFDIFF iter=186 mismatches=0
+@@SELFDIFF iter=187 mismatches=0
+@@SELFDIFF iter=188 mismatches=0
+@@SELFDIFF iter=189 mismatches=0
+@@SELFDIFF iter=190 mismatches=0
+@@SELFDIFF iter=191 mismatches=0
+@@SELFDIFF iter=192 mismatches=0
+@@SELFDIFF iter=193 mismatches=0
+@@SELFDIFF iter=194 mismatches=0
+@@SELFDIFF iter=195 mismatches=0@@SELFDIFF iter=199 mismatches=0
+@@SELFDIFF iter=204 mismatches=0
+@@SELFDIFF iter=209 mismatches=0
+@@SELFDIFF iter=212 mismatches=0@@SELFDIFF iter=216 mismatches=0@@SELFDIFF iter=217 mismatches=0@@SELFDIFF iter=221 mismatches=0@@SELFDIFF iter=222 mismatches=0
+@@SELFDIFF iter=228 mismatches=0
+@@SELFDIFF iter=233 mismatches=0@@SELFDIFF iter=234 mismatches=0@@SELFDIFF iter=238 mismatches=0
+@@SELFDIFF iter=243 mismatches=0
+@@SELFDIFF iter=248 mismatches=0@@SELFDIFF iter=250 mismatches=0@@SELFDIFF iter=252 mismatches=0
+@@SELFDIFF iter=257 mismatches=0@@SELFDIFF iter=259 mismatches=0
+
+@@SELFDIFF iter=266 mismatches=0
+@@SELFDIFF iter=271 mismatches=0@@SELFDIFF iter=273 mismatches=0@@SELFDIFF iter=276 mismatches=0
+@@SELFDIFF iter=280 mismatches=0@@SELFDIFF iter=286 mismatches=0@@SELFDIFF iter=288 mismatches=0
+
+@@SELFDIFF iter=297 mismatches=0@@SELFDIFF iter=298 mismatches=0@@SELFDIFF iter=303 mismatches=0@@SELFDIFF iter=306 mismatches=0@@SELFDIFF iter=308 mismatches=0
+
+
+@@SELFDIFF iter=315 mismatches=0
+
+@@SELFDIFF iter=320 mismatches=0
+@@SELFDIFF iter=324 mismatches=0@@SELFDIFF iter=327 mismatches=0@@SELFDIFF iter=329 mismatches=0
+
+@@SELFDIFF iter=336 mismatches=0
+
+@@SELFDIFF iter=343 mismatches=0@@SELFDIFF iter=346 mismatches=0
+@@SELFDIFF iter=351 mismatches=0@@SELFDIFF iter=353 mismatches=0@@SELFDIFF iter=355 mismatches=0
+@@SELFDIFF iter=357 mismatches=0@@SELFDIFF iter=360 mismatches=0@@SELFDIFF iter=362 mismatches=0@@SELFDIFF iter=365 mismatches=0
+
+
+@@SELFDIFF iter=376 mismatches=0@@SELFDIFF iter=377 mismatches=0
+@@SELFDIFF iter=383 mismatches=0@@SELFDIFF iter=384 mismatches=0
+@@SELFDIFF iter=392 mismatches=0@@SELFDIFF iter=397 mismatches=0
+@@SELFDIFF iter=402 mismatches=0@@SELFDIFF iter=404 mismatches=0
+
+
+@@SELFDIFF iter=415 mismatches=0@@SELFDIFF iter=417 mismatches=0
+@@SELFDIFF iter=421 mismatches=0@@SELFDIFF iter=422 mismatches=0@@SELFDIFF iter=424 mismatches=0@@SELFDIFF iter=426 mismatches=0
+@@SELFDIFF iter=431 mismatches=0
+
+@@SELFDIFF iter=440 mismatches=0@@SELFDIFF iter=441 mismatches=0
+@@SELFDIFF iter=449 mismatches=0
+@@SELFDIFF iter=456 mismatches=0
+@@SELFDIFF iter=461 mismatches=0@@SELFDIFF iter=466 mismatches=0
+@@SELFDIFF iter=472 mismatches=0
+
+@@SELFDIFF iter=479 mismatches=0@@SELFDIFF iter=480 mismatches=0
+
+
+
+@@SELFDIFF iter=495 mismatches=0@@SELFDIFF iter=497 mismatches=0@@SELFDIFF iter=500 mismatches=0@@SELFDIFF iter=502 mismatches=0
+
+@@SELFDIFF iter=509 mismatches=0
+
+@@SELFDIFF iter=518 mismatches=0@@SELFDIFF iter=519 mismatches=0@@SELFDIFF iter=525 mismatches=0
+@@SELFDIFF iter=530 mismatches=0@@SELFDIFF iter=533 mismatches=0@@SELFDIFF iter=535 mismatches=0@@SELFDIFF iter=538 mismatches=0@@SELFDIFF iter=539 mismatches=0
+@@SELFDIFF iter=541 mismatches=0
+@@SELFDIFF iter=542 mismatches=0
+@@SELFDIFF iter=543 mismatches=0
+@@SELFDIFF iter=544 mismatches=0
+@@SELFDIFF iter=545 mismatches=0
+@@SELFDIFF iter=546 mismatches=0
+@@SELFDIFF iter=547 mismatches=0
+@@SELFDIFF iter=548 mismatches=0
+@@SELFDIFF iter=549 mismatches=0
+@@SELFDIFF iter=550 mismatches=0
+@@SELFDIFF iter=551 mismatches=0
+@@SELFDIFF iter=552 mismatches=0
+
+
+@@SELFDIFF iter=563 mismatches=0@@SELFDIFF iter=565 mismatches=0
+@@SELFDIFF iter=569 mismatches=0
+@@SELFDIFF iter=574 mismatches=0
+@@SELFDIFF iter=576 mismatches=0@@SELFDIFF iter=579 mismatches=0
+@@SELFDIFF iter=583 mismatches=0
+@@SELFDIFF iter=590 mismatches=0
+@@SELFDIFF iter=598 mismatches=0@@SELFDIFF iter=600 mismatches=0
+
+
+@@SELFDIFF iter=616 mismatches=0
+@@SELFDIFF iter=620 mismatches=0
+@@SELFDIFF iter=628 mismatches=0@@SELFDIFF iter=630 mismatches=0
+@@SELFDIFF iter=638 mismatches=0@@SELFDIFF iter=639 mismatches=0
+@@SELFDIFF iter=647 mismatches=0
+@@SELFDIFF iter=654 mismatches=0@@SELFDIFF iter=656 mismatches=0@@SELFDIFF iter=659 mismatches=0
+@@SELFDIFF iter=660 mismatches=0@@SELFDIFF iter=666 mismatches=0@@SELFDIFF iter=669 mismatches=0
+@@SELFDIFF iter=673 mismatches=0@@SELFDIFF iter=676 mismatches=0@@SELFDIFF iter=677 mismatches=0@@SELFDIFF iter=681 mismatches=0
+@@SELFDIFF iter=688 mismatches=0
+@@SELFDIFF iter=690 mismatches=0
+
+@@SELFDIFF iter=696 mismatches=0
+
+@@SELFDIFF iter=700 mismatches=0@@SELFDIFF iter=703 mismatches=0@@SELFDIFF iter=706 mismatches=0
+
+@@SELFDIFF iter=713 mismatches=0@@SELFDIFF iter=715 mismatches=0
+@@SELFDIFF iter=722 mismatches=0@@SELFDIFF iter=723 mismatches=0
+@@SELFDIFF iter=730 mismatches=0
+@@SELFDIFF iter=736 mismatches=0
+@@SELFDIFF iter=737 mismatches=0
+@@SELFDIFF iter=743 mismatches=0@@SELFDIFF iter=745 mismatches=0@@SELFDIFF iter=747 mismatches=0@@SELFDIFF iter=753 mismatches=0@@SELFDIFF iter=755 mismatches=0
+@@SELFDIFF iter=757 mismatches=0
+@@SELFDIFF iter=758 mismatches=0
+@@SELFDIFF iter=765 mismatches=0@@SELFDIFF iter=767 mismatches=0@@SELFDIFF iter=771 mismatches=0@@SELFDIFF iter=773 mismatches=0
+@@SELFDIFF iter=778 mismatches=0@@SELFDIFF iter=783 mismatches=0
+
+
+@@SELFDIFF iter=794 mismatches=0@@SELFDIFF iter=795 mismatches=0
+
+@@SELFDIFF iter=801 mismatches=0@@SELFDIFF iter=806 mismatches=0
+@@SELFDIFF iter=812 mismatches=0@@SELFDIFF iter=815 mismatches=0
+@@SELFDIFF iter=822 mismatches=0
+
+@@SELFDIFF iter=831 mismatches=0@@SELFDIFF iter=837 mismatches=0
+
+@@SELFDIFF iter=845 mismatches=0
+@@SELFDIFF iter=846 mismatches=0@@SELFDIFF iter=852 mismatches=0@@SELFDIFF iter=855 mismatches=0@@SELFDIFF iter=856 mismatches=0
+@@SELFDIFF iter=862 mismatches=0@@SELFDIFF iter=863 mismatches=0
+
+
+@@SELFDIFF iter=878 mismatches=0@@SELFDIFF iter=881 mismatches=0@@SELFDIFF iter=883 mismatches=0@@SELFDIFF iter=884 mismatches=0@@SELFDIFF iter=889 mismatches=0
+@@SELFDIFF iter=890 mismatches=0
+@@SELFDIFF iter=892 mismatches=0
+
+@@SELFDIFF iter=897 mismatches=0@@SELFDIFF iter=899 mismatches=0
+@@SELFDIFF iter=903 mismatches=0@@SELFDIFF iter=905 mismatches=0
+@@SELFDIFF iter=910 mismatches=0@@SELFDIFF iter=912 mismatches=0
+@@SELFDIFF iter=918 mismatches=0@@SELFDIFF iter=921 mismatches=0
+@@SELFDIFF iter=928 mismatches=0
+
+@@SELFDIFF iter=935 mismatches=0
+@@SELFDIFF iter=941 mismatches=0@@SELFDIFF iter=944 mismatches=0@@SELFDIFF iter=945 mismatches=0@@SELFDIFF iter=951 mismatches=0
+
+
+
+@@SELFDIFF iter=965 mismatches=0
+
+@@SELFDIFF iter=974 mismatches=0
+@@SELFDIFF iter=979 mismatches=0@@SELFDIFF iter=981 mismatches=0@@SELFDIFF iter=983 mismatches=0@@SELFDIFF iter=986 mismatches=0@@SELFDIFF iter=987 mismatches=0@@SELFDIFF iter=993 mismatches=0
+
+@@SELFDIFF iter=997 mismatches=0@@SELFDIFF iter=1002 mismatches=0@@SELFDIFF iter=1005 mismatches=0@@SELFDIFF iter=1007 mismatches=0
+@@SELFDIFF iter=1012 mismatches=0@@SELFDIFF iter=1014 mismatches=0@@SELFDIFF iter=1017 mismatches=0
+@@SELFDIFF iter=1020 mismatches=0@@SELFDIFF iter=1026 mismatches=0
+
+@@SELFDIFF iter=1030 mismatches=0@@SELFDIFF iter=1035 mismatches=0
+@@SELFDIFF iter=1041 mismatches=0@@SELFDIFF iter=1043 mismatches=0
+@@SELFDIFF iter=1046 mismatches=0
+
+@@SELFDIFF iter=1055 mismatches=0
+@@SELFDIFF iter=1061 mismatches=0@@SELFDIFF iter=1063 mismatches=0@@SELFDIFF iter=1068 mismatches=0
+@@SELFDIFF iter=1072 mismatches=0
+@@SELFDIFF iter=1080 mismatches=0
+@@SELFDIFF iter=1082 mismatches=0
+@@SELFDIFF iter=1090 mismatches=0@@SELFDIFF iter=1092 mismatches=0
+
+@@SELFDIFF iter=1101 mismatches=0
+@@SELFDIFF iter=1106 mismatches=0@@SELFDIFF iter=1108 mismatches=0
+@@SELFDIFF iter=1115 mismatches=0@@SELFDIFF iter=1118 mismatches=0@@SELFDIFF iter=1120 mismatches=0
+@@SELFDIFF iter=1126 mismatches=0
+@@SELFDIFF iter=1130 mismatches=0
+
+
+@@SELFDIFF iter=1143 mismatches=0
+@@SELFDIFF iter=1144 mismatches=0
+@@SELFDIFF iter=1145 mismatches=0
+@@SELFDIFF iter=1146 mismatches=0
+@@SELFDIFF iter=1148 mismatches=0
+@@SELFDIFF iter=1155 mismatches=0
+@@SELFDIFF iter=1161 mismatches=0@@SELFDIFF iter=1162 mismatches=0@@SELFDIFF iter=1168 mismatches=0@@SELFDIFF iter=1170 mismatches=0
+@@SELFDIFF iter=1177 mismatches=0@@SELFDIFF iter=1179 mismatches=0@@SELFDIFF iter=1180 mismatches=0@@SELFDIFF iter=1186 mismatches=0@@SELFDIFF iter=1187 mismatches=0
+@@SELFDIFF iter=1193 mismatches=0@@SELFDIFF iter=1198 mismatches=0@@SELFDIFF iter=1201 mismatches=0
+@@SELFDIFF iter=1206 mismatches=0@@SELFDIFF iter=1208 mismatches=0@@SELFDIFF iter=1213 mismatches=0
+@@SELFDIFF iter=1219 mismatches=0
+@@SELFDIFF iter=1225 mismatches=0
+
+@@SELFDIFF iter=1235 mismatches=0
+@@SELFDIFF iter=1237 mismatches=0@@SELFDIFF iter=1240 mismatches=0
+
+
+
+@@SELFDIFF iter=1255 mismatches=0@@SELFDIFF iter=1257 mismatches=0
+@@SELFDIFF iter=1264 mismatches=0@@SELFDIFF iter=1266 mismatches=0
+@@SELFDIFF iter=1273 mismatches=0@@SELFDIFF iter=1274 mismatches=0@@SELFDIFF iter=1279 mismatches=0
+
+@@SELFDIFF iter=1286 mismatches=0@@SELFDIFF iter=1287 mismatches=0
+@@SELFDIFF iter=1294 mismatches=0
+@@SELFDIFF iter=1301 mismatches=0
+@@SELFDIFF iter=1308 mismatches=0@@SELFDIFF iter=1309 mismatches=0@@SELFDIFF iter=1316 mismatches=0@@SELFDIFF iter=1318 mismatches=0
+
+
+@@SELFDIFF iter=1329 mismatches=0@@SELFDIFF iter=1332 mismatches=0
+@@SELFDIFF iter=1333 mismatches=0@@SELFDIFF iter=1338 mismatches=0
+
+
+@@SELFDIFF iter=1350 mismatches=0
+
+
+@@SELFDIFF iter=1359 mismatches=0
+
+@@SELFDIFF iter=1368 mismatches=0
+@@SELFDIFF iter=1375 mismatches=0
+@@SELFDIFF iter=1382 mismatches=0@@SELFDIFF iter=1384 mismatches=0
+@@SELFDIFF iter=1391 mismatches=0@@SELFDIFF iter=1393 mismatches=0
+@@SELFDIFF iter=1400 mismatches=0@@SELFDIFF iter=1403 mismatches=0@@SELFDIFF iter=1404 mismatches=0
+@@SELFDIFF iter=1412 mismatches=0@@SELFDIFF iter=1415 mismatches=0
+@@SELFDIFF iter=1416 mismatches=0
+@@SELFDIFF iter=1424 mismatches=0@@SELFDIFF iter=1426 mismatches=0
+@@SELFDIFF iter=1433 mismatches=0@@SELFDIFF iter=1435 mismatches=0
+
+
+
+@@SELFDIFF iter=1446 mismatches=0
+@@SELFDIFF iter=1452 mismatches=0@@SELFDIFF iter=1457 mismatches=0@@SELFDIFF iter=1459 mismatches=0@@SELFDIFF iter=1464 mismatches=0@@SELFDIFF iter=1466 mismatches=0
+@@SELFDIFF iter=1473 mismatches=0
+
+@@SELFDIFF iter=1478 mismatches=0@@SELFDIFF iter=1480 mismatches=0@@SELFDIFF iter=1483 mismatches=0
+
+
+@@SELFDIFF iter=1494 mismatches=0@@SELFDIFF iter=1499 mismatches=0
+=== SAMPLER clocks.sm,power.draw,power.limit,temp (200 ms) ===
+--- snap 0 ---
+    Clocks Event Reasons
+        Idle                              : Active
+        Applications Clocks Setting       : Not Active
+        SW Power Cap                      : Not Active
+        HW Slowdown                       : Not Active
+            HW Thermal Slowdown           : Not Active
+            HW Power Brake Slowdown       : Not Active
+        Sync Boost                        : Not Active
+        SW Thermal Slowdown               : Not Active
+        Display Clock Setting             : Not Active
+    Clocks Event Reasons Counters
+        SW Power Capping                  : 13023289457 us
+        Sync Boost                        : 0 us
+        SW Thermal Slowdown               : 0 us
+        HW Thermal Slowdown               : 0 us
+        HW Power Braking                  : 0 us
+    Sparse Operation Mode                 : N/A
+    FB Memory Usage
+        Total                             : 183359 MiB
+        Reserved                          : 728 MiB
+        Used                              : 1 MiB
+        Free                              : 182631 MiB
+    BAR1 Memory Usage
+        Total                             : 262144 MiB
+        Used                              : 2 MiB
+
+--- snap 1 ---
+    Clocks Event Reasons
+        Idle                              : Not Active
+        Applications Clocks Setting       : Not Active
+        SW Power Cap                      : Active
+        HW Slowdown                       : Not Active
+            HW Thermal Slowdown           : Not Active
+            HW Power Brake Slowdown       : Not Active
+        Sync Boost                        : Not Active
+        SW Thermal Slowdown               : Not Active
+        Display Clock Setting             : Not Active
+    Clocks Event Reasons Counters
+        SW Power Capping                  : 13024779679 us
+        Sync Boost                        : 0 us
+        SW Thermal Slowdown               : 0 us
+        HW Thermal Slowdown               : 0 us
+        HW Power Braking                  : 0 us
+    Sparse Operation Mode                 : N/A
+    FB Memory Usage
+        Total                             : 183359 MiB
+        Reserved                          : 728 MiB
+        Used                              : 7434 MiB
+        Free                              : 175198 MiB
+    BAR1 Memory Usage
+        Total                             : 262144 MiB
+        Used                              : 7435 MiB
+
+--- snap 2 ---
+    Clocks Event Reasons
+        Idle                              : Not Active
+        Applications Clocks Setting       : Not Active
+        SW Power Cap                      : Active
+        HW Slowdown                       : Not Active
+            HW Thermal Slowdown           : Not Active
+            HW Power Brake Slowdown       : Not Active
+        Sync Boost                        : Not Active
+        SW Thermal Slowdown               : Not Active
+        Display Clock Setting             : Not Active
+    Clocks Event Reasons Counters
+        SW Power Capping                  : 13026979686 us
+        Sync Boost                        : 0 us
+        SW Thermal Slowdown               : 0 us
+        HW Thermal Slowdown               : 0 us
+        HW Power Braking                  : 0 us
+    Sparse Operation Mode                 : N/A
+    FB Memory Usage
+        Total                             : 183359 MiB
+        Reserved                          : 728 MiB
+        Used                              : 7434 MiB
+        Free                              : 175198 MiB
+    BAR1 Memory Usage
+        Total                             : 262144 MiB
+        Used                              : 7435 MiB
+
+--- snap 3 ---
+    Clocks Event Reasons
+        Idle                              : Not Active
+        Applications Clocks Setting       : Not Active
+        SW Power Cap                      : Not Active
+        HW Slowdown                       : Not Active
+            HW Thermal Slowdown           : Not Active
+            HW Power Brake Slowdown       : Not Active
+        Sync Boost                        : Not Active
+        SW Thermal Slowdown               : Not Active
+        Display Clock Setting             : Not Active
+    Clocks Event Reasons Counters
+        SW Power Capping                  : 13029123145 us
+        Sync Boost                        : 0 us
+        SW Thermal Slowdown               : 0 us
+        HW Thermal Slowdown               : 0 us
+        HW Power Braking                  : 0 us
+    Sparse Operation Mode                 : N/A
+    FB Memory Usage
+        Total                             : 183359 MiB
+        Reserved                          : 728 MiB
+        Used                              : 0 MiB
+        Free                              : 182632 MiB
+    BAR1 Memory Usage
+        Total                             : 262144 MiB
+        Used                              : 1 MiB
+
+✓ App completed. View run at 
+https://modal.com/apps/stephenliang/main/ap-JULUD3IaVcaoYr7VcLrLhe

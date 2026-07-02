@@ -1,0 +1,171 @@
+✓ Initialized. View run at 
+https://modal.com/apps/stephenliang/main/ap-8cQ0XHIHUrU3fZ0GoqIMWU
+✓ Created objects.
+├── 🔨 Created mount /home/sdl/net/sm100_sm103_tests/gpu_interface/runner.py
+├── 🔨 Created mount /home/sdl/net/sm100_sm103_tests
+└── 🔨 Created function build_and_run.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.2.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+=== BUILD ===
+$ make -B fc1-w3 'DFLAGS=-DSELF_DIFF=100 -DNUM_EPI_STAGES=3'
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DSELF_DIFF=100 -DNUM_EPI_STAGES=3 fc1_w3.cu -o fc1-w3 -lcurand_static -lculibos -lcuda
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 7.921 ms
+ptxas info    : Compiling entry function '_Z14count_mismatchPK13__nv_bfloat16S1_xPy' for 'sm_100a'
+ptxas info    : Function properties for _Z14count_mismatchPK13__nv_bfloat16S1_xPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 12.914 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 0.725 ms
+ptxas info    : Compiling entry function '_Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_
+    16 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 109 registers, used 2 barriers, 16 bytes cumulative stack size
+ptxas info    : Compile time = 37.797 ms
+
+=== RUN ===
+$ timeout -k 5 120 stdbuf -oL -eL /root/src/fc1-w3
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 220160 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=220160 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 2.076 ms  2109.84 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=3832809 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 3207168.000000
+C[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=2.076 tflops=2109.84 checksum=3207168.000000 valid=1 c0=1728.0
+@@SELFDIFF_BEGIN launches=100
+@@SELFDIFF iter=0 mismatches=0
+@@SELFDIFF iter=1 mismatches=0
+@@SELFDIFF iter=2 mismatches=0
+@@SELFDIFF iter=3 mismatches=0
+@@SELFDIFF iter=4 mismatches=0
+@@SELFDIFF iter=5 mismatches=0
+@@SELFDIFF iter=6 mismatches=0
+@@SELFDIFF iter=7 mismatches=0
+@@SELFDIFF iter=8 mismatches=0
+@@SELFDIFF iter=9 mismatches=0
+@@SELFDIFF iter=10 mismatches=0
+@@SELFDIFF iter=11 mismatches=0
+@@SELFDIFF iter=12 mismatches=0
+@@SELFDIFF iter=13 mismatches=0
+@@SELFDIFF iter=14 mismatches=0
+@@SELFDIFF iter=15 mismatches=0
+@@SELFDIFF iter=16 mismatches=0
+@@SELFDIFF iter=17 mismatches=0
+@@SELFDIFF iter=18 mismatches=0
+@@SELFDIFF iter=19 mismatches=0
+@@SELFDIFF iter=20 mismatches=0
+@@SELFDIFF iter=21 mismatches=0
+@@SELFDIFF iter=22 mismatches=0
+@@SELFDIFF iter=23 mismatches=0
+@@SELFDIFF iter=24 mismatches=0
+@@SELFDIFF iter=25 mismatches=0
+@@SELFDIFF iter=26 mismatches=0
+@@SELFDIFF iter=27 mismatches=0
+@@SELFDIFF iter=28 mismatches=0
+@@SELFDIFF iter=29 mismatches=0
+@@SELFDIFF iter=30 mismatches=0
+@@SELFDIFF iter=31 mismatches=0
+@@SELFDIFF iter=32 mismatches=0
+@@SELFDIFF iter=33 mismatches=0
+@@SELFDIFF iter=34 mismatches=0
+@@SELFDIFF iter=35 mismatches=0
+@@SELFDIFF iter=36 mismatches=0
+@@SELFDIFF iter=37 mismatches=0
+@@SELFDIFF iter=38 mismatches=0
+@@SELFDIFF iter=39 mismatches=0
+@@SELFDIFF iter=40 mismatches=0
+@@SELFDIFF iter=41 mismatches=0
+@@SELFDIFF iter=42 mismatches=0
+@@SELFDIFF iter=43 mismatches=0
+@@SELFDIFF iter=44 mismatches=0
+@@SELFDIFF iter=45 mismatches=0
+@@SELFDIFF iter=46 mismatches=0
+@@SELFDIFF iter=47 mismatches=0
+@@SELFDIFF iter=48 mismatches=0
+@@SELFDIFF iter=49 mismatches=0
+@@SELFDIFF iter=50 mismatches=0
+@@SELFDIFF iter=51 mismatches=0
+@@SELFDIFF iter=52 mismatches=0
+@@SELFDIFF iter=53 mismatches=0
+@@SELFDIFF iter=54 mismatches=0
+@@SELFDIFF iter=55 mismatches=0
+@@SELFDIFF iter=56 mismatches=0
+@@SELFDIFF iter=57 mismatches=0
+@@SELFDIFF iter=58 mismatches=0
+@@SELFDIFF iter=59 mismatches=0
+@@SELFDIFF iter=60 mismatches=0
+@@SELFDIFF iter=61 mismatches=0
+@@SELFDIFF iter=62 mismatches=0
+@@SELFDIFF iter=63 mismatches=0
+@@SELFDIFF iter=64 mismatches=0
+@@SELFDIFF iter=65 mismatches=0
+@@SELFDIFF iter=66 mismatches=0
+@@SELFDIFF iter=67 mismatches=0
+@@SELFDIFF iter=68 mismatches=0
+@@SELFDIFF iter=69 mismatches=0
+@@SELFDIFF iter=70 mismatches=0
+@@SELFDIFF iter=71 mismatches=0
+@@SELFDIFF iter=72 mismatches=0
+@@SELFDIFF iter=73 mismatches=0
+@@SELFDIFF iter=74 mismatches=0
+@@SELFDIFF iter=75 mismatches=0
+@@SELFDIFF iter=76 mismatches=0
+@@SELFDIFF iter=77 mismatches=0
+@@SELFDIFF iter=78 mismatches=0
+@@SELFDIFF iter=79 mismatches=0
+@@SELFDIFF iter=80 mismatches=0
+@@SELFDIFF iter=81 mismatches=0
+@@SELFDIFF iter=82 mismatches=0
+@@SELFDIFF iter=83 mismatches=0
+@@SELFDIFF iter=84 mismatches=0
+@@SELFDIFF iter=85 mismatches=0
+@@SELFDIFF iter=86 mismatches=0
+@@SELFDIFF iter=87 mismatches=0
+@@SELFDIFF iter=88 mismatches=0
+@@SELFDIFF iter=89 mismatches=0
+@@SELFDIFF iter=90 mismatches=0
+@@SELFDIFF iter=91 mismatches=0
+@@SELFDIFF iter=92 mismatches=0
+@@SELFDIFF iter=93 mismatches=0
+@@SELFDIFF iter=94 mismatches=0
+@@SELFDIFF iter=95 mismatches=0
+@@SELFDIFF iter=96 mismatches=0
+@@SELFDIFF iter=97 mismatches=0
+@@SELFDIFF iter=98 mismatches=0
+@@SELFDIFF iter=99 mismatches=0
+@@SELFDIFF_SUMMARY launches=100 dirty=0 worst=0
+
+=== exit 0 ===
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/stephenliang/main/ap-8cQ0XHIHUrU3fZ0GoqIMWU

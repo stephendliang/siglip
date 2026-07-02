@@ -59,14 +59,17 @@ cutlass-256x256x64
 *.so
 *.so.*
 
-# SASS dumps (large, regenerable) — sass/ holds all disassembly incl. root_dumps/;
+# SASS dumps travel with the repo (2026-07-02: not regenerable on non-CUDA
+# machines); only the stale FC2-era root decomposition dumps stay out.
 # /sass*.txt catches any freshly re-dumped root file before it's moved in.
-sass/
+# NOTE: the old unanchored `sass/` rule silently ignored tools/sass/ sources.
+/sass/root_dumps/sass*.txt
 /sass*.txt
+/tools/sass/sass_tool
 
-# Benchmark artifacts — derived, reproducible on the B200, never hand-edited.
-# Kept off disk entirely (modal-first); conclusions live in CLAUDE.md / memory/*.md.
-/data/
+# Benchmark data: small text logs are primary evidence and travel with the
+# repo; binary profiler artifacts stay out.
+*.ncu-rep
 
 # SASS epilogue templates — regenerable via `tools/template_emitter.py --variant both`.
 /templates/

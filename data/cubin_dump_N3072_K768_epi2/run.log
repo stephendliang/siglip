@@ -1,0 +1,9 @@
+@@CONFIG M=928256 N=3072 K=768 epi=gelu_bias
+@@MODULE id=21 size=5400 magic=7f454c46 file=cubin_21.bin
+@@MODULE id=22 size=3336 magic=7f454c46 file=cubin_22.bin
+@@ALGO id=66 tile=23 stages=36 cluster=3 nres=8
+@@MODULE id=23 size=42676 magic=7f454c46 file=cubin_23.bin
+@@LAUNCH sym=nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_gelubias_TNT
+@@LAUNCH sym=nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_gelubias_TNT
+@@LAUNCH sym=nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_gelubias_TNT
+@@DONE

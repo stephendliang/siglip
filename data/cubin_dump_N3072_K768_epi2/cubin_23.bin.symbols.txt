@@ -1,0 +1,3 @@
+
+symbols:
+STT_FUNC         STB_GLOBAL STO_ENTRY      nvjet_sm100_qqtst_128x256_128x6_2x1_2cta_v_bz_gelubias_TNT

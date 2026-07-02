@@ -1,0 +1,681 @@
+✓ Initialized. View run at 
+https://modal.com/apps/stephenliang/main/ap-T8ida3ETmJxbalBpZGQADO
+✓ Created objects.
+├── 🔨 Created mount /home/sdl/net/sm100_sm103_tests/gpu_interface/paired_fc1.py
+├── 🔨 Created mount /home/sdl/net/sm100_sm103_tests
+└── 🔨 Created function bench.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.2.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+=== BUILD ===
+$ make -B fc1-w3
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static  fc1_w3.cu -o fc1-w3 -lcurand_static -lculibos -lcuda
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 6.841 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 0.783 ms
+ptxas info    : Compiling entry function '_Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_
+    16 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 109 registers, used 1 barriers, 16 bytes cumulative stack size
+ptxas info    : Compile time = 38.478 ms
+$ cp /root/src/fc1-w3 /root/src/fc1-w3-plain
+$ make -B fc1-w3 DFLAGS=-DSELF_DIFF=100
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -DSELF_DIFF=100 fc1_w3.cu -o fc1-w3 -lcurand_static -lculibos -lcuda
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z7pack_u8PhPKhiiii' for 'sm_100a'
+ptxas info    : Function properties for _Z7pack_u8PhPKhiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 20 registers, used 0 barriers
+ptxas info    : Compile time = 6.911 ms
+ptxas info    : Compiling entry function '_Z14count_mismatchPK13__nv_bfloat16S1_xPy' for 'sm_100a'
+ptxas info    : Function properties for _Z14count_mismatchPK13__nv_bfloat16S1_xPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 11.759 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 0.536 ms
+ptxas info    : Compiling entry function '_Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_' for 'sm_100a'
+ptxas info    : Function properties for _Z13fc1_w3_kernel14CUtensorMap_stS_S_PK13__nv_bfloat16PS0_
+    16 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 109 registers, used 1 barriers, 16 bytes cumulative stack size
+ptxas info    : Compile time = 37.636 ms
+$ cp /root/src/fc1-w3 /root/src/fc1-w3-sd
+$ make -B fc1-cutlass
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static  -Ithird_party/cutlass/include -Ithird_party/cutlass/tools/util/include -std=c++17 --expt-relaxed-constexpr fc1_cutlass.cu -o fc1-cutlass -lcurand_static -lculibos -lcuda
+ptxas info    : 1327 bytes gmem
+ptxas info    : Compiling entry function '_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_35MainloopSm100TmaUmmaWarpSpecializedILi5ELi2ELi2ENS5_IJNS4_1CILi2EEENSA_ILi1EEESC_EEEEENS5_IJNSA_ILi256EEESF_NSA_ILi128EEEEEENS_12float_e4m3_tENS5_IJlSC_lEEESI_SJ_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_10MMA_TraitsINS4_25SM100_MMA_F8F6F4_2x1SM_SSEJSI_SI_fSF_SF_NS4_17integral_constantINS4_4UMMA5MajorELSQ_0EEESR_NSO_INSP_7ScaleInELSS_0EEEST_EEEEEENS4_6LayoutINS5_IJSC_SC_SC_EEENS5_IJNSA_ILi0EEESY_SY_EEEEENS5_IJNS4_10UnderscoreES11_S11_EEEEENS4_18SM100_TMA_2SM_LOADENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSW_INS5_IJNSA_ILi8EEESG_EEENS5_IJSG_SC_EEEEEEEvNS4_8identityES14_S1E_vS1F_EENS_8epilogue10collective18CollectiveEpilogueINS1H_23Sm100TmaWarpSpecializedILi4ELi2ELi64ELb1ELb0EEEJNS5_IJSG_SF_SG_EEENS5_IJNSW_ISG_SC_EENSW_INSA_ILi64EEESC_EEEEENS_10bfloat16_tESJ_S1R_SJ_NS1H_6fusion15FusionCallbacksIS1L_NS1S_23LinCombPerColBiasEltActINS1H_6thread11GELU_taylorES1R_ffS1R_fLi4ELNS_15FloatRoundStyleE2EEES1M_S1Q_JEEENS4_5SM1004TMEM4LOAD26SM100_TMEM_LOAD_32dp32b64xENS4_13SM90_TMA_LOADENS15_IS17_NS18_ILi16EEENSW_INS5_IJS1A_S1O_EEENS5_IJS1O_SC_EEEEEEENS4_39AutoVectorizingCopyWithAssumedAlignmentILi128EEENS4_14SM90_TMA_STOREES29_S2B_S2B_EEEvvEEEEvNT_6ParamsE' for 'sm_100a'
+ptxas info    : Function properties for _ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_35MainloopSm100TmaUmmaWarpSpecializedILi5ELi2ELi2ENS5_IJNS4_1CILi2EEENSA_ILi1EEESC_EEEEENS5_IJNSA_ILi256EEESF_NSA_ILi128EEEEEENS_12float_e4m3_tENS5_IJlSC_lEEESI_SJ_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_10MMA_TraitsINS4_25SM100_MMA_F8F6F4_2x1SM_SSEJSI_SI_fSF_SF_NS4_17integral_constantINS4_4UMMA5MajorELSQ_0EEESR_NSO_INSP_7ScaleInELSS_0EEEST_EEEEEENS4_6LayoutINS5_IJSC_SC_SC_EEENS5_IJNSA_ILi0EEESY_SY_EEEEENS5_IJNS4_10UnderscoreES11_S11_EEEEENS4_18SM100_TMA_2SM_LOADENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSW_INS5_IJNSA_ILi8EEESG_EEENS5_IJSG_SC_EEEEEEEvNS4_8identityES14_S1E_vS1F_EENS_8epilogue10collective18CollectiveEpilogueINS1H_23Sm100TmaWarpSpecializedILi4ELi2ELi64ELb1ELb0EEEJNS5_IJSG_SF_SG_EEENS5_IJNSW_ISG_SC_EENSW_INSA_ILi64EEESC_EEEEENS_10bfloat16_tESJ_S1R_SJ_NS1H_6fusion15FusionCallbacksIS1L_NS1S_23LinCombPerColBiasEltActINS1H_6thread11GELU_taylorES1R_ffS1R_fLi4ELNS_15FloatRoundStyleE2EEES1M_S1Q_JEEENS4_5SM1004TMEM4LOAD26SM100_TMEM_LOAD_32dp32b64xENS4_13SM90_TMA_LOADENS15_IS17_NS18_ILi16EEENSW_INS5_IJS1A_S1O_EEENS5_IJS1O_SC_EEEEEEENS4_39AutoVectorizingCopyWithAssumedAlignmentILi128EEENS4_14SM90_TMA_STOREES29_S2B_S2B_EEEvvEEEEvNT_6ParamsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 222 registers, used 7 barriers
+ptxas info    : Compile time = 157.310 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPy' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 0.867 ms
+$ make -B cublaslt-fc1
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lineinfo --ptxas-options=-v --cudart=static -std=c++17 -DDEFAULT_M=928256 -DDEFAULT_N=3072 -DDEFAULT_K=768 -DDEFAULT_EPI=2 bench/cublaslt_introspect.cu -o cublaslt-fc1 -lcublasLt -lcublas
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z9fill_bf16P13__nv_bfloat16mf' for 'sm_100a'
+ptxas info    : Function properties for _Z9fill_bf16P13__nv_bfloat16mf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 10 registers, used 0 barriers
+ptxas info    : Compile time = 2.615 ms
+ptxas info    : Compiling entry function '_Z19read_clock_sentinelPm' for 'sm_100a'
+ptxas info    : Function properties for _Z19read_clock_sentinelPm
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 1.600 ms
+
+=== ROUND 0 RUN fc1-w3-plain ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/fc1-w3-plain
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 220160 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=220160 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 1.962 ms  2232.75 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=3621424 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 3207168.000000
+C[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=1.962 tflops=2232.75 checksum=3207168.000000 valid=1 c0=1728.0
+=== ROUND 0 fc1-w3-plain exit 0 ===
+
+=== ROUND 0 RUN fc1-cutlass ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/fc1-cutlass
+FC1 CUTLASS — GemmUniversal with SM100 TMA warp-specialized epilogue
+  MODE: Fused (GELU + bias, beta=0)
+  [928256, 768] x [768, 3072]^T  FP8E4M3 -> BF16
+  Tile: 256x256x128, Cluster: 2x1, Schedule: 2SM
+  SMEM: 231424 bytes, Epilogue SMEM: 67584 bytes
+  Device: NVIDIA B200 (SM 10.0, SMs=148)
+
+  Alloc + init done
+  CUTLASS initialized (workspace=0)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-CUTLASS: 2.324 ms  1884.86 TFLOPS
+@@CYC name=fc1_cutlass cyc_avg=4288159 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 2555904.000000
+D[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=2.324 tflops=1884.86 checksum=2555904.000000 valid=1 c0=1728.0
+=== ROUND 0 fc1-cutlass exit 0 ===
+
+=== ROUND 0 RUN cublaslt-fc1 928256 3072 768 2 0 0 ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/cublaslt-fc1 928256 3072 768 2 0 0
+### CUBLASLT INTROSPECT M=928256 N=3072 K=768 epi=gelu_bias scale=per_tensor beta=0.0
+### Heuristics returned: 8
+
+# TSV
+rank    heur    ms      cyc     algoId  tile    stages  cluster inner   splitk  redux   swizzle custom  waves   ws_MB   res_ok  epi_ok
+1       0       1.8380  3391312 66      23      36      3       -1      1       0       0       1       588.00  0.0     1       1
+2       2       1.9371  3573358 66      32      36      3       -1      1       0       0       1       784.05  0.0     1       1
+3       1       1.9718  3638490 66      24      36      5       -1      1       0       0       3       588.00  0.0     1       1
+4       4       2.0603  3800392 66      29      36      3       -1      1       0       0       1       940.86  0.0     1       1
+5       3       2.0839  3844756 66      31      36      3       -1      1       0       0       1       784.00  0.0     1       1
+6       5       2.1332  3935330 66      495     36      5       -1      1       0       0       3       784.05  0.0     1       1
+7       6       2.7783  5125686 66      201     36      5       -1      1       0       0       2       882.00  0.0     1       1
+8       7       2.8890  5330112 66      197     36      5       -1      1       0       0       2       931.00  0.0     1       1
+
+# Top-3 caps:
+
+## rank=1  algoId=66  tile=23  stages=36  cluster=3  inner=-1  ms=1.8380
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=2  algoId=66  tile=32  stages=36  cluster=3  inner=-1  ms=1.9371
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=3  algoId=66  tile=24  stages=36  cluster=5  inner=-1  ms=1.9718
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=5
+
+# Winner:  rank=1  tile=23  stages=36  cluster=3  inner=-1  splitk=1  swizzle=0  ms=1.8380  cyc=3391312  res_ok=1  epi_ok=1
+
+@@RESULT ms=1.8380 cyc=3391312 tflops=2383.10 checksum=0.000000 valid=1 c0=0.0
+=== ROUND 0 cublaslt-fc1 928256 3072 768 2 0 0 exit 0 ===
+
+=== ROUND 0 RUN cublaslt-fc1 928256 3072 768 2 1 0 ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/cublaslt-fc1 928256 3072 768 2 1 0
+### CUBLASLT INTROSPECT M=928256 N=3072 K=768 epi=gelu_bias scale=mxfp8 beta=0.0
+### Heuristics returned: 3
+
+# TSV
+rank    heur    ms      cyc     algoId  tile    stages  cluster inner   splitk  redux   swizzle custom  waves   ws_MB   res_ok  epi_ok
+1       0       1.8844  3476359 66      23      36      3       -1      1       0       0       1       588.00  0.0     1       1
+2       1       2.0324  3749590 66      24      36      5       -1      1       0       0       3       588.00  0.0     1       1
+3       2       2.1731  4008497 66      20      36      3       -1      1       0       0       1       1176.00 0.0     1       1
+
+# Top-3 caps:
+
+## rank=1  algoId=66  tile=23  stages=36  cluster=3  inner=-1  ms=1.8844
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=2  algoId=66  tile=24  stages=36  cluster=5  inner=-1  ms=2.0324
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=5
+
+## rank=3  algoId=66  tile=20  stages=36  cluster=3  inner=-1  ms=2.1731
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+# Winner:  rank=1  tile=23  stages=36  cluster=3  inner=-1  splitk=1  swizzle=0  ms=1.8844  cyc=3476359  res_ok=1  epi_ok=1
+
+@@RESULT ms=1.8844 cyc=3476359 tflops=2324.35 checksum=0.000000 valid=1 c0=0.0
+=== ROUND 0 cublaslt-fc1 928256 3072 768 2 1 0 exit 0 ===
+
+=== ROUND 1 RUN fc1-w3-plain ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/fc1-w3-plain
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 220160 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=220160 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 1.961 ms  2234.15 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=3618805 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 3207168.000000
+C[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=1.961 tflops=2234.15 checksum=3207168.000000 valid=1 c0=1728.0
+=== ROUND 1 fc1-w3-plain exit 0 ===
+
+=== ROUND 1 RUN fc1-cutlass ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/fc1-cutlass
+FC1 CUTLASS — GemmUniversal with SM100 TMA warp-specialized epilogue
+  MODE: Fused (GELU + bias, beta=0)
+  [928256, 768] x [768, 3072]^T  FP8E4M3 -> BF16
+  Tile: 256x256x128, Cluster: 2x1, Schedule: 2SM
+  SMEM: 231424 bytes, Epilogue SMEM: 67584 bytes
+  Device: NVIDIA B200 (SM 10.0, SMs=148)
+
+  Alloc + init done
+  CUTLASS initialized (workspace=0)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-CUTLASS: 2.324 ms  1884.90 TFLOPS
+@@CYC name=fc1_cutlass cyc_avg=4287971 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 2555904.000000
+D[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=2.324 tflops=1884.90 checksum=2555904.000000 valid=1 c0=1728.0
+=== ROUND 1 fc1-cutlass exit 0 ===
+
+=== ROUND 1 RUN cublaslt-fc1 928256 3072 768 2 0 0 ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/cublaslt-fc1 928256 3072 768 2 0 0
+### CUBLASLT INTROSPECT M=928256 N=3072 K=768 epi=gelu_bias scale=per_tensor beta=0.0
+### Heuristics returned: 8
+
+# TSV
+rank    heur    ms      cyc     algoId  tile    stages  cluster inner   splitk  redux   swizzle custom  waves   ws_MB   res_ok  epi_ok
+1       0       1.8380  3391350 66      23      36      3       -1      1       0       0       1       588.00  0.0     1       1
+2       2       1.9373  3573541 66      32      36      3       -1      1       0       0       1       784.05  0.0     1       1
+3       1       1.9721  3638961 66      24      36      5       -1      1       0       0       3       588.00  0.0     1       1
+4       4       2.0608  3801362 66      29      36      3       -1      1       0       0       1       940.86  0.0     1       1
+5       3       2.0839  3844784 66      31      36      3       -1      1       0       0       1       784.00  0.0     1       1
+6       5       2.1327  3935203 66      495     36      5       -1      1       0       0       3       784.05  0.0     1       1
+7       6       2.7782  5125532 66      201     36      5       -1      1       0       0       2       882.00  0.0     1       1
+8       7       2.8892  5330296 66      197     36      5       -1      1       0       0       2       931.00  0.0     1       1
+
+# Top-3 caps:
+
+## rank=1  algoId=66  tile=23  stages=36  cluster=3  inner=-1  ms=1.8380
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=2  algoId=66  tile=32  stages=36  cluster=3  inner=-1  ms=1.9373
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=3  algoId=66  tile=24  stages=36  cluster=5  inner=-1  ms=1.9721
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=5
+
+# Winner:  rank=1  tile=23  stages=36  cluster=3  inner=-1  splitk=1  swizzle=0  ms=1.8380  cyc=3391350  res_ok=1  epi_ok=1
+
+@@RESULT ms=1.8380 cyc=3391350 tflops=2383.09 checksum=0.000000 valid=1 c0=0.0
+=== ROUND 1 cublaslt-fc1 928256 3072 768 2 0 0 exit 0 ===
+
+=== ROUND 1 RUN cublaslt-fc1 928256 3072 768 2 1 0 ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/cublaslt-fc1 928256 3072 768 2 1 0
+### CUBLASLT INTROSPECT M=928256 N=3072 K=768 epi=gelu_bias scale=mxfp8 beta=0.0
+### Heuristics returned: 3
+
+# TSV
+rank    heur    ms      cyc     algoId  tile    stages  cluster inner   splitk  redux   swizzle custom  waves   ws_MB   res_ok  epi_ok
+1       0       1.8848  3477089 66      23      36      3       -1      1       0       0       1       588.00  0.0     1       1
+2       1       2.0324  3749995 66      24      36      5       -1      1       0       0       3       588.00  0.0     1       1
+3       2       2.1732  4008952 66      20      36      3       -1      1       0       0       1       1176.00 0.0     1       1
+
+# Top-3 caps:
+
+## rank=1  algoId=66  tile=23  stages=36  cluster=3  inner=-1  ms=1.8848
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=2  algoId=66  tile=24  stages=36  cluster=5  inner=-1  ms=2.0324
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=5
+
+## rank=3  algoId=66  tile=20  stages=36  cluster=3  inner=-1  ms=2.1732
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+# Winner:  rank=1  tile=23  stages=36  cluster=3  inner=-1  splitk=1  swizzle=0  ms=1.8848  cyc=3477089  res_ok=1  epi_ok=1
+
+@@RESULT ms=1.8848 cyc=3477089 tflops=2323.88 checksum=0.000000 valid=1 c0=0.0
+=== ROUND 1 cublaslt-fc1 928256 3072 768 2 1 0 exit 0 ===
+
+=== ROUND 2 RUN fc1-w3-plain ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/fc1-w3-plain
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 220160 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=220160 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 1.960 ms  2234.72 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=3617891 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 3207168.000000
+C[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=1.960 tflops=2234.72 checksum=3207168.000000 valid=1 c0=1728.0
+=== ROUND 2 fc1-w3-plain exit 0 ===
+
+=== ROUND 2 RUN fc1-cutlass ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/fc1-cutlass
+FC1 CUTLASS — GemmUniversal with SM100 TMA warp-specialized epilogue
+  MODE: Fused (GELU + bias, beta=0)
+  [928256, 768] x [768, 3072]^T  FP8E4M3 -> BF16
+  Tile: 256x256x128, Cluster: 2x1, Schedule: 2SM
+  SMEM: 231424 bytes, Epilogue SMEM: 67584 bytes
+  Device: NVIDIA B200 (SM 10.0, SMs=148)
+
+  Alloc + init done
+  CUTLASS initialized (workspace=0)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-CUTLASS: 2.324 ms  1884.82 TFLOPS
+@@CYC name=fc1_cutlass cyc_avg=4288091 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 2555904.000000
+D[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=2.324 tflops=1884.82 checksum=2555904.000000 valid=1 c0=1728.0
+=== ROUND 2 fc1-cutlass exit 0 ===
+
+=== ROUND 2 RUN cublaslt-fc1 928256 3072 768 2 0 0 ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/cublaslt-fc1 928256 3072 768 2 0 0
+### CUBLASLT INTROSPECT M=928256 N=3072 K=768 epi=gelu_bias scale=per_tensor beta=0.0
+### Heuristics returned: 8
+
+# TSV
+rank    heur    ms      cyc     algoId  tile    stages  cluster inner   splitk  redux   swizzle custom  waves   ws_MB   res_ok  epi_ok
+1       0       1.8379  3390866 66      23      36      3       -1      1       0       0       1       588.00  0.0     1       1
+2       2       1.9369  3572840 66      32      36      3       -1      1       0       0       1       784.05  0.0     1       1
+3       1       1.9720  3638586 66      24      36      5       -1      1       0       0       3       588.00  0.0     1       1
+4       4       2.0605  3800683 66      29      36      3       -1      1       0       0       1       940.86  0.0     1       1
+5       3       2.0841  3845109 66      31      36      3       -1      1       0       0       1       784.00  0.0     1       1
+6       5       2.1334  3935918 66      495     36      5       -1      1       0       0       3       784.05  0.0     1       1
+7       6       2.7783  5125698 66      201     36      5       -1      1       0       0       2       882.00  0.0     1       1
+8       7       2.8891  5330131 66      197     36      5       -1      1       0       0       2       931.00  0.0     1       1
+
+# Top-3 caps:
+
+## rank=1  algoId=66  tile=23  stages=36  cluster=3  inner=-1  ms=1.8379
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=2  algoId=66  tile=32  stages=36  cluster=3  inner=-1  ms=1.9369
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=3  algoId=66  tile=24  stages=36  cluster=5  inner=-1  ms=1.9720
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=5
+
+# Winner:  rank=1  tile=23  stages=36  cluster=3  inner=-1  splitk=1  swizzle=0  ms=1.8379  cyc=3390866  res_ok=1  epi_ok=1
+
+@@RESULT ms=1.8379 cyc=3390866 tflops=2383.25 checksum=0.000000 valid=1 c0=0.0
+=== ROUND 2 cublaslt-fc1 928256 3072 768 2 0 0 exit 0 ===
+
+=== ROUND 2 RUN cublaslt-fc1 928256 3072 768 2 1 0 ===
+$ timeout -k 5 180 stdbuf -oL -eL /root/src/cublaslt-fc1 928256 3072 768 2 1 0
+### CUBLASLT INTROSPECT M=928256 N=3072 K=768 epi=gelu_bias scale=mxfp8 beta=0.0
+### Heuristics returned: 3
+
+# TSV
+rank    heur    ms      cyc     algoId  tile    stages  cluster inner   splitk  redux   swizzle custom  waves   ws_MB   res_ok  epi_ok
+1       0       1.8846  3476672 66      23      36      3       -1      1       0       0       1       588.00  0.0     1       1
+2       1       2.0321  3749403 66      24      36      5       -1      1       0       0       3       588.00  0.0     1       1
+3       2       2.1733  4008937 66      20      36      3       -1      1       0       0       1       1176.00 0.0     1       1
+
+# Top-3 caps:
+
+## rank=1  algoId=66  tile=23  stages=36  cluster=3  inner=-1  ms=1.8846
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+## rank=2  algoId=66  tile=24  stages=36  cluster=5  inner=-1  ms=2.0321
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=5
+
+## rank=3  algoId=66  tile=20  stages=36  cluster=3  inner=-1  ms=2.1733
+    CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK      = 2
+    CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT      = 0
+    CUBLASLT_ALGO_CAP_STRIDED_BATCH_SUPPORT      = 1
+    CUBLASLT_ALGO_CAP_OUT_OF_PLACE_RESULT_SUPPORT = 1
+    CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX          = 7
+    CUBLASLT_ALGO_CAP_POINTER_MODE_MASK          = 3
+    CUBLASLT_ALGO_CAP_EPILOGUE_MASK              = 1023
+    CUBLASLT_ALGO_CAP_TILE_IDS                   = --  (status=7 wrote=0)
+    CUBLASLT_ALGO_CAP_STAGES_IDS                 = [36] (n=1, elem=4B)
+    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID sz=2 → status=0 wrote=2 val=3
+
+# Winner:  rank=1  tile=23  stages=36  cluster=3  inner=-1  splitk=1  swizzle=0  ms=1.8846  cyc=3476672  res_ok=1  epi_ok=1
+
+@@RESULT ms=1.8846 cyc=3476672 tflops=2324.19 checksum=0.000000 valid=1 c0=0.0
+=== ROUND 2 cublaslt-fc1 928256 3072 768 2 1 0 exit 0 ===
+
+=== SELF_DIFF GATE fc1-w3 (100 pairs) ===
+$ timeout -k 5 600 stdbuf -oL -eL /root/src/fc1-w3-sd
+FC1 W3 kernel — 6 warps, GELU epilogue
+  GEMM: [928256,768] x [3072,768]^T  5-stage pipeline  SMEM: 220160 bytes
+  Tiles: 3626M × 12N = 43512 total  K_ITERS=6
+  Packing tiles...
+  Packing done
+  Alloc + init done
+  TMA descriptors + func attr done (SMEM=220160 B)
+Launching warmup (2 iters)...
+  Warmup done.
+Timing: 10 iterations...
+FC1-W3 kernel: 1.960 ms  2234.31 TFLOPS
+@@CYC name=fc1_w3 cyc_avg=3618744 launches=10
+Validation: 32/32 spot checks passed
+Checksum (1024 strided): 3207168.000000
+C[0,0..3] = 1728.0 1152.0 1728.0 1152.0
+@@RESULT ms=1.960 tflops=2234.31 checksum=3207168.000000 valid=1 c0=1728.0
+@@SELFDIFF_BEGIN launches=100
+@@SELFDIFF iter=0 mismatches=0
+@@SELFDIFF iter=1 mismatches=0
+@@SELFDIFF iter=2 mismatches=0
+@@SELFDIFF iter=3 mismatches=0
+@@SELFDIFF iter=4 mismatches=0
+@@SELFDIFF iter=5 mismatches=0
+@@SELFDIFF iter=6 mismatches=0
+@@SELFDIFF iter=7 mismatches=0
+@@SELFDIFF iter=8 mismatches=0
+@@SELFDIFF iter=9 mismatches=0
+@@SELFDIFF iter=10 mismatches=0
+@@SELFDIFF iter=11 mismatches=0
+@@SELFDIFF iter=12 mismatches=0
+@@SELFDIFF iter=13 mismatches=0
+@@SELFDIFF iter=14 mismatches=0
+@@SELFDIFF iter=15 mismatches=0
+@@SELFDIFF iter=16 mismatches=0
+@@SELFDIFF iter=17 mismatches=0
+@@SELFDIFF iter=18 mismatches=0
+@@SELFDIFF iter=19 mismatches=0
+@@SELFDIFF iter=20 mismatches=0
+@@SELFDIFF iter=21 mismatches=0
+@@SELFDIFF iter=22 mismatches=0
+@@SELFDIFF iter=23 mismatches=0
+@@SELFDIFF iter=24 mismatches=0
+@@SELFDIFF iter=25 mismatches=0
+@@SELFDIFF iter=26 mismatches=0
+@@SELFDIFF iter=27 mismatches=0
+@@SELFDIFF iter=28 mismatches=0
+@@SELFDIFF iter=29 mismatches=0
+@@SELFDIFF iter=30 mismatches=0
+@@SELFDIFF iter=31 mismatches=0
+@@SELFDIFF iter=32 mismatches=0
+@@SELFDIFF iter=33 mismatches=0
+@@SELFDIFF iter=34 mismatches=0
+@@SELFDIFF iter=35 mismatches=0
+@@SELFDIFF iter=36 mismatches=0
+@@SELFDIFF iter=37 mismatches=0
+@@SELFDIFF iter=38 mismatches=0
+@@SELFDIFF iter=39 mismatches=0
+@@SELFDIFF iter=40 mismatches=0
+@@SELFDIFF iter=41 mismatches=0
+@@SELFDIFF iter=42 mismatches=0
+@@SELFDIFF iter=43 mismatches=0
+@@SELFDIFF iter=44 mismatches=0
+@@SELFDIFF iter=45 mismatches=0
+@@SELFDIFF iter=46 mismatches=0
+@@SELFDIFF iter=47 mismatches=0
+@@SELFDIFF iter=48 mismatches=0
+@@SELFDIFF iter=49 mismatches=0
+@@SELFDIFF iter=50 mismatches=0
+@@SELFDIFF iter=51 mismatches=0
+@@SELFDIFF iter=52 mismatches=0
+@@SELFDIFF iter=53 mismatches=0
+@@SELFDIFF iter=54 mismatches=0
+@@SELFDIFF iter=55 mismatches=0
+@@SELFDIFF iter=56 mismatches=0
+@@SELFDIFF iter=57 mismatches=0
+@@SELFDIFF iter=58 mismatches=0
+@@SELFDIFF iter=59 mismatches=0
+@@SELFDIFF iter=60 mismatches=0
+@@SELFDIFF iter=61 mismatches=0
+@@SELFDIFF iter=62 mismatches=0
+@@SELFDIFF iter=63 mismatches=0
+@@SELFDIFF iter=64 mismatches=0
+@@SELFDIFF iter=65 mismatches=0
+@@SELFDIFF iter=66 mismatches=0
+@@SELFDIFF iter=67 mismatches=0
+@@SELFDIFF iter=68 mismatches=0
+@@SELFDIFF iter=69 mismatches=0
+@@SELFDIFF iter=70 mismatches=0
+@@SELFDIFF iter=71 mismatches=0
+@@SELFDIFF iter=72 mismatches=0
+@@SELFDIFF iter=73 mismatches=0
+@@SELFDIFF iter=74 mismatches=0
+@@SELFDIFF iter=75 mismatches=0
+@@SELFDIFF iter=76 mismatches=0
+@@SELFDIFF iter=77 mismatches=0
+@@SELFDIFF iter=78 mismatches=0
+@@SELFDIFF iter=79 mismatches=0
+@@SELFDIFF iter=80 mismatches=0
+@@SELFDIFF iter=81 mismatches=0
+@@SELFDIFF iter=82 mismatches=0
+@@SELFDIFF iter=83 mismatches=0
+@@SELFDIFF iter=84 mismatches=0
+@@SELFDIFF iter=85 mismatches=0
+@@SELFDIFF iter=86 mismatches=0
+@@SELFDIFF iter=87 mismatches=0
+@@SELFDIFF iter=88 mismatches=0
+@@SELFDIFF iter=89 mismatches=0
+@@SELFDIFF iter=90 mismatches=0
+@@SELFDIFF iter=91 mismatches=0
+@@SELFDIFF iter=92 mismatches=0
+@@SELFDIFF iter=93 mismatches=0
+@@SELFDIFF iter=94 mismatches=0
+@@SELFDIFF iter=95 mismatches=0
+@@SELFDIFF iter=96 mismatches=0
+@@SELFDIFF iter=97 mismatches=0
+@@SELFDIFF iter=98 mismatches=0
+@@SELFDIFF iter=99 mismatches=0
+@@SELFDIFF_SUMMARY launches=100 dirty=0 worst=0
+=== SELF_DIFF exit 0 ===
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/stephenliang/main/ap-T8ida3ETmJxbalBpZGQADO
