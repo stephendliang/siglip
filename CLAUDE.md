@@ -1,863 +1,326 @@
-# SigLIP2 Vision Encoder — Hand-tuned Blackwell GEMM Kernels
+# SigLIP Vision Encoder — Hand-tuned Blackwell GEMM Kernels
 
-Hand-tuned SM100a persistent GEMM for FC1/FC2 of `google/siglip2-base-patch16-224`.
-FP8 (E4M3) → BF16, tcgen05 MMA, TMA, `cta_group::2`, 2-CTA clusters. Cross-compiled
-on CPU VPS, runs B200 (148 SMs, 74 clusters). PE (patch-embed) kernel done.
+SM100a (tcgen05) persistent GEMM for SigLIP FC1/FC2; FP8 (E4M3) → BF16.
+Production points: FC2 M=928256 N=768 K=3072 (+residual); FC1 M=928256 N=3072
+K=768 (GELU+bias).
 
-## Current best (B200, 2026-05-06)
+## Current best (B200, cycles-first)
 
-| target | ms | kernel | dispatch | vs cuBLASLt fused rank-1 |
-|---|---|---|---|---|
-| FC2 K=3072 BIAS_ONLY (strip floor) | 0.98502 | `fc2_w3x` `-DSTRIP_EPILOGUE` | n/a | NS=6+PREFILL structural floor (1814685 cyc) |
-| **FC2 K=3072 BIAS_ONLY (full)** | **1.00092** | `fc2_w3x` (bias-preload, STSM-only) | basin floor (default `gflip_blkswap` TD=54) | **−27 µs** vs 1.028 PerTensor / **−116 µs** vs 1.117 MXFP8; +16 µs exposed epi vs strip |
-| FC2 K=3072 fused (+residual) | **1902.5 kcyc** (wall 1.06–1.13, container clock-dependent) | `fc2_w3` | **gflip_blkswap TD=54** PACKED (now default) | **−14.8% cyc** vs CUTLASS 2232.0k / **−16.7%** vs cuBLASLt beta=1 rank-1 2283.6k (paired) |
-| FC1 K=768 fused (+GELU+bias) | 1.998 | `fc1_w3` | zigzag TD=11 + K_STAGGER=1 | **−416 µs** vs 2.414 PerTensor / **+47 µs** vs 1.951 MXFP8 |
+| target | result | kernel (dispatch) | vs references |
+|---|---|---|---|
+| FC2 bias-only strip floor | 0.98502 ms | `fc2_w3x -DSTRIP_EPILOGUE` | NS=6+PREFILL structural floor |
+| **FC2 bias-only** | **1.00092 ms** | `fc2_w3x` (gflip_blkswap TD=54) | **−27 µs** vs cuBLASLt PT 1.028 / −116 µs vs MXFP8 1.117 |
+| **FC2 fused +residual** | **1902.5 kcyc** (wall 1.06–1.13, clock-dep) | `fc2_w3` (TD=54, back-pressured NS=6) | **−14.8%** vs CUTLASS 2232.0k / −16.7% vs cuBLASLt beta=1 2283.6k |
+| FC1 GELU+bias | 3619.4 kcyc (wall 1.96) | `fc1_w3` (TD=11+ks=1, EPI_DECOUPLE+ES=3 defaults) | **+6.7%** vs cuBLASLt 13.3 PT 3391.2k / +4.1% vs MXFP8 3476.7k / −15.6% vs CUTLASS 4288.1k |
 
-`fc2_w3x` = clean-sheet 6-warp persistent bias-only, beats per-tensor and
-MXFP8 cuBLASLt rank-1.
-`fc2_w3` = legacy 7-warp fused, production for residual path.
-`fc1_w3` beats per-tensor cuBLASLt by 416 µs but trails MXFP8 by 47 µs —
-MXFP8 has different (better) kernels for FC1's small-K geometry.
+`fc2_w3x` = clean-sheet 6-warp bias-only. `fc2_w3` = legacy 7-warp, production
+residual path. `fc1_w3` = FC1 production (legacy family); `fc1_w3x` (clean-sheet
+port) sits at ~3.11 ms — exposed-epilogue problem, does NOT supersede fc1_w3 yet.
 
-cuBLASLt fused-bias / fused-GELU+bias algorithms **do exist** on sm_100a /
-CUDA 13.0 — but only with **BF16 bias dtype**. FP32 bias dtype gets you 0
-algos and `CUBLAS_STATUS_NOT_SUPPORTED` regardless of layout. 4-cell probe
-({[N,M],[M,N]} × {BF16,FP32}) showed bias dtype is the lever. Layout
-orientation [N,M] vs [M,N] doesn't change algo enumeration but DOES change
-the kernels' runtime — the prior 1.894 ms / 1.046 ms references on [M,N]
-(transposed) layout aren't directly comparable to production [N,M] numbers.
-Default in `bench/fc_problem.cuh` is now BF16 bias on [N,M] layout, which
-mirrors cublas-bench-fc1/fc2 and reproduces the rank-1 references above.
+**FC1 is the open front.** libcublasLt 13.3.0.5 (algoId=66 family, GELU
+verified via epi_ok witness) beats us by 228.2 kcyc (~123 µs) at our exact
+geometry. fc1_w3 is **epilogue-RATE-bound** (1-tile overlap already exists;
+E = 6.16 kcyc/tile vs vendor 5.77, loader 4.64@NS5 / 3.09@NS6, MMA 3.15 —
+MMA-side levers can't move the wall). 2026-07-02 win (−336.2 kcyc):
+EPI_DECOUPLE + ES=3 — per-subiter cross-warp barriers dropped (staging is
+warp-private; warps self-pace) + 3-deep store ring; now in-file defaults,
+`-DNO_EPI_DECOUPLE -DNUM_EPI_STAGES=2` reverts SASS-identically. Remaining
+lever = packed GELU: vendor dump
+(`nvjet..._128x256_128x6_2x1_2cta_v_bz_gelubias_TNT`) uses MUFU.TANH +
+packed FMUL2/FFMA2 ≈5.5 issue-slots/element vs our all-scalar ≈7.5; PTX
+`add/mul/fma.rn.f32x2` → FADD2/FMUL2/FFMA2 probe-verified on sm_100a; est
+~300 kcyc ≥ the whole remaining gap. `memory/project-nvjet-cubin-dump.md`.
+NS=6 matrix 2026-07-02: TIE at production (epi wall confirmed directly),
+but strip NS=6 hits the MMA floor (3.09 kcyc/tile, −33% — NS=5's "loader
+floor" was the within-tile stage-0 recycle). Epi-rate wins have runway to
+~1.85 Mcyc; when E < ~4.6, port BIAS_PER_TILE to static dispatch
+(Group-3-only today) → NS6+ES2 or NS5+ES4 fit at 231424 B.
+`memory/project-fc1-ns6-matrix.md`.
 
 ## Kernel structure
 
-7-warp persistent (224 threads), `cta_group::2`, `__cluster_dims__(2,1,1)`. Tile
-256x256x128. K_ITERS = K_DIM/128 (FC2: 24, FC1: 6).
+7-warp persistent (224 threads), `cta_group::2`, `__cluster_dims__(2,1,1)`,
+tile 256x256x128, K_ITERS = K_DIM/128 (FC2 24, FC1 6).
+W0 TMA A+B (TMA-sensitive: any global op in K-loop costs +41–77% tma_issue) ·
+W1 tcgen05.mma K-loop (TMEM 512 cols double-buffered) · W2 epi TMA load
+(residual) · W3-W6 epi compute (LDS + TMEM ld + CVT + STS + TMA store).
+`fc2_w3x`: 6 warps — W0-W3 epi, W4 TMA, W5 MMA CTA0-only, `buf = tt & 1`.
+w3x output ABI: 4D packed tiles `[TILES_M, TILES_N, TM*2, TN]`, host `pack_idx_C(m,n)`.
+PREFILL overlaps prev tile's epi drain with first 6 K-iters of next tile's MMA.
 
-| Warp | Role | Notes |
-|---|---|---|
-| W0 | TMA Load (A+B) | TMA-sensitive — no global ops in K-loop |
-| W1 | tcgen05.mma K-loop | TMEM 512 cols double-buffered |
-| W2 | EpilogueLoad | TMA loads residual (FC2), 2-stage |
-| W3-W6 | Epilogue compute | LDS + TMEM ld + math + CVT + STS + TMA store |
-| W7 | Scheduler (TD=4/LEAN) | atomicAdd tile counter, mbarrier broadcast |
+## Tuning rules
 
-`fc2_w3x` differs: 6 warps (W0-W3 epi, W4 TMA, W5 MMA CTA0-only). No W7. `buf = tt & 1`.
+| knob | rule |
+|---|---|
+| N_STAGES | auto `min(NS_BY_N, max(2, K_ITERS−3))`; NS_BY_N=6/5/4/3 for N≤1536/2048/4096/larger. 228 KB SMEM ceiling (32 KB A+B/stage); fill-gap≥3 (gap=2 FAILs K=1024 NS=6) |
+| PREFILL | auto K_ITERS≥20, else NO_PREFILL (short K deadlocks on parity wrap). PREFILL eff ~0.91 vs ~0.77. fc2_w3 residual FULL auto-forces back-pressure (= NO_PREFILL path, free at K_ITERS=24; `-DFORCE_PREFILL` opts out) |
+| Dispatch | compile-time only (workstealing stripped). FC2 both kernels: gflip_blkswap TD=54. FC1: zigzag TD=11 + K_STAGGER=1 (odd ks helps FC1, wash on FC2). stride TD=0 on fused fc2_w3 = +8.4% — never ship |
 
-## Adaptive tuning + pipeline depth
+Dispatch mechanism (settled): static swizzles > workstealing ~30 µs; bottleneck
+is `long_scoreboard` stalls, NOT DRAM amplification — CUTLASS at 1.000× amp is
+185 µs slower; **tensor-pipe utilization is the lever**. fc2_w3x m-axis basin
+is wide and tied (η²=0.0075): TD=54 is mid-basin, don't churn. Hurts: bare
+gflip, non-XK=1 pairings, gflip_cidperm (breaks SM→L2 contiguity). lmrev: fine
+bias-only, +12–14k cyc on fused — residual consumer is m-traversal-sensitive.
+Tables: `memory/project-perf-table-archive.md`.
 
-| Knob | Rule | Why |
-|---|---|---|
-| N_STAGES | auto: `min(NS_BY_N, max(2, K_ITERS−3))`; NS_BY_N = 6/5/4/3 for N≤1536/2048/4096/larger | SMEM ceiling (228 KB; 32 KB A+B FP8/stage; NS7 too big). Pipeline-fill margin gap≥3 (gap=2 FAILs at K=1024 NS=6). |
-| PREFILL | auto: K_ITERS≥20 → on, else NO_PREFILL | Short K-loop deadlocks (parity wrap). NO_PREFILL caps eff ~0.77; PREFILL ~0.91. fc2_w3 auto-guards via `#if K_DIM/128 < 20`; fc2_w3x kernel-side macro guard (3d6c1cb). |
-| Dispatch | FC2 fused: `gflip_blkswap` (TD=54) **default** (−6018 cyc/−3.4 µs vs dgsw TD=8, STRONG d=−1.33 — basin transfers from bias-only; `make fc2-w3` now builds TD=54). FC2 bias-only: any `gflip_*` basin-floor — `gflip_blkswap` (TD=54) default. FC1: zigzag + K_STAGGER=1. | PACKED_TILES + odd ks helps FC1; FC2 wash on ks. |
-
-PREFILL overlaps prev tile's epi drain with first 6 K-iters of next tile's MMA;
-W1 skips epilogue_mbar check for first 6 iters. 6-stage pipeline = 227 KB / 228 KB SMEM.
-
-## FC2 fused status (PACKED_TILES, M=928256, K=3072, N=768)
-
-| Variant | fused | gemm | strip | f-g | g-s |
-|---|---|---|---|---|---|
-| **default (stride)** | **1.071** | 1.073 | 1.026 | -0.002 | 0.047 |
-| zigzag (TD=11) | 1.073 | 1.073 | 0.988 | 0.000 | 0.085 |
-| dgswizzle (TD=8) | 1.065 | 1.053 | 0.989 | 0.012 | 0.064 |
-| rowmajor / zorder / hilbert | 1.07–1.09 | ~1.07 | ~0.988 | — | — |
-| sched (TD=4) | 1.101 | 1.083 | 0.994 | 0.018 | 0.089 |
-| lean (LEAN_DISPATCH) | 1.107 | 1.093 | 0.994 | 0.014 | 0.099 |
-| ncycle / nsnake / nflat | 1.20–1.23 | — | — | — | — |
-| rowsteal | 1.242 | 1.213 | 1.037 | 0.029 | 0.176 |
-
-Static swizzles > work-stealing (~30 µs). Strip ~0.988 ms.
-`fused = strip + (g-s) + (f-g)`. g-s: store contention, cluster-wavefront N-column
-diversity. f-g: epi/next-tile-mainloop overlap, K_ITERS-limited.
-
-**gflip basin sweep on fused fc2_w3 (2026-06-30, cyc, n=134 trimmed passes, η²=0.99).**
-fc2_w3 is now templated `<TD,DGG>` like fc2_w3x; the whole gflip basin compiles
-into one `-DCOMBO_QUICK` binary (`make fc2-w3-swizzle-sweep`, cyc via CLOCK_TOTAL).
-**The bias-only basin floor transfers: `gflip_blkswap` (TD=54) wins the fused path
-too — −6018 cyc (−3.4 µs/−0.32%) vs dgsw TD=8, STRONG (d=−1.33, 34% win).** Top
-tier blkswap/dgsnake/snrot2/gflip_snrot/gflip all STRONG faster than dgsw (−4.2 to
-−6.0k cyc). **But the lmrev family DECISIVELY *hurts* fused (+12 to +14k cyc) —
-opposite of bias-only, where lmrev tied for first; the residual consumer is
-m-axis-traversal sensitive in a way bias-only isn't.** `stride` (old TD=0 default)
-is +156k cyc (+8.4%) — never ship it; TD=54 is now the `make fc2-w3` default.
-**Sparse output RACE — FIXED 2026-07-01 (back-pressure, zero cost).** fc2_w3's
-fused residual had a scheduling race (full self-diff: ~0.25% of ALL elements every
-run; the old "~0.04%/~1/20" was the coarse 32-spot estimate). ROOT CAUSE = a
-buffer/rate deficit, NOT a handshake bug: under PREFILL, W1 free-runs the MMA and
-at NS=6 outpaces the 2-slot ReuseSmemC epilogue staging. Proof it's depth/rate not
-handshake — the IDENTICAL handshake code is bit-exact at a 4-deep ring (NS5 ES4
-dirty=0/100) and races at 2-deep (NS5 ES2 13/100, NS6 ES2 100/100). FIX = restore
-W1's `epilogue_mbar` wait to bound the MMA to the epilogue's pace (the existing
-`NO_PREFILL` path), now AUTO-ENABLED for the residual FULL path (STRIP/GEMM/BIAS
-keep PREFILL; `-DFORCE_PREFILL` opts out). **dirty=0/350 across 3 runs +
-0/1500 (2026-07-01 throttle-probe run), valid=1,
-1.077 ms vs 1.079 PREFILL** — free, because K_ITERS=24 fully hides the wait.
-Detector: `-DSELF_DIFF=N` (double-launch bitwise self-diff, `@@SELFDIFF_SUMMARY`).
+**fc2_w3 residual race — FIXED 2026-07-01 (170e543), goal CLOSED.** Root cause
+= buffer/rate deficit, not handshake: free-running NS=6 MMA under PREFILL laps
+the 2-slot ReuseSmemC staging (~0.25% elements dirty/run). Fix = the auto
+back-pressure above; dirty=0/1850 cumulative, 1.077 ms (vs 1.079 PREFILL).
+Gate ANY residual change with `-DSELF_DIFF=N` (double-launch bitwise self-diff,
+`@@SELFDIFF_SUMMARY`; 32-spot checks miss sparse corruption).
 Full analysis: `memory/project-fc2-w3-epilogue-race.md`.
 
-## FC1 fused status (PACKED_TILES, M=928256, K=768, N=3072)
+## Compute floor (FC2)
 
-| Variant | fused | gemm | strip | f-g | g-s |
-|---|---|---|---|---|---|
-| **zigzag + K_STAGGER=1** (TD=11) | **1.998** | — | — | — | — |
-| dgswizzle + K_STAGGER=1 (TD=8) | 2.023 | — | — | — | — |
-| zigzag (TD=11) | 2.024 | 1.894 | 1.382 | 0.130 | 0.512 |
-| nflat | 2.035 | 1.721 | 1.339 | 0.314 | 0.382 |
-| nsnake / ncycle | ~2.034 | ~2.04 | 1.337 | ~0 | ~0.703 |
-| sched / lean | ~2.075 | ~1.84 | 1.41 | ~0.23 | ~0.43 |
-| dgswizzle (no ks) | 2.093 | 1.659 | 1.378 | 0.434 | 0.281 |
-| hilbert | 2.257 | 1.694 | 1.435 | 0.563 | 0.259 |
+Per-cluster cyc = 147 tiles × 24 K_iters × cyc/iter:
 
-FC1 dispatch lever > FC2's. Odd K_STAGGER (1/3) helps; ks=2 hurts.
-ncycle/nsnake have f-g≈0 — pathological.
+| source | cyc/iter | wall |
+|---|---|---|
+| HW MMA retirement (no staging) | 460 | 0.896 ms — unreachable |
+| **fc2-w3x-strip** (NS=6+PREFILL) | **493** | **0.98502** — structural staging floor |
+| **fc2-w3x** (full) | **502** | **1.00092** — production |
+| cuBLASLt PT fused rank-1 | ~515 | 1.028 |
+| cuBLASLt MXFP8 fused rank-1 | ~559 | 1.117 |
 
-## Tile dispatch — mechanism
-
-Static swizzles win under PACKED_TILES parity. Pre-2026-04-17 "work-stealing
-wins via 1.00× DRAM amplification" thesis dead — static reads 20–59% MORE bytes,
-runs faster. Real metric: **`long_scoreboard` stalls** (synchronous-A-wavefront),
-not DRAM amp.
-
-| FC2 fused | ms | long_sb | barrier | DRAM rd | amp |
-|---|---|---|---|---|---|
-| default | 1.071 | 2.12M | 272K | 6.79 GB | 1.59× |
-| zigzag TD=11 | 1.073 | 2.12M | 271K | 6.04 GB | 1.41× |
-| dgswizzle TD=8 | 1.065 | 2.02M | 267K | 5.44 GB | 1.27× |
-| sched | 1.101 | 2.66M | 45K | 4.28 GB | 1.00× |
-| lean | 1.107 | 2.66M | 44K | 4.28 GB | 1.00× |
-
-LEAN trades 540K more long_sb for 230K fewer barrier — slower net.
-
-**"DRAM amp ≠ bottleneck" cleanest proof (cutlass-static, 2026-04-23)** — same
-tile/cluster/2SM-schedule/PACKED, only scheduler/epi differ:
-
-| variant | wall µs | tensor% | long_sb | L2 hit% | DRAM rd | amp |
-|---|---|---|---|---|---|---|
-| cutlass-static (fused) | 1244 | 81.92 | 10.22 | 59.53 | 4.280 GB | **1.000×** |
-| fc2_w3x (bias-only)    | 1059 | **97.94** | **6.70** | **67.65** | 2.978 GB | 1.043× |
-
-CUTLASS at 1.000× amp floor, 185 µs slower at 21% more instructions
-(169.9M vs 140.2M → 16-pt tensor-pipe gap). **Tensor-pipe utilization is the
-lever.** fc2_w3x reads 1.3 GB MORE per launch, runs faster.
-
-## fc2_w3x basin (n=29420) — settled
-
-m-axis dispatch is a **wide tied basin**. Top 7 cells (blkx5/6/7, blk_qrt0/2/3,
-blkswap) within ~135 cyc, η²=0.0075 NEGLIGIBLE. **Default `gflip_blkswap`
-(TD=54) stays — middle of basin, zero churn.**
-
-Mechanism: once gflip's XOR=1 group pairing is in place (`cluster_tm_corr ↓`
-0.94→0.65), any m-axis perturbation that decorrelates paired CTAs' tm-traversal
-saturates the gain. Three sub-tiers (Stage 1 n=2048): floor (XK=1 + m-axis
-perturb) Δ −600 to −770 cyc; mid (weaker perturb) Δ −400 to −500; shallow
-(gflip alone or wrong axis) Δ −100 to −300.
-
-**Catastrophic gflip failures stay relevant:** `gflip_cidperm` (TD=55, +1718
-DECISIVE — `*15 mod 74` cluster perm breaks SM→L2 contiguity, cluster_tm_corr
-0.16 vs 0.65), `gflip_xk2/3/5/7_blkswap` (non-XK=1 pairs non-adjacent groups),
-bare `gflip` (~80% of gain is m-axis perturb). **`lmrev` demoted:** prior
-n=43910 "blkswap+lmrev TIE" sweep artifact; σ=768 in n=2048 fluke produced
-misleading DECISIVE call.
-
-`tools/bloom_filter.py` validated conservative-let-through, zero false
-negatives across n=43910+n=29420. WORTHY/MARGINAL = build, OVERSHOOT-RISK =
-build expecting regression, STUPID = skip. `adj_tn_diff` empirical channel
-may be stale (snrot2 12th at n=10978 vs "2nd at n=32768" prior).
-
-Swizzle metric pipeline (Stage 1 simulate `lin_tile = cluster_id + tt*NC`,
-Stage 2 PCA+KMeans+Ward against baked WALL_NS200):
-```bash
-python3 tools/analyze_swizzle.py --csv /tmp/swizzle_metrics.csv
-python3 tools/cluster_swizzle.py /tmp/swizzle_metrics.csv
-```
-Verdict (2026-04-28): PARTIALLY CAPTURES. dgsnake/gflip/lmrev within ~150 cyc
-metric-indistinguishable; blkswap/lmrev captured by sign-stable τ axes
-(`adj_tm_diff`, `tm_extent_mean`).
-
-Full table + tier mechanics + bloom scorecard: `memory/project_w3x_n29420_basin.md`.
-
-## Compute floor
-
-`tcgen05.mma.cta_group::2` = cluster-wide work per insn. Per-cluster cycles =
-`147 tiles × 24 K_iters × cyc/iter`:
-
-| source | cyc/iter | wall (B200) | notes |
-|---|---|---|---|
-| hardware MMA retirement | 460 | 0.896 ms | absolute ceiling, no staging — **unreachable** |
-| bench NS=4 + W0-TMA overlap | 520.8 | 1.014 ms | published microbench |
-| bench NS=4, no TMA overlap | 525.6 | 1.023 ms | published microbench |
-| **fc2-w3x-strip** (NS=6+PREFILL) | **493** | **0.98502 ms** | **structural staging floor** |
-| **fc2-w3x** (full) | **502** | **1.00092 ms** | production |
-| cuBLASLt fused rank-1 PerTensor | ~515 | 1.028 ms | reference (BF16 bias, [N,M] layout) |
-| cuBLASLt fused rank-1 MXFP8 | ~559 | 1.117 ms | block-scaled reference |
-
-**Strip vs full = 15.9 µs / 31460 cyc / 214 cyc/tile** (1.7% of 12482 cyc/tile
-MMA budget) — exposed epi coupling W0-W3 epi-end and W5's next-tile MMA via
-`bar.sync` / `mbar_wait`. ~98% of epi hidden in MMA shadow; the 2% that isn't
-is real headroom.
-
-**Gap decomposition** (vs structural floor):
-- **89 µs** (pure-MMA → strip): NS=6 staging bubble, unreachable without removing staging.
-- **16 µs** (strip → fc2-w3x): exposed epi, real headroom.
-- **43 µs** (strip → cuBLASLt PerTensor rank-1): rank-1 has more exposed epi.
-
-**Realistic recoverable: ~1-3 µs.**
-
-Per-SASS stall hotspots (regen `tools/ncu_fc2_w3x.sh`): mbar spin-wait dominates
-at 5.0M samples, 7× next category (epi compute body ~696K each); TMA store
-scaffolding ~174K each. TC pipe 98.49% → strip IS the MMA-staging structural
-floor. **Final-tile drain FALSE** (per-tt PROFILE_W5: tt=146 = 11872 cyc
-fastest); 12 µs gap between ncu cyc_avg and wall cyc_max is cross-CTA workload
-variance (~26800 cyc tail), not final-tile artifact. LAST_TILE_FAST_PATH would
-save <1 µs — not implemented.
-
-**16 µs gap = ~4 µs steady-state mbar/cluster bar.sync + ~12 µs cross-CTA tail
-variance.**
-
-**Ignore ncu warnings:** `"13398-way bank conflict"` (STSM mis-attribution; ncu
-doesn't model `stmatrix`'s bank-routed datapath); `"21.3 active threads/warp"`
-(warp-specialization by design). FC1 strip is TMA-load-dominated.
-
-NANOSLEEP_CYC sweep (n=5489): ns32 lone WEAK-faster (-0.06 µs); ns0 busy-spin
-WEAK slower (+170 cyc) — spin runs on idle warps, removing nap doesn't unlock
-budget. Spread ~281 cyc; anything in [4..32] equivalent. ns20 default stays.
-Calibration: n=1373→n=5489 demoted 3 of 4 "WEAK faster" cells to TIE — same
-canonical pattern as gflip basin. See `memory/project_w3x_nanosleep_basin.md`.
-
-## FC2 N×K dim sweep (pow2 grid, 2026-05-06, 16 cells)
-
-`tools/dim_sweep_w3x.py` default = `N ∈ {256,512,1024,2048} × K ∈
-{1024,2048,4096,8192}`. Cycles paired with cuBLASLt rank-1 via
-stream-serialized `clock64()` sentinels (same SM-clock domain). Both
-`cb_bias` (EPI=3 BIAS_ONLY) and `cb_none` (EPI=0 GEMM-only) are now valid —
-the prior table had `cb_bias` blocked by FP32-bias enumeration failure;
-fixed in `bench/fc_problem.cuh` (BF16-bias default).
-
-| N | K | K_it | NS | ours cyc | cb_bias cyc | Δb% | cb_b tile | cb_none cyc | Δn% | cb_n tile |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 256 | 1024 | 8  | 5\* | 398.1k  | 372.5k   | +6.85  | 128x160 | 378.7k  | +5.13  | 128x128 |
-| 256 | 2048 | 16 | 6   | 634.9k  | 668.0k   | −4.96  | 128x256 | 669.6k  | −5.17  | 128x256 |
-| 256 | 4096 | 32 | 6   | 1152.7k | 1180.7k  | −2.38  | 128x256 | 1179.9k | −2.31  | 128x256 |
-| 256 | 8192 | 64 | 6   | 2151.7k | 2417.8k  | −11.01 | **128x384** | 2416.8k | −10.97 | 128x256 |
-| 512 | 1024 | 8  | 5   | 661.9k  | 618.8k   | +6.97  | 128x256 | 582.0k  | +13.72 | 128x256 |
-| 512 | 2048 | 16 | 6   | 952.5k  | 959.1k   | −0.69  | 128x256 | 949.2k  | +0.35  | 128x256 |
-| 512 | 4096 | 32 | 6   | 1779.6k | 1743.9k  | +2.05  | 128x256 | 1736.0k | +2.51  | 128x256 |
-| 512 | 8192 | 64 | 6   | 3384.3k | 3574.2k  | −5.31  | 128x256 | 3542.7k | −4.47  | id=513  |
-| 1024| 1024 | 8  | 5   | 1333.9k | 1090.6k  | +22.30 | 128x256 | 1011.8k | +31.83 | 128x256 |
-| 1024| 2048 | 16 | 6   | 1691.2k | 1729.5k  | −2.21  | 128x256 | 1719.6k | −1.65  | 128x256 |
-| 1024| 4096 | 32 | 6   | 3409.6k | 3280.5k  | +3.94  | 128x256 | 3277.5k | +4.03  | 128x256 |
-| 1024| 8192 | 64 | 6   | 6512.0k | 6593.9k  | −1.24  | **128x192** | 6580.9k | −1.05  | 128x192 |
-| 2048| 1024 | 8  | 5   | 2691.4k | 2092.9k  | +28.60 | 128x256 | 1964.3k | +37.02 | 128x256 |
-| 2048| 2048 | 16 | 5   | 3761.1k | 3303.0k  | +13.87 | 128x256 | 3295.7k | +14.12 | 128x256 |
-| 2048| 4096 | 32 | 5   | 6738.3k | 6483.4k  | +3.93  | 128x256 | 6487.1k | +3.87  | 128x256 |
-| 2048| 8192 | 64 | 5   | 12963.5k| 12974.9k | −0.09  | 128x256 | 13006.1k| −0.33  | 128x256 |
-
-cluster_id=2x1x1 (id=3) on every cell, both columns. tile=23 (128x256) is
-the default; **bold** = cuBLASLt picks a non-default tile. id=513 is a
-vendor-private tile id beyond the standard `cublasLtMatmulTile_t` enum.
-
-\*N=256 K=1024 picks NS=5 via `min(NS_BY_N=6, K_ITERS−3=5)`. K=1024 N∈{512,1024}
-was FAIL@NS=6; auto-picker now NS=5.
-
-cb_bias is generally within 1-2% of cb_none — cuBLASLt's algoId=66 fuses
-bias nearly free into the same family of kernels.
-
-**cuBLASLt rank-1 picks tile=128x256 cluster=2x1x1 in 13 of 16 cells**
-for the BIAS_ONLY column. Outliers: N=256 K=1024 → tile=29 (128x160);
-N=256 K=8192 → tile=177 (128x384); N=1024 K=8192 → tile=32 (128x192).
-noBIAS column has 14 of 16 at 128x256, with N=256 K=1024 → 128x128 and
-N=512 K=8192 → vendor-private tile id=513. At small N (=256) cuBLASLt
-narrows the N-tile dimension; at long K with mid N it picks 128x192.
-Cluster_id=3 (2x1x1) holds across every cell — exactly fc2_w3x's geometry.
-
-**Production point K=3072 N=768: fc2_w3x 1.0043 ms vs cuBLASLt
-BIAS_ONLY rank-1 1.0270 ms = −22.7 µs / −2.2% in cycles** (apples-to-apples
-fused-bias-on-bias). Confirmed via separate K-sweep below.
-
-**Loss patterns (sharper now that cb_bias is visible):**
-1. **K=1024 universal loss (+5 to +29% across N).** cuBLASLt's K=1024 BIAS_ONLY
-   kernel (algoId=66 tile=23 NS=36 cluster=2x1x1, same family as K=3072) is much
-   tighter at small K — our NS=5 + NO_PREFILL + gap=3 stack pays heavily here.
-   N=2048 K=1024 catastrophe (+28.59% bias / +36.96% none, eff=0.54) is the
-   extreme.
-2. **K=4096 systematic loss N≥512 (+2.07 to +3.96% bias).** Persistent across
-   reruns. cuBLASLt heuristic switches efficiency tier; ours flat. Suspects:
-   256×96 tile (TILE_ID=495), deeper NS, split-K.
-3. **N=2048 NS=5 SMEM tax.** Now decisively visible: K=2048 +13.72% bias
-   (was −3.92% in prior n=1 sample — old number was a fluke), K=4096 +3.94%.
-   Gap closes by K=8192 (−0.14%). 1-stage latency-hide loss confirms
-   LDTM_X64's NUM_EPI_STAGES=1 costs ~14 µs.
-
-**Sweet spots:** K=8192 across all N (−0.14 to −11.10%, the longer K-loop
-amortizes our pipeline depth advantage); K=2048 at small N (N=256/512/1024:
-−5 to −1%, K_ITERS=16 past PREFILL gap=10); K=4096 at smallest N (N=256:
-−2.38%, cuBLASLt floor degrades fastest at lowest tile/cluster).
-
-See `memory/project_w3x_dim_sweep_vs_cublas.md` for cuBLASLt sparse-heuristic
-gaps at non-pow2 K.
-
-## FC1 N×K dim sweep (2026-05-06, 16 cells)
-
-`tools/dim_sweep_fc1.py` default = `N ∈ {1024,2048,3072,4096} × K ∈
-{512,768,1024,1536}` — centered on FC1 production (N=3072, K=768).
-fc1_w3 with production tune (zigzag TILE_DISPATCH=11 + K_STAGGER=1).
-cuBLASLt rank-1 via `cublaslt-introspect` at EPI=2 (GELU+BIAS) and
-EPI=0 (GEMM-only). Comparison in **ms** — fc1_w3 doesn't emit per-CTA
-clock64 cyc.
-
-| N | K | K_it | NS | ms | cb_gelu | Δg µs | Δg% | cb_g cl | cb_none | Δn% |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 1024 | 512  | 4  | 3 | 0.7120 | 0.8049 | −93   | −11.54 | 2x2x1 | 0.4079 | +74.55 |
-| 1024 | 768  | 6  | 5 | 0.6700 | 0.8130 | −143  | −17.59 | 2x2x1 | 0.4665 | +43.62 |
-| 1024 | 1024 | 8  | 5 | 0.6970 | 0.8298 | −133  | −16.00 | 2x2x1 | 0.5476 | +27.28 |
-| 1024 | 1536 | 12 | 5 | 0.8960 | 0.8481 | +48   | +5.65  | 2x2x1 | 0.7335 | +22.15 |
-| 2048 | 512  | 4  | 3 | 1.4140 | 1.5991 | −185  | −11.58 | 2x2x1 | 0.8083 | +74.94 |
-| 2048 | 768  | 6  | 5 | 1.3300 | 1.6126 | −283  | −17.52 | 2x2x1 | 0.9267 | +43.52 |
-| 2048 | 1024 | 8  | 5 | 1.3860 | 1.6474 | −261  | −15.87 | 2x2x1 | 1.0647 | +30.18 |
-| 2048 | 1536 | 12 | 5 | 1.7050 | 1.6805 | +24   | +1.46  | 2x2x1 | 1.3685 | +24.59 |
-| 3072 | 512  | 4  | 3 | 2.1210 | 2.3943 | −273  | −11.41 | **4x4x1** | 1.2097 | +75.33 |
-| **3072**| **768**| 6 | 5 |**2.0260**| **2.4135**| **−388** | **−16.06** | 2x2x1 | 1.3642 | +48.51 |
-| 3072 | 1024 | 8  | 5 | 2.0810 | 2.4649 | −384  | −15.57 | 2x2x1 | 1.5997 | +30.09 |
-| 3072 | 1536 | 12 | 5 | 2.5310 | 2.5118 | +19   | +0.76  | 2x2x1 | 2.0520 | +23.34 |
-| 4096 | 512  | 4  | 3 | 2.8080 | 3.1902 | −382  | −11.98 | 2x2x1 | 1.6100 | +74.41 |
-| 4096 | 768  | 6  | 5 | 2.6490 | 3.2137 | **−565** | **−17.57** | 2x2x1 | 1.8253 | +45.13 |
-| 4096 | 1024 | 8  | 5 | 2.7690 | 3.2821 | −513  | −15.63 | 2x2x1 | 2.1331 | +29.81 |
-| 4096 | 1536 | 12 | 5 | 3.2840 | 3.3433 | −59   | −1.77  | **2x4x1** | 2.7720 | +18.47 |
-
-GELU+BIAS column: tile=128x256 in every cell; cluster mostly 2x2x1
-(id=6), two outliers in **bold**. cb_none column: tile=128x256 cluster
-2x1x1 (id=3) uniformly across all 16 cells — same family fc2_w3x targets.
-
-**Production point N=3072 K=768: −16.06% / −388 µs vs PerTensor rank-1.**
-Reproduces 2.026 ms (within run-variance of the published 1.998 reference).
-
-**Three K regions, consistent across all N tested:**
-1. **K∈{512,768,1024} — ours dominates by 11.4 to 17.6%.** fc1_w3 was tuned
-   exactly for this regime (K=768 gets a flat −17.5% across all N from
-   1024 to 4096). cuBLASLt's algoId=71 GELU+BIAS family doesn't have an
-   efficient short-K kernel.
-2. **K=1536 — flip to near-tie or slight loss.** Ranges +5.61% (N=1024)
-   to −1.79% (N=4096). Crossover where cuBLASLt's K-amortization catches
-   up — K_iters=12 lets the algoId=71 family hide GELU.
-3. **K≥2048** (from FC1 K-sweep, not in this grid): ours decisively
-   loses vs PerTensor (+177 to +653 µs at K=2048), still beats MXFP8 at
-   K=3072/4096.
-
-**Best absolute Δ%: K=768 at every N** (−17.4 to −17.6%). **Best absolute
-µs: N=4096 K=768 = −565 µs.** Production N=3072 K=768 leaves ~50 µs vs
-MXFP8 (per separate K-sweep) — real headroom signal at FC1 small-K geometry.
-
-`cb_none` (GEMM-only) is a noBIAS reference; ours is +18 to +75% over it
-because we're doing GELU+BIAS the cb_none entry isn't. Useful only as a
-GEMM-floor anchor.
-
-**Cluster shape across cells:** GELU+BIAS rank-1 is `tile=128x256 cl=2x2x1`
-(id=6) in 14 of 16 cells. Two outliers: N=3072 K=512 → `cl=4x4x1` (id=10),
-N=4096 K=1536 → `cl=2x4x1` (id=9). noBIAS rank-1 is `tile=128x256
-cl=2x1x1` (id=3) uniformly — same family fc2_w3x targets. fc1_w3 uses
-2-CTA cluster (2x1x1) like fc2_w3x; cuBLASLt's GELU+BIAS family runs on
-4-CTA clusters (2x2x1). The 50 µs MXFP8 gap may be a function of cluster
-choice as much as algo family.
-
+Gap: 89 µs (MMA→strip, staging bubble, unreachable) + 16 µs (strip→full,
+exposed epi ≈ 4 µs steady-state mbar/bar.sync + 12 µs cross-CTA tail variance).
+TC pipe 98.5%; mbar spin-wait dominates SASS stalls 7× next category
+(regen `tools/ncu_fc2_w3x.sh`). Realistic recoverable ~1–3 µs — needs a new
+lever class (past wins: bias-preload 1.7 µs, STSM 0.4 µs; SASS-level epi
+tuning exhausted). NANOSLEEP: [4..32] cyc equivalent, ns20 stays.
+**Ignore ncu warnings:** "13398-way bank conflict" (STSM mis-attribution) and
+"21.3 active threads/warp" (warp specialization). FC1 strip is TMA-load-dominated.
 
 ## cuBLASLt reference
 
-`tools/probe_cublaslt.sh` (probe 1) enumerates every heuristic, times each,
-reports rank-1. `bench/fc_problem.cuh` is the single source of truth for
-descriptor / layout / bias-dtype across `cublaslt_introspect` and
-`cublas_bench`.
+`bench/fc_problem.cuh` = single source of truth (FP8, **BF16 bias**, [N,M]
+layout) for `cublas_bench` + `cublaslt_introspect`. **BF16 bias is mandatory**
+— FP32 bias enumerates 0 fused algos on sm_100a; layout orientation changes
+runtime, not enumeration.
+`./cublaslt-introspect <M> <N> <K> <epi> [scale] [beta]` enumerates + times all
+heuristics, reports rank-1; `res_ok` col guards silent C-skip, `epi_ok` guards
+silent GELU/bias-skip (beta=0, bias=−0.5 witness). Rank-1 at both production
+points = algoId=66 tile=23 (128x256) NS=36(AUTO) cluster 2x1x1 — exactly our
+geometry. Decode + cluster-id map: `memory/project-perf-table-archive.md` and
+`tools/dim_sweep_w3x.py:CLUSTER_SHAPE_NAME`.
 
-**Critical knob: bias dtype = BF16.** cuBLASLt's fused-FP8-bias kernels on
-sm_100a / CUDA 13.0 only enumerate when `BIAS_DATA_TYPE = CUDA_R_16BF`. FP32
-bias gets you 0 algos. Layout orientation `[N,M]` vs `[M,N]` doesn't change
-algo enumeration — but DOES change kernel runtime, especially at FC1 dims
-(see below).
+### FC2 K=3072 (wall ms, [N,M] BF16 bias)
 
-History (now fully resolved): pre-fix introspect ran [M,N] (transposed) with
-BF16 bias → enumerated algos but on a different problem geometry, producing
-the 1.046 ms FC2 / 1.894 ms FC1 references that ended up in CLAUDE.md. The
-"FP32 bias to match cublas-bench" commit (`be6198c`) blocked enumeration
-without us realizing — cublas-bench had been silently returning 0 fused
-algos for the same FP32-bias reason. `rank1.sass` is real (real cuBLASLt
-FP8 BIAS_ONLY kernel, BF16 bias) but its 1.046 ms timing was for the
-transposed [M,N] geometry.
+| variant | ms |
+|---|---|
+| **fc2_w3x** bias-only fused | **1.001** |
+| cuBLASLt fused BIAS_ONLY PT rank-1 | 1.028 |
+| cuBLASLt GEMM-only rank-1 | 1.043 |
+| cuBLASLt fused BIAS_ONLY MXFP8 rank-1 | 1.117 |
+| cuBLASLt BIAS + residual beta=1 (beta=0 control 1.0346) | 1.237 |
+| cuBLASLt unfused (GEMM + bias kernel) | 1.546 |
 
-### FC2 K=3072 (production [N,M], BF16 bias)
+### FC2 fused-residual paired cyc (2026-07-01, one container, 3 interleaved rounds)
 
-| variant                                       | ms     | algo     |
-|-----------------------------------------------|--------|----------|
-| cuBLASLt fused BIAS_ONLY rank-1 (PerTensor)   | 1.028  | algoId=66 tile=128x256 NS=36 cluster=2x1x1 (id=3) |
-| cuBLASLt fused BIAS_ONLY rank-1 (MXFP8)       | 1.117  | algoId=66 tile=128x256 NS=36 cluster=2x1x1 (id=3) |
-| cuBLASLt fused BIAS+residual rank-1 (beta=1)  | 1.237  | same algo identity; 1.0346 beta=0 control same container |
-| cuBLASLt GEMM-only rank-1                     | 1.043  | per-tensor, no epilogue |
-| cuBLASLt unfused (GEMM + post-kernel bias)    | 1.546  | sequential |
-| **fc2_w3x** (bias-only, fully fused)          | **1.001** | gflip_blkswap TD=54 |
-| **fc2_w3** (fused +residual)                  | **~1.060** | gflip_blkswap TD=54, back-pressured NS=6 |
-
-fc2_w3x beats both fused rank-1 paths (-27 µs PerTensor, -116 µs MXFP8) and
-the GEMM-only path (-42 µs while fused).
-
-**Fused-residual paired cyc reference (2026-07-01, one B200 container, 3
-interleaved rounds, identical clock64-sentinel metric = avg cyc over 10
-launches; `gpu_interface/paired_residual.py`, log
-`data/residual_introspect_20260701/`):**
-
-| impl | kcyc/launch | wall ms | implied GHz |
+| impl | kcyc/launch | wall ms | GHz |
 |---|---|---|---|
-| **fc2_w3** (TD=54, back-pressured NS=6) | **1902.5** (spread 2.7k) | 1.130 | 1.68 |
-| CUTLASS `fc2-cutlass` (carveout NS) | 2232.0 (2.5k) | 1.209 | 1.85 |
-| cuBLASLt rank-1 beta=1 (algoId=66 t23 cl3) | 2283.6 (0.8k) | 1.237 | 1.85 |
+| **fc2_w3** (TD=54, back-pressured NS=6) | **1902.5** (±2.7k) | 1.130 | 1.68 |
+| CUTLASS fc2-cutlass | 2232.0 (±2.5k) | 1.209 | 1.85 |
+| cuBLASLt rank-1 beta=1 | 2283.6 (±0.8k) | 1.237 | 1.85 |
 
-fc2_w3 **−14.8% cyc vs CUTLASS, −16.7% vs cuBLASLt** — and faster in cycles
-than cuBLASLt's residual-FREE beta=0 control (1910.6k). CUTLASS beats
-cuBLASLt by 2.3% (old 1.226-vs-1.237 wall "tie" resolved). cuBLASLt CAN
-fuse residual (BIAS epi + beta=1, out-of-place BF16 C; all 8 algoId=66
-kernels pass the res_ok probe: A/B/bias=0, C=1 → D==1) but pays +19.5% cyc
-over its beta=0 control; ours pays ~59 kcyc (+3.2%) over w3x bias-only.
-**Wall understates the lead: fc2_w3's denser power draw throttles clocks
-~9% in the same container (1.68 vs 1.85 GHz) → wall −6.5/−8.6%;
-locked-clock realizes the cyc gap.** Throttle probe (2026-07-01): limiter
-= **SW Power Cap at the 1000 W board max** (power.limit == max_limit;
-thermal + HW-brake Not Active; capped ~100% of a 5 s sustained fc2_w3
-load) — NOT preventable: no power headroom even with root, and
-`nvidia-smi -lgc`/`-pl` are permission-denied on Modal anyway (a clock
-lock can't override the cap). Saturated-tensor-pipe kernels always cap;
-the vendor kernels only clock higher because they idle more.
-Cycles-first reporting is the mitigation. cyc itself drifts ~±1.5% with
-sustained-clock state (1930.3k at 1.75 GHz vs 1902.5k at 1.68 — fixed-ns
-DRAM latency costs more cyc at higher clock); still ~10× tighter than
-wall. cyc is container-portable (cuBLASLt
-beta=1 2280.2k→2283.6k across containers, +0.15%); wall is not (fc2_w3
-1.077→1.130). `./cublaslt-introspect <M> <N> <K> <epi> [scale] [beta]`;
-res_ok TSV col guards silent C-skip. fc2_w3 + fc2_cutlass emit `@@CYC`
-sentinel cyc unconditionally (`-DCLOCK_TOTAL` adds fc2_w3's kernel-span
-max as cross-check: 1922.5k worst-launch vs 1902.5k mean).
+fc2_w3 beats even cuBLASLt's residual-free beta=0 control (1910.6k). cuBLASLt
+CAN fuse residual (all 8 algoId=66 kernels pass res_ok) but pays +19.5% cyc
+over beta=0; ours pays +3.2% over w3x. **Wall understates the lead:** fc2_w3's
+denser draw hits the 1000 W SW power cap (1.68 vs 1.85 GHz; not preventable,
+`-lgc`/`-pl` denied on Modal) — cycles-first reporting is the mitigation. cyc
+is container-portable (+0.15%); wall is not. Protocol: stream-serialized
+clock64 sentinels, avg over 10 launches; fc2_w3/fc2_cutlass/fc1_w3/fc1_cutlass
+emit `@@CYC` unconditionally. Detail: `memory/project-perf-table-archive.md`,
+logs `data/residual_introspect_20260701/`.
 
-### FC1 K=768 (production [N,M], BF16 bias)
+### FC1 K=768 paired cyc (2026-07-02, libcublasLt 13.3.0.5)
 
-| variant                                       | ms     | algo     |
-|-----------------------------------------------|--------|----------|
-| cuBLASLt fused GELU+BIAS rank-1 (PerTensor)   | 2.414  | algoId=71 tile=128x256 NS=36 cluster=2x2x1 (id=6) |
-| cuBLASLt fused GELU+BIAS rank-1 (MXFP8)       | 1.951  | algoId=66 tile=128x256 NS=36 cluster=2x1x1 (id=3) |
-| cuBLASLt fused BIAS_ONLY (no GELU, hypothetical) | 1.520 | algoId=66 — much faster without GELU |
-| cuBLASLt GEMM-only rank-1                     | 1.363  | per-tensor |
-| cuBLASLt unfused (GEMM + post-kernel GELU+bias) | 4.320 | sequential |
-| **fc1_w3** (zigzag TD=11 + ks=1, fully fused) | **1.998** | |
+| impl | kcyc/launch | wall ms |
+|---|---|---|
+| cuBLASLt PT rank-1 (algoId=66 t23 cl 2x1x1) | **3391.2** (±0.3k) | 1.838 |
+| cuBLASLt MXFP8 rank-1 (same identity) | 3476.7 (±0.4k) | 1.885 |
+| **fc1_w3** (TD=11+ks=1, EPI_DECOUPLE+ES=3, production) | **3619.4** (±1.8k) | 1.961 |
+| fc1_cutlass (GELU_taylor) | 4288.1 (±0.1k) | 2.324 |
 
-fc1_w3 beats per-tensor fused (-416 µs) but trails MXFP8 fused (+47 µs).
-**MXFP8 wins by switching algo families:** algoId=66 (the BIAS_ONLY family)
-+ cluster=2x1x1 instead of PT's algoId=71 (GELU+BIAS family) + cluster=2x2x1.
-The MXFP8 codepath effectively runs the BIAS_ONLY kernel and folds GELU into
-the same kernel-internal apply pass that MXFP8 already needs for VEC32_UE8M0
-scales — so GELU is "free" piggyback while PT pays the algoId=71 GELU pass.
-fc1_w3 leaves ~50 µs vs MXFP8 at FC1's K=768 geometry; the lever is matching
-this 2x1x1 cluster choice + algoId=66 family discipline.
+EPI_DECOUPLE+ES=3 = −336.2 kcyc (−8.5%) vs the 2026-07-01 lockstep build
+(3955.6, itself −43.1 over TD=0): both per-subiter 128-thread barriers
+dropped (staging regions are warp-private → warps self-pace; single-flag
+split: decouple −310, ES=3 −123, combined −326) + 3-deep store ring.
+SELF_DIFF dirty=0/100 ×4 runs; `-DNUM_EPI_STAGES=2 -DNO_EPI_DECOUPLE`
+reproduces the old build SASS byte-identically. No differential throttle at
+FC1 (~1.85 GHz all impls). Logs `data/fc1_epi_decouple_20260702/`.
 
-The +894 µs jump from BIAS_ONLY (1.520) to GELU+BIAS (2.414) on the
-PerTensor path tells you GELU is expensive in cuBLASLt's algoId=71 family.
-fc1_w3's fused-GELU path doesn't pay this — likely because we vectorize
-GELU directly in the epilogue compute warps without an extra pass.
+### Dim/K sweep conclusions (full tables: `memory/project-perf-table-archive.md`)
 
-**MXFP8 algo enumeration is uniform** across every (FC1, FC2) × every K
-we've measured: algoId=66 tile=23 (128x256) NS=36 cluster=3 (2x1x1)
-splitk=1 swizzle=0. PerTensor varies cluster_id by problem (FC2 BIAS_ONLY
-always 2x1x1; FC1 GELU+BIAS shifts 4x4x1/2x2x1/2x4x1 by K). MXFP8 only ever
-uses the BIAS_ONLY-family kernel — even when the epilogue requests
-GELU+BIAS — apparently because the GELU+BIAS algoId=71 family hasn't been
-ported to the VEC32_UE8M0 codepath. Source: `data/mxfp8_introspect_20260506/`.
-
-### FC2 K-sweep (cuBLASLt fused BIAS_ONLY rank-1, PerTensor; N=768)
-
-apples-to-apples both columns are BIAS_ONLY (fc2_w3x is bias-only fused;
-cuBLASLt is fused BIAS_ONLY rank-1). Prior table mixed kernels and had
-"heur ERR" for K∈{1024,2048} from FP32-bias enumeration failure — fixed.
-
-| K    | cuBLASLt fused | fc2_w3x (bias-only) | gap     |
-|------|----------------|---------------------|---------|
-| 1024 | 0.4548         | 0.5466              | +91.8 µs |
-| 2048 | 0.7254         | 0.7230              | −2.4 µs (tie) |
-| 3072 | **1.0270**     | **1.0043**          | **−22.7 µs** |
-| 4096 | 1.3462         | 1.4055              | +59.3 µs |
-| 6144 | 1.9996         | 1.9762              | −23.4 µs |
-| 8192 | 2.7378         | 2.6711              | −66.7 µs |
-
-All cuBLASLt K values pick algoId=66 tile=23 (128x256) NS=36 cluster=2x1x1
-(id=3). MXFP8 picks the same kernel identity at every K (just slower).
-
-**Two new losses surfaced:**
-1. **K=1024 +92 µs** — cuBLASLt's same algoId=66 family runs much tighter at
-   small K. Matches the dim-sweep K=1024 universal loss (+5 to +29% across N).
-2. **K=4096 +59 µs** — surprising; we're winning at K=3072 and K=6144 but
-   losing at K=4096. Likely N=768/K=4096 is in cuBLASLt's sweet spot (32
-   K-iters with 2-CTA cluster waves of 147 tiles at perfectly tuned tile=23).
-   Probably actionable — tune fc2_w3x basin at K=4096.
-
-K=2048 is a tie. Production point K=3072 holds at −23 µs. Long-K wins (K=6144,
-K=8192) hold.
-
-### FC1 K-sweep (cuBLASLt fused GELU+BIAS rank-1; N=3072)
-
-apples-to-apples GELU+BIAS both sides. cuBLASLt PerTensor via introspect
-rank-1; cuBLASLt MXFP8 via `cublas-bench-fc1` (the only path that hits the
-MXFP8 codepath). fc1_w3 with the production tune (zigzag TD=11 +
-K_STAGGER=1 + auto NO_PREFILL).
-
-| K    | cuBLASLt PT | cuBLASLt MXFP8 | fc1_w3 | Δ vs PT  | Δ vs MXFP8 |
-|------|-------------|----------------|--------|----------|------------|
-| 512  | 2.392       | 1.923          | 2.123  | −269 µs  | +200 µs    |
-| 768  | **2.413**   | **1.951**      | **2.025** | **−388 µs** | **+74 µs** |
-| 1024 | 2.465       | 2.055          | 2.081  | −384 µs  | +26 µs     |
-| 1536 | 2.512       | 2.445          | 2.532  | +20 µs   | +87 µs     |
-| 2048 | 2.687       | 3.071          | 3.34   | +653 µs  | +269 µs    |
-| 3072 | 3.952       | 4.470          | 4.129  | +177 µs  | −341 µs    |
-| 4096 | 5.249       | 5.838          | 5.709  | +460 µs  | −129 µs    |
-
-cuBLASLt PT picks algoId=71 tile=23 (128x256) NS=36 across K. cluster shape
-varies: 4x4x1 / 2x2x1 / 2x2x1 / 2x2x1 / 2x4x1 / 2x2x1 / 2x2x1 from K=512→4096
-(cluster_id 10/6/6/6/9/6/6). algoId=71 = GELU+BIAS family; FC2 BIAS_ONLY uses
-algoId=66 with cluster=2x1x1 (id=3).
-
-**Three regions:**
-1. **Small K (≤1024)** — fc1_w3 tracks MXFP8 within ~25-200 µs, decisively
-   beats PT (-269 to -388 µs). Production K=768 lands here. fc1_w3 was
-   tuned for this.
-2. **Tie zone (K=1536)** — all three within 87 µs; ours +20 µs vs PT.
-3. **Large K (≥2048)** — ours decisively LOSES vs PT at K=2048 (+653 µs)
-   and stays bad through K=4096. cuBLASLt's PerTensor switches algorithm
-   tier at K=2048 (cluster=9 instead of 6); fc1_w3 doesn't have that gear.
-   At K∈{3072,4096} ours BEATS MXFP8 by 129-341 µs but trails PT —
-   indicates cuBLASLt's PT path has a better large-K kernel that MXFP8
-   doesn't get.
-
-The K=768 production point reproduces 2.025 ms in 4-rep min — within run
-variance of the published 1.998 reference. PT/MXFP8 references match
-CLAUDE.md (2.413 / 1.951).
-
-### Rank-1 decode (FC2 K=3072 BIAS_ONLY, [N,M] BF16 bias, PerTensor)
-
-Kernel name pattern: `nvjet_sm100_qqtst_<M>x<N>_128x<NS>_<CM>x<CN>_[2cta_]<h|v>_<...>_T<A><B>`.
-`2cta` = `cta_group::2`. Algo enumeration:
-
-| rank | algoId | tile_id | tile     | NS | cluster_id | cluster | ms     |
-|------|--------|---------|----------|----|------------|---------|--------|
-| 1    | 66     | 23      | 128x256  | 36 | 3          | 2x1x1   | 1.0277 |
-| 2    | 66     | 29      | 128x160  | 36 | 3          | 2x1x1   | 1.1128 |
-| 3    | 66     | 31      | 192x128  | 36 | 3          | 2x1x1   | 1.2252 |
-
-Tile 23 = 128x256 = our exact geometry. NS=36 in the algoConfig encodes
-"AUTO" (NS resolved per kernel; reads as 36 = 0x24 = AUTO marker). cluster=3
-is the cuBLASLt enum value for `(2,1,1)` 2-CTA cluster
-(`CUBLASLT_CLUSTER_SHAPE_2x1x1`). `rank1.sass` (dumped from pre-fix [M,N]
-runs) is the same algo family — the SASS opcodes are real, the ms timing
-was for the transposed problem.
-
-**Cluster_id → shape map** (subset of `cublasLtClusterShape_t`):
-
-| id | shape  | id | shape  | id | shape  | id | shape  | id | shape   |
-|----|--------|----|--------|----|--------|----|--------|----|---------|
-| 2  | 1x1x1  | 3  | 2x1x1  | 4  | 4x1x1  | 5  | 1x2x1  | 6  | 2x2x1   |
-| 7  | 4x2x1  | 8  | 1x4x1  | 9  | 2x4x1  | 10 | 4x4x1  | 11 | 8x1x1   |
-| 12 | 1x8x1  | 13 | 8x2x1  | 14 | 2x8x1  | 15 | 16x1x1 | 16 | 1x16x1  |
-
-Full map encoded in `tools/dim_sweep_w3x.py:CLUSTER_SHAPE_NAME` and
-`tools/dim_sweep_fc1.py:CLUSTER_SHAPE_NAME`. The introspect tool now also
-runs MXFP8 (`./cublaslt-introspect <M> <N> <K> <epi> 1`) — see
-`data/mxfp8_introspect_20260506/`.
-
-## Status (2026-04-30)
-
-fc2_w3x bias-only at 1.00092 ms with `gflip_blkswap` (TD=54), beats cuBLASLt
-fused PerTensor rank-1 (1.028 ms) by 27 µs and MXFP8 rank-1 (1.117 ms) by
-116 µs; W5 MMA-ceiling-bound (~12482 cyc/tile ≈ 24×520 cyc/iter), tensor
-pipe 95.84% active. Tree state: bias-preload default (Δ=−1.73 µs at
-z=−23.23 STRONG, n=128), STSM default (matches FP8-bias-only SASS pattern
-from rank1.sass; LDTM_X32 ties at MMA floor — Δ=−0.021 µs), 4D packed-tile
-output ABI (`[TILES_M, TILES_N, TM*2, TN]`; host `pack_idx_C(m,n)`);
-SASS-level epi tuning exhausted.
-Histories: `memory/project_w3x_bias_preload_win.md`, `project_w3x_packed_c_abi.md`.
-
-**Realistic remaining headroom ~1-3 µs** — largest single target by past-win
-standards (bias-preload 1.7 µs, STSM 0.4 µs); probably needs new lever class.
-
-**CLOSED GOAL (2026-07-01): 100%-valid residual-carrying NS=6 kernel — DONE.**
-The former OPEN GOAL (a bit-exact fused-residual fc2_w3 at NS=6) is met. The race
-was a buffer/rate deficit, not the `consumed_mbar` handshake (the identical
-handshake is clean at a 4-deep ring): under PREFILL the free-running NS=6 MMA
-laps the 2-slot ReuseSmemC staging. FIX = auto-enable back-pressure (W1's
-`epilogue_mbar` wait, the `NO_PREFILL` path) for the residual FULL path — **free
-at K_ITERS=24** (1.077 ms, dirty=0/350 over 3 self-diff runs). STRIP/GEMM/BIAS
-keep PREFILL; `-DFORCE_PREFILL` restores the old free-run. The prior "must not
-drop NS=6, NS=5 is +71 µs" tension is moot — the fix keeps NS=6 AND speed.
-Validate any residual change with `-DSELF_DIFF=N` (full-tensor double-launch
-self-diff; the 32-spot check misses ~0.25% sparse corruption). Full analysis:
-`memory/project-fc2-w3-epilogue-race.md`.
+- **FC2 vs cuBLASLt BIAS_ONLY (cyc-paired pow2 grid + K-sweep at N=768, both
+  columns valid):** we win long K (K=8192: −0.1..−11%; K=6144 −23 µs; K=3072
+  −22.7 µs), tie K=2048, **lose K=1024 universally** (+5..+29%; NS=5 +
+  NO_PREFILL + gap=3 stack pays) and **K=4096 at N≥512** (+2..+4%, +59 µs at
+  N=768 — possibly actionable: tune basin at K=4096). N=2048 pays NS=5 SMEM tax.
+  cuBLASLt picks algoId=66 tile 128x256 cluster 2x1x1 almost everywhere.
+- **FC1 grid (CUDA-13.0-era cuBLASLt columns — STALE, algoId=71 era):** ours
+  dominated K≤1024 across N (−11..−18%), tie K=1536, lost K≥2048. Our-kernel
+  column still directional across dims; re-run on 13.3 before citing cuBLASLt.
 
 ## Dead ends — do NOT retry
 
-Full chronological log + per-item memory files: `memory/MEMORY.md`. Headlines:
+Per-item files: `memory/MEMORY.md`. One-liners:
 
-- **fc2_w3y (residual on fc2_w3x) — DEAD END (2026-06-28).** w3x's 1.001 floor is
-  a *zero-slack* MMA: under PREFILL it free-runs with NO consumer back-pressure
-  (`MBAR_TMEM_CONSUMED` is `#ifdef NO_PREFILL` only), so correctness is pure
-  rate-ordering on the 2-deep TMEM. Residual slows the consumer → the marginless
-  MMA laps the TMEM. Severity scales with NS: **NS=6 deadlock / NS=5 sparse
-  accumulator corruption (2/32) / NS=4 valid but 1.243 ms** (regression). The
-  1.001 floor and a fused residual are mutually exclusive in one kernel —
-  residual needs the slack the floor removed. Tried across Rounds 4-6: dedicated
-  residual ring + decoupled handshake; LDSM gather (NS=5 valid 1.134, still >
-  legacy 1.063); X32+uint4 "cheap" read (bank-conflicted, no win). bias-only
-  `LDTM_X32` PASSES at NS=6 1.004 → proves the wedge is consumer cost, not the
-  store. **Residual stays in `fc2_w3` (NS=6, 1.063, full-tile prefetch +
-  xor-swizzled uint4 read).** Reverted to f8b70b5, fc2_w3y.cu deleted.
-  `memory/project-fc2-resadd-port.md`.
-- **Source-level epi tuning** — ptxas owns STS layout. CUTLASS_LOOP, FP32_EPILOGUE,
-  cvta.shared, NUM_EPI_STAGES, stmatrix variants — identical SASS.
-- **Cross-warp STS clustering (intra-warp)** — SELF_LOAD/STAGGER, SASS reorder
-  zero effect (wrong axis). *Inter-cluster* arrival into STS/TMA-store IS
-  ordering-controlled (g-s).
-- **Hand-written PTX** (tried, artifact removed) — byte-identical SASS, no perf
-  delta. PTX has no UR type; ptxas owns R-vs-UR, so PTX source form can't steer it.
-- **K_UNROLL** — u1/u2/u3/u4/u8 regress 87–197 µs (UR datapath collapses on
-  non-N_STAGES-multiples). u6/u12/u24 tie default; `K_UNROLL=24` shrinks SASS
-  39% — free cleanup. `memory/project_k_unroll_sweep.md`.
-- **Cluster-axis swap** — B200 hard-rejects `(1,2,1)`/`(1,1,2)` cluster_dims.
-  cuBLASLt `2x1`/`1x2` is logical labeling inside X-axis grid (`rank1.sass`
-  encodes cluster (2,1,1)). 2-CTA clusters X-axis-only.
-- **KERN_3WARP merge** — W4 TMA into W5 MMA regresses 1.006→1.172 ms (+166 µs).
-  W4 empty_wait is hw-sleep, not free issue. Structural warp floor = 4.
-- **EPI_2WARP + DROP_LEAD_BARSYNC marginal opt-in (n=128):** v10011 −0.27 µs at
-  z=−3.49; v10110 (no EPI_2WARP) +2.54 µs at z=+34.9. Stays opt-in — DROP_LEAD
-  ships cross-warp STS-before-TMA race; EPI_2WARP fc2_w3x-only.
-- **LDTM_X32 ties STSM at MMA floor (n=512):** Δ=−0.021 µs. STSM stays default
-  by rank-1 SASS parity (rank1.sass is the real cuBLASLt FP8 BIAS_ONLY
-  algoId=66 kernel — opcodes apply). **LDTM_X64 forces NUM_EPI_STAGES=2→1 →
-  +14 µs STRONG** (n=16) — confirms NS_EPI=2 is worth ~14 µs.
-- **fc2_w3x post-WIN levers (all ±3 µs or regression):** subpass 8→4, cross-tile
-  TMA carry, SWIZZLE_64B, DROP_TRAIL_BARSYNC, WAIT_GROUP_READ, **XPF_A/B**
-  (Bonferroni-confirmed regressions; macros removed), CHET/PMIX/INGH,
-  **gflip_cidperm** (TD=55, +1568 cyc DECISIVE; bloom-filter overshoot caught
-  this), **STAGGER=2 split-mbar** (+3 µs across 11 dispatches; macro removed),
-  DG sweep, native BF16 epi (kept ±0, cleaner).
-- **Older dead variants:** TD=1/5/6/7, COL_LOCK, 4-CTA TMA multicast (deadlock),
-  mbar→SMEM polling, L2 cache hints, dgphase/dgnrot, fc2_ldg, fc2_hybrid,
-  N-batch / phase-offset / Group-3 (pre-PACKED_TILES — re-test before citing).
-- **Workstealing dispatch STRIPPED from fc1_w3.cu/fc2_w3.cu (2026-06-27):** all
-  dynamic-dispatch code removed — fc2: TD∈{1,2,3,4,6,7} (atomic + grid-nonpersistent);
-  fc1: TD=4 — plus helper flags ATOMIC_TILES / ROW_STEAL / TAIL_STEAL / COL_LOCK /
-  LEAN_DISPATCH and the dedicated scheduler warp (W7 fc2 / SCHED_WARP fc1) + g_tile_ctr.
-  Static-only now: TD=0 (Group-3 strided / BIDIR_SNAKE) + TD≥8 (swizzles in
-  tile_dispatch.cuh). fc2_w3.cu 4117→3426 lines, fc1_w3.cu 1888→1445.
-  **Provably SASS-identical** for production (TD=0/8/11): pp-diff + cubin SASS
-  byte-match (only dynamic branches removed, already `#if`-false at those TDs).
-  Workstealing always lost anyway (static > stealing ~30 µs; sched 1.101 / lean
-  1.107 / rowsteal 1.242 vs dgswizzle 1.065 — bottleneck is long_scoreboard, not
-  the warp). Removed Makefile targets fc2-w3-sched / fc2-w3-lean. The historical
-  perf tables above are retained as the *why*. Dispatch is now compile-time only.
-- **FC1 FORCE_PREFILL** — deadlocks at K_ITERS=6. NO_PREFILL guard mandatory.
-- **fc1_w3x PER_WARP_STORE** — per-warp TMA store (private double-buffers, drop
-  the cross-warp store bar.sync) to fix the 3.11 ms FC1 epilogue-exposed
-  regression. CONCLUSIVELY DEAD (B200, 2026-06, via Modal): barrier-free
-  (`__syncwarp` only) **crashes** — Xid 13 CGA "CTA Not Present", one
-  `cta_group::2` CTA drains its private buffers and exits the persistent loop
-  while its cluster peer still issues cluster ops. Adding back a full `bar.sync`
-  (`PW_STORE_BARSYNC`) is correct but **3.177 ms = +63 µs vs the 3.114 ms serial
-  default** — reintroduces the serialization it meant to remove. Hard proof the
-  tid==0 serial store was never the FC1 bottleneck; the regression is exposed
-  epilogue COMPUTE (K_ITERS=6 MMA shadow too short — identical store hides fine
-  in fc2_w3x at K_ITERS=24/1.001 ms). Reverted to HEAD. NOT the store path. See
+- **fc2_w3y (residual on fc2_w3x):** w3x's 1.001 floor is a zero-slack MMA;
+  residual needs the slack the floor removed. NS=6 deadlock / NS=5 corrupt /
+  NS=4 valid but 1.243 ms. Residual stays in fc2_w3. `memory/project-fc2-resadd-port.md`.
+- **Source-level epi tuning / hand-written PTX / cross-warp STS clustering:**
+  ptxas owns SASS — byte-identical or noise (CUTLASS_LOOP, FP32_EPILOGUE,
+  cvta.shared, NUM_EPI_STAGES, stmatrix variants, SELF_LOAD/STAGGER).
+- **K_UNROLL:** non-N_STAGES multiples regress 87–197 µs; u6/u12/u24 tie.
+- **Cluster-axis swap:** B200 hard-rejects (1,2,1)/(1,1,2); 2-CTA clusters
+  X-axis only (cuBLASLt "2x1/1x2" is logical labeling).
+- **KERN_3WARP merge (W4→W5):** +166 µs; W4 empty_wait is hw-sleep, not free
+  issue. Structural warp floor = 4.
+- **EPI_2WARP + DROP_LEAD_BARSYNC:** −0.27 µs, opt-in only (DROP_LEAD ships a
+  cross-warp STS-before-TMA race); not applicable to GELU ops.
+- **LDTM_X32 ties STSM** at MMA floor; STSM stays (rank1.sass parity).
+  **LDTM_X64 forces NS_EPI 2→1 = +14 µs** — NS_EPI=2 is worth ~14 µs.
+- **fc2_w3x post-WIN levers all ±3 µs or regressions:** subpass 8→4, cross-tile
+  TMA carry, SWIZZLE_64B, DROP_TRAIL_BARSYNC, WAIT_GROUP_READ, XPF_A/B (macros
+  removed), CHET/PMIX/INGH, gflip_cidperm, STAGGER=2 split-mbar (removed), DG
+  sweep, native BF16 epi (kept, ±0).
+- **Older:** TD=1/5/6/7, COL_LOCK, 4-CTA TMA multicast (deadlock), mbar→SMEM
+  polling, L2 hints, dgphase/dgnrot, fc2_ldg, fc2_hybrid, N-batch/phase-offset/
+  Group-3 (pre-PACKED_TILES — re-test before citing).
+- **Workstealing stripped from fc1_w3/fc2_w3 (2026-06-27):** static-only now
+  (TD=0 + TD≥8); provably SASS-identical at production TDs via `nvcc -E`
+  pp-diff + cubin byte-match (reuse that gate for any `#ifdef` strip). Static
+  always won anyway. `memory/project-w3-workstealing-strip.md`.
+- **FC1 FORCE_PREFILL:** deadlocks at K_ITERS=6. NO_PREFILL guard mandatory.
+- **FC1 LDG_BIAS:** +2.0 Mcyc (+54%) — L1 bias in the epi hot loop is dead;
+  SMEM bias mandatory (only layout-parity use in no-bias builds).
+- **fc1_w3x PER_WARP_STORE:** barrier-free crashes (Xid 13 CGA "CTA Not
+  Present" — one CTA exits persistent loop while cluster peer issues cluster
+  ops); with bar.sync back, +63 µs. Serial tid==0 store was never the FC1
+  bottleneck — the 3.11 ms regression is exposed epi COMPUTE (K_ITERS=6 MMA
+  shadow too short; same store hides fine at K_ITERS=24).
   `memory/project-fc1-w3x-epilogue-exposed.md`.
-- **fc1_w3x WIDE_SUBPASS** — 64-col subpasses (4 instead of 8) via a
-  `SUBPASS_CHUNKS` inner loop, grouping 2 of the fixed 32-col TMEM-load/STSM
-  units into one staging buffer + ONE bar.sync pair + ONE TMA store (halves
-  per-subpass sync/store-dispatch overhead). TESTED, NOT a production win (B200,
-  2026-06-26, Modal): GELU production 3.116→3.133 ms = **wash** (repeats span
-  3.114–3.137, ~23 µs run-noise > the gap); bias-only (`-DNO_GELU`) 2.317→2.270
-  = **−47 µs real**. So the per-subpass overhead IS a genuine cost, but GELU's
-  SFU-bound compute (808 µs, see below) masks it entirely at the production
-  point — and FC1 always needs GELU, so the bias-only win has no home. Macro
-  kept opt-in (default off, SUBPASS_CHUNKS=1 = byte-clean). **GELU/bias split
-  (NO_GELU switch):** strip 1.353 / bias-only 2.317 / full GELU 3.125 — GELU =
-  +808 µs but *cheaper* than cuBLASLt's 894 µs; the +797 µs deficit vs cuBLASLt
-  bias-only (1.520) is the exposed bias/CVT/STS structure, not GELU. **Real FC1
-  lever = GELU compute throughput (SFU/`MUFU.tanh` scheduling), not epilogue
-  structure.** See `memory/project-fc1-w3x-epilogue-exposed.md`.
+- **fc1_w3x WIDE_SUBPASS (64-col subpasses):** wash on GELU production
+  (SFU-bound compute masks it), −47 µs bias-only (no home; FC1 always needs
+  GELU). Kept opt-in. GELU/bias split: strip 1.353 / bias-only 2.317 / full
+  3.125 — our GELU +808 µs is cheaper than cuBLASLt's 894 µs; the deficit vs
+  their bias-only is exposed bias/CVT/STS structure. **Real FC1 lever = GELU
+  compute throughput (SFU/`MUFU.tanh` scheduling), not epilogue structure.**
 
 ## Build and run
 
 ```bash
-make fc2-w3x && ./fc2-w3x                   # ~1.001 ms (BEST, beats cuBLASLt fused rank-1 PerTensor 1.028 / MXFP8 1.117)
-make fc2-w3x-strip && ./fc2-w3x-strip       # NS=6+PREFILL floor (~0.985 ms)
-
-make fc2-w3x-tile-sweep                     # TILE_DISPATCH variants
-./tools/sweep_fc2_w3x_swizzle.sh            # SWEEP=front for top tier
-./tools/sweep_fc2_w3x_nanosleep.sh          # NS_CYC sweep
-./tools/sweep_fc2_w3x_dg.sh                 # DG_GROUP_SIZE × INNER_T × STAGGER
-./tools/sweep_fc2_w3x_prof.sh               # per-warp clock64
-python3 tools/aggregate_prof.py data/<dir>
-make fc2-w3x DFLAGS='-DPROFILE_CYCLES'      # |-DPROFILE_KI|-DPROFILE_TILE|-DPROFILE_W5
-
-make fc1-w3x && ./fc1-w3x                   # FC1 GELU+BIAS (clean-sheet, target ~2.025 ms ± basin)
-make fc1-w3x-tile-sweep                     # TILE_DISPATCH variants for FC1
-make fc1-w3x-ks-sweep                       # K_STAGGER sweep (default ks=1)
-make fc2-w3 && ./fc2-w3                     # fused ~1.060 (gflip_blkswap TD=54 default)
+make fc2-w3x && ./fc2-w3x                   # 1.001 ms production bias-only
+make fc2-w3x-strip && ./fc2-w3x-strip       # 0.985 floor
+make fc2-w3 && ./fc2-w3                     # fused residual (TD=54 default)
+make fc1-w3 && ./fc1-w3                     # FC1 production (TD=11+ks=1, EPI_DECOUPLE+ES=3)
+make fc1-w3x && ./fc1-w3x                   # FC1 clean-sheet (~3.11 ms, WIP)
+make fc1-cutlass && ./fc1-cutlass           # FC1 CUTLASS reference
+make fc2-cutlass && ./fc2-cutlass           # FC2 CUTLASS reference
 make fc2-w3-swizzle-sweep && ./fc2-w3-swizzle-sweep SWEEP=front REPS=200  # basin sweep (cyc)
-make fc1-w3 && ./fc1-w3                     # FC1 legacy 1.998 (zigzag+ks=1) — fc1_w3x supersedes for non-residual
+./tools/probe_cublaslt.sh                   # cuBLASLt rank-1 enumeration
+./tools/dim_sweep_w3x.py                    # fc2_w3x N×K grid vs cuBLASLt
+./tools/dim_sweep_fc1.py                    # fc1_w3 N×K grid vs cuBLASLt
+modal run gpu_interface/cubin_dump.py       # CUPTI nvjet SASS dump (no ncu needed)
+bash tools/ncu_fc2_w3x.sh --max --reps 3    # SASS stalls (vast.ai only)
+bash tools/ncu_fc2_pipes.sh                 # dodges --set full deadlock
 
 make -B fc2-w3 DFLAGS='-DM_TOTAL=464128 -DN_DIM=1024 -DK_DIM=2048'  # custom dims need -B
-# Decomp: -DSTRIP_EPILOGUE / -DGEMM_ONLY
-
-make fc2-cutlass && ./fc2-cutlass           # 1.226 reference
-./tools/probe_cublaslt.sh                   # cuBLASLt rank-1 (BF16 bias, [N,M] layout)
-bash tools/bench.sh --comprehensive         # cuBLASLt-rank-1-baselined
-bash tools/ncu_bench.sh && python3 tools/ncu_anova.py
-bash tools/ncu_fc2_w3x.sh --max --reps 3
-bash tools/ncu_fc2_pipes.sh                 # dodges --set full deadlock
-./tools/dim_sweep.sh --fast                 # fc2_w3 80 configs (M×N×K)
-./tools/dim_sweep_w3x.py                    # fc2_w3x N×K pow2 grid (vs cuBLASLt BIAS_ONLY)
-./tools/dim_sweep_fc1.py                    # fc1_w3 N×K grid (vs cuBLASLt GELU+BIAS, prod tune)
+# Decomp: -DSTRIP_EPILOGUE / -DGEMM_ONLY; profiling: -DPROFILE_CYCLES|_KI|_TILE|_W5
+# Sweeps: tools/sweep_fc2_w3x_{swizzle,nanosleep,dg,prof}.sh; aggregate_prof.py
 ```
 
-## Remote B200 via Modal (timing runs, not ncu)
-
-`gpu_interface/modal.py` builds one Makefile target on a Modal B200 and runs it —
-faster turnaround than spinning up vast/verda for `clock64` cycle-timing and
-`-DPROFILE_*` decomposition. **Replaces vast/verda for timing only; Modal's
-CUDA image has no Nsight Compute and shared GPUs block perf counters, so
-`ncu --set full` SASS-stall work still needs vast.ai.**
+## Remote B200 via Modal (timing only — no ncu; perf counters blocked)
 
 ```bash
-pip install modal && modal token new                                  # one-time
-modal run gpu_interface/modal.py                                              # fc1-w3x default
-modal run gpu_interface/modal.py --target fc2-w3x
-modal run gpu_interface/modal.py --target fc1-w3x --dflags "-DPER_WARP_STORE"
-modal run gpu_interface/modal.py --target fc1-w3x --dflags "-DPROFILE_CYCLES"
-modal run gpu_interface/modal.py --target fc2-w3 \
-    --dflags "-DM_TOTAL=464128 -DN_DIM=1024 -DK_DIM=2048"
+modal run gpu_interface/runner.py --target fc2-w3x [--dflags "-DPROFILE_CYCLES"]
 ```
 
-Mechanics: `nvidia/cuda:13.2.0-devel-ubuntu24.04` + `add_python="3.14"`
-(needed for `gen/bias_switch_inc_*.cuh` codegen) + `apt_install("make")`.
-Repo root mounted via `image.add_local_dir(".", "/root/src", ignore=[...])`
-— `data/`, `*.log`, `.git`, `.claude`, `third_party`, CSVs excluded so each
-run doesn't re-upload GB of benchmark artifacts. Binary name == target name
-(in `/root/src`). `--rebuild` (default True) forces `make -B` — mandatory
-because DFLAGS changes don't touch `.cu` mtime, same reason custom dims need
-`-B`. Output is line-streamed so `@@SAMPLE`/`@@RESULT` appear live. **Never pipe
-a Modal run through `tail`/`grep`/`head` — block-buffering swallows the
-`@@RESULT`/`PASS`/Xid lines you actually need; redirect the FULL output to a log
-(`modal run ... > run.log 2>&1`) and read the log.** Build and
-run share one B200-attached container, so `-lcuda` links against the real
-driver. Aggregation (`aggregate_prof.py`, `anova_1way.py`) stays local
-against streamed stdout — don't ship it to the container. The deprecated
-pre-1.0 `modal.Mount` / `mounts=` API does NOT work; use image-folded
-`add_local_dir`.
+Image `nvidia/cuda:13.2.0-devel-ubuntu24.04` + python 3.14 (codegen) + make;
+repo mounted via image-folded `add_local_dir` (data/, logs, .git, third_party
+excluded; pre-1.0 `modal.Mount` API does NOT work). `--rebuild` default forces
+`make -B` (DFLAGS don't touch mtime). Build+run share one B200 container so
+`-lcuda` links the real driver. **Never pipe a Modal stream through
+tail/grep/head — block-buffering swallows `@@RESULT`/PASS/Xid; redirect FULL
+output to a log (`modal run ... > run.log 2>&1`) and Read the log.**
+Aggregation stays local. `ncu --set full` SASS-stall work still needs vast.ai.
 
 ## Key files
 
 ```
-fc2_w3x.cu         FC2 bias-only (ACTIVE — beats cuBLASLt fused PerTensor & MXFP8 rank-1)
-fc1_w3x.cu         FC1 GELU+BIAS (ACTIVE — clean-sheet port of fc2_w3x architecture)
-fc2_w3.cu          FC2 fused-residual (legacy, retained for residual path)
-fc1_w3.cu          FC1 (legacy; superseded by fc1_w3x for non-residual)
-swizzle_w3x.cuh    Shared 48 swizzle templates (TD=11..99) for fc1_w3x/fc2_w3x
-epilogue_ops.cuh   Shared CVT_ADD/CVT_GELU_ADD macros + gelu_approx + pack_idx_C
-gen/bias_switch_inc_<N>.cuh  Build-time codegen — see tools/gen_bias_switch.py
-tile_dispatch.cuh  Legacy TD=8..58 used by fc1_w3 / fc2_w3 (NOT w3x family)
-fc2_cutlass.cu     CUTLASS reference
-kernel_common.cuh, kernel_body.cuh  Legacy w3 infra (NOT used by w3x family)
-sass/root_dumps/rank1.sass  Dumped cuBLASLt FP8 BIAS_ONLY kernel (real algoId=66 tile=128x256; SASS opcodes apply, but its 1.046 ms timing was on transposed [M,N] geometry — see "cuBLASLt reference" for correct [N,M] numbers)
-bench/fc_problem.cuh       Shared cuBLASLt FP8 problem definition (BF16 bias [N,M]) — single source of truth for cublas_bench + cublaslt_introspect
-tools/bench.sh, probe_cublaslt.sh, dim_sweep.sh, dim_sweep_w3x.py, dim_sweep_fc1.py
-tools/gen_bias_switch.py   Codegen for bias-load switch chain (avoids local-mem spill)
-tools/sweep_fc2_w3x_*.sh   tiles / dg / nanosleep / prof
-tools/ncu_*.sh, ncu_anova.py, aggregate_prof.py
-tools/analyze_swizzle.py, cluster_swizzle.py    structural metric + verdict
-tools/anova_1way.py        paired ANOVA + AUC + d + η² + rank/win%
-tools/sass_edit.py         SASS binary editor + CP-SAT scheduler
-gpu_interface/modal.py             Remote B200 build+run on Modal (timing/PROFILE_*, not ncu)
+fc2_w3x.cu / fc1_w3x.cu    clean-sheet family (fc2 ACTIVE-best; fc1 WIP, exposed-epi)
+fc2_w3.cu / fc1_w3.cu      legacy family — fc2 production residual, fc1 production GELU
+swizzle_w3x.cuh            48 swizzle templates (TD=11..99), w3x family
+epilogue_ops.cuh           CVT_ADD/CVT_GELU_ADD + gelu_approx + pack_idx_C (shared w3x)
+gen/bias_switch_inc_<N>.cuh  codegen via tools/gen_bias_switch.py (Makefile rule)
+tile_dispatch.cuh          legacy TD=8..58 for fc1_w3/fc2_w3 (NOT w3x)
+kernel_common.cuh, kernel_body.cuh  legacy w3 infra (NOT w3x)
+fc2_cutlass.cu / fc1_cutlass.cu     CUTLASS references
+bench/fc_problem.cuh       shared cuBLASLt problem def (BF16 bias [N,M])
+bench/cublaslt_cubindump.cu + gpu_interface/cubin_dump.py  CUPTI nvjet SASS dump
+bench/                     TMA/MMA/stmatrix microbench + cublaslt_introspect
+sass/root_dumps/rank1.sass real cuBLASLt algoId=66 kernel dump (opcodes valid)
+tools/anova_1way.py        paired ANOVA + AUC + d + η² (canonical analysis)
+tools/                     bench/probe/dim_sweep/ncu/sweep/sass_edit/analyze_swizzle
+gpu_interface/runner.py     remote B200 build+run
 token_count.py             tiktoken budgeting
-bench/                     TMA / MMA / stmatrix / cublaslt_introspect
-data/                      Benchmark + ncu results
+data/                      benchmark + ncu results
 ```
+
+Do NOT cross-include between w3 (kernel_common/kernel_body/tile_dispatch) and
+w3x (swizzle_w3x/epilogue_ops/gen) families. w3x shared headers: edit once,
+both kernels rebuild; real fc1↔fc2 lever surface ~150 lines (header / dims /
+NS picker / GELU-vs-BIAS macro at subpass site / K_STAGGER / golden ref).
 
 ## SM100a hardware (B200-measured)
 
-- STS.128: 27 cyc | LDS.128: 25 cyc @ILP=1, 3.5 cyc @ILP=7
+- STS.128: 27 cyc | LDS.128: 25 cyc @ILP=1, 3.5 @ILP=7
 - TMA load: 419 cyc (L2-warm) | TMA store: 197 cyc
 - TMEM load (tcgen05.ld.sync): 2 cyc regardless of width/ILP
-- MMA K-iter: 665 cyc (pipelined: 525.6 cyc/iter)
-- STS scaling: 10→37 cyc at 8 warps (3.65×); LDS 4.5→16 cyc (3.56×)
-- FFMA: ~free (1.36× at 8 warps); F2FP: zero contention (flat 2.0 cyc)
+- MMA K-iter: 665 cyc (pipelined 525.6)
+- STS scaling 10→37 cyc at 8 warps; LDS 4.5→16; FFMA ~free; F2FP flat 2.0
 
 ## Key constraints
 
-- Target: sm_100a (B200, 148 SMs), `cta_group::2`, 74 clusters
-- TMEM: 512 cols, single alloc for double buffering. SMEM: 228 KB/SM
-- Inline PTX in fc2_w3.cu/fc1_w3.cu (no CUTLASS dependency)
-- OFF_STAGING must be 1024-byte aligned for SWIZZLE_128B
-- `fence.proxy.async.shared::cta` required before TMA store after st.shared
-- N_STAGES + PREFILL kernel-side auto-picked from N_DIM + K_ITERS (3d6c1cb)
-- BIAS_SMEM=1 default (-15 µs free); custom dims require `make -B`
-- W0 K-loop TMA-sensitive: any global op (atomicAdd) costs +41–77% tma_issue.
-  Non-critical-path global ops (W7 scheduler at tile-boundary) fine.
+- sm_100a (B200, 148 SMs), `cta_group::2`, 74 clusters; TMEM 512 cols single
+  alloc; SMEM 228 KB/SM
+- Inline PTX in the w3 family (no CUTLASS dependency)
+- OFF_STAGING 1024-byte aligned for SWIZZLE_128B
+- `fence.proxy.async.shared::cta` before TMA store after st.shared
+- N_STAGES + PREFILL auto-picked kernel-side from N_DIM + K_ITERS
+- BIAS_SMEM=1 default; custom dims require `make -B`
 
 ## Benchmarking
 
-- **Cycles, not ms.** `clock64()` per-CTA, `max_over_CTAs / N_TIMED`. Clock-freq
-  invariant — required on vast.ai (no locked clocks). Wall ms lies: B200 boost→base
-  is ~8%, thermal ramp 1–10% over ~30 s, cold-L2 inflates the first launches.
-- **Pass-major** (randomized block): outer pass p, inner variant v.
-  `@@SAMPLE pass=p variant=v cyc=Y` per launch — within-pass contrast cancels drift.
-  Never batch ("100 of A then 100 of B").
-- **Trim** first 33–50% of passes (cold L2 + thermal ramp).
-- **Paired analysis** by pass (residual = sample − per-pass mean); report **AUC**,
-  **Cohen's d**, **η²**, **mean rank**, **win%**. **No p-values** at large n (t∝√n
-  → everything "significant"; ask "large enough to care," not "any effect").
-- **Verdict bands:** AUC (folded [0.5,1]) <0.55 TIE · <0.65 WEAK · <0.75 MOD ·
-  <0.85 STRONG · ≥0.85 DECISIVE. η² <0.01 negligible · <0.06 small · <0.14 medium ·
-  ≥0.14 large. |d| <0.2 trivial · <0.5 small · <0.8 medium · ≥0.8 large. Kendall
-  |τ| ≥0.7 strong · ≥0.5 moderate · <0.3 weak (cross-metric rank agreement — low
-  cyc-vs-ms τ on one run ⇒ the ms is clock-noise, not signal).
-- `tools/anova_1way.py --metric cyc --paired rep --trim 0.33` is canonical (emits
-  per-cell + residual stats, ANOVA η², mean-rank/win%, pairwise d+AUC vs fastest).
-- **n thresholds (σ_residual ~1400 cyc):** n<5000 unreliable for sub-σ effects
-  (Stage 1 lmrev DECISIVE n=2048 → Stage 2 mid-pack n=29420). MOD-band ~600 cyc:
-  n≥10978; TIE-band ~150 cyc: n≥43910 — within-basin may be sub-resolution.
-  Default 2-stage: REPS=2048 filter → REPS=43910 survivors.
+- **Cycles, not ms.** clock64 per-CTA `max/N_TIMED` or stream-serialized
+  sentinels. Wall lies: boost→base ~8%, thermal ramp, cold L2, power cap.
+- **Pass-major randomized blocks**, `@@SAMPLE pass=p variant=v cyc=Y`; never
+  batch variants. **Trim** first 33–50% of passes.
+- **Paired analysis** (residual = sample − per-pass mean): report AUC, Cohen's
+  d, η², mean rank, win%. **No p-values** at large n.
+- **Verdict bands:** AUC <0.55 TIE · <0.65 WEAK · <0.75 MOD · <0.85 STRONG ·
+  ≥0.85 DECISIVE. η² <0.01 negligible · <0.06 small · <0.14 medium · ≥ large.
+  |d| <0.2 trivial · <0.5 small · <0.8 medium · ≥ large. Kendall τ cross-metric:
+  low cyc-vs-ms τ ⇒ the ms is clock noise.
+- Canonical: `tools/anova_1way.py --metric cyc --paired rep --trim 0.33`.
+- **n thresholds (σ_res ~1400 cyc):** n<5000 unreliable sub-σ; MOD ~600 cyc
+  needs n≥10978; TIE ~150 cyc needs n≥43910. Two-stage: REPS=2048 filter →
+  43910 survivors. Small-n DECISIVE calls routinely demote on rerun.
 
 ## Working in this repo
 
-Names say what, comments say why. No single-line `/**/`, no multi-line `//`, no
-decorated block comments. Bare `/*`, undecorated lines, `*/`.
-
-Don't narrate tool calls; don't echo file contents; parallelize independent
-tool calls; offset/limit for large files.
-
-**Token terseness** (kernel/profiler dumps blow the budget — `fc2_w3.cu` alone is
-~56 K tokens): locate with grep/Explore then `Read` offset/limit, never whole;
-`nvcc -E` to collapse `#ifdef` before reading (also the SASS-identity gate);
-`cuobjdump -symbols` first, full `-sass` to disk (`sass/`, gitignored) never into
-context; ncu with `--metrics … --csv`, never `--set full` into context; `git
-show`/`log -p` over re-reading; delegate multi-file fan-out to the Explore agent.
-Local bench output is ~3 lines — `tail` it; **but never `tail`/`grep` a Modal
-stream** (block-buffering eats `@@RESULT`) — redirect FULL output to a log, Read that.
-
-**w3x shared-header structure (2026-05-07):** fc1_w3x.cu and fc2_w3x.cu share
-three pieces of infrastructure — edit once, both kernels rebuild:
-  - `swizzle_w3x.cuh`  — 48 swizzle templates + tile_swizzle_t / tile_in_group_t
-  - `epilogue_ops.cuh` — CVT_ADD / CVT_GELU_ADD macros + gelu_approx + pack_idx_C
-  - `gen/bias_switch_inc_<N>.cuh` — build-time codegen via tools/gen_bias_switch.py
-    (Makefile rule `gen/bias_switch_inc_%.cuh`; new BIAS_REG_COUNT just needs the
-    Makefile prereq line updated, .cu uses `#include "gen/bias_switch_inc_<N>.cuh"`)
-SASS-verified zero codegen change vs prior in-line copies (cuobjdump diff = 0).
-**Real fc1↔fc2 lever surface is now ~150 lines** (header / dim defines / NS
-picker / GELU vs BIAS-only macro at the subpass site / K_STAGGER / golden ref).
-Legacy w3 family (fc1_w3, fc2_w3) still uses kernel_common.cuh / kernel_body.cuh
-/ tile_dispatch.cuh — do NOT cross-include between w3 and w3x families.
-
-LLM context is the binding constraint — treat CLAUDE.md, docs, memory as a
-token budget. Prefer brief pointers to topic files. `./token_count.py <file>`
-is coarse proxy (tiktoken o200k_base); Claude tokenizer reports ~1.5× higher
-on table-heavy markdown.
+- Names say what, comments say why. Bare `/*`, undecorated lines, `*/` — no
+  single-line `/**/`, no multi-line `//`.
+- Use `rtk` before every standard bash command (A MUST).
+- Token terseness: grep/Explore then Read offset/limit, never whole kernels
+  (fc2_w3.cu ~56 K tokens); `nvcc -E` to collapse `#ifdef` (also the
+  SASS-identity gate); `cuobjdump -symbols` first, full `-sass` to disk only;
+  ncu `--metrics --csv` only; `git show` over re-reading; Explore agent for
+  multi-file fan-out. CLAUDE.md/docs/memory are a token budget — brief
+  pointers to topic files; `./token_count.py` (Claude ≈1.5× on tables).
+- Local bench output ~3 lines — tail is fine; Modal streams NEVER (see Modal).
+- Don't narrate tool calls; don't echo file contents; parallelize independent
+  calls.

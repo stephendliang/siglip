@@ -5,7 +5,7 @@ from pathlib import Path
 
 import modal
 
-# Invoke with `modal run gpu_interface/modal.py ...` (NOT `python modal.py` —
+# Invoke with `modal run gpu_interface/runner.py ...` (NOT `python runner.py` —
 # this file is named modal.py, so running it as a script would shadow the modal
 # package on sys.path[0]; under `modal run` the real package is already imported
 # so `import modal` resolves fine). The repo root is derived from this file's
@@ -111,11 +111,11 @@ def main(
 ):
     """
     Examples:
-      modal run gpu_interface/modal.py
-      modal run gpu_interface/modal.py --target fc2-w3x
-      modal run gpu_interface/modal.py --target fc1-w3x --dflags "-DPER_WARP_STORE"
-      modal run gpu_interface/modal.py --target fc1-w3x --dflags "-DPROFILE_CYCLES"
-      modal run gpu_interface/modal.py --target fc2-w3 \\
+      modal run gpu_interface/runner.py
+      modal run gpu_interface/runner.py --target fc2-w3x
+      modal run gpu_interface/runner.py --target fc1-w3x --dflags "-DPER_WARP_STORE"
+      modal run gpu_interface/runner.py --target fc1-w3x --dflags "-DPROFILE_CYCLES"
+      modal run gpu_interface/runner.py --target fc2-w3 \\
           --dflags "-DM_TOTAL=464128 -DN_DIM=1024 -DK_DIM=2048"
     """
     build_and_run.remote(

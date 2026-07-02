@@ -15,8 +15,12 @@ Compile-time flags:
   -DGEMM_ONLY           Write D=BF16(A×B), no bias, no GELU (valid=1)
   -DN_STAGES=N          Pipeline depth (default 5, max K_ITERS)
   -DNO_PREFILL          Restore epilogue_mbar wait in W1
-  -DTILE_DISPATCH=4     Dedicated scheduler warp, atomicAdd dispatch
+  -DTILE_DISPATCH=N     Static tile swizzle: 0=Group-3 strided, >=8 see
+                        tile_dispatch.cuh (default 11 = zigzag)
+  -DK_STAGGER=N         Per-cluster K-phase shift (default 1; 0 disables)
   -DNUM_EPI_WARPS=N     Epilogue warp count (1, 2, or 4; default 4)
+  -DNUM_EPI_STAGES=N    Epilogue staging ring depth (2-4; default 3; 4 needs LDG_BIAS headroom)
+  -DNO_EPI_DECOUPLE     Restore per-subiter cross-warp barriers (lockstep epi)
 */
 
 #include <cuda.h>
@@ -87,8 +91,13 @@ Compile-time flags:
 #define GROUPS_PER_WARP (4 / NUM_EPI_WARPS)
 static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 
+/* Production tune (paired 2026-07-01: −43 kcyc vs TD=0 stride): zigzag
+   dispatch + per-cluster K-phase stagger. -DK_STAGGER=0 disables the shift. */
 #ifndef TILE_DISPATCH
-#define TILE_DISPATCH 0
+#define TILE_DISPATCH 11
+#endif
+#ifndef K_STAGGER
+#define K_STAGGER 1
 #endif
 
 #include "tile_dispatch.cuh"
@@ -120,7 +129,44 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define _LAYOUT_END _MBAR_END
 
 #define NUM_EPI_SUBITERS   4
-#define NUM_EPI_STAGES     2
+#ifndef NUM_EPI_STAGES
+#define NUM_EPI_STAGES     3
+#endif
+
+/*
+Non-last store pacing tracks the staging ring: ES-1 bulk groups in flight
+keeps the oldest slot drained before its STS reuse one subiter later.
+*/
+#if NUM_EPI_STAGES == 2
+#define EPI_WG_NONLAST "cp.async.bulk.wait_group 1;"
+#elif NUM_EPI_STAGES == 3
+#define EPI_WG_NONLAST "cp.async.bulk.wait_group 2;"
+#elif NUM_EPI_STAGES == 4
+#define EPI_WG_NONLAST "cp.async.bulk.wait_group 3;"
+#else
+#error "NUM_EPI_STAGES must be 2, 3, or 4"
+#endif
+
+/*
+EPI_DECOUPLE: each epi warp's STS and TMA store touch only its own
+row_group staging region, so the per-subiter CTA barriers enforce nothing
+but lockstep — drop them and let warps self-pace. fence.proxy.async is
+per-lane; __syncwarp orders lane 0's TMA store after all lanes' fenced STS.
+Production default with ES=3 (paired 2026-07-02: 3619.4 kcyc vs 3955.6
+lockstep ES=2 = −336.2 kcyc); -DNO_EPI_DECOUPLE opts out.
+*/
+#ifndef NO_EPI_DECOUPLE
+#ifndef EPI_DECOUPLE
+#define EPI_DECOUPLE
+#endif
+#endif
+#ifdef EPI_DECOUPLE
+#define EPI_SUBITER_BAR()
+#define EPI_PRESTORE_SYNC() __syncwarp()
+#else
+#define EPI_SUBITER_BAR()   asm volatile(BAR_EPI_SYNC ::: "memory")
+#define EPI_PRESTORE_SYNC() asm volatile(BAR_EPI_SYNC ::: "memory")
+#endif
 
 /*
  * Bias loading strategy:
@@ -157,6 +203,13 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define EPI_STAGE_BYTES       (4 * STAGING_REGION_BYTES)
 #define OFF_STAGING           ((OFF_BIAS_SMEM + BIAS_SMEM_BYTES + 1023) & ~1023)
 #define SMEM_BYTES            ((OFF_STAGING + NUM_EPI_STAGES * EPI_STAGE_BYTES + 127) & ~127)
+
+/*
+sm_100a max dynamic SMEM opt-in is 227 KB per block. Infeasible knob combos
+(N_STAGES=6 with full SMEM bias or NUM_EPI_STAGES>=3; ES=4 without LDG_BIAS)
+must die here, not at cudaFuncSetAttribute.
+*/
+static_assert(SMEM_BYTES <= 232448, "SMEM layout exceeds 227 KB block ceiling");
 
 /* ── WGMMA / TMEM ── */
 #define TMEM_COLS      512
@@ -333,10 +386,10 @@ static __host__ __forceinline__ float gelu_fwd(float x) {
         if (LAST) \
             asm volatile("cp.async.bulk.wait_group 0;" ::: "memory"); \
         else \
-            asm volatile("cp.async.bulk.wait_group 1;" ::: "memory"); \
+            asm volatile(EPI_WG_NONLAST ::: "memory"); \
     } \
     __syncwarp(); \
-    asm volatile(BAR_EPI_SYNC ::: "memory"); \
+    EPI_SUBITER_BAR(); \
 } while(0)
 
 /* K-iteration macro (accumulating, ki >= 1). Single asm block emits all 4
@@ -547,13 +600,13 @@ fc1_w3_kernel(
         if (warp == 0) {
             /* ── W0: TMA A/B loads ── */
             const uint32_t smem_base = warp_uniform(smem_to_uint(smem));
-#ifdef K_STAGGER
+#if K_STAGGER
             const int k_shift_b = (cluster_id * K_STAGGER) % K_ITERS;
 #endif
             PRAGMA_UNROLL(K_ITERS)
             for (int ki = 0; ki < K_ITERS; ki++) {
                 const int s = ki % N_STAGES;
-#ifdef K_STAGGER
+#if K_STAGGER
                 const int k_block = (ki + k_shift_b) % K_ITERS;
 #else
                 const int k_block = ki;
@@ -735,7 +788,7 @@ fc1_w3_kernel(
                     } /* close row_group */
 
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    asm volatile(BAR_EPI_SYNC ::: "memory");
+                    EPI_PRESTORE_SYNC();
 
 #if GROUPS_PER_WARP > 1
                     if (lane == 0) {
@@ -878,7 +931,7 @@ fc1_w3_kernel(
                     } /* close row_group */
 
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    asm volatile(BAR_EPI_SYNC ::: "memory");
+                    EPI_PRESTORE_SYNC();
 
 #if GROUPS_PER_WARP > 1
                     if (lane == 0) {
@@ -1003,7 +1056,7 @@ fc1_w3_kernel(
                 } /* close row_group */
 
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                asm volatile(BAR_EPI_SYNC ::: "memory");
+                EPI_PRESTORE_SYNC();
 
 #if GROUPS_PER_WARP > 1
                 if (lane == 0) {
@@ -1124,7 +1177,7 @@ fc1_w3_kernel(
                 } /* close row_group */
 
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                asm volatile(BAR_EPI_SYNC ::: "memory");
+                EPI_PRESTORE_SYNC();
 
 #if GROUPS_PER_WARP > 1
                 if (lane == 0) {
@@ -1167,6 +1220,43 @@ fc1_w3_kernel(
 /* ════════════════════════════════════════════════════════════════
    HOST
    ════════════════════════════════════════════════════════════════ */
+
+#ifndef SELF_DIFF
+#define SELF_DIFF 0
+#endif
+
+/*
+  Stream-serialized SM-clock sentinel: single thread reads %%clock64 on the
+  default stream before/after the timed loop, so (end-start)/launches is avg
+  SM cycles per launch in the same clock domain as every other harness that
+  emits @@CYC — cross-binary comparable where wall-ms is DVFS-confounded.
+*/
+__global__ void read_clock_sentinel(unsigned long long* out) {
+    if (threadIdx.x == 0) {
+        unsigned long long c;
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(c));
+        out[0] = c;
+    }
+}
+
+#if SELF_DIFF
+/* Double-launch bitwise self-diff: any element differing between two launches
+   on identical inputs is a race witness (same detector as fc2_w3's). FC1 runs
+   the auto-NO_PREFILL back-pressured path, so expect dirty=0. */
+__global__ void count_mismatch(const __nv_bfloat16* __restrict__ a,
+                               const __nv_bfloat16* __restrict__ b,
+                               long long total,
+                               unsigned long long* __restrict__ mm) {
+    unsigned long long local = 0;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (long long)gridDim.x * blockDim.x) {
+        unsigned short ba = *reinterpret_cast<const unsigned short*>(&a[i]);
+        unsigned short bb = *reinterpret_cast<const unsigned short*>(&b[i]);
+        if (ba != bb) local++;
+    }
+    if (local) atomicAdd(mm, local);
+}
+#endif
 
 #ifdef PACKED_TILES
 __global__ void pack_u8(uint8_t* __restrict__ dst, const uint8_t* __restrict__ src,
@@ -1361,20 +1451,32 @@ int main() {
 
     /* Timed: 10 iterations */
     printf("Timing: 10 iterations...\n");
+    unsigned long long* d_clk = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_clk, 2 * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaDeviceSynchronize());
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0);
     cudaEventCreate(&t1);
+    read_clock_sentinel<<<1, 1>>>(d_clk + 0);
     cudaEventRecord(t0);
     for (int i = 0; i < 10; i++) {
         LAUNCH_KERNEL();
     }
     cudaEventRecord(t1);
+    read_clock_sentinel<<<1, 1>>>(d_clk + 1);
     cudaEventSynchronize(t1);
+    CUDA_CHECK(cudaDeviceSynchronize());
     float ms;
     cudaEventElapsedTime(&ms, t0, t1);
     ms /= 10.0f;
     printf("FC1-W3 kernel: %.3f ms  %.2f TFLOPS\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9);
+    {
+        unsigned long long clk[2];
+        CUDA_CHECK(cudaMemcpy(clk, d_clk, sizeof(clk), cudaMemcpyDeviceToHost));
+        printf("@@CYC name=fc1_w3 cyc_avg=%llu launches=10\n",
+               (clk[1] > clk[0]) ? (clk[1] - clk[0]) / 10ULL : 0ULL);
+    }
     cudaEventDestroy(t0);
     cudaEventDestroy(t1);
 
@@ -1433,6 +1535,41 @@ int main() {
     printf("@@RESULT ms=%.3f tflops=%.2f checksum=%f valid=%d c0=%.1f\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9, cksum, valid,
            __bfloat162float(h_C[0]));
+
+#if SELF_DIFF
+    {
+        const long long sd_total = (long long)M_TOTAL * N_DIM;
+        __nv_bfloat16* d_Cref = nullptr;
+        unsigned long long* d_mm = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_Cref, (size_t)sd_total * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMalloc(&d_mm, sizeof(unsigned long long)));
+        const int sd_tpb = 256;
+        int sd_bpg = (int)((sd_total + sd_tpb - 1) / sd_tpb);
+        if (sd_bpg > 65535) sd_bpg = 65535;
+        int dirty = 0; unsigned long long worst = 0;
+        printf("@@SELFDIFF_BEGIN launches=%d\n", (int)SELF_DIFF);
+        for (int k = 0; k < (int)SELF_DIFF; k++) {
+            LAUNCH_KERNEL();
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(d_Cref, d_C, (size_t)sd_total * sizeof(__nv_bfloat16),
+                                  cudaMemcpyDeviceToDevice));
+            LAUNCH_KERNEL();
+            CUDA_CHECK(cudaDeviceSynchronize());
+            unsigned long long z = 0;
+            CUDA_CHECK(cudaMemcpy(d_mm, &z, sizeof(z), cudaMemcpyHostToDevice));
+            count_mismatch<<<sd_bpg, sd_tpb>>>(d_C, d_Cref, sd_total, d_mm);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            unsigned long long n = 0;
+            CUDA_CHECK(cudaMemcpy(&n, d_mm, sizeof(n), cudaMemcpyDeviceToHost));
+            if (n > 0) { dirty++; if (n > worst) worst = n; }
+            printf("@@SELFDIFF iter=%d mismatches=%llu\n", k, n);
+        }
+        printf("@@SELFDIFF_SUMMARY launches=%d dirty=%d worst=%llu\n",
+               (int)SELF_DIFF, dirty, worst);
+        cudaFree(d_Cref); cudaFree(d_mm);
+    }
+#endif
 
     free(h_C);
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_bias); cudaFree(d_C);

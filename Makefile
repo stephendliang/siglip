@@ -328,6 +328,13 @@ fc2-cutlass-static: fc2_cutlass.cu
 
 fc2-cutlass-static-strip: fc2_cutlass.cu
 	$(NVCC) $(CFLAGS) -DSTATIC_SCHED -DSTRIP_EPILOGUE $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)
+
+# ── FC1 CUTLASS kernel (GELU_taylor + bias, beta=0) ──
+fc1-cutlass: fc1_cutlass.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)
+
+fc1-cutlass-strip: fc1_cutlass.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) -DSTRIP_EPILOGUE $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)
 # ── CUTLASS benchmark (per-tensor FP8, grid search) ──
 cutlass-bench: bench/cutlass_bench.cu bench/siglip_periodic_add.hpp
 	$(NVCC) $(CFLAGS) $(CUTLASS_INC) $(CUTLASS_FLAGS) $< -o $@ $(LDFLAGS)
@@ -444,6 +451,14 @@ cublaslt-fc1: bench/cublaslt_introspect.cu bench/fc_problem.cuh
 
 cublaslt-fc2: bench/cublaslt_introspect.cu bench/fc_problem.cuh
 	$(NVCC) $(CFLAGS) -std=c++17 -DDEFAULT_M=928256 -DDEFAULT_N=768 -DDEFAULT_K=3072 -DDEFAULT_EPI=3 $< -o $@ -lcublasLt -lcublas
+
+# CUPTI module-capture nvjet SASS dump (Modal-safe: no perf counters, no ncu)
+CUPTI_INC = -I/usr/local/cuda/extras/CUPTI/include
+CUPTI_LIB = -L/usr/local/cuda/extras/CUPTI/lib64 -lcupti \
+            -Xlinker -rpath=/usr/local/cuda/extras/CUPTI/lib64 \
+            -Xlinker -rpath=/usr/local/cuda/lib64
+cublaslt-cubindump: bench/cublaslt_cubindump.cu bench/fc_problem.cuh
+	$(NVCC) $(CFLAGS) -std=c++17 $(CUPTI_INC) $< -o $@ -lcublasLt -lcublas $(CUPTI_LIB)
 
 # ── SASS analysis C++ tool ──
 sass-tool:

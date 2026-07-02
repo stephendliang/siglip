@@ -21,7 +21,7 @@
 #        tools/sweep_fc2_w3_swizzle.sh                       # SWEEP=all REPS=20
 #        SWEEP=front REPS=200 tools/sweep_fc2_w3_swizzle.sh
 #   2. No local GPU (this VPS): run on Modal, then analyze the saved log:
-#        modal run gpu_interface/modal.py --target fc2-w3-swizzle-sweep \
+#        modal run gpu_interface/runner.py --target fc2-w3-swizzle-sweep \
 #            --run-args "SWEEP=front REPS=200" > /tmp/w3sweep.log 2>&1
 #        ANALYZE=/tmp/w3sweep.log tools/sweep_fc2_w3_swizzle.sh
 

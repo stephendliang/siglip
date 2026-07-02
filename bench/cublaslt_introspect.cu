@@ -46,6 +46,7 @@ struct AlgoInfo {
     int algo_id, tile_id, stages_id, cluster_id, inner_id;
     int splitk, reduction, swizzle, custom;
     int res_ok;
+    int epi_ok;
     size_t ws_size;
     float waves;
 };
@@ -222,6 +223,17 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemset(dBias, 0, fc::bias_bytes(N)));
 
     /*
+      Epilogue witness: with beta=0 a nonzero bias makes bias-application and
+      GELU distinguishable in D — D = act(0 + bias) reads back -0.5 for BIAS,
+      ~-0.1543 for GELU_BIAS, 0 if the epilogue is silently skipped. beta!=0
+      keeps bias=0 so the res_ok D==beta probe stays exact.
+    */
+    if (BETA == 0.0f && (EPI == 2 || EPI == 3)) {
+        fill_bf16<<<64, 256>>>((__nv_bfloat16*)dBias, (size_t)N, -0.5f);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    /*
       Residual mode: C is a distinct BF16 [N,M] tensor so the matmul is
       out-of-place (C != D), matching fc2_w3's fused-residual read. C shares
       layD — same dtype/shape/ld as D. beta==0 keeps the legacy in-place
@@ -312,6 +324,24 @@ int main(int argc, char** argv) {
             }
         }
 
+        /*
+          Epilogue applied? AB=0 and bias=-0.5, so D must read back
+          gelu(-0.5)≈-0.1543 (EPI=2) or -0.5 (EPI=3). An algo that accepts the
+          epilogue attr but skips GELU shows -0.5 here and gets demoted.
+        */
+        int epi_ok = 1;
+        if (BETA == 0.0f && (EPI == 2 || EPI == 3)) {
+            const float exp_e = (EPI == 2) ? -0.15430f : -0.5f;
+            const size_t nElem = (size_t)N * M;
+            const size_t probe[3] = {0, nElem / 2, nElem - 1};
+            for (int pi = 0; pi < 3; pi++) {
+                __nv_bfloat16 h;
+                CUDA_CHECK(cudaMemcpy(&h, (const __nv_bfloat16*)dD + probe[pi],
+                                      sizeof(h), cudaMemcpyDeviceToHost));
+                if (fabsf(__bfloat162float(h) - exp_e) > 0.01f) { epi_ok = 0; break; }
+            }
+        }
+
         AlgoInfo a{};
         a.heur_idx = i;
         a.ms       = ms;
@@ -332,24 +362,26 @@ int main(int argc, char** argv) {
         a.swizzle    = get_algo_int(&heur[i].algo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING);
         a.custom     = get_algo_int(&heur[i].algo, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION);
         a.res_ok     = res_ok;
+        a.epi_ok     = epi_ok;
         infos.push_back(a);
     }
 
     std::sort(infos.begin(), infos.end(), [](const AlgoInfo& a, const AlgoInfo& b){
         if (a.res_ok != b.res_ok) return a.res_ok > b.res_ok;
+        if (a.epi_ok != b.epi_ok) return a.epi_ok > b.epi_ok;
         return a.ms < b.ms;
     });
 
     // TSV for easy awk'ing
     printf("# TSV\n");
-    printf("rank\theur\tms\tcyc\talgoId\ttile\tstages\tcluster\tinner\tsplitk\tredux\tswizzle\tcustom\twaves\tws_MB\tres_ok\n");
+    printf("rank\theur\tms\tcyc\talgoId\ttile\tstages\tcluster\tinner\tsplitk\tredux\tswizzle\tcustom\twaves\tws_MB\tres_ok\tepi_ok\n");
     for (size_t r = 0; r < infos.size(); r++) {
         const auto& a = infos[r];
-        printf("%zu\t%d\t%.4f\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\t%.1f\t%d\n",
+        printf("%zu\t%d\t%.4f\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\t%.1f\t%d\t%d\n",
                r+1, a.heur_idx, a.ms, (unsigned long long)a.cyc,
                a.algo_id, a.tile_id, a.stages_id,
                a.cluster_id, a.inner_id, a.splitk, a.reduction,
-               a.swizzle, a.custom, a.waves, a.ws_size / (1024.0*1024.0), a.res_ok);
+               a.swizzle, a.custom, a.waves, a.ws_size / (1024.0*1024.0), a.res_ok, a.epi_ok);
     }
 
     printf("\n# Top-3 caps:\n");
@@ -365,12 +397,13 @@ int main(int argc, char** argv) {
         printf("\n@@RESULT ms=ERR cyc=0 tflops=0.00 checksum=0.000000 valid=0 c0=0.0\n");
         return 1;
     }
-    printf("\n# Winner:  rank=1  tile=%d  stages=%d  cluster=%d  inner=%d  splitk=%d  swizzle=%d  ms=%.4f  cyc=%llu  res_ok=%d\n",
+    printf("\n# Winner:  rank=1  tile=%d  stages=%d  cluster=%d  inner=%d  splitk=%d  swizzle=%d  ms=%.4f  cyc=%llu  res_ok=%d  epi_ok=%d\n",
            infos[0].tile_id, infos[0].stages_id, infos[0].cluster_id, infos[0].inner_id,
            infos[0].splitk, infos[0].swizzle, infos[0].ms,
-           (unsigned long long)infos[0].cyc, infos[0].res_ok);
+           (unsigned long long)infos[0].cyc, infos[0].res_ok, infos[0].epi_ok);
     double tflops = 2.0 * (double)M * (double)N * (double)K / ((double)infos[0].ms * 1e9);
     printf("\n@@RESULT ms=%.4f cyc=%llu tflops=%.2f checksum=0.000000 valid=%d c0=0.0\n",
-           infos[0].ms, (unsigned long long)infos[0].cyc, tflops, infos[0].res_ok);
+           infos[0].ms, (unsigned long long)infos[0].cyc, tflops,
+           infos[0].res_ok && infos[0].epi_ok);
     return 0;
 }
