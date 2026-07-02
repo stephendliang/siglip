@@ -9,9 +9,14 @@ top-3 actually-used algos ranked by measured time (not heuristic).
 Output is both human-readable and a TSV header+rows so the shell script can
 grep/awk it.
 
-Usage: ./cublaslt-introspect <M> <N> <K> <epi> [scale]
+Usage: ./cublaslt-introspect <M> <N> <K> <epi> [scale] [beta]
   epi:   0=none, 2=gelu_bias, 3=bias_only
   scale: 0=per_tensor (default), 1=mxfp8 (VEC32_UE8M0 block scales)
+  beta:  0 (default) = D = epi(AB). Nonzero = fused residual
+         D = epi(alpha*A^T@B) + beta*C with C a separate BF16 [N,M] tensor
+         (out-of-place C != D) — the fc2_w3 fused-residual problem. A/B/bias
+         stay zero and C is filled with 1.0, so D == beta everywhere iff the
+         kernel really read C; res_ok in the TSV is that check per algo.
 */
 
 #include <cstdio>
@@ -40,6 +45,7 @@ struct AlgoInfo {
     uint64_t cyc;
     int algo_id, tile_id, stages_id, cluster_id, inner_id;
     int splitk, reduction, swizzle, custom;
+    int res_ok;
     size_t ws_size;
     float waves;
 };
@@ -57,6 +63,13 @@ __global__ void read_clock_sentinel(uint64_t* out) {
         asm volatile("mov.u64 %0, %%clock64;" : "=l"(c));
         out[0] = c;
     }
+}
+
+__global__ void fill_bf16(__nv_bfloat16* p, size_t n, float v) {
+    __nv_bfloat16 b = __float2bfloat16(v);
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += (size_t)gridDim.x * blockDim.x)
+        p[i] = b;
 }
 
 /* epi_name comes from fc_problem.cuh — accept the int form from argv. */
@@ -158,13 +171,14 @@ int main(int argc, char** argv) {
     int EPI   = (argc >= 5) ? atoi(argv[4]) : DEFAULT_EPI;
     int SCALE = (argc >= 6) ? atoi(argv[5]) : 0;
 #else
-    if (argc < 5) { fprintf(stderr,"usage: %s <M> <N> <K> <epi:0|2|3> [scale:0=PT|1=MXFP8]\n",argv[0]); return 1; }
+    if (argc < 5) { fprintf(stderr,"usage: %s <M> <N> <K> <epi:0|2|3> [scale:0=PT|1=MXFP8] [beta]\n",argv[0]); return 1; }
     int M     = atoi(argv[1]);
     int N     = atoi(argv[2]);
     int K     = atoi(argv[3]);
     int EPI   = atoi(argv[4]);
     int SCALE = (argc >= 6) ? atoi(argv[5]) : 0;
 #endif
+    float BETA = (argc >= 7) ? (float)atof(argv[6]) : 0.0f;
     bool MXFP8 = (SCALE == 1);
     if (MXFP8 && (K % 32) != 0) {
         fprintf(stderr, "MXFP8 requires K %% 32 == 0 (got K=%d)\n", K);
@@ -207,6 +221,19 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemset(dB,0,szB));
     CUDA_CHECK(cudaMemset(dBias, 0, fc::bias_bytes(N)));
 
+    /*
+      Residual mode: C is a distinct BF16 [N,M] tensor so the matmul is
+      out-of-place (C != D), matching fc2_w3's fused-residual read. C shares
+      layD — same dtype/shape/ld as D. beta==0 keeps the legacy in-place
+      C=D call so all prior reference numbers stay reproducible.
+    */
+    void* dC = dD;
+    if (BETA != 0.0f) {
+        CUDA_CHECK(cudaMalloc(&dC, szD));
+        fill_bf16<<<1024, 256>>>((__nv_bfloat16*)dC, (size_t)N*M, 1.0f);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
     fc::Layouts lay = fc::make_layouts(M, N, K);
     cublasLtMatrixLayout_t& layA = lay.A;
     cublasLtMatrixLayout_t& layB = lay.B;
@@ -228,10 +255,12 @@ int main(int argc, char** argv) {
     cublasLtMatmulHeuristicResult_t heur[MAX]; int n = 0;
     CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(lt, desc, layA, layB, layD, layD, pref, MAX, heur, &n));
 
-    printf("### CUBLASLT INTROSPECT M=%d N=%d K=%d epi=%s scale=%s\n", M, N, K, epi_name_int(EPI), MXFP8 ? "mxfp8" : "per_tensor");
+    printf("### CUBLASLT INTROSPECT M=%d N=%d K=%d epi=%s scale=%s beta=%.1f%s\n",
+           M, N, K, epi_name_int(EPI), MXFP8 ? "mxfp8" : "per_tensor",
+           BETA, BETA != 0.0f ? " (fused residual, out-of-place C)" : "");
     printf("### Heuristics returned: %d\n\n", n);
 
-    float alpha=1.0f, beta=0.0f;
+    float alpha=1.0f, beta=BETA;
     cudaEvent_t t0,t1; CUDA_CHECK(cudaEventCreate(&t0)); CUDA_CHECK(cudaEventCreate(&t1));
 
     uint64_t* d_clk = nullptr;
@@ -242,18 +271,18 @@ int main(int argc, char** argv) {
         // warm + time
         for (int w=0;w<N_WARM;w++) {
             auto s = cublasLtMatmul(lt, desc, &alpha, dA, layA, dB, layB, &beta,
-                                    dD, layD, dD, layD, &heur[i].algo, dWS, WS, 0);
+                                    dC, layD, dD, layD, &heur[i].algo, dWS, WS, 0);
             if (s != CUBLAS_STATUS_SUCCESS) { break; }
         }
         auto s = cublasLtMatmul(lt, desc, &alpha, dA, layA, dB, layB, &beta,
-                                dD, layD, dD, layD, &heur[i].algo, dWS, WS, 0);
+                                dC, layD, dD, layD, &heur[i].algo, dWS, WS, 0);
         if (s != CUBLAS_STATUS_SUCCESS) continue;
         CUDA_CHECK(cudaDeviceSynchronize());
         read_clock_sentinel<<<1, 1>>>(d_clk + 0);
         CUDA_CHECK(cudaEventRecord(t0));
         for (int r=0;r<N_TIME;r++) {
             cublasLtMatmul(lt, desc, &alpha, dA, layA, dB, layB, &beta,
-                           dD, layD, dD, layD, &heur[i].algo, dWS, WS, 0);
+                           dC, layD, dD, layD, &heur[i].algo, dWS, WS, 0);
         }
         CUDA_CHECK(cudaEventRecord(t1));
         read_clock_sentinel<<<1, 1>>>(d_clk + 1);
@@ -264,6 +293,24 @@ int main(int argc, char** argv) {
         uint64_t clk[2];
         CUDA_CHECK(cudaMemcpy(clk, d_clk, sizeof(clk), cudaMemcpyDeviceToHost));
         uint64_t cyc = (clk[1] > clk[0]) ? (clk[1] - clk[0]) / (uint64_t)N_TIME : 0;
+
+        /*
+          Residual applied? AB and bias are zero and C is 1.0, so D must read
+          back exactly beta at every probe point. An algo that "succeeds" but
+          skips the C read (or mishandles out-of-place) fails this and gets
+          demoted below every res_ok algo in the ranking.
+        */
+        int res_ok = 1;
+        if (BETA != 0.0f) {
+            const size_t nElem = (size_t)N * M;
+            const size_t probe[3] = {0, nElem / 2, nElem - 1};
+            for (int pi = 0; pi < 3; pi++) {
+                __nv_bfloat16 h;
+                CUDA_CHECK(cudaMemcpy(&h, (const __nv_bfloat16*)dD + probe[pi],
+                                      sizeof(h), cudaMemcpyDeviceToHost));
+                if (__bfloat162float(h) != BETA) { res_ok = 0; break; }
+            }
+        }
 
         AlgoInfo a{};
         a.heur_idx = i;
@@ -284,21 +331,25 @@ int main(int argc, char** argv) {
         a.reduction  = get_algo_int(&heur[i].algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME);
         a.swizzle    = get_algo_int(&heur[i].algo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING);
         a.custom     = get_algo_int(&heur[i].algo, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION);
+        a.res_ok     = res_ok;
         infos.push_back(a);
     }
 
-    std::sort(infos.begin(), infos.end(), [](const AlgoInfo& a, const AlgoInfo& b){ return a.ms < b.ms; });
+    std::sort(infos.begin(), infos.end(), [](const AlgoInfo& a, const AlgoInfo& b){
+        if (a.res_ok != b.res_ok) return a.res_ok > b.res_ok;
+        return a.ms < b.ms;
+    });
 
     // TSV for easy awk'ing
     printf("# TSV\n");
-    printf("rank\theur\tms\tcyc\talgoId\ttile\tstages\tcluster\tinner\tsplitk\tredux\tswizzle\tcustom\twaves\tws_MB\n");
+    printf("rank\theur\tms\tcyc\talgoId\ttile\tstages\tcluster\tinner\tsplitk\tredux\tswizzle\tcustom\twaves\tws_MB\tres_ok\n");
     for (size_t r = 0; r < infos.size(); r++) {
         const auto& a = infos[r];
-        printf("%zu\t%d\t%.4f\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\t%.1f\n",
+        printf("%zu\t%d\t%.4f\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\t%.1f\t%d\n",
                r+1, a.heur_idx, a.ms, (unsigned long long)a.cyc,
                a.algo_id, a.tile_id, a.stages_id,
                a.cluster_id, a.inner_id, a.splitk, a.reduction,
-               a.swizzle, a.custom, a.waves, a.ws_size / (1024.0*1024.0));
+               a.swizzle, a.custom, a.waves, a.ws_size / (1024.0*1024.0), a.res_ok);
     }
 
     printf("\n# Top-3 caps:\n");
@@ -314,12 +365,12 @@ int main(int argc, char** argv) {
         printf("\n@@RESULT ms=ERR cyc=0 tflops=0.00 checksum=0.000000 valid=0 c0=0.0\n");
         return 1;
     }
-    printf("\n# Winner:  rank=1  tile=%d  stages=%d  cluster=%d  inner=%d  splitk=%d  swizzle=%d  ms=%.4f  cyc=%llu\n",
+    printf("\n# Winner:  rank=1  tile=%d  stages=%d  cluster=%d  inner=%d  splitk=%d  swizzle=%d  ms=%.4f  cyc=%llu  res_ok=%d\n",
            infos[0].tile_id, infos[0].stages_id, infos[0].cluster_id, infos[0].inner_id,
            infos[0].splitk, infos[0].swizzle, infos[0].ms,
-           (unsigned long long)infos[0].cyc);
+           (unsigned long long)infos[0].cyc, infos[0].res_ok);
     double tflops = 2.0 * (double)M * (double)N * (double)K / ((double)infos[0].ms * 1e9);
-    printf("\n@@RESULT ms=%.4f cyc=%llu tflops=%.2f checksum=0.000000 valid=1 c0=0.0\n",
-           infos[0].ms, (unsigned long long)infos[0].cyc, tflops);
+    printf("\n@@RESULT ms=%.4f cyc=%llu tflops=%.2f checksum=0.000000 valid=%d c0=0.0\n",
+           infos[0].ms, (unsigned long long)infos[0].cyc, tflops, infos[0].res_ok);
     return 0;
 }

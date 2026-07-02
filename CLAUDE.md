@@ -10,7 +10,7 @@ on CPU VPS, runs B200 (148 SMs, 74 clusters). PE (patch-embed) kernel done.
 |---|---|---|---|---|
 | FC2 K=3072 BIAS_ONLY (strip floor) | 0.98502 | `fc2_w3x` `-DSTRIP_EPILOGUE` | n/a | NS=6+PREFILL structural floor (1814685 cyc) |
 | **FC2 K=3072 BIAS_ONLY (full)** | **1.00092** | `fc2_w3x` (bias-preload, STSM-only) | basin floor (default `gflip_blkswap` TD=54) | **−27 µs** vs 1.028 PerTensor / **−116 µs** vs 1.117 MXFP8; +16 µs exposed epi vs strip |
-| FC2 K=3072 fused (+residual) | ~1.060 | `fc2_w3` | **gflip_blkswap TD=54** PACKED (now default) | (no apples-to-apples ref) |
+| FC2 K=3072 fused (+residual) | **1902.5 kcyc** (wall 1.06–1.13, container clock-dependent) | `fc2_w3` | **gflip_blkswap TD=54** PACKED (now default) | **−14.8% cyc** vs CUTLASS 2232.0k / **−16.7%** vs cuBLASLt beta=1 rank-1 2283.6k (paired) |
 | FC1 K=768 fused (+GELU+bias) | 1.998 | `fc1_w3` | zigzag TD=11 + K_STAGGER=1 | **−416 µs** vs 2.414 PerTensor / **+47 µs** vs 1.951 MXFP8 |
 
 `fc2_w3x` = clean-sheet 6-warp persistent bias-only, beats per-tensor and
@@ -82,19 +82,20 @@ tier blkswap/dgsnake/snrot2/gflip_snrot/gflip all STRONG faster than dgsw (−4.
 opposite of bias-only, where lmrev tied for first; the residual consumer is
 m-axis-traversal sensitive in a way bias-only isn't.** `stride` (old TD=0 default)
 is +156k cyc (+8.4%) — never ship it; TD=54 is now the `make fc2-w3` default.
-**Caveat:** fc2_w3 has a **confirmed sparse output RACE** (~0.04%, the
-run-to-run nondeterminism). Root cause PROVEN 2026-06-30 (Modal B200,
-barrier-knockout + depth battery, 20×/cfg) = **epilogue-staging recycle DEPTH**
-(`NUM_EPI_STAGES`), NOT the MMA/TMEM handshake and NOT the store barriers:
-BIAS_ONLY ES1→ES2 fixes both the race AND the deterministic +64 (20/20 valid, 1
-checksum); removing wait_group/bar.sync/proxy-fence does NOT worsen FULL.
-Production FULL already runs ES2 so the severe ES1 collision doesn't apply; its
-remaining 1/20 spot collapse (e.g. 290080,470 → 780) is the W2-residual-ring ↔
-consumed_mbar handshake, still marginal at depth 2. Deeper ring needs NS6→5
-(= resadd-port path, +71 µs). Kernel SASS byte-identical to pre-template HEAD →
-not the swizzle refactor; doesn't affect cyc so the basin sweep stands. Full
-analysis: `memory/project-fc2-w3-epilogue-race.md`. Sweep: `tools/sweep_fc2_w3_swizzle.sh` /
-`modal run gpu_interface/modal.py --target fc2-w3-swizzle-sweep --run-args "SWEEP=front REPS=200"`.
+**Sparse output RACE — FIXED 2026-07-01 (back-pressure, zero cost).** fc2_w3's
+fused residual had a scheduling race (full self-diff: ~0.25% of ALL elements every
+run; the old "~0.04%/~1/20" was the coarse 32-spot estimate). ROOT CAUSE = a
+buffer/rate deficit, NOT a handshake bug: under PREFILL, W1 free-runs the MMA and
+at NS=6 outpaces the 2-slot ReuseSmemC epilogue staging. Proof it's depth/rate not
+handshake — the IDENTICAL handshake code is bit-exact at a 4-deep ring (NS5 ES4
+dirty=0/100) and races at 2-deep (NS5 ES2 13/100, NS6 ES2 100/100). FIX = restore
+W1's `epilogue_mbar` wait to bound the MMA to the epilogue's pace (the existing
+`NO_PREFILL` path), now AUTO-ENABLED for the residual FULL path (STRIP/GEMM/BIAS
+keep PREFILL; `-DFORCE_PREFILL` opts out). **dirty=0/350 across 3 runs +
+0/1500 (2026-07-01 throttle-probe run), valid=1,
+1.077 ms vs 1.079 PREFILL** — free, because K_ITERS=24 fully hides the wait.
+Detector: `-DSELF_DIFF=N` (double-launch bitwise self-diff, `@@SELFDIFF_SUMMARY`).
+Full analysis: `memory/project-fc2-w3-epilogue-race.md`.
 
 ## FC1 fused status (PACKED_TILES, M=928256, K=768, N=3072)
 
@@ -389,12 +390,50 @@ transposed [M,N] geometry.
 |-----------------------------------------------|--------|----------|
 | cuBLASLt fused BIAS_ONLY rank-1 (PerTensor)   | 1.028  | algoId=66 tile=128x256 NS=36 cluster=2x1x1 (id=3) |
 | cuBLASLt fused BIAS_ONLY rank-1 (MXFP8)       | 1.117  | algoId=66 tile=128x256 NS=36 cluster=2x1x1 (id=3) |
+| cuBLASLt fused BIAS+residual rank-1 (beta=1)  | 1.237  | same algo identity; 1.0346 beta=0 control same container |
 | cuBLASLt GEMM-only rank-1                     | 1.043  | per-tensor, no epilogue |
 | cuBLASLt unfused (GEMM + post-kernel bias)    | 1.546  | sequential |
 | **fc2_w3x** (bias-only, fully fused)          | **1.001** | gflip_blkswap TD=54 |
+| **fc2_w3** (fused +residual)                  | **~1.060** | gflip_blkswap TD=54, back-pressured NS=6 |
 
 fc2_w3x beats both fused rank-1 paths (-27 µs PerTensor, -116 µs MXFP8) and
 the GEMM-only path (-42 µs while fused).
+
+**Fused-residual paired cyc reference (2026-07-01, one B200 container, 3
+interleaved rounds, identical clock64-sentinel metric = avg cyc over 10
+launches; `gpu_interface/paired_residual.py`, log
+`data/residual_introspect_20260701/`):**
+
+| impl | kcyc/launch | wall ms | implied GHz |
+|---|---|---|---|
+| **fc2_w3** (TD=54, back-pressured NS=6) | **1902.5** (spread 2.7k) | 1.130 | 1.68 |
+| CUTLASS `fc2-cutlass` (carveout NS) | 2232.0 (2.5k) | 1.209 | 1.85 |
+| cuBLASLt rank-1 beta=1 (algoId=66 t23 cl3) | 2283.6 (0.8k) | 1.237 | 1.85 |
+
+fc2_w3 **−14.8% cyc vs CUTLASS, −16.7% vs cuBLASLt** — and faster in cycles
+than cuBLASLt's residual-FREE beta=0 control (1910.6k). CUTLASS beats
+cuBLASLt by 2.3% (old 1.226-vs-1.237 wall "tie" resolved). cuBLASLt CAN
+fuse residual (BIAS epi + beta=1, out-of-place BF16 C; all 8 algoId=66
+kernels pass the res_ok probe: A/B/bias=0, C=1 → D==1) but pays +19.5% cyc
+over its beta=0 control; ours pays ~59 kcyc (+3.2%) over w3x bias-only.
+**Wall understates the lead: fc2_w3's denser power draw throttles clocks
+~9% in the same container (1.68 vs 1.85 GHz) → wall −6.5/−8.6%;
+locked-clock realizes the cyc gap.** Throttle probe (2026-07-01): limiter
+= **SW Power Cap at the 1000 W board max** (power.limit == max_limit;
+thermal + HW-brake Not Active; capped ~100% of a 5 s sustained fc2_w3
+load) — NOT preventable: no power headroom even with root, and
+`nvidia-smi -lgc`/`-pl` are permission-denied on Modal anyway (a clock
+lock can't override the cap). Saturated-tensor-pipe kernels always cap;
+the vendor kernels only clock higher because they idle more.
+Cycles-first reporting is the mitigation. cyc itself drifts ~±1.5% with
+sustained-clock state (1930.3k at 1.75 GHz vs 1902.5k at 1.68 — fixed-ns
+DRAM latency costs more cyc at higher clock); still ~10× tighter than
+wall. cyc is container-portable (cuBLASLt
+beta=1 2280.2k→2283.6k across containers, +0.15%); wall is not (fc2_w3
+1.077→1.130). `./cublaslt-introspect <M> <N> <K> <epi> [scale] [beta]`;
+res_ok TSV col guards silent C-skip. fc2_w3 + fc2_cutlass emit `@@CYC`
+sentinel cyc unconditionally (`-DCLOCK_TOTAL` adds fc2_w3's kernel-span
+max as cross-check: 1922.5k worst-launch vs 1902.5k mean).
 
 ### FC1 K=768 (production [N,M], BF16 bias)
 
@@ -542,21 +581,18 @@ Histories: `memory/project_w3x_bias_preload_win.md`, `project_w3x_packed_c_abi.m
 **Realistic remaining headroom ~1-3 µs** — largest single target by past-win
 standards (bias-preload 1.7 µs, STSM 0.4 µs); probably needs new lever class.
 
-**OPEN GOAL (2026-06-30): a 100%-valid residual-carrying NS=6 kernel.**
-fc2_w3's fused residual path at NS=6/ES2 is NOT race-free — ~0.04% sparse output
-corruption (~1/20 spot-check fail), root-caused to the epilogue-staging recycle
-(W2-residual-ring ↔ `consumed_mbar` handshake, marginal at ES depth 2). Proven
-2026-06-30: GEMM_ONLY (NS6/ES1) and BIAS_ONLY (NS6/ES2) are both 20/20 valid +
-deterministic, but **no residual-carrying config is provably clean at NS=6**.
-This is now a correctness REQUIREMENT, not a perf nicety — residual is the
-production path. Constraint: must hold NS=6 (the 1.063 ms floor); dropping to
-NS=5 for a deeper ring is the `fc2_w3y` path (+71 µs) and does NOT meet this goal.
-Full analysis + fix paths: `memory/project-fc2-w3-epilogue-race.md`.
-
-**Next:** close the residual NS=6 race. The fused-residual *port* to fc2_w3x
-(`fc2_w3y`) is a DEAD END — see Dead ends below — but the race lives in the
-legacy `fc2_w3` residual path itself and must be fixed there. Residual's home
-stays `fc2_w3` (NS=6, 1.063 ms) — but it must become bit-exact across launches.
+**CLOSED GOAL (2026-07-01): 100%-valid residual-carrying NS=6 kernel — DONE.**
+The former OPEN GOAL (a bit-exact fused-residual fc2_w3 at NS=6) is met. The race
+was a buffer/rate deficit, not the `consumed_mbar` handshake (the identical
+handshake is clean at a 4-deep ring): under PREFILL the free-running NS=6 MMA
+laps the 2-slot ReuseSmemC staging. FIX = auto-enable back-pressure (W1's
+`epilogue_mbar` wait, the `NO_PREFILL` path) for the residual FULL path — **free
+at K_ITERS=24** (1.077 ms, dirty=0/350 over 3 self-diff runs). STRIP/GEMM/BIAS
+keep PREFILL; `-DFORCE_PREFILL` restores the old free-run. The prior "must not
+drop NS=6, NS=5 is +71 µs" tension is moot — the fix keeps NS=6 AND speed.
+Validate any residual change with `-DSELF_DIFF=N` (full-tensor double-launch
+self-diff; the 32-spot check misses ~0.25% sparse corruption). Full analysis:
+`memory/project-fc2-w3-epilogue-race.md`.
 
 ## Dead ends — do NOT retry
 

@@ -270,6 +270,14 @@ fc1-w3x-r-sweep: fc1-w3x-r120 fc1-w3x-r136 fc1-w3x-r152 fc1-w3x-r160 fc1-w3x-r16
 fc2-w3: fc2_w3.cu
 	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
 
+# NS=6 residual-race protocol-tweak sweep cell. Combo supplied via DFLAGS:
+#   -DSELF_DIFF=100 [-DFORCE_WAIT0] [-DDELAY_TMA_STORE=1] [-DLATE_CONSUMED]
+# Distinct binary name so it doesn't clobber the production fc2-w3 on Modal.
+# modal run gpu_interface/modal.py --target fc2-w3-race-cell \
+#   --dflags "-DSELF_DIFF=100 -DFORCE_WAIT0 -DLATE_CONSUMED"
+fc2-w3-race-cell: fc2_w3.cu
+	$(NVCC) $(CFLAGS) $(DFLAGS) $< -o $@ $(LDFLAGS)
+
 # Single-binary swizzle basin sweep (ported gflip basin + dgsw/zigzag/stride
 # baselines). Run: ./fc2-w3-swizzle-sweep SWEEP=front REPS=200  (or env vars).
 # Reports frequency-invariant cyc via CLOCK_TOTAL — fc2_w3's HBM-noise-immune

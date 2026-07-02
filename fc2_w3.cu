@@ -259,6 +259,26 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #ifndef DELAY_TMA_STORE
 #define DELAY_TMA_STORE    0
 #endif
+#ifndef SELF_DIFF
+#define SELF_DIFF          0
+#endif
+
+/* Residual back-pressure (2026-07-01). Under PREFILL, W1 free-runs the MMA
+   (skips the epilogue_mbar wait) and at NS=6 outpaces the 2-slot ReuseSmemC
+   epilogue staging → the fused-residual output race (SELF_DIFF dirty=100/100).
+   The race is a buffer/rate deficit, not a handshake bug: the identical
+   handshake is bit-exact at a 4-deep ring (proven NS5 ES4 dirty=0). Restoring
+   W1's epilogue_mbar wait (NO_PREFILL) bounds the MMA to the epilogue's pace and
+   closes it — at ZERO cost here, because K_ITERS=24's K-loop fully hides the wait
+   (measured 1.077 ms, dirty=0/250 over 2 runs, vs PREFILL 1.079 ms dirty=100/100).
+   Auto-enable it for the residual FULL path only; STRIP/GEMM_ONLY/BIAS_ONLY have
+   no W2 residual, are already race-free, and keep PREFILL (their published floor).
+   Opt back to PREFILL with -DFORCE_PREFILL. */
+#if !defined(NO_PREFILL) && !defined(FORCE_PREFILL) && \
+    !defined(STRIP_EPILOGUE) && !defined(GEMM_ONLY) && !defined(BIAS_ONLY)
+#define NO_PREFILL
+#endif
+
 #ifndef CPP_EPILOGUE
 #define CPP_EPILOGUE       0
 #endif
@@ -2929,6 +2949,21 @@ fc2_w3_kernel(
    HOST
    ════════════════════════════════════════════════════════════════ */
 
+/*
+  Stream-serialized clock64 sentinel bracketing the timed loop — identical
+  metric to cublaslt_introspect.cu and fc2_cutlass.cu (avg SM-clock cycles
+  per launch, launch gaps included uniformly), so the three fused-residual
+  implementations compare in one clock domain. CLOCK_TOTAL's per-CTA span
+  max stays as the kernel-only cross-check.
+*/
+__global__ void read_clock_sentinel(unsigned long long* out) {
+    if (threadIdx.x == 0) {
+        unsigned long long c;
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(c));
+        out[0] = c;
+    }
+}
+
 __global__ void init_residual(__nv_bfloat16* __restrict__ res, int n_dim, long long total) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < total) {
@@ -2937,6 +2972,27 @@ __global__ void init_residual(__nv_bfloat16* __restrict__ res, int n_dim, long l
         res[idx] = __float2bfloat16((float)(row % 128) * 0.25f + (float)col * 0.125f);
     }
 }
+
+#if SELF_DIFF
+/* SELF_DIFF detector: bitwise-compare two independent launches. The NS=6
+   residual race is nondeterministic, so any element that differs between two
+   runs of the same kernel on identical inputs is a race witness. Grid-stride
+   over the raw BF16 bits (exact, no tolerance). Guarded so the OFF-path binary
+   stays SASS-identical to HEAD. */
+__global__ void count_mismatch(const __nv_bfloat16* __restrict__ a,
+                               const __nv_bfloat16* __restrict__ b,
+                               long long total,
+                               unsigned long long* __restrict__ mm) {
+    unsigned long long local = 0;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (long long)gridDim.x * blockDim.x) {
+        unsigned short ba = *reinterpret_cast<const unsigned short*>(&a[i]);
+        unsigned short bb = *reinterpret_cast<const unsigned short*>(&b[i]);
+        if (ba != bb) local++;
+    }
+    if (local) atomicAdd(mm, local);
+}
+#endif
 
 /*
 Row-varying A init for STSM diagnostic.
@@ -3432,20 +3488,32 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpyToSymbol(g_w3_cyc, h_zero, sizeof(h_zero)));
     }
 #endif
+    unsigned long long* d_clk = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_clk, 2 * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaDeviceSynchronize());
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0);
     cudaEventCreate(&t1);
+    read_clock_sentinel<<<1, 1>>>(d_clk + 0);
     cudaEventRecord(t0);
     for (int i = 0; i < 10; i++) {
         LAUNCH_KERNEL();
     }
     cudaEventRecord(t1);
+    read_clock_sentinel<<<1, 1>>>(d_clk + 1);
     cudaEventSynchronize(t1);
+    CUDA_CHECK(cudaDeviceSynchronize());
     float ms;
     cudaEventElapsedTime(&ms, t0, t1);
     ms /= 10.0f;
     printf("FC2-W3 kernel: %.3f ms  %.2f TFLOPS\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9);
+    {
+        unsigned long long clk[2];
+        CUDA_CHECK(cudaMemcpy(clk, d_clk, sizeof(clk), cudaMemcpyDeviceToHost));
+        printf("@@CYC name=fc2_w3 cyc_avg=%llu launches=10\n",
+               (clk[1] > clk[0]) ? (clk[1] - clk[0]) / 10ULL : 0ULL);
+    }
     cudaEventDestroy(t0);
     cudaEventDestroy(t1);
 
@@ -3607,6 +3675,44 @@ int main(int argc, char** argv) {
     printf("@@RESULT ms=%.3f tflops=%.2f checksum=%f valid=%d c0=%.1f\n",
            ms, 2.0 * M_TOTAL * N_DIM * K_DIM / ms / 1e9, cksum, valid,
            __bfloat162float(h_C[0]));
+
+#if SELF_DIFF
+    /* Double-launch self-diff: run the kernel twice into the same d_C, snapshot
+       the first into d_Cref, bitwise-compare the second. dirty>0 over the whole
+       budget = the NS=6 residual race is still live. */
+    {
+        const long long sd_total = (long long)M_TOTAL * N_DIM;
+        __nv_bfloat16* d_Cref = nullptr;
+        unsigned long long* d_mm = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_Cref, (size_t)sd_total * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMalloc(&d_mm, sizeof(unsigned long long)));
+        const int sd_tpb = 256;
+        int sd_bpg = (int)((sd_total + sd_tpb - 1) / sd_tpb);
+        if (sd_bpg > 65535) sd_bpg = 65535;
+        int dirty = 0; unsigned long long worst = 0;
+        printf("@@SELFDIFF_BEGIN launches=%d\n", (int)SELF_DIFF);
+        for (int k = 0; k < (int)SELF_DIFF; k++) {
+            LAUNCH_KERNEL();
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(d_Cref, d_C, (size_t)sd_total * sizeof(__nv_bfloat16),
+                                  cudaMemcpyDeviceToDevice));
+            LAUNCH_KERNEL();
+            CUDA_CHECK(cudaDeviceSynchronize());
+            unsigned long long z = 0;
+            CUDA_CHECK(cudaMemcpy(d_mm, &z, sizeof(z), cudaMemcpyHostToDevice));
+            count_mismatch<<<sd_bpg, sd_tpb>>>(d_C, d_Cref, sd_total, d_mm);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            unsigned long long n = 0;
+            CUDA_CHECK(cudaMemcpy(&n, d_mm, sizeof(n), cudaMemcpyDeviceToHost));
+            if (n > 0) { dirty++; if (n > worst) worst = n; }
+            printf("@@SELFDIFF iter=%d mismatches=%llu\n", k, n);
+        }
+        printf("@@SELFDIFF_SUMMARY launches=%d dirty=%d worst=%llu\n",
+               (int)SELF_DIFF, dirty, worst);
+        cudaFree(d_Cref); cudaFree(d_mm);
+    }
+#endif
 
 #ifdef CLOCK_TIMING
     {

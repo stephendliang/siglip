@@ -136,6 +136,20 @@ using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 constexpr size_t SmemBytes = sizeof(typename GemmKernel::SharedStorage);
 
 /* Residual init — matches fc2_w3.cu pattern */
+/*
+  Stream-serialized clock64 sentinel bracketing the timed loop — same
+  technique and clock domain as cublaslt_introspect.cu, so cyc numbers from
+  the two harnesses (and fc2_w3's bracket) are directly comparable without
+  DVFS/thermal guessing.
+*/
+__global__ void read_clock_sentinel(unsigned long long* out) {
+    if (threadIdx.x == 0) {
+        unsigned long long c;
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(c));
+        out[0] = c;
+    }
+}
+
 __global__ void init_residual(__nv_bfloat16* d, int N, long long total) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) {
@@ -295,17 +309,28 @@ int main() {
 
     /* Timed: 10 iterations */
     printf("Timing: 10 iterations...\n");
+    unsigned long long* d_clk = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_clk, 2 * sizeof(unsigned long long)));
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0);
     cudaEventCreate(&t1);
+    read_clock_sentinel<<<1, 1>>>(d_clk + 0);
     cudaEventRecord(t0);
     for (int i = 0; i < 10; i++) gemm.run();
     cudaEventRecord(t1);
+    read_clock_sentinel<<<1, 1>>>(d_clk + 1);
     CUDA_CHECK(cudaEventSynchronize(t1));
+    CUDA_CHECK(cudaDeviceSynchronize());
     float ms;
     cudaEventElapsedTime(&ms, t0, t1);
     ms /= 10.0f;
     printf("FC2-CUTLASS: %.3f ms  %.2f TFLOPS\n", ms, flops / ms / 1e9);
+    {
+        unsigned long long clk[2];
+        CUDA_CHECK(cudaMemcpy(clk, d_clk, sizeof(clk), cudaMemcpyDeviceToHost));
+        printf("@@CYC name=fc2_cutlass cyc_avg=%llu launches=10\n",
+               (clk[1] > clk[0]) ? (clk[1] - clk[0]) / 10ULL : 0ULL);
+    }
     cudaEventDestroy(t0);
     cudaEventDestroy(t1);
 
