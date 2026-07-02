@@ -11,23 +11,26 @@ K=768 (GELU+bias).
 | FC2 bias-only strip floor | 0.98502 ms | `fc2_w3x -DSTRIP_EPILOGUE` | NS=6+PREFILL structural floor |
 | **FC2 bias-only** | **1.00092 ms** | `fc2_w3x` (gflip_blkswap TD=54) | **−27 µs** vs cuBLASLt PT 1.028 / −116 µs vs MXFP8 1.117 |
 | **FC2 fused +residual** | **1902.5 kcyc** (wall 1.06–1.13, clock-dep) | `fc2_w3` (TD=54, back-pressured NS=6) | **−14.8%** vs CUTLASS 2232.0k / −16.7% vs cuBLASLt beta=1 2283.6k |
-| FC1 GELU+bias | 3487.7 kcyc (wall 1.89; matrix cell, base anchor 3620.8) | `fc1_w3` (TD=11+ks=1, EPI_DECOUPLE+ES=3+BIAS_PER_TILE ring defaults) | **+2.8%** vs cuBLASLt 13.3 PT 3391.2k / +0.3% vs MXFP8 3476.7k / −18.7% vs CUTLASS 4288.1k |
+| FC1 GELU+bias | **3473.9 kcyc** (wall 1.88; paired, wins 5/5 rounds) | `fc1_w3` (TD=11+ks=1, EPI_DECOUPLE+ES=3+BIAS_PER_TILE ring+WGREAD defaults) | **+2.5%** vs cuBLASLt 13.3 PT 3390.0k / ≈tie MXFP8 3476.7k (cross-container) / −19.0% vs CUTLASS 4288.1k |
 
 `fc2_w3x` = clean-sheet 6-warp bias-only. `fc2_w3` = legacy 7-warp, production
 residual path. `fc1_w3` = FC1 production (legacy family); `fc1_w3x` (clean-sheet
 port) sits at ~3.11 ms — exposed-epilogue problem, does NOT supersede fc1_w3 yet.
 
 **FC1 is the open front.** libcublasLt 13.3.0.5 (algoId=66 family, GELU
-verified via epi_ok witness) beats us by 96.5 kcyc at our exact geometry.
-fc1_w3 is **epilogue-RATE-bound** (1-tile overlap exists; E = 5.93 kcyc/tile
+verified via epi_ok witness) beats us by 83.9 kcyc at our exact geometry.
+fc1_w3 is **epilogue-RATE-bound** (1-tile overlap exists; E = 5.91 kcyc/tile
 vs vendor 5.77, loader 4.64@NS5 / 3.09@NS6, MMA 3.15 — MMA-side levers can't
 move the wall). Shipped in-file defaults: EPI_DECOUPLE+ES=3 (2026-07-02,
 −336.2 kcyc — per-subiter cross-warp barriers dropped, warps self-pace +
 3-deep store ring; `-DNO_EPI_DECOUPLE -DNUM_EPI_STAGES=2` reverts
-SASS-identically) and BIAS_PER_TILE cp.async 3-slot ring at TD≥8
+SASS-identically); BIAS_PER_TILE cp.async 3-slot ring at TD≥8
 (2026-07-02 evening, −133.1 kcyc; `-DNO_BIAS_PER_TILE` reverts; mechanism
 PROVEN = compact 512 B slots: `-DSTAGING_PAD=4608` restores the old
-OFF_STAGING=171008 and the win survives).
+OFF_STAGING=171008 and the win survives); WGREAD read-paced epi waits
+(2026-07-02 night, −13.9 kcyc paired 5/5; `-DNO_WGREAD` reverts
+SASS-identically; win = dropping the CCTL.IVALL full-L1-invalidate ptxas
+appends to every plain bulk wait, 4/tile — also why LDG_BIAS died).
 **Remaining gap is bare store RATE, not math or opcode:** vendor GEMM-only
 rank-1 = 2510.4 kcyc (4.27 kcyc/tile bare store, full GELU only +1.5/tile on
 top) vs our GEMM_ONLY 3227.3 (5.49/tile — our GELU-on-top +0.44/tile is
@@ -35,7 +38,11 @@ CHEAPER than theirs); packed f32x2 GELU (4.5 slots/elem, denser than vendor
 5.5) REGRESSED +31 — not FP-issue-bound; STSM stores REGRESSED +45..52
 GELU / TIE GEMM_ONLY even at vendor's exact STSM.16.MT88.4
 (`-DSTSM_STORE[=1|2]` timing-only probe — 16x256b LDTM rewrite not worth
-it). Left: wait_group→UTMACMDFLUSH-style pacing, LDTM width, subpass shape.
+it). **Pacing SETTLED 2026-07-02 night:** RING_CARRY (continuous ring, no
+per-tile full drain) +64, LATE_WAIT +295, WGREAD=2 +8.6 — the tile-last
+wait_group 0 is load-bearing back-pressure (fc2-race physics: free-running
+stores deepen the TMA queue and stall longer than the drain). Left: LDTM
+width, subpass shape. `memory/project-fc1-store-pacing.md`,
 `memory/project-fc1-gelu-x2-bias-ring.md`.
 NS=6 matrix 2026-07-02: TIE at production (and pays the ES=2 tax vs ring);
 strip NS=6 hits the MMA floor (3.09 kcyc/tile, −33% — NS=5's "loader floor"
@@ -147,9 +154,10 @@ logs `data/residual_introspect_20260701/`.
 |---|---|---|
 | cuBLASLt GEMM-only rank-1 (epi=0, context) | 2510.4 | 1.360 |
 | fc1_w3 GEMM_ONLY (store-only, context) | 3227.3 | 1.748 |
-| cuBLASLt PT rank-1 (algoId=66 t23 cl 2x1x1) | **3391.2** (±0.3k) | 1.838 |
-| **fc1_w3** (production; matrix cell, base anchor 3620.8) | **3487.7** | 1.891 |
+| cuBLASLt PT rank-1 (algoId=66 t23 cl 2x1x1) | **3390.0** (±0.02k; was 3391.2) | 1.838 |
+| **fc1_w3** (production, +WGREAD; paired 5/5) | **3473.9** (±6.4k) | 1.879 |
 | cuBLASLt MXFP8 rank-1 (same identity) | 3476.7 (±0.4k) | 1.885 |
+| fc1_w3 ring pre-WGREAD (paired same run) | 3487.9 (±5.0k) | 1.888 |
 | fc1_w3 pre-ring (EPI_DECOUPLE+ES=3, paired) | 3619.4 (±1.8k) | 1.961 |
 | fc1_cutlass (GELU_taylor) | 4288.1 (±0.1k) | 2.324 |
 
@@ -161,10 +169,13 @@ SELF_DIFF dirty=0/100 ×4 runs; `-DNUM_EPI_STAGES=2 -DNO_EPI_DECOUPLE`
 reproduces the old build SASS byte-identically. No differential throttle at
 FC1 (~1.85 GHz all impls). Logs `data/fc1_epi_decouple_20260702/`.
 BIAS_PER_TILE ring = −133.1 further (2026-07-02 evening 9-cell matrix, all
-valid=1 + dirty=0/100; ES=4 +169, NS=6 +120 vs ring; paired rerun pending).
+valid=1 + dirty=0/100; ES=4 +169, NS=6 +120 vs ring; paired-confirmed same
+night: ring base 3487.9 vs PT 3390.0 = +97.9 ≈ cell-based +96.5).
 Logs `data/fc1_x2_ring_20260702/`. Store probe (same day, logs
 `data/fc1_store_probe_20260702/`): base 3484.5 reproduced ring cross-container
 (+13.2 base2 drift); STSM/pad/GEMM_ONLY verdicts in the open-front paragraph.
+WGREAD = −13.9 further (2026-07-02 night paired, logs
+`data/fc1_pacing_20260702/`; SELF_DIFF dirty=0/100 both WGREAD and =2).
 
 ### Dim/K sweep conclusions (full tables: `memory/project-perf-table-archive.md`)
 
@@ -208,6 +219,10 @@ Per-item files: `memory/MEMORY.md`. One-liners:
   (TD=0 + TD≥8); provably SASS-identical at production TDs via `nvcc -E`
   pp-diff + cubin byte-match (reuse that gate for any `#ifdef` strip). Static
   always won anyway. `memory/project-w3-workstealing-strip.md`.
+- **FC1 RING_CARRY / LATE_WAIT / WGREAD=2 (store-pacing variants):** +64 /
+  +295 / +8.6 kcyc — the per-tile wait_group 0 drain is load-bearing
+  back-pressure; freeing the store queue deepens TMA latency more than the
+  drain cost. Flags kept opt-in. `memory/project-fc1-store-pacing.md`.
 - **FC1 FORCE_PREFILL:** deadlocks at K_ITERS=6. NO_PREFILL guard mandatory.
 - **FC1 LDG_BIAS:** +2.0 Mcyc (+54%) — L1 bias in the epi hot loop is dead;
   SMEM bias mandatory (only layout-parity use in no-bias builds).

@@ -37,6 +37,15 @@ Compile-time flags:
   -DSTAGING_PAD=N       Pad bytes between bias and staging (default 0).
                         4608 restores the pre-ring OFF_STAGING=171008 —
                         isolates ring-win mechanism (slots vs staging address)
+  -DNO_WGREAD           Plain wait_group instead of the default .read
+                        pacing (restores per-wait CCTL.IVALL L1 invalidates;
+                        pre-WGREAD SASS). -DWGREAD=2 keeps only the
+                        tile-last drain full — tested +8.6, do not ship
+  -DRING_CARRY          Carry the staging-ring phase across tiles
+                        (stage=(t*4+si)%ES) so tile-boundary reuse stays at
+                        distance ES; drops the per-tile wait_group 0 drain
+  -DLATE_WAIT           Ring wait moves inside the subiter, after LDTM+bias
+                        issue and before the first STS (implies RING_CARRY)
 */
 
 #include <cuda.h>
@@ -149,18 +158,65 @@ static_assert(4 % NUM_EPI_WARPS == 0, "NUM_EPI_WARPS must be 1, 2, or 4");
 #define NUM_EPI_STAGES     3
 #endif
 
+#if defined(LATE_WAIT) && !defined(RING_CARRY)
+/* The relocated wait runs at uniform NONLAST depth in every subiter; only
+   the carried ring keeps tile-boundary reuse at that distance. */
+#define RING_CARRY
+#endif
+#if defined(LATE_WAIT) && defined(NO_EPI_DECOUPLE)
+#error "LATE_WAIT empties the subiter-tail EPI_WAIT that carries the lockstep barrier"
+#endif
+
 /*
 Non-last store pacing tracks the staging ring: ES-1 bulk groups in flight
 keeps the oldest slot drained before its STS reuse one subiter later.
+WGREAD waits on TMA *read* completion — reads-done is the exact slot-reuse
+requirement; nothing in-kernel ever needs the global writes visible. In
+SASS the .read variant drops the CCTL.IVALL (full L1 invalidate) ptxas
+appends to every plain bulk wait — 4 per tile in the epi hot loop.
+Production default (paired 2026-07-02: −13.9 kcyc, wins 5/5 rounds);
+-DNO_WGREAD reverts to plain waits, SASS-identically to the pre-flag build.
 */
+#if !defined(WGREAD) && !defined(NO_WGREAD)
+#define WGREAD 1
+#endif
+#ifdef WGREAD
+#define _EPI_WG "cp.async.bulk.wait_group.read "
+#else
+#define _EPI_WG "cp.async.bulk.wait_group "
+#endif
 #if NUM_EPI_STAGES == 2
-#define EPI_WG_NONLAST "cp.async.bulk.wait_group 1;"
+#define EPI_WG_NONLAST _EPI_WG "1;"
 #elif NUM_EPI_STAGES == 3
-#define EPI_WG_NONLAST "cp.async.bulk.wait_group 2;"
+#define EPI_WG_NONLAST _EPI_WG "2;"
 #elif NUM_EPI_STAGES == 4
-#define EPI_WG_NONLAST "cp.async.bulk.wait_group 3;"
+#define EPI_WG_NONLAST _EPI_WG "3;"
 #else
 #error "NUM_EPI_STAGES must be 2, 3, or 4"
+#endif
+
+/*
+4 subiters on a 3-slot ring wrap to slot 0 mid-tile, putting the next
+tile's si=0 reuse at distance 1 — hence the full wait_group 0 at every
+tile's last subiter, an exposed store drain the vendor kernel never pays
+(its pacing is one UTMACMDFLUSH per subpass on a 2-slot ping-pong).
+RING_CARRY keeps the ring phase running across tiles so every reuse sits
+at distance ES and the tile-last wait drops to NONLAST depth; only the
+kernel-final drain still waits to zero.
+*/
+#ifdef RING_CARRY
+#define EPI_WG_TILE_LAST EPI_WG_NONLAST
+#define EPI_STAGE_OF(T, SI) (((T) * NUM_EPI_SUBITERS + (SI)) % NUM_EPI_STAGES)
+#else
+#if defined(WGREAD) && WGREAD == 2
+/* WGREAD=2: read-paced subiter waits, but the tile-last drain stays a full
+   wait_group 0 — keeps the write-completion back-pressure the ring-carry
+   matrix showed is load-bearing. */
+#define EPI_WG_TILE_LAST "cp.async.bulk.wait_group 0;"
+#else
+#define EPI_WG_TILE_LAST _EPI_WG "0;"
+#endif
+#define EPI_STAGE_OF(T, SI) ((SI) % NUM_EPI_STAGES)
 #endif
 
 /*
@@ -485,7 +541,37 @@ across lanes by the stmatrix unit, so bytes land permuted; see header).
     } \
 } while(0)
 
+#ifdef LATE_WAIT
+#define EPI_WAIT(LAST)
+/* Relocated ring wait: after the subiter's LDTM + bias issue, before its
+   first STS — the DEPBAR overlaps the load latency instead of tailing the
+   store. Uniform NONLAST depth (RING_CARRY implied). */
+#define EPI_WAIT_PRE_STS() do { \
+    if (lane == 0) \
+        asm volatile(EPI_WG_NONLAST ::: "memory"); \
+    __syncwarp(); \
+} while(0)
+#define EPI_WAIT_DRAIN(LAST) do { \
+    if (LAST) { \
+        if (lane == 0) \
+            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory"); \
+        __syncwarp(); \
+    } \
+} while(0)
+#else
 #define EPI_WAIT(LAST) do { \
+    if (lane == 0) { \
+        if (LAST) \
+            asm volatile(EPI_WG_TILE_LAST ::: "memory"); \
+        else \
+            asm volatile(EPI_WG_NONLAST ::: "memory"); \
+    } \
+    __syncwarp(); \
+    EPI_SUBITER_BAR(); \
+} while(0)
+/* Drain tail: the kernel-final wait is always a full wait_group 0 — never
+   exit the persistent loop with bulk-group writes pending. */
+#define EPI_WAIT_DRAIN(LAST) do { \
     if (lane == 0) { \
         if (LAST) \
             asm volatile("cp.async.bulk.wait_group 0;" ::: "memory"); \
@@ -495,6 +581,7 @@ across lanes by the stmatrix unit, so bytes land permuted; see header).
     __syncwarp(); \
     EPI_SUBITER_BAR(); \
 } while(0)
+#endif
 
 /* K-iteration macro (accumulating, ki >= 1). Single asm block emits all 4
    MMAs back-to-back so ptxas emits one elect+R2UR.BROADCAST wrapper for the
@@ -853,7 +940,7 @@ fc1_w3_kernel(
                 asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
-                    const int stage = si % NUM_EPI_STAGES;
+                    const int stage = EPI_STAGE_OF(_ti - 1, si);
                     const int nc_base = si * 64;
 
 #if GROUPS_PER_WARP > 1
@@ -887,6 +974,9 @@ fc1_w3_kernel(
                         const uint32_t rsw2 = chunk ? sw6 : sw2;
                         const uint32_t rsw3 = chunk ? sw7 : sw3;
 
+#ifdef LATE_WAIT
+                        if (_ci == 0) EPI_WAIT_PRE_STS();
+#endif
                         TMEM_WAIT();
 
                         GEMM_CVT_STS(a0,a1,a2,a3,a4,a5,a6,a7, stage_base + rsw0);
@@ -980,7 +1070,7 @@ fc1_w3_kernel(
 #endif
 
                 for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
-                    const int stage = si % NUM_EPI_STAGES;
+                    const int stage = EPI_STAGE_OF(_ti - 1, si);
                     const int nc_base = si * 64;
 
 #if GROUPS_PER_WARP > 1
@@ -1052,6 +1142,9 @@ fc1_w3_kernel(
                         const uint32_t rsw2 = chunk ? sw6 : sw2;
                         const uint32_t rsw3 = chunk ? sw7 : sw3;
 
+#ifdef LATE_WAIT
+                        if (_ci == 0) EPI_WAIT_PRE_STS();
+#endif
                         TMEM_WAIT();
 
                         GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
@@ -1147,7 +1240,7 @@ fc1_w3_kernel(
             ml_phase[last_buf] ^= 1;
 
             for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
-                const int stage = si % NUM_EPI_STAGES;
+                const int stage = EPI_STAGE_OF(tile_count - 1, si);
                 const int nc_base = si * 64;
 
 #if GROUPS_PER_WARP > 1
@@ -1181,6 +1274,9 @@ fc1_w3_kernel(
                     const uint32_t rsw2 = chunk ? sw6 : sw2;
                     const uint32_t rsw3 = chunk ? sw7 : sw3;
 
+#ifdef LATE_WAIT
+                    if (_ci == 0) EPI_WAIT_PRE_STS();
+#endif
                     TMEM_WAIT();
 
                     GEMM_CVT_STS(a0,a1,a2,a3,a4,a5,a6,a7, stage_base + rsw0);
@@ -1212,7 +1308,7 @@ fc1_w3_kernel(
                 { const int row_group = ew;
                 EPI_STORE(stage, nc_base, last_n, last_m); }
 #endif
-                EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
+                EPI_WAIT_DRAIN(si == NUM_EPI_SUBITERS - 1);
             }
 
             mbar_arrive(epi_mbar_masked + last_buf * 8);
@@ -1238,7 +1334,7 @@ fc1_w3_kernel(
 #endif
 
             for (int si = 0; si < NUM_EPI_SUBITERS; si++) {
-                const int stage = si % NUM_EPI_STAGES;
+                const int stage = EPI_STAGE_OF(tile_count - 1, si);
                 const int nc_base = si * 64;
 
 #if GROUPS_PER_WARP > 1
@@ -1308,6 +1404,9 @@ fc1_w3_kernel(
                     const uint32_t rsw2 = chunk ? sw6 : sw2;
                     const uint32_t rsw3 = chunk ? sw7 : sw3;
 
+#ifdef LATE_WAIT
+                    if (_ci == 0) EPI_WAIT_PRE_STS();
+#endif
                     TMEM_WAIT();
 
                     GELU_CVT_STS_V4(a0,a1,a2,a3,a4,a5,a6,a7,
@@ -1343,7 +1442,7 @@ fc1_w3_kernel(
                 { const int row_group = ew;
                 EPI_STORE(stage, nc_base, last_n, last_m); }
 #endif
-                EPI_WAIT(si == NUM_EPI_SUBITERS - 1);
+                EPI_WAIT_DRAIN(si == NUM_EPI_SUBITERS - 1);
             }
 
             mbar_arrive(epi_mbar_masked + last_buf * 8);
